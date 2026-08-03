@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <em>The coordination substrate you can verify.</em>
+  <em>Strongly consistent distributed KV with no storage ceiling.</em>
 </p>
 
 <p align="center">
@@ -12,11 +12,10 @@
   <img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="Rust 1.85+">
 </p>
 
-Orbita is a strongly consistent, multitenant distributed key-value store for
-people building distributed systems. It is the place to put the locks, leases,
-epochs, catalogs, and control-plane state that a platform coordinates on. It
-starts as a single partition on your laptop and splits as it grows, past where
-etcd stops.
+Orbita is where you put the locks, leases, epochs, catalogs, and control-plane
+state that a platform coordinates on. It is multitenant, so one cluster serves
+every team that needs it rather than one cluster each, and it starts as a
+single partition on your laptop and splits as it grows, past where etcd stops.
 
 ## Why this exists
 
