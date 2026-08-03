@@ -1,6 +1,18 @@
 {
   "version": 1,
   "skills": {
+    "conventional-commit-message": {
+      "source": "conventional-changelog/conventional-changelog",
+      "sourceType": "github",
+      "skillPath": "skills/conventional-commit-message/SKILL.md",
+      "computedHash": "6ae250d67edc757e2e54163dae2d32f7b44bd8827231cbab2895db8fc0331ac3"
+    },
+    "pr-branch-naming": {
+      "source": "thedesignproject/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/pr-branch-naming/SKILL.md",
+      "computedHash": "368b786e0dd5de2475a638af865f6009acedd2423c27c025ced9a314335ff162"
+    },
     "prd": {
       "source": "github/awesome-copilot",
       "sourceType": "github",
