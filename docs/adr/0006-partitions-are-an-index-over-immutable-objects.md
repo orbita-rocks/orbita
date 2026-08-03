@@ -35,6 +35,10 @@ storage, plus a mutable table of recent writes.
 
 ### The pieces
 
+The bytes are specified in [docs/format](../format/), which is the artifact
+that makes any of this worth doing. A format nobody outside this repository can
+implement against is a single-implementation format with extra steps.
+
 **Segments** are immutable objects holding a sorted run of records. They are
 the unit of storage, they are never modified after they are written, and their
 format is specified and versioned independently of any implementation.

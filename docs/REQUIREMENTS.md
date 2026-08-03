@@ -231,18 +231,50 @@ dies on ease of adoption.
 
 ## Scale envelope
 
-v1 targets the small-cluster sweet spot. These numbers bound what we design
-and test for, and they become the limits we document.
+Two different things get called scale, and this section used to mix them. What
+the architecture bounds is a property of Orbita and belongs in the pitch. What
+v1 is tested to is a statement about our effort so far, and it moves every time
+someone runs a bigger experiment. Only the first is a ceiling.
 
-| Dimension | v1 target |
-|---|---|
-| Workers | 3 to 15, and capacity grows by adding them |
-| Hot data | the sum of memory across the workers |
-| Total data | bounded by object storage, not by the cluster |
-| Cluster read throughput | ~100k reads/sec |
-| Cluster write throughput | ~10k writes/sec |
-| Max key size | 10KB |
-| Max value size | 10MB, per keyspace, default far lower |
+| Dimension | What bounds it | v1 target |
+|---|---|---|
+| Workers | Nothing in the design. Three is the floor, because a 2-of-3 WAL quorum needs three. | 3 and up |
+| Partitions | Leader group metadata throughput, which is the real ceiling on cluster size | not characterized yet |
+| Hot data | The sum of memory across the workers | grows by adding workers |
+| Total data | Object storage, meaning effectively nothing | unbounded in practice, and independent of worker count |
+| Read throughput | Replica count, since replicas serve reads | ~100k reads/sec |
+| Write throughput | Partition count, since one owner serializes each partition | ~10k writes/sec |
+| Max key size | Fixed | 10KB |
+| Max value size | Per-keyspace configuration | 10MB, default far lower |
+
+There is no architectural cap on workers, and claiming a small one gave away
+the product's main argument for free. The thing that does grow with cluster
+size is the partition map: every worker caches all of it, and every worker
+heartbeats its progress on every partition it holds to the leader group. So the
+leader group's capacity to carry metadata is what bounds a cluster, and it is
+bounded in partitions rather than in machines.
+
+That distinction is the whole etcd contrast, so it is worth being exact about.
+etcd puts every operation through one Raft group, which is why its ceiling
+arrives at around 8GB of data. Orbita puts only metadata changes through one,
+and reads and writes never touch it at all. A cluster gets big enough to
+strain the leader group only when it has enough partitions to hold far more
+data than etcd can, and the fix when that day comes is a sharded control plane
+rather than a rewrite.
+
+The throughput numbers are targets rather than measurements, and they are
+cluster-wide figures for a cluster of the size we currently test. Neither is a
+ceiling. Read capacity grows with replicas per
+[ADR 0001](adr/0001-linearizable-reads-from-replicas.md), and write capacity
+grows with partitions, which split as they grow. Publishing a measured curve
+of both against worker count is a release deliverable, and it replaces these
+rows when it exists.
+
+The partition ceiling is genuinely unknown, which is worth saying rather than
+guessing at. The simulator has no partition-count knob today, so nothing has
+established where the leader group starts to strain. Finding that number is the
+experiment that turns the argument above from a design claim into a published
+one, and it should happen before we make the scaling claim in marketing.
 
 Hot and total are separate numbers because
 [ADR 0006](adr/0006-partitions-are-an-index-over-immutable-objects.md) keeps
@@ -338,4 +370,6 @@ cannot creep past it:
 2. Third-party Jepsen analysis.
 3. Additional object storage backends via the storage trait (GCS, Azure).
 4. Multi-region story.
-5. Multi-key transactions, if the substrate positioning ever demands it.
+Multi-key transactions are deliberately absent from this list. FoundationDB is
+the better tool if you need them, and conceding that flatly is a more
+persuasive position than leaving a door open we do not intend to walk through.

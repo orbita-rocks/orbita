@@ -1,0 +1,43 @@
+# Code owners are requested for review automatically. The point is not
+# gatekeeping, it is that some parts of this repo are load-bearing for
+# everything else and should not change without the person who will have to
+# live with it seeing the change.
+#
+# The last matching pattern wins, so the specific entries below override the
+# catch-all.
+
+# Everything, unless something more specific claims it.
+*                       @bradhe
+
+# The contract crates define the vocabulary every other crate compiles
+# against. Two people independently improving a shared trait is the failure
+# mode this file exists to catch, and it is invisible until the merge.
+/crates/orbita-core/    @bradhe
+/crates/orbita-runtime/ @bradhe
+/crates/orbita-objectstore/ @bradhe
+/crates/orbita-proto/   @bradhe
+
+# The wire protocol is a published interface. Changing it breaks clients that
+# share no code with the server.
+/proto/                 @bradhe
+
+# The simulation harness is the basis of the correctness claim, so a change
+# that weakens it is worse than a bug.
+/crates/orbita-sim/     @bradhe
+
+# Requirements and accepted decisions. Records are immutable once accepted; a
+# change here should usually be a new record instead.
+/docs/REQUIREMENTS.md   @bradhe
+/docs/adr/              @bradhe
+
+# Build, release, and deployment surface.
+/.github/               @bradhe
+/Dockerfile             @bradhe
+/docker-compose.yml     @bradhe
+/deploy/                @bradhe
+
+# Project governance.
+/LICENSE                @bradhe
+/NOTICE                 @bradhe
+/CODE_OF_CONDUCT.md     @bradhe
+/SECURITY.md            @bradhe
