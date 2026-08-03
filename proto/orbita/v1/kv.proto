@@ -13,6 +13,14 @@ service Kv {
   rpc Set(SetRequest) returns (SetResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc List(ListRequest) returns (ListResponse);
+
+  // Reports the sizes this cluster will accept.
+  //
+  // Call this before doing anything else. Limits are configured per keyspace
+  // and can change, so a client that hardcodes them will be wrong on somebody
+  // else's cluster. The alternative to asking is discovering a limit by
+  // exceeding it, which is a poor way to learn.
+  rpc GetLimits(GetLimitsRequest) returns (GetLimitsResponse);
 }
 
 // The precondition a write must satisfy.
@@ -26,6 +34,33 @@ message Condition {
     // Apply only if the key exists at exactly this version.
     uint64 if_version = 2;
   }
+}
+
+message GetLimitsRequest {
+  // Limits are per keyspace. Leave this empty to get the largest values any
+  // keyspace on this cluster is configured for, which is what a client sizing
+  // a connection it will reuse should ask for.
+  string keyspace = 1;
+}
+
+message GetLimitsResponse {
+  uint32 max_key_bytes = 1;
+  uint32 max_value_bytes = 2;
+
+  // The most entries one List page will return.
+  uint32 max_list_entries = 3;
+  // The most bytes one List page will return. With large values this binds
+  // long before the entry count does.
+  uint64 max_list_bytes = 4;
+
+  // What to configure this client's maximum gRPC message size to.
+  //
+  // This is the field most clients actually need. gRPC implementations
+  // default to a 4MB message limit, and a keyspace configured above that will
+  // fail inside the client's own gRPC stack with an error about message size
+  // rather than anything describing Orbita. It is the value size plus room for
+  // the rest of the message, so setting a channel to exactly this is correct.
+  uint64 max_message_bytes = 5;
 }
 
 message GetRequest {

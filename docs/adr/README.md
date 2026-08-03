@@ -19,3 +19,5 @@ forward. The history of a wrong turn is worth more than a tidy directory.
 | [0003](0003-conditions-evaluate-against-pending-writes.md) | Conditions evaluate against pending writes | Accepted |
 | [0004](0004-peer-traffic-uses-private-framing.md) | Peer traffic uses private framing, not gRPC | Accepted, corrected by 0005 |
 | [0005](0005-upgrades-follow-kubernetes-rollouts.md) | Upgrades follow Kubernetes rollouts | Accepted |
+| [0006](0006-partitions-are-an-index-over-immutable-objects.md) | Partitions are a memory-resident index over immutable objects | Accepted |
+| [0007](0007-large-values-are-their-own-objects.md) | Large values are their own objects | Accepted |

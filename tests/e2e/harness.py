@@ -91,14 +91,29 @@ def build_binary() -> Path:
 
 
 def free_port() -> int:
-    """Pick a port the kernel says is free.
+    """Pick a port where this port and the next one are both free.
 
-    There is a window between closing this socket and the node binding it, but
-    the alternative is a fixed port that collides with a developer's own node.
+    A node binds two listeners, one for clients and one for peers, and the peer
+    one takes the port above the client one. Checking only the first left the
+    suite able to start a node whose second listener collided with something
+    else, which failed as an unexplained startup timeout rather than as a port
+    conflict.
+
+    There is still a window between closing these sockets and the node binding
+    them, but the alternative is a fixed port that collides with whatever the
+    developer is already running.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as first:
+            first.bind(("127.0.0.1", 0))
+            port = first.getsockname()[1]
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as second:
+                    second.bind(("127.0.0.1", port + 1))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("could not find two consecutive free ports")
 
 
 class Node:
@@ -120,12 +135,13 @@ class Node:
         self.port = 0
         self.kv = None
         self.admin = None
+        self.limits = None
 
-    def start(self, get_request_factory) -> None:
+    def start(self, probe_factory) -> None:
         """Start the process and wait until it actually answers a request.
 
-        Waiting on a real Get rather than on a TCP connect matters because the
-        listener comes up before RocksDB has opened and the default keyspace
+        Waiting on a real request rather than on a TCP connect matters because
+        the listener comes up before storage has opened and the default keyspace
         exists. A fixed sleep would either be slow or flaky, and on a busy CI
         runner it is both.
         """
@@ -148,20 +164,13 @@ class Node:
             stderr=subprocess.STDOUT,
         )
 
-        # gRPC waits a second before retrying a refused connection by default,
-        # which would put a second on every test in the suite while the node is
-        # still opening its storage. Shorten it, since the server is local and
-        # about to come up.
-        self._channel = grpc.insecure_channel(
-            f"127.0.0.1:{self.port}",
-            options=[
-                ("grpc.initial_reconnect_backoff_ms", 20),
-                ("grpc.min_reconnect_backoff_ms", 20),
-                ("grpc.max_reconnect_backoff_ms", 200),
-            ],
-        )
-        self.kv = self._pb2_grpc.kv.KvStub(self._channel)
-        self.admin = self._pb2_grpc.admin.AdminStub(self._channel)
+        # Connect twice on purpose, because a channel's maximum message size is
+        # fixed when it is created and the server is what knows the right one.
+        # So: a small channel to ask, then the real one sized from the answer.
+        # This is what a client library should do at startup, and doing it here
+        # means the suite is the worked example rather than a special case.
+        self._channel = self._connect()
+        self._bind_stubs()
 
         deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
         last_error: Exception | None = None
@@ -172,15 +181,51 @@ class Node:
                     f"startup. Log:\n{self.log()}"
                 )
             try:
-                self.kv.Get(get_request_factory(), timeout=2.0)
-                return
+                # This doubles as the readiness probe. It names the keyspace,
+                # so it fails until the keyspace exists, which is the thing a
+                # test needs to be true before it starts. It also touches no
+                # partition, so it says the node is answering without saying
+                # anything about whether a particular key can be served.
+                self.limits = self.kv.GetLimits(probe_factory(), timeout=2.0)
+                break
             except grpc.RpcError as error:  # noqa: PERF203
                 last_error = error
                 time.sleep(0.05)
-        raise RuntimeError(
-            f"orbita dev never served a request on port {self.port}: {last_error}\n"
-            f"Log:\n{self.log()}"
-        )
+        else:
+            raise RuntimeError(
+                f"orbita dev never served a request on port {self.port}: {last_error}\n"
+                f"Log:\n{self.log()}"
+            )
+
+        # Reconnect at the size the server reported. A client that skipped this
+        # would work until somebody stored a value larger than the 4MB default,
+        # and then fail inside gRPC with an error about message size that says
+        # nothing about Orbita.
+        self._channel.close()
+        self._channel = self._connect(self.limits.max_message_bytes)
+        self._bind_stubs()
+
+    def _connect(self, max_message_bytes: int | None = None):
+        """Opens a channel, optionally sized for this cluster's limits."""
+        # gRPC waits a second before retrying a refused connection by default,
+        # which would put a second on every test in the suite while the node is
+        # still opening its storage. Shorten it, since the server is local and
+        # about to come up.
+        options = [
+            ("grpc.initial_reconnect_backoff_ms", 20),
+            ("grpc.min_reconnect_backoff_ms", 20),
+            ("grpc.max_reconnect_backoff_ms", 200),
+        ]
+        if max_message_bytes is not None:
+            options += [
+                ("grpc.max_receive_message_length", max_message_bytes),
+                ("grpc.max_send_message_length", max_message_bytes),
+            ]
+        return grpc.insecure_channel(f"127.0.0.1:{self.port}", options=options)
+
+    def _bind_stubs(self) -> None:
+        self.kv = self._pb2_grpc.kv.KvStub(self._channel)
+        self.admin = self._pb2_grpc.admin.AdminStub(self._channel)
 
     def stop(self) -> None:
         """Stop the process and close the channel, tolerating either being gone.
@@ -206,9 +251,9 @@ class Node:
             self._log.close()
             self._log = None
 
-    def restart(self, get_request_factory) -> None:
+    def restart(self, probe_factory) -> None:
         self.stop()
-        self.start(get_request_factory)
+        self.start(probe_factory)
 
     def log(self) -> str:
         if not self._log_path.exists():

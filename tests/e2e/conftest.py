@@ -25,14 +25,15 @@ DEFAULT_KEYSPACE = harness.DEFAULT_KEYSPACE
 _STUB_MODULES = SimpleNamespace(kv=kv_pb2_grpc, admin=admin_pb2_grpc)
 
 
-def _probe_request() -> kv_pb2.GetRequest:
-    """The request used to decide a node is up.
+def _probe_request() -> kv_pb2.GetLimitsRequest:
+    """The request used to decide a node is up, and to size the connection.
 
-    It has to touch the default keyspace, because the keyspace is created
-    during startup and a node that has not created it yet will fail this with
-    NOT_FOUND rather than answer it.
+    It names the default keyspace, because the keyspace is created during
+    startup and a node that has not created it yet answers NOT_FOUND rather
+    than succeeding. So one call proves the node is answering, proves the
+    keyspace exists, and returns the limits the real channel is built from.
     """
-    return kv_pb2.GetRequest(keyspace=DEFAULT_KEYSPACE, key=b"__startup_probe__")
+    return kv_pb2.GetLimitsRequest(keyspace=DEFAULT_KEYSPACE)
 
 
 @pytest.fixture(scope="session")
@@ -61,6 +62,17 @@ def node(orbita_binary, tmp_path):
 def kv(node):
     """The Kv stub for the running node, which is what most tests want."""
     return node.kv
+
+
+@pytest.fixture
+def limits(node):
+    """What this cluster says it accepts.
+
+    Tests take sizes from here rather than hardcoding them, so a test asserts
+    that the server agrees with itself rather than that it agrees with a number
+    somebody copied out of the Rust source.
+    """
+    return node.limits
 
 
 def restart(node) -> None:

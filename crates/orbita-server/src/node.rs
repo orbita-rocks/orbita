@@ -34,11 +34,12 @@ use crate::validate;
 use bytes::Bytes;
 use orbita_core::{
     Error, KeyspaceId, KeyspaceInfo, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
-    Version,
+    Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
+    MESSAGE_OVERHEAD_BYTES,
 };
 use orbita_proto::v1::{
-    DeleteRequest, DeleteResponse, GetRequest, GetResponse, ListEntry, ListRequest, ListResponse,
-    SetRequest, SetResponse,
+    DeleteRequest, DeleteResponse, GetLimitsResponse, GetRequest, GetResponse, ListEntry,
+    ListRequest, ListResponse, SetRequest, SetResponse,
 };
 use orbita_runtime::{
     PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError, TransportResult,
@@ -472,6 +473,42 @@ impl<R: Runtime> Node<R> {
                 self.forward(owner, proxy::METHOD_DELETE, request).await
             }
         }
+    }
+
+    /// Reports the sizes this cluster accepts, for the named keyspace or for
+    /// the whole cluster when none is named.
+    ///
+    /// The cluster-wide answer is the largest any keyspace allows rather than
+    /// the smallest, because a client asking without naming a keyspace is
+    /// sizing a connection it intends to reuse, and a connection has to be big
+    /// enough for the largest thing that will cross it.
+    pub(crate) fn limits(&self, keyspace: &str) -> Result<GetLimitsResponse> {
+        let map = self.map();
+
+        let max_value_bytes = if keyspace.is_empty() {
+            map.keyspaces()
+                .filter_map(|k| k.max_value_bytes)
+                .max()
+                .unwrap_or(MAX_VALUE_BYTES as u64)
+        } else {
+            self.keyspace(keyspace)?
+                .max_value_bytes
+                .unwrap_or(MAX_VALUE_BYTES as u64)
+        }
+        .min(MAX_VALUE_BYTES as u64);
+
+        Ok(GetLimitsResponse {
+            max_key_bytes: MAX_KEY_BYTES as u32,
+            max_value_bytes: max_value_bytes as u32,
+            max_list_entries: MAX_LIST_LIMIT,
+            max_list_bytes: MAX_LIST_BYTES,
+            // Big enough for whichever direction is larger, a single maximum
+            // value or a full list page, plus room for the key, the keyspace
+            // name, and framing. Reporting one number means a client sets its
+            // channel once and never has to do this arithmetic or get it
+            // slightly wrong.
+            max_message_bytes: max_value_bytes.max(MAX_LIST_BYTES) + MESSAGE_OVERHEAD_BYTES,
+        })
     }
 
     pub(crate) async fn list(&self, request: ListRequest, forwarded: bool) -> Result<ListResponse> {

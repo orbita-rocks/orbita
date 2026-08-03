@@ -55,7 +55,14 @@ depend on, so it is worth stating rather than leaving to inference:
 - **Failure detection threshold.** Too eager and a garbage collection pause
   triggers a failover; too slow and the 10 second target is missed. Pick
   numbers, justify them against the target, and make them configurable.
-- **Split point selection.** Midpoint by size needs a RocksDB size estimate,
+- **Split triggers.** Size is one.
+  [ADR 0006](../adr/0006-partitions-are-an-index-over-immutable-objects.md)
+  adds another: a partition's index is memory-resident on its owner, so an
+  index that no longer fits comfortably is a reason to split even when the
+  partition's bytes say otherwise. A keyspace of many small values reaches that
+  point long before it reaches a byte threshold.
+
+- **Split point selection.** Midpoint by size needs a storage size estimate,
   which is approximate. Decide how approximate is acceptable and what happens
   when a split produces two lopsided halves.
 - **Merge safety.** The hard case: both partitions must stop accepting writes,
