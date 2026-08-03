@@ -25,10 +25,15 @@ the only version this added.
 ## Getting set up
 
 ```
-proto use
+proto install moon
 ```
 
-That installs the pinned moon. If you do not have proto, one line gets it:
+That installs the pinned moon and nothing else. Do not run `proto use` here.
+proto reads `rust-toolchain.toml` as a version file, so `proto use` takes the
+Rust install away from rustup and hands it to proto, which on a clean machine
+produces a toolchain with no cargo in it.
+
+If you do not have proto, one line gets it:
 
 ```
 curl -fsSL https://moonrepo.dev/install/proto.sh | bash
