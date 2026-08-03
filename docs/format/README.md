@@ -27,6 +27,14 @@ An engine that performs its own I/O also caps what deterministic simulation can
 verify. Everything described here goes through interfaces the simulator
 implements, so faults can be injected anywhere in it.
 
+## Planned
+
+**Golden test vectors.** A tiny valid segment and manifest, checked in as
+fixture bytes, once there is an implementation to produce them. Offset tables
+in prose are checked by whoever reads carefully. Fixture bytes are checked by
+every implementation on every run, and they give a third party something to
+conform to rather than something to interpret.
+
 ## Compatibility rules
 
 Once a version ships, its bytes never change. A change to the layout is a new
@@ -51,10 +59,14 @@ number is a better place for that argument.
 
 - All integers are little endian and unsigned unless stated otherwise.
 - Offsets and lengths are in bytes, measured from the start of the object.
-- Keys sort by unsigned byte-wise comparison, which is what
-  `orbita_core::KeyRange` uses and what partition boundaries mean.
+- Keys sort by unsigned byte-wise comparison. Partition ranges are half-open,
+  and the specification states what that means rather than pointing at source
+  code the reader has, by premise, never seen.
 - Checksums are CRC32C, the Castagnoli polynomial, chosen because it has
   hardware support on every architecture this runs on.
-- A checksum covers the bytes that follow it, including any length prefix that
-  describes them, so a corrupted length cannot direct a reader past the end of
-  what was verified.
+- In record framing and the key index, a checksum precedes the bytes it covers
+  and covers the length that describes them, so a corrupted length cannot
+  direct a reader past the end of what was verified. The segment footer is the
+  exception, because it sits at a known offset from the end of the object,
+  which is what lets a reader find it at all. The specification says where each
+  checksum's coverage begins and ends.
