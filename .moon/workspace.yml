@@ -15,9 +15,11 @@ projects:
   sources:
     e2e: 'tests/e2e'
 
+# What `--affected` compares against. This is develop rather than main because
+# develop is the branch work is cut from and merged back into, so it is the one
+# that answers "what did this change touch".
 vcs:
-  manager: 'git'
-  defaultBranch: 'main'
+  defaultBranch: 'develop'
 
 # Task inputs are hashed by content rather than by timestamp, so a checkout
 # that rewrites mtimes does not invalidate everything.

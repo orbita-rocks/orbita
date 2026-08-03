@@ -33,16 +33,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: moonrepo/setup-toolchain@v0
-        with:
-          # Installs moon at the version in .prototools and nothing else.
-          # auto-install runs `proto install`, and proto reads
-          # rust-toolchain.toml as a version file, so it takes the Rust install
-          # away from rustup and produces a toolchain with no cargo in it.
-          auto-install: false
-          # The cache holds the moon binary. The bump drops the entries saved
-          # while proto was still installing Rust into it.
-          cache-version: moon-only
+      - uses: ./.github/actions/setup-moon
 
       - uses: Swatinem/rust-cache@v2
 
@@ -67,16 +58,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: moonrepo/setup-toolchain@v0
-        with:
-          # Installs moon at the version in .prototools and nothing else.
-          # auto-install runs `proto install`, and proto reads
-          # rust-toolchain.toml as a version file, so it takes the Rust install
-          # away from rustup and produces a toolchain with no cargo in it.
-          auto-install: false
-          # The cache holds the moon binary. The bump drops the entries saved
-          # while proto was still installing Rust into it.
-          cache-version: moon-only
+      - uses: ./.github/actions/setup-moon
 
       - uses: Swatinem/rust-cache@v2
 
@@ -104,16 +86,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: moonrepo/setup-toolchain@v0
-        with:
-          # Installs moon at the version in .prototools and nothing else.
-          # auto-install runs `proto install`, and proto reads
-          # rust-toolchain.toml as a version file, so it takes the Rust install
-          # away from rustup and produces a toolchain with no cargo in it.
-          auto-install: false
-          # The cache holds the moon binary. The bump drops the entries saved
-          # while proto was still installing Rust into it.
-          cache-version: moon-only
+      - uses: ./.github/actions/setup-moon
 
       - uses: Swatinem/rust-cache@v2
 

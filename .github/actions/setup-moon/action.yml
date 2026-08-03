@@ -1,0 +1,26 @@
+name: Set up moon
+description: Installs moon at the version pinned in .prototools.
+
+# This installs the moon binary directly rather than going through proto and
+# moonrepo/setup-toolchain. proto reads rust-toolchain.toml as a version file,
+# so asking it to install the workspace's tools takes the Rust install away
+# from rustup and produces a toolchain with no cargo in it, and asking it not
+# to install anything means it stops honouring the moon version in .prototools
+# and grabs whatever is latest. This repo has exactly one tool to pin, so
+# reading the version out of the file and downloading that binary is both
+# shorter and harder to get wrong.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        version="$(sed -n 's/^moon = "\(.*\)"$/\1/p' .prototools)"
+        if [ -z "$version" ]; then
+          echo "no moon version found in .prototools" >&2
+          exit 1
+        fi
+        echo "Installing moon $version"
+        curl -fsSL https://moonrepo.dev/install/moon.sh | bash -s -- "$version"
+        echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
