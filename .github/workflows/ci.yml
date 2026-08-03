@@ -2,11 +2,21 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
   schedule:
     # Nightly, for the long simulation batch.
     - cron: "0 7 * * *"
+  # The release workflow calls this rather than restating it, so a tag is
+  # gated on exactly the checks a pull request is gated on and the two cannot
+  # drift apart. `sim_seeds` is the one knob it needs: a release is worth far
+  # more simulation than a pull request is.
+  workflow_call:
+    inputs:
+      sim_seeds:
+        type: string
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -86,13 +96,14 @@ jobs:
       # reproduces it exactly on any machine, with a paste-ready command.
       # Pull requests get a short batch to keep the feedback loop tight.
       - name: Run simulation seeds
-        if: github.event_name != 'schedule'
+        if: github.event_name != 'schedule' && inputs.sim_seeds == ''
         run: cargo test -p orbita-sim --release
 
-      # Nightly explores far more of the state space. The seed count is the
-      # knob worth raising when a release is close.
+      # Nightly explores far more of the state space, and so does a release,
+      # which passes its own seed count in. The seed count is the knob worth
+      # raising when a release is close.
       - name: Run the long simulation batch
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.sim_seeds != ''
         env:
-          ORBITA_SIM_SEEDS: "50000"
+          ORBITA_SIM_SEEDS: ${{ inputs.sim_seeds || '50000' }}
         run: cargo test -p orbita-sim --release

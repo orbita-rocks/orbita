@@ -40,3 +40,16 @@ pub mod telemetry;
 /// site so that the compatibility check in [`node`] and the `--version` output
 /// can never disagree.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The commit the binary was built from, short.
+///
+/// `unknown` when the build had no git repository to ask, which is what
+/// building from a source tarball looks like.
+pub const BUILD_SHA: &str = env!("ORBITA_BUILD_SHA");
+
+/// What `--version` prints, and what a bug report should quote.
+///
+/// The version on its own is not enough on `develop`, where it stays at the
+/// next `-dev` version for as long as the cycle lasts and so identifies a
+/// range of commits rather than a build.
+pub const LONG_VERSION: &str = env!("ORBITA_LONG_VERSION");
