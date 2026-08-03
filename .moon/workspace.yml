@@ -1,0 +1,26 @@
+# https://moonrepo.dev/docs/config/workspace
+$schema: 'https://moonrepo.dev/schemas/workspace.json'
+
+# One moon project per Cargo crate, plus the end-to-end suite. The ids come
+# from the directory names, which are already the crate names, so `moon run
+# orbita-wal:test` and `cargo test -p orbita-wal` name the same thing.
+#
+# There is deliberately no project at the repository root. A root project would
+# own every file in the tree, so every task in it would be invalidated by any
+# change anywhere, which is the opposite of what this is for. Workspace-wide
+# runs are spelled `moon run :test`, which fans the task out across projects.
+projects:
+  globs:
+    - 'crates/*'
+  sources:
+    e2e: 'tests/e2e'
+
+vcs:
+  manager: 'git'
+  defaultBranch: 'main'
+
+# Task inputs are hashed by content rather than by timestamp, so a checkout
+# that rewrites mtimes does not invalidate everything.
+hasher:
+  optimization: 'accuracy'
+  walkStrategy: 'vcs'

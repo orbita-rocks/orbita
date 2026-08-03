@@ -1,0 +1,45 @@
+# https://moonrepo.dev/docs/config/project
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+# The suite exists to check the wire contract from outside the Rust build, so
+# moon treats it the same way: it depends on the binary, not on the crates that
+# went into it. That dependency is declared here because nothing in a
+# Cargo.toml or a pyproject.toml records it.
+dependsOn:
+  - 'orbita-cli'
+
+tasks:
+  # A virtualenv under tests/e2e rather than `pip install` into whatever python
+  # happens to be first on PATH. Running the end-to-end suite should not change
+  # the machine it ran on.
+  #
+  # Not cached: it is cheap when everything is already installed, and a cache
+  # hit over a .venv somebody deleted would fail in a much more confusing place
+  # than here.
+  setup:
+    script: 'python3 -m venv .venv && .venv/bin/pip install --quiet --disable-pip-version-check -r requirements.txt'
+    inputs:
+      - 'requirements.txt'
+      - 'pyproject.toml'
+    options:
+      cache: false
+
+  test:
+    command: '.venv/bin/python -m pytest'
+    deps:
+      - 'setup'
+      # The suite starts the shipped binary as a subprocess. Building it here
+      # rather than letting harness.py shell out to cargo keeps the build under
+      # one scheduler, so it is not racing a cargo that moon also started.
+      - 'orbita-cli:build'
+    env:
+      ORBITA_BINARY: '$workspaceRoot/target/debug/orbita'
+    inputs:
+      - '*.py'
+      - 'pyproject.toml'
+      - '/proto/**/*.proto'
+    options:
+      # The binary it drives is not one of this task's declared inputs, so moon
+      # cannot tell that a server change should re-run these tests. Caching
+      # here would hide exactly the regressions the suite is for.
+      cache: false

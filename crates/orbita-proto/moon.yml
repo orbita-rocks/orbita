@@ -1,0 +1,11 @@
+# https://moonrepo.dev/docs/config/project
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+# This crate is generated from /proto by build.rs, so a change to a .proto file
+# changes this crate even though nothing under src/ moved. Without this, moon
+# would report a cache hit on a wire format that had just been edited.
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - '*.rs'
+    - '/proto/**/*.proto'

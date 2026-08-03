@@ -12,6 +12,13 @@
 **/*.rs.bk
 
 #
+# moon's task cache and generated schemas. The configuration under .moon is
+# committed; everything it writes at runtime is not.
+#
+/.moon/cache
+/.moon/docker
+
+#
 # Local cluster scratch data
 #
 /data

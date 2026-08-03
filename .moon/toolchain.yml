@@ -1,0 +1,13 @@
+# https://moonrepo.dev/docs/config/toolchain
+$schema: 'https://moonrepo.dev/schemas/toolchain.json'
+
+# The Rust version lives here now, and moon writes it back out to
+# rust-toolchain.toml on sync. That keeps one number in one place: rustup
+# users, moon users, and CI all end up on the same compiler, and a bump is a
+# one-line change here rather than a change here and a change there that drift.
+rust:
+  version: '1.91.1'
+  components:
+    - 'clippy'
+    - 'rustfmt'
+  syncToolchainConfig: true
