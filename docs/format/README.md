@@ -27,13 +27,32 @@ An engine that performs its own I/O also caps what deterministic simulation can
 verify. Everything described here goes through interfaces the simulator
 implements, so faults can be injected anywhere in it.
 
+## Golden test vectors
+
+A tiny valid segment and manifest, checked in as fixture bytes:
+
+```
+crates/orbita-format/tests/golden/partition-v1.oseg
+crates/orbita-format/tests/golden/partition-v1.manifest.json
+```
+
+Offset tables in prose are checked by whoever reads carefully. Fixture bytes
+are checked by every implementation on every run, and they give a third party
+something to conform to rather than something to interpret. The segment holds
+one of every legal record shape, including the three an external reader is most
+likely to get wrong: a tombstone, a record with an expiry, and a value stored in
+its own object.
+
+The reference implementation is `orbita-format`. It is one implementation of
+this specification rather than its meaning; where the two disagree, the
+specification is what a third party built against.
+
 ## Planned
 
-**Golden test vectors.** A tiny valid segment and manifest, checked in as
-fixture bytes, once there is an implementation to produce them. Offset tables
-in prose are checked by whoever reads carefully. Fixture bytes are checked by
-every implementation on every run, and they give a third party something to
-conform to rather than something to interpret.
+**Fault injection through the simulator.** Everything the implementation writes
+goes through `ObjectStore`, so a torn commit, a lost conditional write, or a
+deposed writer racing its replacement are all reachable from a seeded run. The
+unit tests cover each of those individually today.
 
 ## Compatibility rules
 
