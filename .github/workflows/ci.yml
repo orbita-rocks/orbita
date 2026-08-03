@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # develop is the integration branch and the default, so it is what the README
+  # badge reports. main is here because releases come off it, and a release
+  # branch with no CI history is the wrong thing to cut from.
   push:
-    branches: [main]
+    branches: [develop, main]
   pull_request:
   schedule:
     # Nightly, for the long simulation batch.
