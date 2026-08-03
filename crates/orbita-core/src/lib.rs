@@ -19,7 +19,9 @@ mod record;
 
 pub use error::{Error, Result};
 pub use ids::{Epoch, KeyspaceId, KeyspaceName, Lamport, NodeId, PartitionId, Version};
-pub use limits::{MAX_KEY_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES};
+pub use limits::{
+    MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES, MESSAGE_OVERHEAD_BYTES,
+};
 pub use map::{CoverageError, KeyspaceInfo, MapVersion, PartitionInfo, PartitionMap};
 pub use range::KeyRange;
 pub use record::{Record, WriteCondition};

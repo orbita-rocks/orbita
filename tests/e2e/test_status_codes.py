@@ -12,11 +12,9 @@ from orbita.v1 import kv_pb2
 
 from conftest import DEFAULT_KEYSPACE as KS
 
-# These are not in the protos. They come from the requirements document and
-# from constants inside the server, so a client has to be told them out of
-# band. That is a finding, recorded in the README.
-MAX_KEY_BYTES = 10 * 1024
-MAX_VALUE_BYTES = 256 * 1024
+# Sizes come from GetLimits rather than from constants copied out of the Rust
+# source, so these tests check that the server agrees with what it publishes.
+# A hardcoded number here would keep passing after the server changed.
 
 
 def code_of(call):
@@ -56,38 +54,42 @@ def test_a_keyspace_name_the_server_will_not_accept_is_invalid_argument(kv):
     assert code == grpc.StatusCode.INVALID_ARGUMENT
 
 
-def test_an_oversized_key_is_invalid_argument(kv):
+def test_an_oversized_key_is_invalid_argument(kv, limits):
     code, details = code_of(
         lambda: kv.Set(
-            kv_pb2.SetRequest(keyspace=KS, key=b"k" * (MAX_KEY_BYTES + 1), value=b"v")
+            kv_pb2.SetRequest(
+                keyspace=KS, key=b"k" * (limits.max_key_bytes + 1), value=b"v"
+            )
         )
     )
     assert code == grpc.StatusCode.INVALID_ARGUMENT
-    assert str(MAX_KEY_BYTES) in details, (
-        "the limit is not in the protos, so the message is the only place a "
-        "client can learn it"
+    assert str(limits.max_key_bytes) in details, (
+        "the message should name the limit it enforced, so a client that did "
+        "not call GetLimits still learns it"
     )
 
 
-def test_an_oversized_value_is_invalid_argument(kv):
+def test_an_oversized_value_is_invalid_argument(kv, limits):
     code, details = code_of(
         lambda: kv.Set(
-            kv_pb2.SetRequest(keyspace=KS, key=b"k", value=b"v" * (MAX_VALUE_BYTES + 1))
+            kv_pb2.SetRequest(
+                keyspace=KS, key=b"k", value=b"v" * (limits.max_value_bytes + 1)
+            )
         )
     )
     assert code == grpc.StatusCode.INVALID_ARGUMENT
-    assert str(MAX_VALUE_BYTES) in details
+    assert str(limits.max_value_bytes) in details
 
 
-def test_a_key_and_value_exactly_at_the_limit_are_accepted(kv):
+def test_a_key_and_value_exactly_at_the_limit_are_accepted(kv, limits):
     response = kv.Set(
         kv_pb2.SetRequest(
             keyspace=KS,
-            key=b"k" * MAX_KEY_BYTES,
-            value=b"v" * MAX_VALUE_BYTES,
+            key=b"k" * limits.max_key_bytes,
+            value=b"v" * limits.max_value_bytes,
         )
     )
-    assert response.applied, "the documented maximum has to be inclusive"
+    assert response.applied, "a published maximum has to be inclusive"
 
 
 def test_a_failed_condition_is_a_successful_call_that_did_not_apply(kv):

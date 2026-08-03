@@ -11,8 +11,8 @@ use crate::status::to_status;
 
 use orbita_proto::v1::kv_server::Kv;
 use orbita_proto::v1::{
-    DeleteRequest, DeleteResponse, GetRequest, GetResponse, ListRequest, ListResponse, SetRequest,
-    SetResponse,
+    DeleteRequest, DeleteResponse, GetLimitsRequest, GetLimitsResponse, GetRequest, GetResponse,
+    ListRequest, ListResponse, SetRequest, SetResponse,
 };
 use orbita_runtime::Runtime;
 
@@ -54,6 +54,19 @@ impl<R: Runtime> Kv for KvService<R> {
         self.node
             .delete(request.into_inner(), false)
             .await
+            .map(Response::new)
+            .map_err(|e| to_status(&e))
+    }
+
+    async fn get_limits(
+        &self,
+        request: Request<GetLimitsRequest>,
+    ) -> Result<Response<GetLimitsResponse>, Status> {
+        // Answered from the cached map without touching a partition, because a
+        // client calls this before it can do anything else and should not have
+        // its first request depend on a partition being available.
+        self.node
+            .limits(&request.into_inner().keyspace)
             .map(Response::new)
             .map_err(|e| to_status(&e))
     }

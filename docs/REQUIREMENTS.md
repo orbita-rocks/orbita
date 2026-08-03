@@ -177,14 +177,30 @@ operations rather than rehashing events.
 
 A write goes to the partition owner, which replicates a WAL entry to the two
 replicas and acknowledges at 2-of-3. Replicas apply entries asynchronously to
-their own local RocksDB. Compacted SSTs are uploaded to object storage.
+their own in-memory table.
 
 This hybrid (replicated WAL for latency, object storage for bulk durability)
 is a deliberate middle path. Object storage alone puts a 50 to 100ms floor
 under writes; local disk alone makes losing a machine a data-loss event. The
 2-of-3 WAL gives single-digit-millisecond writes that survive the loss of any
-one worker with zero data loss, and the S3-resident SSTs keep workers cheap to
-replace and rebalance.
+one worker with zero data loss, and object-storage-resident data keeps workers
+cheap to replace and rebalance.
+
+There are therefore two durability levels a client can ask about. A write is
+**replicated** by default, meaning it survives losing a worker, and that is
+what an acknowledgement means. A client that needs the write to survive losing
+the whole cluster asks for it to be **flushed** and waits for the segment to
+reach object storage. Flushing also happens on its own, on a size and time
+trigger; asking only means waiting for it.
+
+### Storage format
+
+Partitions are a memory-resident index over immutable objects in object
+storage, described in
+[ADR 0006](adr/0006-partitions-are-an-index-over-immutable-objects.md). The
+format is our own and it is specified, because a single-implementation format
+means data at rest is reachable only through Orbita, and because an engine that
+does its own I/O puts a ceiling on what deterministic simulation can verify.
 
 Object storage access goes through a pluggable storage trait. v1 ships and
 supports the S3-compatible API only (AWS S3, MinIO, R2); other backends are
@@ -220,12 +236,39 @@ and test for, and they become the limits we document.
 
 | Dimension | v1 target |
 |---|---|
-| Workers | 3 to 15 |
-| Logical data | up to ~10TB |
+| Workers | 3 to 15, and capacity grows by adding them |
+| Hot data | the sum of memory across the workers |
+| Total data | bounded by object storage, not by the cluster |
 | Cluster read throughput | ~100k reads/sec |
 | Cluster write throughput | ~10k writes/sec |
 | Max key size | 10KB |
-| Max value size | 256KB |
+| Max value size | 10MB, per keyspace, default far lower |
+
+Hot and total are separate numbers because
+[ADR 0006](adr/0006-partitions-are-an-index-over-immutable-objects.md) keeps
+values in memory and their data in object storage. What a cluster holds hot is
+what its workers can hold in memory; what it holds at all is a question about
+object storage, and the answer there is effectively no limit. Both scale by
+adding workers, since partitions split and distribute.
+
+Two sizing notes for whoever is choosing machine types. A partition's index is
+resident whether or not its values are, so memory serves two purposes at once,
+and a keyspace of small values gets less byte capacity per gigabyte of memory
+than the value size alone suggests. And a single partition's index has to fit
+on its owner, which is one of the things that triggers a split.
+
+Value size is a per-keyspace setting rather than one global number. Large
+values cost memory in the cache and time on the wire, so a tenant that needs
+them raises its own limit and accepts different performance, instead of every
+keyspace paying for one tenant's blobs.
+
+A value above a threshold is stored as its own object and written before it is
+committed, so the log carries a reference rather than megabytes. See
+[ADR 0007](adr/0007-large-values-are-their-own-objects.md). One consequence
+reaches clients: gRPC implementations default to a 4MB message limit, so a
+keyspace configured above that requires clients to raise their own limit. The
+API publishes the limits so a client can discover them rather than learning
+them by exceeding one.
 
 ## Operations
 
@@ -258,8 +301,14 @@ and test for, and they become the limits we document.
 
 v1 does not ship until these are measured, not estimated:
 
-1. p99 GET latency at or under 2ms in-cluster at the target read throughput.
-2. p99 SET latency at or under 5ms at the target write throughput.
+1. p99 GET latency at or under 2ms in-cluster at the target read throughput,
+   for keys in the memory-resident hot set. A read that misses and has to fetch
+   from object storage is reported separately, because publishing one number
+   for both would be wrong in whichever direction it landed.
+2. p99 SET latency at or under 5ms at the target write throughput, for values
+   at the default size limit. This is the replicated acknowledgement; an
+   explicit flush to object storage is a different operation with its own
+   number.
 3. Linearizability verified under fault injection (partitions, crashes,
    restarts, clock skew) in the deterministic simulator.
 4. Owner failover completes in under 10 seconds with zero acknowledged writes

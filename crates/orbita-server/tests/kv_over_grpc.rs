@@ -574,3 +574,58 @@ async fn acknowledged_writes_survive_a_restart() {
 
     server.shutdown().await.unwrap();
 }
+
+/// A client has to be able to size its connection before it sends anything,
+/// and the only alternative to asking is exceeding a limit and reading the
+/// error. This is also the one call that must work when no partition is
+/// available, since it is the first thing a client does.
+#[tokio::test]
+async fn a_client_can_discover_the_sizes_this_cluster_accepts() {
+    let dir = DataDir::new("limits");
+    let (server, mut client) = start(&dir).await;
+
+    let limits = client
+        .get_limits(orbita_proto::v1::GetLimitsRequest::default())
+        .await
+        .expect("limits are always answerable")
+        .into_inner();
+
+    assert_eq!(limits.max_key_bytes, orbita_core::MAX_KEY_BYTES as u32);
+    assert_eq!(limits.max_value_bytes, orbita_core::MAX_VALUE_BYTES as u32);
+    assert_eq!(limits.max_list_entries, orbita_core::MAX_LIST_LIMIT);
+    assert_eq!(limits.max_list_bytes, orbita_core::MAX_LIST_BYTES);
+
+    assert!(
+        limits.max_message_bytes > u64::from(limits.max_value_bytes),
+        "a channel sized to the value limit alone would reject a maximum value \
+         once the key and framing are added"
+    );
+    assert!(
+        limits.max_message_bytes >= limits.max_list_bytes,
+        "a full list page has to fit through the same channel"
+    );
+
+    let named = client
+        .get_limits(orbita_proto::v1::GetLimitsRequest {
+            keyspace: orbita_server::DEFAULT_KEYSPACE.to_string(),
+        })
+        .await
+        .expect("the default keyspace exists")
+        .into_inner();
+    assert_eq!(named.max_key_bytes, limits.max_key_bytes);
+
+    // An unknown keyspace is an error rather than a plausible looking default,
+    // because a client that quietly gets the wrong limit finds out later.
+    let unknown = client
+        .get_limits(orbita_proto::v1::GetLimitsRequest {
+            keyspace: "nosuchkeyspace".to_string(),
+        })
+        .await;
+    assert_eq!(
+        unknown.unwrap_err().code(),
+        tonic::Code::NotFound,
+        "an unknown keyspace must not silently report cluster defaults"
+    );
+
+    server.shutdown().await.unwrap();
+}

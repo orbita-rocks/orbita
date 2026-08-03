@@ -54,12 +54,16 @@ protocol definitions do not say. Each is small on its own. Together they are
 the gap between "you can use generated stubs" and "you can use generated stubs
 without reading our Rust".
 
-**The size limits are not in the protos.** A key is capped at 10 KiB, a value
-at 256 KiB, and a list page at 1000 entries. Those numbers live in
-`crates/orbita-core/src/limits.rs` and in the requirements document. A client
-cannot ask for them, and there is no RPC that reports them, so this suite
-hardcodes them. The error message quotes the limit, which means the only way to
-learn a limit is to exceed it.
+**The size limits are not in the protos.** Fixed. `GetLimits` now reports the
+key, value, and list page limits, along with the maximum gRPC message size a
+client should configure its channel to. The harness calls it during startup and
+sizes the real connection from the answer, which is what a client library
+should do, and the tests take sizes from it rather than hardcoding numbers
+copied out of the Rust source.
+
+This one mattered more than it looked. gRPC implementations default to a 4 MB
+message limit, so a keyspace configured above that would fail inside a client's
+own gRPC stack with an error about message size and nothing about Orbita.
 
 **`Condition.if_not_present` is a bool inside a oneof, and only `true` means
 anything.** Setting it to `false` selects the oneof arm, so it is not the same

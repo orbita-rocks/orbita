@@ -198,6 +198,20 @@ impl Admin for Fake {
 
 #[tonic::async_trait]
 impl Kv for Fake {
+    async fn get_limits(
+        &self,
+        request: Request<orbita_proto::GetLimitsRequest>,
+    ) -> Result<Response<orbita_proto::GetLimitsResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(orbita_proto::GetLimitsResponse {
+            max_key_bytes: 10 * 1024,
+            max_value_bytes: 256 * 1024,
+            max_list_entries: 1000,
+            max_list_bytes: 4 * 1024 * 1024,
+            max_message_bytes: 4 * 1024 * 1024 + 64 * 1024,
+        }))
+    }
+
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         self.record_auth(&request);
         Ok(Response::new(GetResponse {

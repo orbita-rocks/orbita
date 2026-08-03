@@ -39,6 +39,17 @@ after the fact tends to be a simulator the system cannot actually run under.
 - Simulating RocksDB's internal I/O. See the honest limit below.
 - Performance measurement. Virtual time says nothing about real latency.
 
+## The limit, being removed
+
+[ADR 0006](../adr/0006-partitions-are-an-index-over-immutable-objects.md)
+replaces RocksDB with a format this project owns, and everything that format
+persists goes through `Disk` or `ObjectStore`. When that lands, the limit below
+stops being true and this section should be deleted rather than reworded, and
+the public correctness report can claim the system is verified under simulation
+rather than the distributed layer.
+
+Until then the paragraphs below still describe what is actually true.
+
 ## The limit, stated honestly
 
 RocksDB does its own file I/O beneath `orbita_runtime::Disk`, so the simulator
