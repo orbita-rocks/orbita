@@ -80,11 +80,17 @@ dumb (see Protocol below).
 - **LIST(keyspace, prefix, cursor, limit)** returns an ordered page of keys
   and values matching a prefix, plus a continuation cursor.
 
-Every value carries a version. Conditional writes (CAS on version, plus IF NOT
-PRESENT) are required, not optional, because they are what make Orbita usable
-for locks, elections, and catalog pointers. Writes for a key already serialize
-through one owner, so the incremental cost is low and the payoff is the entire
-coordination use case.
+Every value carries a version, which is the partition Lamport at which the key
+was last written. Versions increase and are never reissued, so a
+compare-and-swap cannot succeed against a key that was deleted and recreated
+under an old version. See [ADR 0002](adr/0002-key-versions-are-partition-lamports.md),
+including its correction on what uniqueness does and does not mean across a
+merge.
+
+Conditional writes (CAS on version, plus IF NOT PRESENT) are required, not
+optional, because they are what make Orbita usable for locks, elections, and
+catalog pointers. Writes for a key already serialize through one owner, so the
+incremental cost is low and the payoff is the entire coordination use case.
 
 ### LIST semantics
 
@@ -104,12 +110,21 @@ reclamation window in v1.
 
 ### Consistency
 
-All reads are linearizable. Each partition maintains a Lamport timestamp.
-Replicas apply writes asynchronously and track how caught up they are; a
-replica that is caught up to the required timestamp serves the read locally,
-and one that is not forwards the read to the partition owner. This is what
-lets Orbita fan reads out across replicas without weakening the guarantee,
-which is the core of the read-over-write optimization.
+All reads are linearizable, and replicas serve them so that read capacity grows
+with the cluster rather than bottlenecking on one node per range.
+
+A replica serves a read locally only while it holds a live read lease from the
+partition owner, has not missed an invalidation, and has not been told that
+this particular key is being written. Otherwise it forwards to the owner. The
+owner invalidates individual keys by riding on the WAL replication it already
+performs, so keeping replicas coherent costs no extra round trip in the healthy
+case.
+
+[ADR 0001](adr/0001-linearizable-reads-from-replicas.md) has the design and the
+reasoning, including why a simpler per-partition watermark was rejected. The
+short version is that a partition-wide freshness check makes a replica behind
+for every key whenever any key is being written, so read fan-out collapses
+under exactly the load it exists to absorb.
 
 ### Multitenancy
 

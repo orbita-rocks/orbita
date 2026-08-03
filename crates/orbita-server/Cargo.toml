@@ -1,0 +1,30 @@
+[package]
+name = "orbita-server"
+description = "The worker: gRPC surface, request routing, and the linearizable read path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# orbita-control is deliberately not a dependency yet. This crate consumes the
+# partition map through its own `MapSource` trait, so the two can be built at
+# the same time without either waiting on the other, and wiring `ControlClient`
+# in later is one adapter rather than a rewrite.
+
+[dependencies]
+orbita-core.workspace = true
+orbita-runtime.workspace = true
+orbita-proto.workspace = true
+orbita-storage.workspace = true
+orbita-wal.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+prost = "0.13"
+tonic = "0.12"
+
+[dev-dependencies]
+orbita-sim = { path = "../orbita-sim" }

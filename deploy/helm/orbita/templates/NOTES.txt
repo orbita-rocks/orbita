@@ -1,0 +1,22 @@
+Orbita is starting: {{ .Values.leader.replicas }} leader group members and {{ .Values.worker.replicas }} workers.
+
+Watch them come up:
+
+  kubectl --namespace {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} --watch
+
+Clients connect to one address, and any worker answers:
+
+  {{ include "orbita.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+From your laptop:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "orbita.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  orbita cluster describe
+  orbita keyspace create demo
+  orbita set demo greeting hello
+  orbita get demo greeting
+{{ if not .Values.objectStore.endpoint }}
+Warning: no object store is configured, so compacted data stays on local disks
+and replacing a worker means rehydrating it from its replicas. Set
+objectStore.endpoint before this cluster holds anything you care about.
+{{- end }}

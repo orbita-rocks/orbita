@@ -3,3 +3,17 @@
 #
 *.sw[onp]
 /.claude
+.DS_Store
+
+#
+# Rust build output
+#
+/target
+**/*.rs.bk
+
+#
+# Local cluster scratch data
+#
+/data
+/devdata
+/.orbita

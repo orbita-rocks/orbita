@@ -1,0 +1,20 @@
+[package]
+name = "orbita-storage"
+description = "Single-partition storage engine over RocksDB: versioned values, conditional writes, and TTL."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+orbita-core.workspace = true
+orbita-runtime.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rocksdb = "0.24.0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

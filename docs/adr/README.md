@@ -1,0 +1,19 @@
+# Architecture decision records
+
+These record decisions that were argued about, where the reasoning matters as
+much as the outcome. The requirements document says what Orbita does. These say
+why it does it that way, and what we gave up.
+
+A record earns its place when someone will later look at the code, think "that
+is a strange way to do it," and be right to ask. If a decision is obvious from
+the code or was never contested, it does not need one.
+
+Records are immutable once accepted. When a decision changes, write a new
+record that supersedes the old one and leave the old one in place with a link
+forward. The history of a wrong turn is worth more than a tidy directory.
+
+| Record | Title | Status |
+|---|---|---|
+| [0001](0001-linearizable-reads-from-replicas.md) | Linearizable reads from replicas | Accepted |
+| [0002](0002-key-versions-are-partition-lamports.md) | Key versions are partition Lamports | Accepted, corrected |
+| [0003](0003-conditions-evaluate-against-pending-writes.md) | Conditions evaluate against pending writes | Accepted |

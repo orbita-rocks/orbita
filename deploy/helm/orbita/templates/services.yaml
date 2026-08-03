@@ -1,0 +1,69 @@
+{{/*
+Three Services with three different jobs.
+
+The two headless ones give every pod a stable DNS name, which is what the
+bootstrap peer list and partition ownership both depend on. The third is the
+one clients use.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "orbita.fullname" . }}-leader
+  labels:
+    {{- include "orbita.labels" . | nindent 4 }}
+    app.kubernetes.io/component: leader
+spec:
+  clusterIP: None
+  # Peers have to be resolvable before they are ready, or the group can never
+  # form: every member is waiting for the others to become ready first.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: {{ include "orbita.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: leader
+  ports:
+    - name: grpc
+      port: {{ .Values.service.port }}
+      targetPort: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "orbita.fullname" . }}-worker
+  labels:
+    {{- include "orbita.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: {{ include "orbita.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: worker
+  ports:
+    - name: grpc
+      port: {{ .Values.service.port }}
+      targetPort: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "orbita.fullname" . }}
+  labels:
+    {{- include "orbita.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  # Any worker answers any request, forwarding to the owner when it is not the
+  # owner itself, so there is nothing here that has to be sticky or clever.
+  selector:
+    app.kubernetes.io/name: {{ include "orbita.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: worker
+  ports:
+    - name: grpc
+      port: {{ .Values.service.port }}
+      targetPort: grpc

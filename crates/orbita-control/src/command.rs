@@ -1,0 +1,485 @@
+//! The alphabet of the replicated log.
+//!
+//! Everything the leader group decides is one of these, and the state machine
+//! in [`crate::state`] is a pure function of the sequence of them. Two rules
+//! shape the list.
+//!
+//! **Nothing here reads a clock or a random number.** Applying a command has
+//! to produce the same state on every member, and a member that consulted its
+//! own clock during apply would diverge from one that applied the same entry a
+//! second later. Where a time is genuinely part of the decision, such as a
+//! keyspace's creation timestamp, the proposing leader reads its clock once
+//! and puts the value in the command.
+//!
+//! **Nothing here is an observation.** Heartbeat arrival times and replica
+//! progress are not replicated, because a monotonic clock reading from one
+//! node means nothing on another and because a log entry every 250ms per node
+//! would dwarf everything else in the log. The leader keeps observations in
+//! memory and replicates only the conclusions it draws from them, which is
+//! what [`ControlCommand::SetHealth`] is. A leader that has just taken over
+//! has no observations, waits to collect some, and then re-derives health.
+
+use crate::codec::{CodecError, CodecResult, Reader, Writer};
+use crate::membership::{NodeHealth, NodeRole};
+use crate::model::{Credential, KeyspaceConfig};
+
+use bytes::Bytes;
+use orbita_core::{Epoch, KeyspaceId, NodeId, PartitionId};
+
+const TAG_REGISTER_NODE: u8 = 1;
+const TAG_SET_HEALTH: u8 = 2;
+const TAG_FORGET_NODE: u8 = 3;
+const TAG_CREATE_KEYSPACE: u8 = 4;
+const TAG_UPDATE_KEYSPACE: u8 = 5;
+const TAG_DELETE_KEYSPACE: u8 = 6;
+const TAG_CREATE_CREDENTIAL: u8 = 7;
+const TAG_REVOKE_CREDENTIAL: u8 = 8;
+const TAG_FENCE_PARTITION: u8 = 9;
+const TAG_ASSIGN_OWNER: u8 = 10;
+const TAG_SET_REPLICAS: u8 = 11;
+const TAG_SPLIT_PARTITION: u8 = 12;
+
+/// One decision, committed once and applied everywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlCommand {
+    /// Admits a node to the cluster, or updates the address of one already in
+    /// it. Idempotent, because a restarting node re-registers on every start
+    /// and must not need to know whether it succeeded last time.
+    RegisterNode {
+        node: NodeId,
+        role: NodeRole,
+        address: String,
+    },
+
+    /// Records the leader group's conclusion about a node.
+    SetHealth {
+        node: NodeId,
+        health: NodeHealth,
+    },
+
+    /// Removes a node entirely. Only legal once it holds no partitions, so
+    /// that forgetting a node can never be what creates a hole in the map.
+    ForgetNode {
+        node: NodeId,
+    },
+
+    /// Creates a keyspace and, in the same entry, the single unbounded
+    /// partition that covers it.
+    ///
+    /// They are one command because a keyspace with no partition is a
+    /// keyspace whose keys belong to nobody. Splitting this into two entries
+    /// would leave a window, however short, in which `check_coverage` fails,
+    /// and there is no reason to have that window exist at all.
+    CreateKeyspace {
+        id: KeyspaceId,
+        name: String,
+        config: KeyspaceConfig,
+        created_at_millis: u64,
+        /// Allocated by the proposer so that applying is deterministic.
+        first_partition: PartitionId,
+        /// `None` when the cluster has no worker to give it to yet. The
+        /// partition still exists and still covers the range, so the map stays
+        /// complete; it is unavailable rather than absent, and the leader
+        /// assigns an owner as soon as one appears.
+        owner: Option<NodeId>,
+        replicas: Vec<NodeId>,
+    },
+
+    UpdateKeyspace {
+        id: KeyspaceId,
+        config: KeyspaceConfig,
+    },
+
+    /// Destroys a keyspace and every partition in it.
+    DeleteKeyspace {
+        id: KeyspaceId,
+    },
+
+    CreateCredential {
+        credential: Box<Credential>,
+    },
+
+    RevokeCredential {
+        id: String,
+    },
+
+    /// Fences the current owner by bumping the epoch and leaving the partition
+    /// ownerless.
+    ///
+    /// `expect_epoch` makes this safe to retry and safe to race: a second
+    /// proposal for a partition somebody else already fenced fails on the
+    /// epoch check instead of bumping again and stranding the promotion that
+    /// was already in flight.
+    FencePartition {
+        partition: PartitionId,
+        expect_epoch: Epoch,
+    },
+
+    /// Gives an ownerless partition an owner.
+    ///
+    /// The state machine refuses this for a partition that still has one,
+    /// which is what forces the fence to commit first. The ordering is not a
+    /// convention the caller is trusted to follow; it is the only sequence the
+    /// state machine accepts.
+    AssignOwner {
+        partition: PartitionId,
+        owner: NodeId,
+        replicas: Vec<NodeId>,
+        expect_epoch: Epoch,
+    },
+
+    /// Changes the replica set without touching ownership, which is how a
+    /// partition regains a third copy after losing one.
+    SetReplicas {
+        partition: PartitionId,
+        replicas: Vec<NodeId>,
+        expect_epoch: Epoch,
+    },
+
+    /// Replaces one partition with two at a boundary key.
+    ///
+    /// One entry, so the map goes from covered to covered with nothing in
+    /// between. There is no instant at which a key in the parent's range
+    /// belongs to nobody, and no instant at which it belongs to two owners.
+    SplitPartition {
+        parent: PartitionId,
+        at: Bytes,
+        lower: PartitionId,
+        upper: PartitionId,
+        expect_epoch: Epoch,
+    },
+}
+
+impl ControlCommand {
+    #[must_use]
+    pub fn encode(&self) -> Bytes {
+        let mut w = Writer::new();
+        match self {
+            ControlCommand::RegisterNode {
+                node,
+                role,
+                address,
+            } => {
+                w.u8(TAG_REGISTER_NODE)
+                    .u64(node.get())
+                    .u8(role_tag(*role))
+                    .str(address);
+            }
+            ControlCommand::SetHealth { node, health } => {
+                w.u8(TAG_SET_HEALTH).u64(node.get()).u8(health_tag(*health));
+            }
+            ControlCommand::ForgetNode { node } => {
+                w.u8(TAG_FORGET_NODE).u64(node.get());
+            }
+            ControlCommand::CreateKeyspace {
+                id,
+                name,
+                config,
+                created_at_millis,
+                first_partition,
+                owner,
+                replicas,
+            } => {
+                w.u8(TAG_CREATE_KEYSPACE).u64(id.get()).str(name);
+                config.encode(&mut w);
+                w.u64(*created_at_millis)
+                    .u64(first_partition.get())
+                    .opt_u64(owner.map(NodeId::get))
+                    .seq(replicas, |w, n| {
+                        w.u64(n.get());
+                    });
+            }
+            ControlCommand::UpdateKeyspace { id, config } => {
+                w.u8(TAG_UPDATE_KEYSPACE).u64(id.get());
+                config.encode(&mut w);
+            }
+            ControlCommand::DeleteKeyspace { id } => {
+                w.u8(TAG_DELETE_KEYSPACE).u64(id.get());
+            }
+            ControlCommand::CreateCredential { credential } => {
+                w.u8(TAG_CREATE_CREDENTIAL);
+                credential.encode(&mut w);
+            }
+            ControlCommand::RevokeCredential { id } => {
+                w.u8(TAG_REVOKE_CREDENTIAL).str(id);
+            }
+            ControlCommand::FencePartition {
+                partition,
+                expect_epoch,
+            } => {
+                w.u8(TAG_FENCE_PARTITION)
+                    .u64(partition.get())
+                    .u64(expect_epoch.get());
+            }
+            ControlCommand::AssignOwner {
+                partition,
+                owner,
+                replicas,
+                expect_epoch,
+            } => {
+                w.u8(TAG_ASSIGN_OWNER)
+                    .u64(partition.get())
+                    .u64(owner.get())
+                    .seq(replicas, |w, n| {
+                        w.u64(n.get());
+                    })
+                    .u64(expect_epoch.get());
+            }
+            ControlCommand::SetReplicas {
+                partition,
+                replicas,
+                expect_epoch,
+            } => {
+                w.u8(TAG_SET_REPLICAS)
+                    .u64(partition.get())
+                    .seq(replicas, |w, n| {
+                        w.u64(n.get());
+                    })
+                    .u64(expect_epoch.get());
+            }
+            ControlCommand::SplitPartition {
+                parent,
+                at,
+                lower,
+                upper,
+                expect_epoch,
+            } => {
+                w.u8(TAG_SPLIT_PARTITION)
+                    .u64(parent.get())
+                    .bytes(at)
+                    .u64(lower.get())
+                    .u64(upper.get())
+                    .u64(expect_epoch.get());
+            }
+        }
+        w.finish()
+    }
+
+    pub fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let command = match r.u8()? {
+            TAG_REGISTER_NODE => ControlCommand::RegisterNode {
+                node: NodeId(r.u64()?),
+                role: role_from_tag(r.u8()?)?,
+                address: r.string()?,
+            },
+            TAG_SET_HEALTH => ControlCommand::SetHealth {
+                node: NodeId(r.u64()?),
+                health: health_from_tag(r.u8()?)?,
+            },
+            TAG_FORGET_NODE => ControlCommand::ForgetNode {
+                node: NodeId(r.u64()?),
+            },
+            TAG_CREATE_KEYSPACE => {
+                let id = KeyspaceId(r.u64()?);
+                let name = r.string()?;
+                let config = KeyspaceConfig::decode(&mut r)?;
+                ControlCommand::CreateKeyspace {
+                    id,
+                    name,
+                    config,
+                    created_at_millis: r.u64()?,
+                    first_partition: PartitionId(r.u64()?),
+                    owner: r.opt_u64()?.map(NodeId),
+                    replicas: r.seq(|r| Ok(NodeId(r.u64()?)))?,
+                }
+            }
+            TAG_UPDATE_KEYSPACE => {
+                let id = KeyspaceId(r.u64()?);
+                ControlCommand::UpdateKeyspace {
+                    id,
+                    config: KeyspaceConfig::decode(&mut r)?,
+                }
+            }
+            TAG_DELETE_KEYSPACE => ControlCommand::DeleteKeyspace {
+                id: KeyspaceId(r.u64()?),
+            },
+            TAG_CREATE_CREDENTIAL => ControlCommand::CreateCredential {
+                credential: Box::new(Credential::decode(&mut r)?),
+            },
+            TAG_REVOKE_CREDENTIAL => ControlCommand::RevokeCredential { id: r.string()? },
+            TAG_FENCE_PARTITION => ControlCommand::FencePartition {
+                partition: PartitionId(r.u64()?),
+                expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_ASSIGN_OWNER => ControlCommand::AssignOwner {
+                partition: PartitionId(r.u64()?),
+                owner: NodeId(r.u64()?),
+                replicas: r.seq(|r| Ok(NodeId(r.u64()?)))?,
+                expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_SET_REPLICAS => ControlCommand::SetReplicas {
+                partition: PartitionId(r.u64()?),
+                replicas: r.seq(|r| Ok(NodeId(r.u64()?)))?,
+                expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_SPLIT_PARTITION => ControlCommand::SplitPartition {
+                parent: PartitionId(r.u64()?),
+                at: r.bytes()?,
+                lower: PartitionId(r.u64()?),
+                upper: PartitionId(r.u64()?),
+                expect_epoch: Epoch(r.u64()?),
+            },
+            tag => {
+                return Err(CodecError::UnknownTag {
+                    what: "control command",
+                    tag: u64::from(tag),
+                })
+            }
+        };
+        r.done()?;
+        Ok(command)
+    }
+}
+
+fn role_tag(role: NodeRole) -> u8 {
+    match role {
+        NodeRole::Leader => 1,
+        NodeRole::Worker => 2,
+    }
+}
+
+fn role_from_tag(tag: u8) -> CodecResult<NodeRole> {
+    match tag {
+        1 => Ok(NodeRole::Leader),
+        2 => Ok(NodeRole::Worker),
+        other => Err(CodecError::UnknownTag {
+            what: "node role",
+            tag: u64::from(other),
+        }),
+    }
+}
+
+fn health_tag(health: NodeHealth) -> u8 {
+    match health {
+        NodeHealth::Healthy => 1,
+        NodeHealth::Suspect => 2,
+        NodeHealth::Dead => 3,
+    }
+}
+
+fn health_from_tag(tag: u8) -> CodecResult<NodeHealth> {
+    match tag {
+        1 => Ok(NodeHealth::Healthy),
+        2 => Ok(NodeHealth::Suspect),
+        3 => Ok(NodeHealth::Dead),
+        other => Err(CodecError::UnknownTag {
+            what: "node health",
+            tag: u64::from(other),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{hash_secret, Permission};
+
+    fn every_command() -> Vec<ControlCommand> {
+        vec![
+            ControlCommand::RegisterNode {
+                node: NodeId(1),
+                role: NodeRole::Worker,
+                address: "10.0.0.1:7000".into(),
+            },
+            ControlCommand::SetHealth {
+                node: NodeId(1),
+                health: NodeHealth::Suspect,
+            },
+            ControlCommand::ForgetNode { node: NodeId(4) },
+            ControlCommand::CreateKeyspace {
+                id: KeyspaceId(1),
+                name: "catalog".into(),
+                config: KeyspaceConfig {
+                    default_ttl_millis: Some(1),
+                    ..KeyspaceConfig::default()
+                },
+                created_at_millis: 5,
+                first_partition: PartitionId(1),
+                owner: Some(NodeId(2)),
+                replicas: vec![NodeId(3), NodeId(4)],
+            },
+            ControlCommand::UpdateKeyspace {
+                id: KeyspaceId(1),
+                config: KeyspaceConfig::default(),
+            },
+            ControlCommand::DeleteKeyspace { id: KeyspaceId(1) },
+            ControlCommand::CreateCredential {
+                credential: Box::new(Credential {
+                    id: "c".into(),
+                    secret_hash: hash_secret("s"),
+                    keyspaces: vec!["catalog".into()],
+                    permissions: vec![Permission::Read],
+                    description: String::new(),
+                    created_at_millis: 0,
+                    expires_at_millis: None,
+                }),
+            },
+            ControlCommand::RevokeCredential { id: "c".into() },
+            ControlCommand::FencePartition {
+                partition: PartitionId(1),
+                expect_epoch: Epoch(3),
+            },
+            ControlCommand::AssignOwner {
+                partition: PartitionId(1),
+                owner: NodeId(2),
+                replicas: vec![NodeId(3), NodeId(4)],
+                expect_epoch: Epoch(4),
+            },
+            ControlCommand::SetReplicas {
+                partition: PartitionId(1),
+                replicas: vec![NodeId(3)],
+                expect_epoch: Epoch(4),
+            },
+            ControlCommand::SplitPartition {
+                parent: PartitionId(1),
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(2),
+                upper: PartitionId(3),
+                expect_epoch: Epoch(4),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_command_round_trips() {
+        for command in every_command() {
+            let encoded = command.encode();
+            assert_eq!(
+                ControlCommand::decode(&encoded),
+                Ok(command.clone()),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_written_by_a_newer_binary_is_rejected_rather_than_misread() {
+        // A log entry this binary does not understand has to stop recovery
+        // loudly. Applying a partial decode would silently diverge this
+        // member's state machine from the others.
+        let encoded = Bytes::from_static(&[200, 0, 0, 0]);
+        assert!(matches!(
+            ControlCommand::decode(&encoded),
+            Err(CodecError::UnknownTag { .. })
+        ));
+    }
+
+    #[test]
+    fn a_truncated_command_is_rejected() {
+        let encoded = ControlCommand::SplitPartition {
+            parent: PartitionId(1),
+            at: Bytes::from_static(b"m"),
+            lower: PartitionId(2),
+            upper: PartitionId(3),
+            expect_epoch: Epoch(4),
+        }
+        .encode();
+        for cut in 1..encoded.len() {
+            assert!(
+                ControlCommand::decode(&encoded[..cut]).is_err(),
+                "a command cut at {cut} must not decode"
+            );
+        }
+    }
+}

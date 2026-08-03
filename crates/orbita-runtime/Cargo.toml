@@ -1,0 +1,21 @@
+[package]
+name = "orbita-runtime"
+description = "The seams Orbita runs on: clock, disk, peer transport, randomness, and task spawning."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["tokio-runtime"]
+# The production runtime. Disable it to build a binary that can only run under
+# simulation, which is what the deterministic test harness does.
+tokio-runtime = ["dep:tokio"]
+
+[dependencies]
+orbita-core.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }

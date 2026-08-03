@@ -1,0 +1,47 @@
+{{/*
+Everything that is not a secret and not per-pod goes in the file. Node id and
+advertise address are per-pod and come from the environment instead, which is
+exactly the split the configuration precedence was designed for.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "orbita.fullname" . }}
+  labels:
+    {{- include "orbita.labels" . | nindent 4 }}
+data:
+  orbita.toml: |
+    [node]
+    listen = "0.0.0.0:{{ .Values.service.port }}"
+    data_dir = "/var/lib/orbita"
+
+    [cluster]
+    name = {{ .Values.cluster.name | quote }}
+    leader_peers = [{{ range $i, $peer := splitList "," (include "orbita.leaderPeers" .) }}{{ if $i }}, {{ end }}{{ $peer | quote }}{{ end }}]
+    allow_version_skew = {{ .Values.cluster.allowVersionSkew }}
+
+    [object_store]
+    {{- if .Values.objectStore.endpoint }}
+    endpoint = {{ .Values.objectStore.endpoint | quote }}
+    {{- end }}
+    bucket = {{ .Values.objectStore.bucket | quote }}
+    region = {{ .Values.objectStore.region | quote }}
+    force_path_style = {{ .Values.objectStore.forcePathStyle }}
+
+    [telemetry]
+    {{- if .Values.telemetry.otlpEndpoint }}
+    otlp_endpoint = {{ .Values.telemetry.otlpEndpoint | quote }}
+    {{- end }}
+    trace_sample_ratio = {{ .Values.telemetry.traceSampleRatio }}
+    service_name = {{ .Values.telemetry.serviceName | quote }}
+    log_level = {{ .Values.telemetry.logLevel | quote }}
+
+    [telemetry.resource_attributes]
+    "k8s.namespace.name" = {{ .Release.Namespace | quote }}
+    {{- range $key, $value := .Values.telemetry.resourceAttributes }}
+    {{ $key | quote }} = {{ $value | quote }}
+    {{- end }}
+    {{- with .Values.extraConfig }}
+
+    {{ . | nindent 4 | trim }}
+    {{- end }}

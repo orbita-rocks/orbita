@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "orbita.fullname" . }}-leader
+  labels:
+    {{- include "orbita.labels" . | nindent 4 }}
+    app.kubernetes.io/component: leader
+spec:
+  serviceName: {{ include "orbita.fullname" . }}-leader
+  replicas: {{ .Values.leader.replicas }}
+  # Raft members need a stable identity and their own disk, and they must come
+  # up one at a time so that the first one can form the initial configuration
+  # before the others look for it.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "orbita.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: leader
+  template:
+    metadata:
+      labels:
+        {{- include "orbita.labels" . | nindent 8 }}
+        app.kubernetes.io/component: leader
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Restart the pods when the configuration changes. Without this a
+        # `helm upgrade` that only edits values appears to do nothing.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "orbita.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 60
+      {{- if .Values.leader.topologySpreadEnabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "orbita.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: leader
+      {{- end }}
+      {{- with .Values.leader.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.leader.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: orbita
+          image: {{ include "orbita.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # A StatefulSet cannot give each pod a different environment
+          # variable, and a node id has to be stable and unique. The ordinal in
+          # the hostname is both, so it is turned into an id here. `exec` keeps
+          # the binary as pid 1, which is what lets it receive the termination
+          # signal directly.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ordinal="${HOSTNAME##*-}"
+              export ORBITA_NODE_ID="$((1 + ordinal))"
+              export ORBITA_ADVERTISE="${HOSTNAME}.{{ include "orbita.fullname" . }}-leader.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}"
+              exec /usr/local/bin/orbita serve --role leader
+          env:
+            - name: ORBITA_CONFIG
+              value: /etc/orbita/orbita.toml
+            {{- if or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId }}
+            - name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orbita.objectStoreSecretName" . }}
+                  key: access_key_id
+            - name: ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orbita.objectStoreSecretName" . }}
+                  key: secret_access_key
+            {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.port }}
+          resources:
+            {{- toYaml .Values.leader.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/orbita
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/orbita
+            # The root filesystem is read only, so anything that needs to write
+            # a scratch file needs somewhere to put it.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "orbita.fullname" . }}
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.leader.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.leader.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.leader.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.leader.persistence.size }}
+  {{- end }}

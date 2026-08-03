@@ -1,0 +1,471 @@
+//! The CLI against a real gRPC server.
+//!
+//! The unit tests cover request building and rendering separately. These cover
+//! the join: that the client dials, that the credential arrives as a header,
+//! that responses come back through the view types, and that the exit codes
+//! mean what the help says they mean.
+//!
+//! The server here is a stand-in with canned answers, not orbita-server. What
+//! is being tested is the wire, and a stand-in exercises the same generated
+//! code the real one would.
+
+#![forbid(unsafe_code)]
+
+use std::sync::{Arc, Mutex};
+
+use orbita_cli::cli::{
+    ClusterCommand, GetArgs, KeyspaceCommand, KeyspaceConfigArgs, SetArgs, EXIT_CONDITION_NOT_MET,
+    EXIT_NOT_FOUND,
+};
+use orbita_cli::config::{Config, Layer};
+use orbita_cli::output::Format;
+use orbita_cli::{admin, data};
+use orbita_proto::v1::admin_server::{Admin, AdminServer};
+use orbita_proto::v1::kv_server::{Kv, KvServer};
+use orbita_proto::v1::{
+    CreateCredentialRequest, CreateCredentialResponse, CreateKeyspaceRequest,
+    DeleteKeyspaceRequest, DeleteKeyspaceResponse, DeleteRequest, DeleteResponse,
+    DescribeClusterRequest, DescribeClusterResponse, GetRequest, GetResponse, Keyspace,
+    KeyspaceConfig, ListKeyspacesRequest, ListKeyspacesResponse, ListRequest, ListResponse,
+    MergePartitionsRequest, MergePartitionsResponse, Node, NodeHealth, NodeRole, Partition,
+    Replica, RevokeCredentialRequest, RevokeCredentialResponse, SetRequest, SetResponse,
+    SplitPartitionRequest, SplitPartitionResponse, TransferOwnershipRequest,
+    TransferOwnershipResponse, UpdateKeyspaceRequest,
+};
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Request, Response, Status};
+
+/// What the stand-in server saw, so a test can assert on the request as well
+/// as the response.
+#[derive(Debug, Default)]
+struct Seen {
+    authorization: Option<String>,
+    keyspace_name: Option<String>,
+    set_key: Option<Vec<u8>>,
+    set_condition: bool,
+}
+
+#[derive(Clone)]
+struct Fake {
+    seen: Arc<Mutex<Seen>>,
+    /// Whether Get should report a hit, so the miss path can be tested.
+    key_exists: bool,
+    /// Whether Set should report the condition as met.
+    condition_holds: bool,
+}
+
+impl Fake {
+    fn record_auth<T>(&self, request: &Request<T>) {
+        let value = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        self.seen.lock().unwrap().authorization = value;
+    }
+}
+
+fn keyspace(name: &str) -> Keyspace {
+    Keyspace {
+        id: 1,
+        name: name.to_owned(),
+        config: Some(KeyspaceConfig {
+            default_ttl_millis: Some(60_000),
+            max_value_bytes: Some(1024),
+            max_storage_bytes: None,
+            max_reads_per_second: None,
+            max_writes_per_second: None,
+        }),
+        created_at_millis: 1_700_000_000_000,
+        partition_count: 1,
+        stored_bytes: 4096,
+    }
+}
+
+#[tonic::async_trait]
+impl Admin for Fake {
+    async fn create_keyspace(
+        &self,
+        request: Request<CreateKeyspaceRequest>,
+    ) -> Result<Response<Keyspace>, Status> {
+        self.record_auth(&request);
+        let name = request.into_inner().name;
+        self.seen.lock().unwrap().keyspace_name = Some(name.clone());
+        Ok(Response::new(keyspace(&name)))
+    }
+
+    async fn update_keyspace(
+        &self,
+        request: Request<UpdateKeyspaceRequest>,
+    ) -> Result<Response<Keyspace>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(keyspace(&request.into_inner().name)))
+    }
+
+    async fn delete_keyspace(
+        &self,
+        request: Request<DeleteKeyspaceRequest>,
+    ) -> Result<Response<DeleteKeyspaceResponse>, Status> {
+        self.record_auth(&request);
+        let request = request.into_inner();
+        if request.name != request.confirm_name {
+            return Err(Status::invalid_argument("confirm_name does not match"));
+        }
+        Ok(Response::new(DeleteKeyspaceResponse {}))
+    }
+
+    async fn list_keyspaces(
+        &self,
+        request: Request<ListKeyspacesRequest>,
+    ) -> Result<Response<ListKeyspacesResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(ListKeyspacesResponse {
+            keyspaces: vec![keyspace("orders"), keyspace("sessions")],
+        }))
+    }
+
+    async fn create_credential(
+        &self,
+        request: Request<CreateCredentialRequest>,
+    ) -> Result<Response<CreateCredentialResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(CreateCredentialResponse {
+            credential_id: "cred-1".to_owned(),
+            secret: "s3cret".to_owned(),
+        }))
+    }
+
+    async fn revoke_credential(
+        &self,
+        request: Request<RevokeCredentialRequest>,
+    ) -> Result<Response<RevokeCredentialResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(RevokeCredentialResponse {}))
+    }
+
+    async fn describe_cluster(
+        &self,
+        request: Request<DescribeClusterRequest>,
+    ) -> Result<Response<DescribeClusterResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(DescribeClusterResponse {
+            nodes: vec![Node {
+                id: 1,
+                address: "10.0.0.1:7100".to_owned(),
+                role: NodeRole::Leader as i32,
+                health: NodeHealth::Healthy as i32,
+                is_raft_leader: true,
+            }],
+            partitions: vec![Partition {
+                id: 10,
+                keyspace_id: 1,
+                start_key: Vec::new(),
+                end_key: Vec::new(),
+                owner_node_id: 2,
+                epoch: 3,
+                committed_lamport: 500,
+                replicas: vec![Replica {
+                    node_id: 3,
+                    applied_lamport: 490,
+                }],
+                size_bytes: 1_048_576,
+            }],
+        }))
+    }
+
+    async fn split_partition(
+        &self,
+        _: Request<SplitPartitionRequest>,
+    ) -> Result<Response<SplitPartitionResponse>, Status> {
+        Err(Status::unimplemented("not needed by these tests"))
+    }
+
+    async fn merge_partitions(
+        &self,
+        _: Request<MergePartitionsRequest>,
+    ) -> Result<Response<MergePartitionsResponse>, Status> {
+        Err(Status::unimplemented("not needed by these tests"))
+    }
+
+    async fn transfer_ownership(
+        &self,
+        _: Request<TransferOwnershipRequest>,
+    ) -> Result<Response<TransferOwnershipResponse>, Status> {
+        Err(Status::unimplemented("not needed by these tests"))
+    }
+}
+
+#[tonic::async_trait]
+impl Kv for Fake {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(GetResponse {
+            found: self.key_exists,
+            value: if self.key_exists {
+                b"hello".to_vec()
+            } else {
+                Vec::new()
+            },
+            version: 42,
+            expires_at_millis: None,
+        }))
+    }
+
+    async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
+        self.record_auth(&request);
+        let request = request.into_inner();
+        {
+            let mut seen = self.seen.lock().unwrap();
+            seen.set_key = Some(request.key.clone());
+            seen.set_condition = request.condition.is_some();
+        }
+        Ok(Response::new(SetResponse {
+            applied: self.condition_holds,
+            version: 43,
+            current_version: if self.condition_holds { None } else { Some(41) },
+        }))
+    }
+
+    async fn delete(
+        &self,
+        request: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(DeleteResponse {
+            applied: true,
+            existed: true,
+            current_version: None,
+        }))
+    }
+
+    async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(ListResponse {
+            entries: Vec::new(),
+            next_cursor: Vec::new(),
+        }))
+    }
+}
+
+/// Starts the stand-in on a loopback port and returns a config pointing at it.
+///
+/// The port comes from the listener rather than from a guess, so parallel test
+/// binaries cannot collide.
+async fn start(fake: Fake) -> (Config, Arc<Mutex<Seen>>) {
+    let seen = Arc::clone(&fake.seen);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let service = fake.clone();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(AdminServer::new(service.clone()))
+            .add_service(KvServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+
+    let mut layer = Layer::default();
+    layer.client.endpoint = Some(format!("http://{address}"));
+    layer.client.credential = Some("token-abc".to_owned());
+    (layer.resolve().unwrap(), seen)
+}
+
+fn fake() -> Fake {
+    Fake {
+        seen: Arc::new(Mutex::new(Seen::default())),
+        key_exists: true,
+        condition_holds: true,
+    }
+}
+
+#[tokio::test]
+async fn listing_keyspaces_returns_every_keyspace_the_server_reported() {
+    let (config, _) = start(fake()).await;
+    let text = admin::keyspace(&config, Format::Human, KeyspaceCommand::List)
+        .await
+        .unwrap();
+    assert!(text.contains("orders"), "{text}");
+    assert!(text.contains("sessions"), "{text}");
+}
+
+#[tokio::test]
+async fn a_credential_reaches_the_server_as_a_bearer_token() {
+    let (config, seen) = start(fake()).await;
+    admin::keyspace(&config, Format::Json, KeyspaceCommand::List)
+        .await
+        .unwrap();
+    assert_eq!(
+        seen.lock().unwrap().authorization.as_deref(),
+        Some("Bearer token-abc")
+    );
+}
+
+#[tokio::test]
+async fn creating_a_keyspace_sends_the_name_and_renders_what_came_back() {
+    let (config, seen) = start(fake()).await;
+    let text = admin::keyspace(
+        &config,
+        Format::Json,
+        KeyspaceCommand::Create {
+            name: "orders".to_owned(),
+            config: KeyspaceConfigArgs {
+                default_ttl: Some(60_000),
+                ..KeyspaceConfigArgs::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        seen.lock().unwrap().keyspace_name.as_deref(),
+        Some("orders")
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["name"], "orders");
+    assert_eq!(json["config"]["default_ttl_millis"], 60_000);
+}
+
+#[tokio::test]
+async fn a_mismatched_confirmation_stops_before_the_request_is_sent() {
+    let (config, seen) = start(fake()).await;
+    let err = admin::keyspace(
+        &config,
+        Format::Human,
+        KeyspaceCommand::Delete {
+            name: "orders".to_owned(),
+            confirm: "order".to_owned(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("Nothing was deleted"),
+        "{err:#}"
+    );
+    assert!(seen.lock().unwrap().authorization.is_none());
+}
+
+#[tokio::test]
+async fn describing_the_cluster_shows_nodes_and_replica_lag() {
+    let (config, _) = start(fake()).await;
+    let text = admin::cluster(
+        &config,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    assert!(text.contains("10.0.0.1:7100"), "{text}");
+    assert!(text.contains("leader"), "{text}");
+    // Replica 3 has applied 490 of the owner's 500.
+    assert!(text.contains("3(-10)"), "{text}");
+}
+
+#[tokio::test]
+async fn a_get_that_found_the_key_exits_zero_and_prints_the_value_first() {
+    let (config, _) = start(fake()).await;
+    let outcome = data::get(
+        &config,
+        Format::Human,
+        GetArgs {
+            keyspace: "demo".to_owned(),
+            key: "greeting".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.code, 0);
+    assert!(outcome.text.starts_with("hello\n"), "{}", outcome.text);
+}
+
+#[tokio::test]
+async fn a_get_that_missed_exits_with_the_not_found_code_rather_than_failing() {
+    let (config, _) = start(Fake {
+        key_exists: false,
+        ..fake()
+    })
+    .await;
+    let outcome = data::get(
+        &config,
+        Format::Json,
+        GetArgs {
+            keyspace: "demo".to_owned(),
+            key: "greeting".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.code, EXIT_NOT_FOUND);
+    let json: serde_json::Value = serde_json::from_str(&outcome.text).unwrap();
+    assert_eq!(json["found"], false);
+    assert!(json["value"].is_null());
+}
+
+fn set_args() -> SetArgs {
+    SetArgs {
+        keyspace: "demo".to_owned(),
+        key: "locks/leader".to_owned(),
+        value: Some("node-1".to_owned()),
+        value_file: None,
+        ttl: None,
+        if_not_present: true,
+        if_version: None,
+    }
+}
+
+#[tokio::test]
+async fn a_conditional_write_that_applied_exits_zero() {
+    let (config, seen) = start(fake()).await;
+    let outcome = data::set(&config, Format::Human, set_args()).await.unwrap();
+    assert_eq!(outcome.code, 0);
+    assert_eq!(outcome.text, "ok, version 43\n");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.set_key.as_deref(), Some(b"locks/leader".as_slice()));
+    assert!(seen.set_condition, "the condition did not reach the server");
+}
+
+#[tokio::test]
+async fn a_conditional_write_that_lost_the_race_exits_with_its_own_code() {
+    let (config, _) = start(Fake {
+        condition_holds: false,
+        ..fake()
+    })
+    .await;
+    let outcome = data::set(&config, Format::Human, set_args()).await.unwrap();
+    assert_eq!(outcome.code, EXIT_CONDITION_NOT_MET);
+    assert!(outcome.text.contains("version 41"), "{}", outcome.text);
+}
+
+#[tokio::test]
+async fn an_unreachable_endpoint_reports_an_error_rather_than_hanging() {
+    let mut layer = Layer::default();
+    // Port 1 on loopback is never listening, and connecting fails fast.
+    layer.client.endpoint = Some("http://127.0.0.1:1".to_owned());
+    let config = layer.resolve().unwrap();
+    let result = admin::keyspace(&config, Format::Human, KeyspaceCommand::List).await;
+    assert!(result.is_err());
+}
+
+/// Both services are reachable through the one endpoint a client is given,
+/// which is what lets the CLI and an application share a single address.
+#[tokio::test]
+async fn the_admin_and_data_services_share_one_endpoint() {
+    let (config, _) = start(fake()).await;
+    assert!(
+        admin::keyspace(&config, Format::Json, KeyspaceCommand::List)
+            .await
+            .is_ok()
+    );
+    assert!(data::get(
+        &config,
+        Format::Json,
+        GetArgs {
+            keyspace: "demo".to_owned(),
+            key: "k".to_owned(),
+        }
+    )
+    .await
+    .is_ok());
+}

@@ -1,0 +1,16 @@
+[package]
+name = "orbita-proto"
+description = "Generated gRPC bindings for the Orbita client and admin APIs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+prost = "0.13"
+tonic = "0.12"
+
+[build-dependencies]
+tonic-build = "0.12"

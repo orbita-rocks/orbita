@@ -1,0 +1,761 @@
+//! The command surface.
+//!
+//! This module is clap types and nothing else, so that the shape of the tool
+//! can be read in one file. The help text here is the documentation most
+//! people will actually read, so it is written to be sufficient on its own:
+//! the quickstart in the README should be a formality for anyone who runs
+//! `orbita --help`.
+//!
+//! Every command that talks to a cluster does so through the same gRPC API a
+//! program would use. There is no private channel and no second
+//! implementation, which is what makes "anything an operator can do is
+//! scriptable" true by construction rather than by discipline.
+
+use std::path::PathBuf;
+
+use anyhow::{bail, Result};
+use clap::{Args, Parser, Subcommand};
+
+use crate::config::{ClientLayer, ClusterLayer, Layer, NodeLayer, Role, TelemetryLayer};
+use crate::output::Format;
+
+/// Something went wrong, and the tool has said what.
+pub const EXIT_ERROR: i32 = 1;
+/// A `get` found no key. This is a separate code from an error because an
+/// absent key is a normal answer, and a script checking a lock should not have
+/// to parse output to tell the two apart.
+pub const EXIT_NOT_FOUND: i32 = 2;
+/// A conditional `set` or `delete` did not apply. Losing a compare-and-swap is
+/// the expected outcome of an election, not a failure.
+pub const EXIT_CONDITION_NOT_MET: i32 = 3;
+
+/// What a command produced: the text to print and the code to exit with.
+///
+/// The code is carried alongside the output rather than returned by printing
+/// so that "the key was absent" and "the condition failed" can be normal
+/// results with their own exit codes instead of errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    pub text: String,
+    pub code: i32,
+}
+
+impl Outcome {
+    /// A command that succeeded.
+    #[must_use]
+    pub fn ok(text: String) -> Self {
+        Self { text, code: 0 }
+    }
+
+    /// A command that worked but whose answer was no.
+    #[must_use]
+    pub fn with_code(text: String, code: i32) -> Self {
+        Self { text, code }
+    }
+}
+
+const ABOUT: &str = "A strongly consistent, multitenant key-value store.";
+
+const LONG_ABOUT: &str = "\
+A strongly consistent, multitenant key-value store.
+
+One binary does everything. `orbita serve` runs a node, as a leader group
+member or as a worker depending on configuration. Every other command is a
+client that talks to a running cluster over the same gRPC API a program would
+use, so anything you can do here you can script.
+
+Start here:
+
+  orbita dev &                     a single node cluster on 127.0.0.1:7100
+  orbita keyspace create demo
+  orbita set demo greeting hello
+  orbita get demo greeting
+
+Configuration comes from four places, each beating the one before it: built-in
+defaults, a TOML file, environment variables, then flags. Run `orbita config
+show` to see what was resolved and `orbita config env` for the variables that
+are read.
+
+Exit codes: 0 success, 1 error, 2 the key was not found, 3 a conditional write
+was not applied.";
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "orbita",
+    version,
+    about = ABOUT,
+    long_about = LONG_ABOUT,
+    disable_help_subcommand = true
+)]
+pub struct Cli {
+    #[command(flatten)]
+    pub global: GlobalArgs,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Options that mean the same thing to every command.
+///
+/// They sit under their own heading so that a subcommand's help shows the
+/// flags specific to it first, which is what the reader came for.
+#[derive(Debug, Args, Default)]
+#[command(next_help_heading = "Global options")]
+pub struct GlobalArgs {
+    /// Path to the configuration file.
+    ///
+    /// Without this the tool tries ORBITA_CONFIG, then ./orbita.toml, then
+    /// /etc/orbita/orbita.toml, and runs on defaults if none exist. A path
+    /// given here must exist, because silently ignoring it would start a node
+    /// with settings nobody chose.
+    #[arg(short, long, value_name = "PATH", global = true)]
+    pub config: Option<PathBuf>,
+
+    /// How to print results. Use json in scripts; the human tables are not a
+    /// stable interface and the JSON field names are.
+    #[arg(short, long, value_name = "FORMAT", global = true)]
+    pub output: Option<Format>,
+
+    /// The cluster to talk to, for every command except serve and dev.
+    ///
+    /// Any worker will do. A worker that does not own the key forwards the
+    /// request internally, so there is nothing to route on the client side.
+    #[arg(long, value_name = "URL", global = true)]
+    pub endpoint: Option<String>,
+
+    /// The credential secret to authenticate with.
+    ///
+    /// Prefer ORBITA_CREDENTIAL or the configuration file. A secret on the
+    /// command line is visible to every other process on the machine.
+    #[arg(long, value_name = "SECRET", global = true)]
+    pub credential: Option<String>,
+
+    /// Log verbosity, as a tracing filter such as info or orbita=debug.
+    #[arg(long, value_name = "LEVEL", global = true)]
+    pub log_level: Option<String>,
+}
+
+impl GlobalArgs {
+    /// The configuration layer the global flags contribute.
+    #[must_use]
+    pub fn layer(&self) -> Layer {
+        Layer {
+            client: ClientLayer {
+                endpoint: self.endpoint.clone(),
+                credential: self.credential.clone(),
+            },
+            telemetry: TelemetryLayer {
+                log_level: self.log_level.clone(),
+                ..TelemetryLayer::default()
+            },
+            ..Layer::default()
+        }
+    }
+
+    #[must_use]
+    pub fn format(&self) -> Format {
+        self.output.unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run a node.
+    #[command(long_about = "\
+Run a node, in whichever role the configuration says.
+
+A leader group member runs Raft and owns the partition map, keyspace metadata,
+and failover. A worker owns partitions and serves reads and writes. Both are
+this binary; nothing else is installed.
+
+A fresh leader node forms the initial Raft configuration from
+cluster.leader_peers, which must be identical on every leader. Once the data
+directory holds a Raft log that list is ignored, so it is safe to leave in a
+template forever. Workers do not need it: they register with the leader group
+and are told where everything is.")]
+    Serve(ServeArgs),
+
+    /// Run a single node cluster with no configuration at all.
+    #[command(long_about = "\
+Run a single node cluster on this machine, for trying things out.
+
+The node is its own leader group and its own worker, so there is no quorum to
+form and no peer list to write down. State goes under the data directory,
+which you can delete when you are done. There is no object store, so this is
+not a durable deployment and is not meant to be one.")]
+    Dev(DevArgs),
+
+    /// Create, inspect, and change keyspaces.
+    #[command(long_about = "\
+Keyspaces are the unit of tenancy. Each one is an isolated, independently
+partitioned key namespace with its own credentials, quotas, and defaults.
+
+A new keyspace starts as a single partition covering the whole range and
+splits as it grows, so there is no partition count to choose up front.")]
+    Keyspace {
+        #[command(subcommand)]
+        command: KeyspaceCommand,
+    },
+
+    /// Issue and revoke credentials.
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommand,
+    },
+
+    /// Inspect the cluster.
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
+
+    /// Split, merge, and move partitions by hand.
+    #[command(long_about = "\
+The leader group splits, merges, and rebalances on its own. These commands
+exist for the times an operator needs to force the issue, such as splitting
+ahead of a load test or draining a node before maintenance.")]
+    Partition {
+        #[command(subcommand)]
+        command: PartitionCommand,
+    },
+
+    /// Read a key.
+    Get(GetArgs),
+
+    /// Write a key.
+    Set(SetArgs),
+
+    /// Remove a key.
+    Delete(DeleteArgs),
+
+    /// List keys under a prefix.
+    List(ListArgs),
+
+    /// Inspect the resolved configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// This node's id, which must be unique in the cluster and stable across
+    /// restarts.
+    #[arg(long, value_name = "ID")]
+    pub node_id: Option<u64>,
+
+    /// Whether this node joins the leader group or serves partitions.
+    #[arg(long, value_name = "ROLE")]
+    pub role: Option<Role>,
+
+    /// The address to bind. Client, admin, and peer traffic share one port.
+    #[arg(long, value_name = "ADDR")]
+    pub listen: Option<String>,
+
+    /// The address other nodes should dial to reach this one. Required in any
+    /// deployment where listen is a wildcard, because no peer can dial
+    /// 0.0.0.0.
+    #[arg(long, value_name = "ADDR")]
+    pub advertise: Option<String>,
+
+    /// Where the WAL, the local RocksDB, and the Raft log live.
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: Option<PathBuf>,
+
+    /// The initial leader group membership, as advertise addresses. Identical
+    /// on every leader node, and ignored once the node has a Raft log.
+    #[arg(long, value_name = "ADDR", value_delimiter = ',')]
+    pub leader_peers: Option<Vec<String>>,
+
+    /// Start even if the leader group runs an incompatible version.
+    ///
+    /// Unsupported. The default is to refuse, which turns a rolling upgrade
+    /// into a decision somebody makes rather than an outage somebody
+    /// discovers.
+    #[arg(long)]
+    pub allow_version_skew: bool,
+}
+
+impl ServeArgs {
+    /// The configuration layer the serve flags contribute.
+    #[must_use]
+    pub fn layer(&self) -> Layer {
+        Layer {
+            node: NodeLayer {
+                id: self.node_id,
+                role: self.role,
+                listen: self.listen.clone(),
+                advertise: self.advertise.clone(),
+                data_dir: self.data_dir.clone(),
+            },
+            cluster: ClusterLayer {
+                leader_peers: self.leader_peers.clone(),
+                allow_version_skew: self.allow_version_skew.then_some(true),
+                ..ClusterLayer::default()
+            },
+            ..Layer::default()
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct DevArgs {
+    /// The port to listen on, bound to the loopback address only.
+    #[arg(long, default_value_t = crate::config::DEFAULT_PORT, value_name = "PORT")]
+    pub port: u16,
+
+    /// Where to keep state. Delete this directory to start over.
+    #[arg(long, default_value = ".orbita/dev", value_name = "PATH")]
+    pub data_dir: PathBuf,
+
+    /// Remove the data directory before starting, for a guaranteed clean run.
+    #[arg(long)]
+    pub clean: bool,
+
+    /// A keyspace to create on startup if it does not exist, so that the first
+    /// write does not need a second command.
+    #[arg(long, default_value = "default", value_name = "NAME")]
+    pub keyspace: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KeyspaceCommand {
+    /// Create a keyspace.
+    Create {
+        /// The name clients will use. Unique within the cluster.
+        name: String,
+
+        #[command(flatten)]
+        config: KeyspaceConfigArgs,
+    },
+
+    /// List every keyspace and what it is using.
+    List,
+
+    /// Change a keyspace's limits and defaults.
+    ///
+    /// Only the options given are changed. Everything else is left as it is.
+    Update {
+        name: String,
+
+        #[command(flatten)]
+        config: KeyspaceConfigArgs,
+    },
+
+    /// Delete a keyspace and everything in it.
+    #[command(long_about = "\
+Delete a keyspace and destroy its data.
+
+The name has to be given twice, once as the argument and once as --confirm.
+That is deliberate friction: a script that deletes the wrong keyspace has to
+get the same name wrong in two places.")]
+    Delete {
+        name: String,
+
+        /// The keyspace name again, to confirm.
+        #[arg(long, value_name = "NAME")]
+        confirm: String,
+    },
+}
+
+/// The per-keyspace limits, shared by create and update.
+#[derive(Debug, Args, Default)]
+pub struct KeyspaceConfigArgs {
+    /// TTL applied to writes that do not carry their own, such as 30s or 1h.
+    /// Unset means keys do not expire by default.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration_millis)]
+    pub default_ttl: Option<u64>,
+
+    /// Per-keyspace value size cap. Cannot exceed the cluster maximum.
+    #[arg(long, value_name = "BYTES")]
+    pub max_value_bytes: Option<u64>,
+
+    /// Storage quota across every partition of this keyspace.
+    #[arg(long, value_name = "BYTES")]
+    pub max_storage_bytes: Option<u64>,
+
+    /// Read rate cap, so one tenant cannot starve the others.
+    #[arg(long, value_name = "N")]
+    pub max_reads_per_second: Option<u32>,
+
+    /// Write rate cap.
+    #[arg(long, value_name = "N")]
+    pub max_writes_per_second: Option<u32>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CredentialCommand {
+    /// Issue a credential scoped to one or more keyspaces.
+    #[command(long_about = "\
+Issue a credential.
+
+The secret is returned once, at creation, and is not stored in a form anyone
+can read back. If it is lost, revoke the credential and issue another.")]
+    Create {
+        /// A keyspace this credential may touch. Repeat for more than one. A
+        /// credential scoped to nothing is always a mistake, so at least one
+        /// is required.
+        #[arg(long, value_name = "NAME", required = true)]
+        keyspace: Vec<String>,
+
+        /// What the credential may do. Repeat to grant both.
+        #[arg(long, value_name = "PERMISSION", required = true)]
+        permission: Vec<PermissionArg>,
+
+        /// A note about who or what this is for, so the list is readable in a
+        /// year.
+        #[arg(long, default_value = "", value_name = "TEXT")]
+        description: String,
+
+        /// Expire the credential this long from now, such as 90d.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration_millis)]
+        expires_in: Option<u64>,
+    },
+
+    /// Revoke a credential immediately.
+    Revoke { credential_id: String },
+}
+
+/// What a credential is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum PermissionArg {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ClusterCommand {
+    /// Show the partition map and node health.
+    #[command(long_about = "\
+Show every node, its health, and every partition with its owner, epoch, and
+replicas.
+
+Each replica is printed with how far it trails the owner's committed lamport.
+That number is what decides whether a replica can serve a linearizable read
+locally and how far behind it would be if it were promoted, so it is the first
+thing to look at during a failover.")]
+    Describe {
+        /// Only show partitions belonging to this keyspace.
+        #[arg(long, value_name = "NAME")]
+        keyspace: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PartitionCommand {
+    /// Split a partition in two.
+    Split {
+        partition_id: u64,
+
+        /// The key to split at. Without it the owner picks a midpoint by size.
+        #[arg(long, value_name = "KEY")]
+        at: Option<String>,
+    },
+
+    /// Merge two adjacent partitions into one.
+    Merge {
+        /// The lower partition of the pair.
+        lower_partition_id: u64,
+        /// The upper partition, which must start where the lower one ends.
+        upper_partition_id: u64,
+    },
+
+    /// Move ownership of a partition to another node.
+    #[command(long_about = "\
+Hand a partition to a different owner.
+
+The target must already be a replica. Transferring to a node with no data
+would leave the partition unavailable until it hydrated, which is a failover,
+not a transfer.")]
+    Transfer {
+        partition_id: u64,
+
+        /// The node to hand it to.
+        #[arg(long, value_name = "NODE_ID")]
+        to: u64,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct GetArgs {
+    /// The keyspace to read from.
+    pub keyspace: String,
+    /// The key to read.
+    pub key: String,
+}
+
+#[derive(Debug, Args)]
+#[command(long_about = "\
+Write a key.
+
+The value can be an argument, a file, or standard input, because a value is
+bytes and not every byte survives a shell.
+
+Conditions are what make this usable for locks and catalog pointers.
+--if-not-present takes a lock; --if-version swings a pointer only if nobody
+else moved it first. A condition that is not met is not an error: the command
+exits 3 and reports the version it found instead.")]
+pub struct SetArgs {
+    /// The keyspace to write to.
+    pub keyspace: String,
+    /// The key to write.
+    pub key: String,
+    /// The value. Omit it to read the value from standard input.
+    pub value: Option<String>,
+
+    /// Read the value from this file instead.
+    #[arg(long, value_name = "PATH", conflicts_with = "value")]
+    pub value_file: Option<PathBuf>,
+
+    /// Expire the key this long after the write commits, such as 30s or 1h.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration_millis)]
+    pub ttl: Option<u64>,
+
+    /// Write only if the key does not exist. An expired key counts as absent.
+    #[arg(long, conflicts_with = "if_version")]
+    pub if_not_present: bool,
+
+    /// Write only if the key is at exactly this version.
+    #[arg(long, value_name = "VERSION")]
+    pub if_version: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    /// The keyspace to delete from.
+    pub keyspace: String,
+    /// The key to delete.
+    pub key: String,
+
+    /// Delete only if the key is at exactly this version.
+    #[arg(long, value_name = "VERSION")]
+    pub if_version: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+#[command(long_about = "\
+List keys under a prefix, one page at a time.
+
+Each page is a consistent snapshot of a single partition's range. A scan that
+spans several pages is not a point-in-time snapshot of the keyspace, and a
+caller that needs one has to build it. The cursor is printed rather than
+followed automatically so that this stays true and visible.")]
+pub struct ListArgs {
+    /// The keyspace to scan.
+    pub keyspace: String,
+    /// The prefix to match. Empty scans the whole keyspace.
+    #[arg(default_value = "")]
+    pub prefix: String,
+
+    /// Continue from the cursor a previous page returned.
+    #[arg(long, value_name = "CURSOR")]
+    pub cursor: Option<String>,
+
+    /// Maximum entries to return, capped by the server.
+    #[arg(long, default_value_t = 100, value_name = "N")]
+    pub limit: u32,
+
+    /// Return values as well as keys. Without this the server never reads
+    /// values it would only discard.
+    #[arg(long)]
+    pub values: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the resolved configuration, with secrets omitted.
+    ///
+    /// This is the answer to "which of my four configuration sources won".
+    Show,
+
+    /// List every environment variable the tool reads.
+    Env,
+}
+
+/// Parses a duration such as `500ms`, `30s`, `5m`, `2h`, or `7d` into
+/// milliseconds.
+///
+/// A unit is required. A bare number would have to mean either seconds or
+/// milliseconds, and whichever we picked would be wrong by a factor of a
+/// thousand for somebody, on a TTL, silently.
+pub fn parse_duration_millis(text: &str) -> Result<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, unit) = text.split_at(split);
+    if digits.is_empty() {
+        bail!("expected a number and a unit, such as 30s, got {text:?}");
+    }
+    let value: u64 = digits.parse()?;
+    let millis = match unit {
+        "ms" => value,
+        "s" => value * 1_000,
+        "m" => value * 60_000,
+        "h" => value * 3_600_000,
+        "d" => value * 86_400_000,
+        "" => bail!("durations need a unit: ms, s, m, h, or d. Got {text:?}"),
+        other => bail!("unknown duration unit {other:?}. Use ms, s, m, h, or d"),
+    };
+    Ok(millis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_command_surface_is_internally_consistent() {
+        // Catches conflicting short flags, duplicate argument names, and the
+        // other structural mistakes clap can only find at runtime.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn durations_require_a_unit_so_a_ttl_cannot_be_wrong_by_a_thousand() {
+        assert_eq!(parse_duration_millis("500ms").unwrap(), 500);
+        assert_eq!(parse_duration_millis("30s").unwrap(), 30_000);
+        assert_eq!(parse_duration_millis("5m").unwrap(), 300_000);
+        assert_eq!(parse_duration_millis("2h").unwrap(), 7_200_000);
+        assert_eq!(parse_duration_millis("7d").unwrap(), 604_800_000);
+        assert!(parse_duration_millis("30").is_err());
+        assert!(parse_duration_millis("30 weeks").is_err());
+        assert!(parse_duration_millis("s").is_err());
+    }
+
+    #[test]
+    fn global_flags_are_accepted_after_a_subcommand() {
+        let cli = Cli::try_parse_from(["orbita", "keyspace", "list", "--output", "json"]).unwrap();
+        assert_eq!(cli.global.format(), Format::Json);
+    }
+
+    #[test]
+    fn serve_flags_become_a_configuration_layer_that_beats_the_file() {
+        let cli = Cli::try_parse_from([
+            "orbita",
+            "serve",
+            "--role",
+            "leader",
+            "--node-id",
+            "3",
+            "--leader-peers",
+            "a:7100,b:7100",
+        ])
+        .unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        let layer = args.layer();
+        assert_eq!(layer.node.role, Some(Role::Leader));
+        assert_eq!(layer.node.id, Some(3));
+        assert_eq!(
+            layer.cluster.leader_peers.as_deref(),
+            Some(["a:7100".to_owned(), "b:7100".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn an_unset_serve_flag_leaves_the_option_to_the_lower_layers() {
+        let cli = Cli::try_parse_from(["orbita", "serve"]).unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        let layer = args.layer();
+        assert_eq!(layer.node.listen, None);
+        assert_eq!(layer.cluster.allow_version_skew, None);
+    }
+
+    #[test]
+    fn the_two_conditions_on_a_write_are_mutually_exclusive() {
+        let result = Cli::try_parse_from([
+            "orbita",
+            "set",
+            "demo",
+            "k",
+            "v",
+            "--if-not-present",
+            "--if-version",
+            "4",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deleting_a_keyspace_requires_the_name_twice() {
+        assert!(Cli::try_parse_from(["orbita", "keyspace", "delete", "demo"]).is_err());
+        assert!(
+            Cli::try_parse_from(["orbita", "keyspace", "delete", "demo", "--confirm", "demo"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_credential_scoped_to_nothing_is_rejected_before_it_reaches_the_server() {
+        assert!(Cli::try_parse_from(["orbita", "credential", "create"]).is_err());
+        assert!(Cli::try_parse_from([
+            "orbita",
+            "credential",
+            "create",
+            "--keyspace",
+            "demo",
+            "--permission",
+            "read"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn dev_runs_with_no_arguments_at_all() {
+        let cli = Cli::try_parse_from(["orbita", "dev"]).unwrap();
+        let Command::Dev(args) = cli.command else {
+            panic!("expected dev");
+        };
+        assert_eq!(args.port, crate::config::DEFAULT_PORT);
+        assert_eq!(args.keyspace, "default");
+    }
+
+    #[test]
+    fn the_root_help_names_every_top_level_command() {
+        let help = Cli::command().render_long_help().to_string();
+        for command in [
+            "serve",
+            "dev",
+            "keyspace",
+            "credential",
+            "cluster",
+            "partition",
+            "get",
+            "set",
+            "delete",
+            "list",
+            "config",
+        ] {
+            assert!(help.contains(command), "{command} is missing from the help");
+        }
+    }
+
+    #[test]
+    fn the_root_help_shows_a_worked_example_and_the_exit_codes() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("orbita keyspace create demo"), "{help}");
+        assert!(help.contains("Exit codes"), "{help}");
+    }
+
+    #[test]
+    fn every_subcommand_has_help_text() {
+        fn check(command: &clap::Command, path: &str) {
+            for sub in command.get_subcommands() {
+                let name = format!("{path} {}", sub.get_name());
+                assert!(
+                    sub.get_about().is_some(),
+                    "{name} has no description, so it is invisible in the parent help"
+                );
+                check(sub, &name);
+            }
+        }
+        check(&Cli::command(), "orbita");
+    }
+}

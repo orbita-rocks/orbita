@@ -1,0 +1,189 @@
+syntax = "proto3";
+
+package orbita.v1;
+
+// The operator-facing control API, served by the leader group.
+//
+// The CLI is a thin wrapper over this, so anything an operator can do is
+// scriptable by construction.
+service Admin {
+  rpc CreateKeyspace(CreateKeyspaceRequest) returns (Keyspace);
+  rpc UpdateKeyspace(UpdateKeyspaceRequest) returns (Keyspace);
+  rpc DeleteKeyspace(DeleteKeyspaceRequest) returns (DeleteKeyspaceResponse);
+  rpc ListKeyspaces(ListKeyspacesRequest) returns (ListKeyspacesResponse);
+
+  rpc CreateCredential(CreateCredentialRequest) returns (CreateCredentialResponse);
+  rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
+
+  // Cluster inspection: the partition map, worker membership, and health.
+  rpc DescribeCluster(DescribeClusterRequest) returns (DescribeClusterResponse);
+
+  // Manual overrides. The leader splits, merges, and rebalances on its own;
+  // these exist for operators who need to force the issue.
+  rpc SplitPartition(SplitPartitionRequest) returns (SplitPartitionResponse);
+  rpc MergePartitions(MergePartitionsRequest) returns (MergePartitionsResponse);
+  rpc TransferOwnership(TransferOwnershipRequest) returns (TransferOwnershipResponse);
+}
+
+message KeyspaceConfig {
+  // Applied to writes that do not specify their own TTL. Unset means keys do
+  // not expire by default.
+  optional uint64 default_ttl_millis = 1;
+  // Per-keyspace cap, which cannot exceed the global MAX_VALUE_BYTES.
+  optional uint64 max_value_bytes = 2;
+  // Storage quota across all partitions of this keyspace. Unset is unlimited.
+  optional uint64 max_storage_bytes = 3;
+  // Request rate caps, so one tenant cannot starve the others.
+  optional uint32 max_reads_per_second = 4;
+  optional uint32 max_writes_per_second = 5;
+}
+
+message Keyspace {
+  uint64 id = 1;
+  string name = 2;
+  KeyspaceConfig config = 3;
+  uint64 created_at_millis = 4;
+  // Current partition count, which grows as the keyspace splits.
+  uint32 partition_count = 5;
+  uint64 stored_bytes = 6;
+}
+
+message CreateKeyspaceRequest {
+  string name = 1;
+  KeyspaceConfig config = 2;
+}
+
+message UpdateKeyspaceRequest {
+  string name = 1;
+  KeyspaceConfig config = 2;
+}
+
+message DeleteKeyspaceRequest {
+  string name = 1;
+  // Deleting a keyspace destroys its data. The name must be repeated here to
+  // make that hard to do by accident from a script.
+  string confirm_name = 2;
+}
+
+message DeleteKeyspaceResponse {}
+
+message ListKeyspacesRequest {}
+
+message ListKeyspacesResponse {
+  repeated Keyspace keyspaces = 1;
+}
+
+enum Permission {
+  PERMISSION_UNSPECIFIED = 0;
+  PERMISSION_READ = 1;
+  PERMISSION_WRITE = 2;
+}
+
+message CreateCredentialRequest {
+  // Keyspaces this credential may touch. Empty is rejected; a credential
+  // scoped to nothing is always a mistake.
+  repeated string keyspaces = 1;
+  repeated Permission permissions = 2;
+  string description = 3;
+  optional uint64 expires_at_millis = 4;
+}
+
+message CreateCredentialResponse {
+  string credential_id = 1;
+  // Returned once, at creation, and never retrievable again.
+  string secret = 2;
+}
+
+message RevokeCredentialRequest {
+  string credential_id = 1;
+}
+
+message RevokeCredentialResponse {}
+
+message DescribeClusterRequest {
+  // Restrict the partition list to one keyspace. Empty returns all of them.
+  string keyspace = 1;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_LEADER = 1;
+  NODE_ROLE_WORKER = 2;
+}
+
+enum NodeHealth {
+  NODE_HEALTH_UNSPECIFIED = 0;
+  NODE_HEALTH_HEALTHY = 1;
+  // Missed heartbeats, but not yet declared dead.
+  NODE_HEALTH_SUSPECT = 2;
+  NODE_HEALTH_DEAD = 3;
+}
+
+message Node {
+  uint64 id = 1;
+  string address = 2;
+  NodeRole role = 3;
+  NodeHealth health = 4;
+  // True for the current Raft leader of the control plane.
+  bool is_raft_leader = 5;
+}
+
+message Replica {
+  uint64 node_id = 1;
+  // How far this replica has applied, for comparison against the owner's
+  // lamport. The gap is what decides whether it can serve a read locally and
+  // how far behind it would be if promoted.
+  uint64 applied_lamport = 2;
+}
+
+message Partition {
+  uint64 id = 1;
+  uint64 keyspace_id = 2;
+  // Half-open range [start_key, end_key). An empty end_key means unbounded.
+  bytes start_key = 3;
+  bytes end_key = 4;
+  uint64 owner_node_id = 5;
+  // Bumped on every ownership change; a write carrying a stale epoch is
+  // rejected, which is what fences a deposed owner.
+  uint64 epoch = 6;
+  uint64 committed_lamport = 7;
+  repeated Replica replicas = 8;
+  uint64 size_bytes = 9;
+}
+
+message DescribeClusterResponse {
+  repeated Node nodes = 1;
+  repeated Partition partitions = 2;
+}
+
+message SplitPartitionRequest {
+  uint64 partition_id = 1;
+  // Where to split. Empty asks the owner to choose a midpoint by size.
+  bytes split_key = 2;
+}
+
+message SplitPartitionResponse {
+  Partition lower = 1;
+  Partition upper = 2;
+}
+
+message MergePartitionsRequest {
+  // Must be adjacent, in order, and in the same keyspace.
+  uint64 lower_partition_id = 1;
+  uint64 upper_partition_id = 2;
+}
+
+message MergePartitionsResponse {
+  Partition merged = 1;
+}
+
+message TransferOwnershipRequest {
+  uint64 partition_id = 1;
+  // Must already be a replica of this partition, since a transfer to a node
+  // with no data would mean an unavailable partition until it hydrates.
+  uint64 to_node_id = 2;
+}
+
+message TransferOwnershipResponse {
+  Partition partition = 1;
+}

@@ -1,0 +1,44 @@
+[package]
+name = "orbita-cli"
+description = "The orbita binary: runs a node in either role, and wraps the admin API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The crate is called orbita-cli so it sorts next to its siblings, but the
+# thing a user installs is called `orbita`. One binary, not two, because the
+# role a node runs in is configuration rather than a different program.
+[[bin]]
+name = "orbita"
+path = "src/main.rs"
+
+[lib]
+name = "orbita_cli"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22"
+bytes.workspace = true
+clap = { version = "4.6.5", features = ["derive", "wrap_help"] }
+orbita-core.workspace = true
+orbita-proto.workspace = true
+orbita-server = { version = "0.0.0", path = "../orbita-server" }
+# orbita-server is deliberately absent until it exposes Server::start. Adding
+# a dependency on a crate that is still being written means every unrelated
+# `orbita config show` waits on it, and a compile error over there stops work
+# over here. See src/node.rs, which is the one place it will be needed.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+tokio.workspace = true
+toml = "1.1.4"
+tonic = "0.12"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }

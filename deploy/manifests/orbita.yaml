@@ -1,0 +1,344 @@
+# A three member leader group and three workers, with no templating.
+#
+#   kubectl apply -f deploy/manifests/orbita.yaml
+#
+# This is the same topology the Helm chart produces, written out so that it can
+# be read, diffed, and edited by anyone who does not want Helm in the loop. If
+# you are going to change more than the image tag and the object store, use the
+# chart instead: keeping two copies of a StatefulSet in sync by hand is how
+# they end up different.
+#
+# Before this holds anything that matters, fill in the object store block in
+# the ConfigMap and the credentials in the Secret. Without them the workers
+# keep everything on local disks.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: orbita
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orbita
+  namespace: orbita
+# Orbita does not talk to the Kubernetes API, so no token is mounted.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orbita-object-store
+  namespace: orbita
+type: Opaque
+stringData:
+  access_key_id: ""
+  secret_access_key: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orbita
+  namespace: orbita
+data:
+  orbita.toml: |
+    [node]
+    listen = "0.0.0.0:7100"
+    data_dir = "/var/lib/orbita"
+
+    [cluster]
+    name = "orbita"
+    # The initial leader group membership, identical on every node. Ignored
+    # once a node has a Raft log, so it is safe to leave here forever.
+    leader_peers = [
+      "orbita-leader-0.orbita-leader.orbita.svc.cluster.local:7100",
+      "orbita-leader-1.orbita-leader.orbita.svc.cluster.local:7100",
+      "orbita-leader-2.orbita-leader.orbita.svc.cluster.local:7100",
+    ]
+    allow_version_skew = false
+
+    [object_store]
+    # endpoint = "https://s3.us-east-1.amazonaws.com"
+    bucket = "orbita"
+    region = "us-east-1"
+    # AWS S3 wants false here. MinIO and most other S3-compatible stores want
+    # true.
+    force_path_style = false
+
+    [telemetry]
+    # otlp_endpoint = "http://otel-collector.observability:4317"
+    trace_sample_ratio = 1.0
+    service_name = "orbita"
+    log_level = "info"
+
+    [telemetry.resource_attributes]
+    "k8s.namespace.name" = "orbita"
+---
+# Headless, so every leader has a stable DNS name. Not-ready addresses are
+# published because the group cannot form if every member is waiting for the
+# others to become ready first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orbita-leader
+  namespace: orbita
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: orbita
+    app.kubernetes.io/component: leader
+  ports:
+    - name: grpc
+      port: 7100
+      targetPort: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orbita-worker
+  namespace: orbita
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: orbita
+    app.kubernetes.io/component: worker
+  ports:
+    - name: grpc
+      port: 7100
+      targetPort: grpc
+---
+# What clients connect to. Any worker answers any request, forwarding to the
+# owner internally, so plain round robin is correct here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orbita
+  namespace: orbita
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: orbita
+    app.kubernetes.io/component: worker
+  ports:
+    - name: grpc
+      port: 7100
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orbita-leader
+  namespace: orbita
+  labels:
+    app.kubernetes.io/name: orbita
+    app.kubernetes.io/component: leader
+spec:
+  serviceName: orbita-leader
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orbita
+      app.kubernetes.io/component: leader
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orbita
+        app.kubernetes.io/component: leader
+    spec:
+      serviceAccountName: orbita
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: orbita
+          image: ghcr.io/bradhe/orbita:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # A StatefulSet cannot give each pod its own environment variable,
+          # and a node id has to be stable and unique. The ordinal in the
+          # hostname is both. `exec` keeps the binary as pid 1 so that it
+          # receives the termination signal directly.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ordinal="${HOSTNAME##*-}"
+              export ORBITA_NODE_ID="$((1 + ordinal))"
+              export ORBITA_ADVERTISE="${HOSTNAME}.orbita-leader.orbita.svc.cluster.local:7100"
+              exec /usr/local/bin/orbita serve --role leader
+          env:
+            - name: ORBITA_CONFIG
+              value: /etc/orbita/orbita.toml
+            - name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: orbita-object-store
+                  key: access_key_id
+            - name: ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: orbita-object-store
+                  key: secret_access_key
+          ports:
+            - name: grpc
+              containerPort: 7100
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/orbita
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/orbita
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: orbita
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orbita-worker
+  namespace: orbita
+  labels:
+    app.kubernetes.io/name: orbita
+    app.kubernetes.io/component: worker
+spec:
+  serviceName: orbita-worker
+  replicas: 3
+  # Workers can start together, because one that finds no leader group yet
+  # retries rather than failing.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orbita
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orbita
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: orbita
+      # Long enough for the leader group to move this worker's partitions
+      # elsewhere before the process goes away.
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: orbita
+          image: ghcr.io/bradhe/orbita:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Worker ids start at 101 so a worker id and a leader id can never
+          # collide, however either group is scaled.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ordinal="${HOSTNAME##*-}"
+              export ORBITA_NODE_ID="$((101 + ordinal))"
+              export ORBITA_ADVERTISE="${HOSTNAME}.orbita-worker.orbita.svc.cluster.local:7100"
+              exec /usr/local/bin/orbita serve --role worker
+          env:
+            - name: ORBITA_CONFIG
+              value: /etc/orbita/orbita.toml
+            - name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: orbita-object-store
+                  key: access_key_id
+            - name: ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: orbita-object-store
+                  key: secret_access_key
+          ports:
+            - name: grpc
+              containerPort: 7100
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              memory: 8Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/orbita
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/orbita
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: orbita
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
+---
+# A node drain must not take the leader group below quorum.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orbita-leader
+  namespace: orbita
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orbita
+      app.kubernetes.io/component: leader
+---
+# Every partition is an owner plus two replicas, so losing two workers at once
+# can take a partition below the 2-of-3 a write needs.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orbita-worker
+  namespace: orbita
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orbita
+      app.kubernetes.io/component: worker

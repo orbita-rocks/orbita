@@ -1,0 +1,128 @@
+# Defaults that deploy a working cluster on a fresh Kubernetes with no edits.
+#
+# The one thing worth setting before a real deployment is objectStore, because
+# the default points at nothing and a cluster with no object storage keeps
+# everything on local disks.
+
+image:
+  repository: ghcr.io/bradhe/orbita
+  # Empty means the chart's appVersion, so the image and the chart cannot drift
+  # apart by accident.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# The leader group runs Raft and owns the partition map. Three is the smallest
+# number that survives losing one node, which is the point of having a group.
+# Use an odd number: a group of four tolerates the same single failure as three
+# and needs one more vote to agree.
+leader:
+  replicas: 3
+  persistence:
+    enabled: true
+    size: 10Gi
+    # Empty uses the cluster's default StorageClass.
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+  nodeSelector: {}
+  tolerations: []
+  # Spread the group across nodes, because three Raft members on one machine is
+  # a single point of failure wearing a quorum as a disguise.
+  topologySpreadEnabled: true
+
+# Workers own partitions and serve reads and writes. This is the number to
+# raise when the cluster needs more capacity.
+worker:
+  replicas: 3
+  persistence:
+    enabled: true
+    size: 100Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      memory: 8Gi
+  nodeSelector: {}
+  tolerations: []
+  topologySpreadEnabled: true
+
+# The client-facing Service, in front of the workers. Any worker can answer any
+# request, forwarding internally when it is not the owner, so a plain round
+# robin Service is correct here and not a compromise.
+service:
+  type: ClusterIP
+  port: 7100
+  annotations: {}
+
+cluster:
+  name: orbita
+  # Refusing to start against an incompatible leader group is the default.
+  # Turning this off is unsupported and exists only for an operator who has
+  # decided the alternative is worse.
+  allowVersionSkew: false
+
+objectStore:
+  endpoint: ""
+  bucket: orbita
+  region: us-east-1
+  # AWS S3 wants this false. MinIO, R2, and most other S3-compatible stores
+  # want it true.
+  forcePathStyle: true
+  # Credentials come from a Secret. Set existingSecret to bring your own, with
+  # keys access_key_id and secret_access_key. Otherwise the chart creates one
+  # from the values below, which is fine for a test cluster and not for a real
+  # one.
+  existingSecret: ""
+  accessKeyId: ""
+  secretAccessKey: ""
+
+telemetry:
+  # Empty disables trace and metric export. Logs still go to stdout, because a
+  # node that cannot reach a collector still has to be debuggable.
+  otlpEndpoint: ""
+  traceSampleRatio: 1.0
+  serviceName: orbita
+  logLevel: info
+  resourceAttributes: {}
+    # deployment.environment: production
+
+# Anything else, appended verbatim to the generated orbita.toml. This is the
+# escape hatch for an option the chart does not model yet, so that a missing
+# value is never a blocker.
+extraConfig: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# A disruption budget so that a rolling node drain cannot take the leader group
+# below quorum.
+podDisruptionBudget:
+  enabled: true

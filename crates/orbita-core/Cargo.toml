@@ -1,0 +1,13 @@
+[package]
+name = "orbita-core"
+description = "Shared vocabulary types for Orbita: identifiers, key ranges, versions, and errors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true

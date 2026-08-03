@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "orbita.fullname" . }}-worker
+  labels:
+    {{- include "orbita.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  serviceName: {{ include "orbita.fullname" . }}-worker
+  replicas: {{ .Values.worker.replicas }}
+  # Workers own partitions on their own disks, so they need a stable name and a
+  # stable volume. They can all start at once, because a worker that finds no
+  # leader group yet retries rather than failing.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "orbita.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "orbita.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "orbita.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Long enough for the leader group to move ownership of this worker's
+      # partitions somewhere else before the process goes away.
+      terminationGracePeriodSeconds: 120
+      {{- if .Values.worker.topologySpreadEnabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "orbita.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: worker
+      {{- end }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: orbita
+          image: {{ include "orbita.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # Worker ids start at 101 so that a worker id and a leader id can
+          # never collide, however either group is scaled.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ordinal="${HOSTNAME##*-}"
+              export ORBITA_NODE_ID="$((101 + ordinal))"
+              export ORBITA_ADVERTISE="${HOSTNAME}.{{ include "orbita.fullname" . }}-worker.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}"
+              exec /usr/local/bin/orbita serve --role worker
+          env:
+            - name: ORBITA_CONFIG
+              value: /etc/orbita/orbita.toml
+            {{- if or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId }}
+            - name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orbita.objectStoreSecretName" . }}
+                  key: access_key_id
+            - name: ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orbita.objectStoreSecretName" . }}
+                  key: secret_access_key
+            {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.port }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/orbita
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/orbita
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "orbita.fullname" . }}
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.worker.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.worker.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.worker.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.worker.persistence.size }}
+  {{- end }}

@@ -1,0 +1,32 @@
+[package]
+name = "orbita-control"
+description = "The leader group: partition map, membership, failover, and split and merge decisions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+orbita-core.workspace = true
+orbita-runtime.workspace = true
+orbita-proto.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tonic = "0.12"
+async-trait = "0.1"
+crc32fast = "1.5.0"
+# Credentials must not come from the seeded generator in orbita-runtime, whose
+# own documentation forbids it. This is the operating system's entropy, used in
+# exactly one place and never on a path the simulator has to reproduce.
+getrandom = "0.2"
+sha2 = "0.10"
+# Only the synchronisation primitives, which are executor agnostic. Nothing
+# here spawns, sleeps, or touches the Tokio reactor, so the control plane runs
+# unchanged under the simulator's single threaded scheduler.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+orbita-sim = { path = "../orbita-sim" }

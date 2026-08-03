@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly, for the long simulation batch.
+    - cron: "0 7 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # The toolchain version comes from rust-toolchain.toml, so CI and a
+      # developer laptop cannot drift apart.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo test --all-features
+
+  simulation:
+    name: deterministic simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Simulation runs are seeded, so a failure here reports a seed that
+      # reproduces it exactly on any machine, with a paste-ready command.
+      # Pull requests get a short batch to keep the feedback loop tight.
+      - name: Run simulation seeds
+        if: github.event_name != 'schedule'
+        run: cargo test -p orbita-sim --release
+
+      # Nightly explores far more of the state space. The seed count is the
+      # knob worth raising when a release is close.
+      - name: Run the long simulation batch
+        if: github.event_name == 'schedule'
+        env:
+          ORBITA_SIM_SEEDS: "50000"
+        run: cargo test -p orbita-sim --release

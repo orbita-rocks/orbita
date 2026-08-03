@@ -1,0 +1,18 @@
+# Everything the image does not need. A smaller build context is a faster
+# build, and a host `target` directory copied into a Linux builder is worse
+# than useless because none of the artefacts are usable.
+target
+.git
+.github
+.claude
+.agents
+docs
+deploy
+data
+.orbita
+docker-compose.yml
+Dockerfile
+.dockerignore
+**/*.md
+**/.DS_Store
+**/*.sw[onp]

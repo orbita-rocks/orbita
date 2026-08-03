@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/orbita-core",
+    "crates/orbita-runtime",
+    "crates/orbita-objectstore",
+    "crates/orbita-proto",
+    "crates/orbita-storage",
+    "crates/orbita-wal",
+    "crates/orbita-control",
+    "crates/orbita-server",
+    "crates/orbita-sim",
+    "crates/orbita-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/bradhe/orbita"
+authors = ["The Orbita Authors"]
+
+[workspace.dependencies]
+orbita-core = { path = "crates/orbita-core" }
+orbita-runtime = { path = "crates/orbita-runtime" }
+orbita-objectstore = { path = "crates/orbita-objectstore" }
+orbita-proto = { path = "crates/orbita-proto" }
+orbita-storage = { path = "crates/orbita-storage" }
+orbita-wal = { path = "crates/orbita-wal" }
+orbita-control = { path = "crates/orbita-control" }
+orbita-server = { path = "crates/orbita-server" }
+orbita-sim = { path = "crates/orbita-sim" }
+
+async-trait = "0.1"
+bytes = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[profile.release]
+debug = 1
+lto = "thin"

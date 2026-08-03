@@ -1,0 +1,15 @@
+[package]
+name = "orbita-sim"
+description = "The deterministic simulation harness: virtual time, fault injection, and linearizability checking."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+orbita-core.workspace = true
+orbita-runtime.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
