@@ -17,11 +17,10 @@ moon fixes that by holding one definition of each task and letting both CI and
 a laptop run it. It also knows which crates a change actually touches, so a
 change to `orbita-wal` does not have to retest `orbita-cli`.
 
-The other half of this is versions. The Rust version lives in
-`.moon/toolchain.yml`, and moon writes it back out to `rust-toolchain.toml`, so
-rustup users get the same compiler without knowing moon exists. moon's own
-version is pinned in `.prototools`. Neither CI nor a developer picks a version
-of anything, which is the point.
+moon does not own the compiler version. `rust-toolchain.toml` still does, and
+rustup still installs it, because that already worked and everyone who writes
+Rust already knows it. moon's own version is pinned in `.prototools`, which is
+the only version this added.
 
 ## Getting set up
 
@@ -35,10 +34,11 @@ That installs the pinned moon. If you do not have proto, one line gets it:
 curl -fsSL https://moonrepo.dev/install/proto.sh | bash
 ```
 
-moon installs the Rust toolchain itself on the first run. You still need
-`protoc` on the machine, because `orbita-proto` compiles the wire definitions
-at build time and that is a system dependency moon does not manage. On a Mac
-that is `brew install protobuf`.
+You need rustup and `protoc` on the machine. rustup reads
+`rust-toolchain.toml` and installs the pinned compiler the first time you run
+anything. `protoc` is a system dependency moon does not manage, and
+`orbita-proto` compiles the wire definitions at build time. On a Mac that is
+`brew install protobuf`.
 
 ## The tasks
 

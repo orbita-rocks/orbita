@@ -1,13 +1,12 @@
 # https://moonrepo.dev/docs/config/toolchain
 $schema: 'https://moonrepo.dev/schemas/toolchain.json'
 
-# The Rust version lives here now, and moon writes it back out to
-# rust-toolchain.toml on sync. That keeps one number in one place: rustup
-# users, moon users, and CI all end up on the same compiler, and a bump is a
-# one-line change here rather than a change here and a change there that drift.
-rust:
-  version: '1.91.1'
-  components:
-    - 'clippy'
-    - 'rustfmt'
-  syncToolchainConfig: true
+# Enabling the Rust toolchain is what lets moon read the path dependencies out
+# of the Cargo.toml files and build its project graph from them, which is what
+# makes `--affected` correct.
+#
+# There is deliberately no `version` here. rust-toolchain.toml already pins the
+# compiler, rustup already installs it on demand, and every Rust developer
+# already knows that. Setting a version here hands the install to proto instead,
+# which buys a second installer for a problem that was already solved.
+rust: {}

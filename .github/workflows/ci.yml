@@ -25,10 +25,14 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      # moon and the Rust toolchain both come from configuration in the repo:
-      # the moon version from .prototools, the compiler from
-      # .moon/toolchain.yml. CI installs no version of its own, so it cannot
-      # drift from a developer laptop.
+      # The compiler version comes from rust-toolchain.toml, so CI and a
+      # developer laptop cannot drift apart. moon's own version comes from
+      # .prototools for the same reason. Rust is installed first, because moon
+      # only runs cargo and does not install it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
       - uses: moonrepo/setup-toolchain@v0
         with:
           auto-install: true
@@ -53,6 +57,8 @@ jobs:
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: moonrepo/setup-toolchain@v0
         with:
@@ -81,6 +87,8 @@ jobs:
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: moonrepo/setup-toolchain@v0
         with:

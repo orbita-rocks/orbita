@@ -1,5 +1,5 @@
-# Pins the version of moon itself. moon pins the Rust toolchain, and this pins
-# moon, so `proto use` in a fresh checkout produces the same build environment
-# CI runs. Rust is deliberately not listed here: it belongs to
-# .moon/toolchain.yml, which is the file that also writes rust-toolchain.toml.
+# Pins the version of moon itself, so `proto use` in a fresh checkout produces
+# the build environment CI runs. Rust is deliberately not listed here.
+# rust-toolchain.toml pins the compiler and rustup installs it, and routing that
+# through proto instead means two installers for one version.
 moon = "1.41.7"
