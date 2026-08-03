@@ -31,7 +31,10 @@
 //! - Workers do not bootstrap. A worker dials any leader address, registers,
 //!   and is told the partition map. A worker that starts before the leader
 //!   group exists retries rather than failing, because in a container
-//!   orchestrator start order is not something anyone controls.
+//!   orchestrator start order is not something anyone controls. The retry is
+//!   exponential and capped, and it gives up after `cluster.join_timeout` so
+//!   that a worker which will never join shows up as a restarting pod rather
+//!   than a process quietly waiting forever.
 //! - The first partition is not an operator's problem. A keyspace is created
 //!   with a single partition covering the whole range, so `keyspace create` is
 //!   the only step and there is no "now create a partition" to forget.
@@ -47,29 +50,47 @@
 //!
 //! # Version skew
 //!
-//! A node refuses to start when the leader group runs a version it is not
-//! compatible with. Compatible means the same major and minor version;
-//! patch releases may mix. Before 1.0 the minor version is the compatibility
-//! unit, because that is where breaking changes go while the format is still
-//! moving.
+//! This module used to refuse to start when the leader group ran a version it
+//! did not match. `docs/adr/0005-upgrades-follow-kubernetes-rollouts.md`
+//! supersedes that, and the reasoning is worth keeping because refusing looks
+//! like the careful answer. Under a StatefulSet rolling update, the first
+//! upgraded pod would exit, land in CrashLoopBackOff, and stall the rollout
+//! with the cluster half upgraded and no forward path. A pod that runs and
+//! reports itself not Ready stops the rollout at exactly one pod and keeps its
+//! logs reachable.
 //!
-//! Refusing is the safe answer and it is also the honest one. The alternative,
-//! starting anyway and hoping the wire format is close enough, turns a rolling
-//! upgrade into something that appears to work and then corrupts a partition
-//! map under load. Refusing makes the upgrade path a question somebody has to
-//! answer during design rather than discover during an incident. There is an
-//! escape hatch, `--allow-version-skew`, and it is documented as unsupported,
-//! because an operator staring at an outage should have the option and should
-//! also know they are on their own.
+//! The replacement is a cluster version held in the control plane's replicated
+//! state, separate from the binary version, with a window of the active
+//! version and the one before it. A node outside the window starts, reports
+//! not Ready, and says why. It does not exit.
+//!
+//! None of that exists yet, because there is no cluster version to read.
+//! [`versions_compatible`] and [`version_skew_message`] compare binary versions
+//! and are kept only so the tests that describe the old rule keep documenting
+//! what changed. Nothing calls them. `--allow-version-skew` is likewise inert
+//! and will be removed when the cluster version lands, because there will be
+//! nothing left for it to override.
+//!
+//! # Two listeners
+//!
+//! A node binds a client gRPC listener and a peer listener on separate
+//! addresses. `docs/adr/0004-peer-traffic-uses-private-framing.md` is the
+//! record of why. The consequence for this module is that both addresses have
+//! to be dialable by the people who dial them, and that the peer one is not
+//! something to expose: it carries WAL bytes in the framing they have on disk
+//! and it belongs on a private network. ADR 0005 corrects one line of ADR
+//! 0004: peer framing is compatible within a cluster version window rather
+//! than not at all, which is what makes a rolling upgrade possible.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use orbita_core::{KeyspaceName, NodeId};
 use orbita_server::{Server, ServerConfig};
 
-use crate::config::{Config, Role};
+use crate::config::{ClusterConfig, Config, Role};
 
 /// What a node run needs beyond the configuration.
 #[derive(Debug, Clone)]
@@ -84,56 +105,66 @@ pub struct NodeOptions {
 
 /// Starts a node and runs until it is shut down.
 ///
-/// This is deliberately the only call into `orbita-server` in the whole crate,
-/// which is why `orbita-server` is not yet a dependency: one function needs it
-/// and the other twenty commands do not.
+/// This is deliberately the only call into `orbita-server` in the whole crate.
+/// Every other command is a network client, so a change to the server's API is
+/// a change to this one function rather than to twenty.
 ///
-/// When that crate lands its API, this function will:
-///
-/// 1. Build an `orbita_server::ServerConfig` from [`Config`], carrying the
-///    node id, the listen address, the data directory, and the partition map
-///    source, which is the leader peer list for a leader and the leader group
-///    address for a worker.
-/// 2. Call `orbita_server::Server::start(config)`.
-/// 3. Create [`NodeOptions::create_keyspace`] if it is set and absent.
-/// 4. Wait for a shutdown signal and call `Server::shutdown()`.
-///
-/// Everything the function needs from the configuration is already validated
-/// by the time it is called, so wiring it up is a translation and not a
-/// design.
+/// The client listener, the data directory, the node id, and the startup
+/// keyspace are wired up. The peer listener and the leader peer list are
+/// resolved and validated here but not yet handed to the server, because the
+/// server does not accept them yet. The `TODO(peer-listener)` below is the
+/// single place that changes when it does.
 pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
     preflight(config, options)?;
     prepare_data_dir(&config.node.data_dir, false)?;
 
-    // Resolving here rather than at parse time means a hostname in the config
-    // is allowed, which is what a container orchestrator tends to hand you.
-    let listen: SocketAddr = config
-        .node
-        .listen
-        .to_socket_addrs()
-        .with_context(|| format!("resolving node.listen, {}", config.node.listen))?
-        .next()
-        .with_context(|| format!("node.listen resolved to nothing, {}", config.node.listen))?;
+    let listen = resolve("node.listen", &config.node.listen)?;
+    let peer_listen = resolve("node.peer_listen", &config.node.peer_listen)?;
 
-    let mut server_config = ServerConfig::single_node(&config.node.data_dir)
-        .with_node_id(NodeId(config.node.id))
-        .with_listen_addr(listen);
-
-    // The keyspace has to exist before the node serves, because the map a
-    // worker opens its partitions from is built at start. Creating it after
-    // would mean a second start to pick it up, which is exactly the extra step
-    // the dev path exists to remove.
-    if let Some(name) = &options.create_keyspace {
-        let keyspace = KeyspaceName::new(name.as_str())
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("the keyspace to create at startup")?;
-        server_config = server_config.with_keyspaces(&[keyspace]);
+    // TODO(leader-peers): the leader peer list does not reach the server yet.
+    // `ServerConfig::with_peers` wants pairs of node id and address, and
+    // `cluster.leader_peers` is addresses alone, because an operator writing a
+    // peer list should not also have to keep a node id table in sync with it.
+    // Closing that gap is a question for the server's registration path, not
+    // for this crate to guess at, so the list is carried and logged here and
+    // wired up when there is somewhere to put it.
+    if !config.cluster.leader_peers.is_empty() {
+        tracing::info!(
+            leader_peers = %config.cluster.leader_peers.join(","),
+            peer_advertise = %config.node.peer_advertise,
+            "the leader group is configured but this build does not yet register with it"
+        );
     }
 
-    let server = Server::start(server_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("starting the node")?;
+    // A worker whose leader group is not up yet retries instead of failing.
+    // Nobody chooses start order in an orchestrator, and a worker that exits
+    // because it was scheduled first turns an ordinary rollout into a crash
+    // loop that resolves itself only by luck.
+    let joining =
+        config.node.role == Role::Worker && !options.dev && !config.cluster.leader_peers.is_empty();
+    let mut backoff = JoinBackoff::new(&config.cluster);
+
+    let server = loop {
+        match Server::start(server_config(config, options, listen, peer_listen)?).await {
+            Ok(server) => break server,
+            Err(error) if joining => {
+                let Some(delay) = backoff.next_delay() else {
+                    return Err(anyhow::anyhow!("{error}"))
+                        .context(join_give_up_message(&config.cluster));
+                };
+                tracing::warn!(
+                    error = %error,
+                    leader_peers = %config.cluster.leader_peers.join(","),
+                    retry_in_millis = delay.as_millis() as u64,
+                    "cannot join the leader group yet, retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!("{error}")).context("starting the node");
+            }
+        }
+    };
 
     // Startup notes go to stderr so that anything a later command pipes stays
     // clean.
@@ -158,6 +189,104 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
     Ok(())
 }
 
+/// Builds the server configuration for one start attempt.
+///
+/// It is rebuilt per attempt rather than cloned because a `ServerConfig` owns
+/// its partition map source, and a retry after a failed start needs a fresh
+/// one rather than the one that already failed.
+fn server_config(
+    config: &Config,
+    options: &NodeOptions,
+    listen: SocketAddr,
+    peer_listen: SocketAddr,
+) -> Result<ServerConfig> {
+    let mut server_config = ServerConfig::single_node(&config.node.data_dir)
+        .with_node_id(NodeId(config.node.id))
+        .with_listen_addr(listen)
+        .with_peer_listen_addr(peer_listen);
+
+    // The keyspace has to exist before the node serves, because the map a
+    // worker opens its partitions from is built at start. Creating it after
+    // would mean a second start to pick it up, which is exactly the extra step
+    // the dev path exists to remove.
+    if let Some(name) = &options.create_keyspace {
+        let keyspace = KeyspaceName::new(name.as_str())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("the keyspace to create at startup")?;
+        server_config = server_config.with_keyspaces(&[keyspace]);
+    }
+    Ok(server_config)
+}
+
+/// Turns a configured address into a socket address.
+///
+/// Resolving here rather than at parse time means a hostname in the config is
+/// allowed, which is what a container orchestrator tends to hand you.
+fn resolve(option: &str, address: &str) -> Result<SocketAddr> {
+    address
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {option}, {address}"))?
+        .next()
+        .with_context(|| format!("{option} resolved to nothing, {address}"))
+}
+
+/// How long a node waits between attempts to reach the leader group.
+///
+/// The schedule doubles from the initial delay up to the maximum and stays
+/// there, so a group that comes up late is still found within the maximum of
+/// coming up, and a group that never comes up is not hammered. There is no
+/// jitter: a node goes through `orbita_runtime::Runtime` for anything the
+/// simulator has to reproduce, and a startup retry is not worth an unreachable
+/// random number generator here.
+#[derive(Debug, Clone)]
+pub struct JoinBackoff {
+    next: Duration,
+    max: Duration,
+    /// Zero means keep trying forever, which is what an operator who would
+    /// rather have a hung pod than a restarting one asks for.
+    budget: Duration,
+    spent: Duration,
+}
+
+impl JoinBackoff {
+    #[must_use]
+    pub fn new(cluster: &ClusterConfig) -> Self {
+        Self {
+            next: Duration::from_millis(cluster.join_backoff_initial_millis),
+            max: Duration::from_millis(cluster.join_backoff_max_millis),
+            budget: Duration::from_millis(cluster.join_timeout_millis),
+            spent: Duration::ZERO,
+        }
+    }
+
+    /// How long to wait before the next attempt, or `None` when the budget is
+    /// spent and the node should give up.
+    pub fn next_delay(&mut self) -> Option<Duration> {
+        let delay = self.next.min(self.max);
+        if !self.budget.is_zero() && self.spent + delay > self.budget {
+            return None;
+        }
+        self.spent += delay;
+        self.next = self.next.saturating_mul(2).min(self.max);
+        Some(delay)
+    }
+}
+
+/// What a node says when it has waited as long as it was told to.
+///
+/// It names the addresses it was trying, because the usual cause is a peer
+/// address that resolves to nothing or points at the client port.
+#[must_use]
+pub fn join_give_up_message(cluster: &ClusterConfig) -> String {
+    format!(
+        "gave up reaching the leader group after {} ms. Tried {}. Check that these are peer \
+         addresses rather than client ones, that they resolve, and raise cluster.join_timeout \
+         or set it to 0 to keep trying",
+        cluster.join_timeout_millis,
+        cluster.leader_peers.join(", ")
+    )
+}
+
 /// Checks the things that would otherwise fail minutes into a start.
 ///
 /// A configuration mistake found at startup costs a restart. The same mistake
@@ -170,14 +299,43 @@ pub fn preflight(config: &Config, options: &NodeOptions) -> Result<()> {
              listed identically on every leader. Use `orbita dev` for a single node cluster"
         );
     }
-    if config.node.advertise.starts_with("0.0.0.0") && !options.dev {
-        bail!(
-            "node.advertise is {}, which no other node can dial. Set it to an address peers \
-             can reach",
-            config.node.advertise
-        );
+    if !options.dev {
+        if let Some(option) = unroutable("node.advertise", &config.node.advertise) {
+            bail!(
+                "{option} is {}, which nothing can dial. Set it to an address clients can reach",
+                config.node.advertise
+            );
+        }
+        // The same check for the peer address, because a peer advertise
+        // address nobody can dial is the failure that looks like a healthy
+        // node with an empty partition map.
+        if let Some(option) = unroutable("node.peer_advertise", &config.node.peer_advertise) {
+            bail!(
+                "{option} is {}, which no other node can dial. Set it to an address peers can \
+                 reach on your private network",
+                config.node.peer_advertise
+            );
+        }
+        if config.node.advertise == config.node.peer_advertise {
+            bail!(
+                "node.advertise and node.peer_advertise are both {}, but clients and peers reach \
+                 this node on two different listeners. Give the peer listener its own port",
+                config.node.advertise
+            );
+        }
     }
     Ok(())
+}
+
+/// Names the option when an advertise address is one nobody can dial.
+///
+/// A wildcard bind address means "every interface" to the kernel and nothing
+/// at all to a peer that tries to connect to it, and the unspecified IPv6
+/// address is the same mistake spelled differently.
+fn unroutable<'a>(option: &'a str, address: &str) -> Option<&'a str> {
+    let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "0.0.0.0" | "::" | "*").then_some(option)
 }
 
 /// Creates the data directory, optionally clearing it first.
@@ -198,6 +356,12 @@ pub fn prepare_data_dir(path: &Path, clean: bool) -> Result<()> {
 ///
 /// Same major and same minor. Patch versions may mix, which is what makes a
 /// security patch deployable without a coordinated restart of the world.
+///
+/// Superseded by ADR 0005 and called by nothing. Compatibility is a property
+/// of the cluster version rather than of the binary version, because the client
+/// API, the peer framing, the write-ahead log, the storage records, and the
+/// replicated control plane state change at different rates and one binary
+/// version cannot answer for all five.
 #[must_use]
 pub fn versions_compatible(ours: &str, theirs: &str) -> bool {
     fn series(version: &str) -> Option<(u64, u64)> {
@@ -221,6 +385,10 @@ pub fn versions_compatible(ours: &str, theirs: &str) -> bool {
 ///
 /// It names both versions and the flag, because the operator reading it is
 /// mid-upgrade and needs to know which way the skew runs.
+///
+/// Superseded by ADR 0005 along with [`versions_compatible`]. A node outside
+/// the supported window reports itself not Ready rather than failing to start,
+/// so this text describes an outcome that no longer happens.
 #[must_use]
 pub fn version_skew_message(ours: &str, theirs: &str) -> String {
     format!(
@@ -243,6 +411,10 @@ mod tests {
     }
 
     fn config(role: Role, peers: &[&str], advertise: &str) -> Config {
+        layer(role, peers, advertise).resolve().unwrap()
+    }
+
+    fn layer(role: Role, peers: &[&str], advertise: &str) -> Layer {
         Layer {
             node: NodeLayer {
                 role: Some(role),
@@ -255,8 +427,6 @@ mod tests {
             },
             ..Layer::default()
         }
-        .resolve()
-        .unwrap()
     }
 
     #[test]
@@ -271,12 +441,89 @@ mod tests {
     }
 
     #[test]
-    fn a_wildcard_advertise_address_is_refused_because_no_peer_can_dial_it() {
+    fn a_wildcard_advertise_address_is_refused_because_nothing_can_dial_it() {
         let err = preflight(&config(Role::Worker, &[], "0.0.0.0:7100"), &options()).unwrap_err();
+        assert!(format!("{err:#}").contains("nothing can dial"), "{err:#}");
+    }
+
+    #[test]
+    fn a_wildcard_peer_advertise_address_is_refused_the_same_way_as_the_client_one() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.node.peer_advertise = Some("0.0.0.0:7101".to_owned());
+        let err = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
         assert!(
             format!("{err:#}").contains("no other node can dial"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn an_unspecified_ipv6_peer_advertise_address_is_refused_too() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.node.peer_advertise = Some("[::]:7101".to_owned());
+        let err = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no other node can dial"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn one_address_for_both_listeners_is_refused_because_a_node_binds_two() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.node.peer_advertise = Some("10.0.0.1:7100".to_owned());
+        let err = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{err:#}").contains("its own port"), "{err:#}");
+    }
+
+    #[test]
+    fn the_peer_advertise_address_defaults_to_the_client_host_and_the_peer_port() {
+        let config = config(Role::Worker, &[], "worker-1:7100");
+        assert_eq!(config.node.peer_advertise, "worker-1:7101");
+    }
+
+    fn backoff(initial: u64, max: u64, timeout: u64) -> JoinBackoff {
+        let mut cluster = config(Role::Worker, &[], "10.0.0.1:7100").cluster;
+        cluster.join_backoff_initial_millis = initial;
+        cluster.join_backoff_max_millis = max;
+        cluster.join_timeout_millis = timeout;
+        JoinBackoff::new(&cluster)
+    }
+
+    #[test]
+    fn the_join_backoff_doubles_until_it_reaches_the_maximum_and_stays_there() {
+        let mut backoff = backoff(100, 400, 0);
+        let waits: Vec<u64> = (0..5)
+            .map(|_| backoff.next_delay().unwrap().as_millis() as u64)
+            .collect();
+        assert_eq!(waits, [100, 200, 400, 400, 400]);
+    }
+
+    #[test]
+    fn a_zero_join_timeout_means_a_worker_never_stops_trying() {
+        let mut backoff = backoff(1_000, 1_000, 0);
+        for _ in 0..1_000 {
+            assert!(backoff.next_delay().is_some());
+        }
+    }
+
+    #[test]
+    fn a_worker_gives_up_once_it_has_waited_as_long_as_it_was_told_to() {
+        let mut backoff = backoff(1_000, 1_000, 2_500);
+        assert!(backoff.next_delay().is_some());
+        assert!(backoff.next_delay().is_some());
+        // A third wait would run past the budget, so it is refused rather than
+        // truncated: waiting less than the backoff says would be a busy loop.
+        assert!(backoff.next_delay().is_none());
+    }
+
+    #[test]
+    fn giving_up_names_the_addresses_that_were_tried_and_how_to_wait_longer() {
+        let cluster = config(Role::Worker, &["leader-1:7101", "leader-2:7101"], "w:7100").cluster;
+        let message = join_give_up_message(&cluster);
+        assert!(message.contains("leader-1:7101"), "{message}");
+        assert!(message.contains("leader-2:7101"), "{message}");
+        assert!(message.contains("join_timeout"), "{message}");
     }
 
     #[test]
@@ -352,6 +599,10 @@ mod tests {
             node: NodeLayer {
                 advertise: Some("127.0.0.1:0".to_owned()),
                 listen: Some("127.0.0.1:0".to_owned()),
+                // Port 0 for the peer listener too, or two runs of this test
+                // would fight over the default peer port.
+                peer_listen: Some("127.0.0.1:0".to_owned()),
+                peer_advertise: Some("127.0.0.1:1".to_owned()),
                 data_dir: Some(dir.path().join("data")),
                 ..NodeLayer::default()
             },

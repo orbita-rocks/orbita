@@ -1,8 +1,10 @@
 {{- if .Values.podDisruptionBudget.enabled }}
 {{/*
-A voluntary disruption, such as draining a node for maintenance, must not take
-the leader group below quorum. minAvailable is a majority rather than a fixed
-number so that it stays correct when the group is resized.
+A voluntary disruption, such as draining a node for maintenance or a rolling
+upgrade, must not take the leader group below quorum. minAvailable is computed
+as a majority of leader.replicas rather than fixed, so three members give two
+and five give three, and resizing the group does not silently leave the budget
+wrong.
 */}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget

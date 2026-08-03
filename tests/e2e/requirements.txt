@@ -1,0 +1,6 @@
+# The same dependencies as pyproject.toml, for `pip install -r`, which is what
+# CI and most people reach for first.
+grpcio>=1.60
+grpcio-tools>=1.60
+protobuf>=4.25
+pytest>=7.4

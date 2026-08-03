@@ -513,6 +513,7 @@ fn a_replica_that_restarts_still_refuses_the_owner_it_already_fenced() {
             partition: PARTITION,
             epoch: Epoch(1),
             prev_lamport: Lamport::ZERO,
+            committed: Lamport::ZERO,
             entries: vec![{
                 let entry = put(1, 1, "sneaky");
                 let frame = format::encode(&LogRecord::Entry(entry.clone()));

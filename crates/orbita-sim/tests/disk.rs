@@ -41,21 +41,40 @@ fn appends_read_back_at_the_offset_they_reported() {
 }
 
 #[test]
-fn listing_is_ordered_and_scoped_to_the_prefix() {
+fn listing_a_directory_gives_sorted_bare_names_and_does_not_recurse() {
+    // This once returned full paths and matched a prefix rather than a
+    // directory, which disagreed with the production disk. A log in a nested
+    // directory then looked empty, so reopening one silently started a new log
+    // and the entries were gone with nothing reporting a failure. The contract
+    // is spelled out on `Disk::list`, and this is what holds both
+    // implementations to it.
     let sim = Simulation::new(1);
     let node = sim.add_node(NodeId(1));
     let disk = node.disk().clone();
 
-    let names = sim.block_on(async move {
-        for path in ["wal/2.log", "wal/1.log", "sst/a.sst"] {
+    let (with_slash, without_slash, other, missing) = sim.block_on(async move {
+        for path in ["wal/2.log", "wal/1.log", "wal/7/deep.log", "sst/a.sst"] {
             disk.open(path, OpenOptions::create()).await.unwrap();
         }
-        disk.list("wal/").await.unwrap()
+        (
+            disk.list("wal/").await.unwrap(),
+            disk.list("wal").await.unwrap(),
+            disk.list("sst").await.unwrap(),
+            disk.list("nothing/here").await.unwrap(),
+        )
     });
 
+    let expected = vec!["1.log".to_string(), "2.log".to_string()];
+    assert_eq!(with_slash, expected, "bare names, sorted");
     assert_eq!(
-        names,
-        vec!["wal/1.log".to_string(), "wal/2.log".to_string()]
+        without_slash, expected,
+        "a trailing separator must not change the answer"
+    );
+    assert_eq!(other, vec!["a.sst".to_string()], "scoped to one directory");
+    assert!(
+        missing.is_empty(),
+        "a directory that does not exist lists as empty, since opening a log \
+         for the first time is ordinary and not an error"
     );
 }
 

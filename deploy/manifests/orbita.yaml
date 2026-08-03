@@ -11,6 +11,16 @@
 # Before this holds anything that matters, fill in the object store block in
 # the ConfigMap and the credentials in the Secret. Without them the workers
 # keep everything on local disks.
+#
+# Every node binds two listeners: 7100 for client and admin gRPC, and 7101 for
+# peer traffic. The headless Services carry both so that pods can reach each
+# other by name. The client Service carries 7100 only, and it must stay that
+# way: peer traffic uses a private framing that is compatible only within a
+# cluster version window, and a peer port behind a LoadBalancer is a hole. See
+# docs/adr/0004-peer-traffic-uses-private-framing.md.
+#
+# Nothing here stops another pod in the cluster from connecting to 7101. The
+# Helm chart has a NetworkPolicy for that, under networkPolicy.enabled.
 ---
 apiVersion: v1
 kind: Namespace
@@ -44,18 +54,31 @@ data:
   orbita.toml: |
     [node]
     listen = "0.0.0.0:7100"
+    # The peer listener. It is reachable through the headless Services only,
+    # which is where it belongs: peer traffic uses a private framing that is
+    # compatible only within a cluster version window.
+    peer_listen = "0.0.0.0:7101"
     data_dir = "/var/lib/orbita"
 
     [cluster]
     name = "orbita"
-    # The initial leader group membership, identical on every node. Ignored
-    # once a node has a Raft log, so it is safe to leave here forever.
+    # The leader group, as peer addresses on the peer port, identical on every
+    # node. Ignored once a node has a Raft log, so it is safe to leave here
+    # forever. These are peer addresses: a list on the client port would look
+    # almost right and never form a quorum.
     leader_peers = [
-      "orbita-leader-0.orbita-leader.orbita.svc.cluster.local:7100",
-      "orbita-leader-1.orbita-leader.orbita.svc.cluster.local:7100",
-      "orbita-leader-2.orbita-leader.orbita.svc.cluster.local:7100",
+      "orbita-leader-0.orbita-leader.orbita.svc.cluster.local:7101",
+      "orbita-leader-1.orbita-leader.orbita.svc.cluster.local:7101",
+      "orbita-leader-2.orbita-leader.orbita.svc.cluster.local:7101",
     ]
     allow_version_skew = false
+    # A worker that starts before the leader group retries rather than failing,
+    # because pod start order is not something anyone controls. It gives up
+    # eventually so that a worker which will never join is a restarting pod
+    # rather than a process waiting silently. Use "0" to retry forever.
+    join_backoff_initial = "250ms"
+    join_backoff_max = "10s"
+    join_timeout = "5m"
 
     [object_store]
     # endpoint = "https://s3.us-east-1.amazonaws.com"
@@ -92,6 +115,9 @@ spec:
     - name: grpc
       port: 7100
       targetPort: grpc
+    - name: peer
+      port: 7101
+      targetPort: peer
 ---
 apiVersion: v1
 kind: Service
@@ -108,6 +134,9 @@ spec:
     - name: grpc
       port: 7100
       targetPort: grpc
+    - name: peer
+      port: 7101
+      targetPort: peer
 ---
 # What clients connect to. Any worker answers any request, forwarding to the
 # owner internally, so plain round robin is correct here.
@@ -122,6 +151,8 @@ spec:
     app.kubernetes.io/name: orbita
     app.kubernetes.io/component: worker
   ports:
+    # The client port only. Do not add the peer port here: it must not end up
+    # behind a LoadBalancer or an Ingress.
     - name: grpc
       port: 7100
       targetPort: grpc
@@ -149,7 +180,10 @@ spec:
         app.kubernetes.io/component: leader
     spec:
       serviceAccountName: orbita
-      terminationGracePeriodSeconds: 60
+      # Room for a Raft leader to step down and hand off rather than being
+      # failed over. A deploy is not an unexpected failure and should not be
+      # paid for as one. The server does not do the handoff yet.
+      terminationGracePeriodSeconds: 120
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -172,8 +206,12 @@ spec:
             - |
               set -eu
               ordinal="${HOSTNAME##*-}"
+              fqdn="${HOSTNAME}.orbita-leader.orbita.svc.cluster.local"
               export ORBITA_NODE_ID="$((1 + ordinal))"
-              export ORBITA_ADVERTISE="${HOSTNAME}.orbita-leader.orbita.svc.cluster.local:7100"
+              export ORBITA_ADVERTISE="${fqdn}:7100"
+              # Other nodes reach this one here, and it has to match what the
+              # leader peer list says.
+              export ORBITA_PEER_ADVERTISE="${fqdn}:7101"
               exec /usr/local/bin/orbita serve --role leader
           env:
             - name: ORBITA_CONFIG
@@ -191,6 +229,44 @@ spec:
           ports:
             - name: grpc
               containerPort: 7100
+            - name: peer
+              containerPort: 7101
+          # Readiness is what gates the next pod in a rolling update, so it is
+          # the safety mechanism of an upgrade rather than a formality. It is
+          # supposed to mean that this node has registered with the leader
+          # group, recovered its log, opened its partitions, and caught up.
+          # It does not mean that yet: the server reports nothing better than
+          # "the process is answering", which is what `cluster ping` checks.
+          # Stage upgrades with the StatefulSet partition field and watch the
+          # cluster rather than trusting the rollout. See docs/UPGRADES.md.
+          #
+          # Liveness stays conservative, because failing it kills the pod. It
+          # never asks anything about the cluster or about reaching peers: a
+          # liveness probe that did would turn a network partition into every
+          # pod being killed at once. Slow starts belong to the startup probe,
+          # whose budget is long because recovering a large log legitimately
+          # takes time and a worker that starts before the leader group retries
+          # until it can join.
+          startupProbe:
+            exec:
+              command: &leader-probe
+                - /usr/local/bin/orbita
+                - --endpoint
+                - http://127.0.0.1:7100
+                - cluster
+                - ping
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: *leader-probe
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: *leader-probe
+            periodSeconds: 30
+            failureThreshold: 4
           resources:
             requests:
               cpu: 500m
@@ -245,9 +321,11 @@ spec:
         app.kubernetes.io/component: worker
     spec:
       serviceAccountName: orbita
-      # Long enough for the leader group to move this worker's partitions
-      # elsewhere before the process goes away.
-      terminationGracePeriodSeconds: 120
+      # Long enough for this worker to hand each partition to a caught-up
+      # replica before the process goes away. A rolling restart of three
+      # workers is an ordinary weekly event and must not cost three separate
+      # failover windows. The server does not do the handoff yet.
+      terminationGracePeriodSeconds: 300
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -268,8 +346,12 @@ spec:
             - |
               set -eu
               ordinal="${HOSTNAME##*-}"
+              fqdn="${HOSTNAME}.orbita-worker.orbita.svc.cluster.local"
               export ORBITA_NODE_ID="$((101 + ordinal))"
-              export ORBITA_ADVERTISE="${HOSTNAME}.orbita-worker.orbita.svc.cluster.local:7100"
+              export ORBITA_ADVERTISE="${fqdn}:7100"
+              # Other nodes reach this one here, and it has to match what the
+              # leader peer list says.
+              export ORBITA_PEER_ADVERTISE="${fqdn}:7101"
               exec /usr/local/bin/orbita serve --role worker
           env:
             - name: ORBITA_CONFIG
@@ -287,6 +369,44 @@ spec:
           ports:
             - name: grpc
               containerPort: 7100
+            - name: peer
+              containerPort: 7101
+          # Readiness is what gates the next pod in a rolling update, so it is
+          # the safety mechanism of an upgrade rather than a formality. It is
+          # supposed to mean that this node has registered with the leader
+          # group, recovered its log, opened its partitions, and caught up.
+          # It does not mean that yet: the server reports nothing better than
+          # "the process is answering", which is what `cluster ping` checks.
+          # Stage upgrades with the StatefulSet partition field and watch the
+          # cluster rather than trusting the rollout. See docs/UPGRADES.md.
+          #
+          # Liveness stays conservative, because failing it kills the pod. It
+          # never asks anything about the cluster or about reaching peers: a
+          # liveness probe that did would turn a network partition into every
+          # pod being killed at once. Slow starts belong to the startup probe,
+          # whose budget is long because recovering a large log legitimately
+          # takes time and a worker that starts before the leader group retries
+          # until it can join.
+          startupProbe:
+            exec:
+              command: &worker-probe
+                - /usr/local/bin/orbita
+                - --endpoint
+                - http://127.0.0.1:7100
+                - cluster
+                - ping
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: *worker-probe
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: *worker-probe
+            periodSeconds: 30
+            failureThreshold: 4
           resources:
             requests:
               cpu: "1"
@@ -316,7 +436,9 @@ spec:
           requests:
             storage: 100Gi
 ---
-# A node drain must not take the leader group below quorum.
+# A node drain or a rolling upgrade must not take the leader group below
+# quorum. Two of three is a majority. If you change the leader replica count
+# here, change this to match: the Helm chart computes it, this file cannot.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

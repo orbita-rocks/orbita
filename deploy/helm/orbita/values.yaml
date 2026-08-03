@@ -22,6 +22,11 @@ fullnameOverride: ""
 # and needs one more vote to agree.
 leader:
   replicas: 3
+  # Long enough for a Raft leader to step down and hand off before it goes
+  # away, so that a rolling restart does not spend an election per pod. The
+  # server does not perform that handoff yet, and until it does this is only
+  # headroom. See docs/adr/0005-upgrades-follow-kubernetes-rollouts.md.
+  terminationGracePeriodSeconds: 120
   persistence:
     enabled: true
     size: 10Gi
@@ -43,6 +48,12 @@ leader:
 # raise when the cluster needs more capacity.
 worker:
   replicas: 3
+  # A planned shutdown should hand each partition to a caught-up replica rather
+  # than going through failure detection and promotion, because a rolling
+  # restart of three workers is an ordinary weekly event and should not cost
+  # three failover windows. Three hundred seconds is room for a handoff of a
+  # large partition set. The server does not do the handoff yet.
+  terminationGracePeriodSeconds: 300
   persistence:
     enabled: true
     size: 100Gi
@@ -60,17 +71,46 @@ worker:
 # The client-facing Service, in front of the workers. Any worker can answer any
 # request, forwarding internally when it is not the owner, so a plain round
 # robin Service is correct here and not a compromise.
+#
+# Only `port` is on this Service. `peerPort` is carried by the two headless
+# Services and nowhere else, because peer traffic uses a private framing that
+# is compatible only within a cluster version window and has no business being
+# reachable from outside the cluster. See
+# docs/adr/0004-peer-traffic-uses-private-framing.md. Setting service.type to
+# LoadBalancer exposes the client port and nothing else, which is the point of
+# keeping them apart.
 service:
   type: ClusterIP
   port: 7100
+  peerPort: 7101
   annotations: {}
+
+# A NetworkPolicy that lets only this release's own pods open a peer
+# connection. Off by default because it needs a CNI that enforces policy, and a
+# policy that is silently ignored is worse than no policy: it reads like a
+# control and is not one. Turn it on where the CNI supports it.
+networkPolicy:
+  enabled: false
+  # Extra selectors allowed to reach the client port. Empty means every pod in
+  # the cluster can, which is the same as having no policy on that port.
+  clientFrom: []
 
 cluster:
   name: orbita
-  # Refusing to start against an incompatible leader group is the default.
-  # Turning this off is unsupported and exists only for an operator who has
-  # decided the alternative is worse.
+  # Inert, and kept only so that a values file carrying it does not break.
+  # Refusing to start on a version mismatch was replaced by a cluster version
+  # window: a node outside the window starts, reports itself not ready, and
+  # says why, because a pod that exits stalls a rolling update with the cluster
+  # half upgraded. Nothing checks a version yet. See docs/UPGRADES.md.
   allowVersionSkew: false
+  # A worker that starts before the leader group retries rather than failing,
+  # because pod start order is not something anyone controls. It gives up
+  # eventually so that a worker which will never join shows up as a restarting
+  # pod instead of a process waiting silently. Set joinTimeout to "0" to retry
+  # forever.
+  joinBackoffInitial: 250ms
+  joinBackoffMax: 10s
+  joinTimeout: 5m
 
 objectStore:
   endpoint: ""
@@ -123,6 +163,50 @@ securityContext:
     drop: ["ALL"]
 
 # A disruption budget so that a rolling node drain cannot take the leader group
-# below quorum.
+# below quorum. The leader minimum is computed from leader.replicas rather than
+# fixed, so a five member group gets three and not two.
 podDisruptionBudget:
   enabled: true
+
+# Health probes, and these decide whether a rolling upgrade is safe.
+#
+# A StatefulSet replaces pods one at a time and will not move to the next one
+# until the current one reports Ready, so readiness is the entire safety
+# mechanism of an upgrade. Readiness is supposed to mean that this node has
+# registered with the leader group, recovered its write-ahead log, opened every
+# partition the map says it holds, and caught up enough to serve them.
+#
+# It does not mean that yet. The server exposes no such signal, so readiness
+# here runs `orbita cluster ping`, which answers as soon as the process is
+# serving on the client port. That is weaker than the rule above, and it is
+# written down rather than papered over: until the server reports registration
+# and catch-up, a rolling upgrade of this chart can advance to the next pod
+# before the previous one has caught up. Stage upgrades with the StatefulSet
+# partition field and watch the cluster rather than trusting the rollout, and
+# read docs/UPGRADES.md before doing it on anything that matters.
+#
+# Liveness is the opposite and stays conservative, because failing it kills the
+# pod. It asks only whether the process responds, never anything about the
+# cluster or about reaching peers. A liveness probe that depended on peers
+# would turn a network partition into every pod being killed at once.
+#
+# Slow starts belong to the startup probe. Recovering a large write-ahead log
+# legitimately takes time, and that is not the same as being wedged, so the
+# startup budget is generous where the liveness threshold is not.
+probes:
+  readiness:
+    enabled: true
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    enabled: true
+    periodSeconds: 30
+    failureThreshold: 4
+  startup:
+    enabled: true
+    periodSeconds: 5
+    # Five minutes for a leader, ten for a worker. A worker that starts before
+    # the leader group retries until it can join, and killing it for that would
+    # turn an ordinary rollout into a crash loop.
+    leaderFailureThreshold: 60
+    workerFailureThreshold: 120

@@ -1,5 +1,6 @@
 //! The owner side: append locally, replicate, acknowledge at two of three.
 
+use std::collections::HashMap;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -78,6 +79,14 @@ struct OwnerState {
     /// can still rescue it, since acknowledging entry N+1 proves the replica
     /// holds N.
     failed_through: Lamport,
+    /// How far each replica has confirmed, individually.
+    ///
+    /// The durability quorum does not need this, since two of three is a
+    /// count. The coherence quorum in ADR 0001 does: the owner may only
+    /// acknowledge a write once every replica still holding a read lease has
+    /// the invalidation, and that is a question about named nodes rather than
+    /// about how many answered.
+    acked: HashMap<NodeId, Lamport>,
     /// Set when this node must stop being an owner: it was fenced, or its own
     /// disk stopped telling the truth.
     fatal: Option<Error>,
@@ -141,6 +150,7 @@ impl<R: Runtime> Wal<R> {
                 inflight: Vec::new(),
                 replicated: durable,
                 failed_through: Lamport::ZERO,
+                acked: HashMap::new(),
                 fatal: None,
             }),
             progress: tokio::sync::Notify::new(),
@@ -176,6 +186,64 @@ impl<R: Runtime> Wal<R> {
     #[must_use]
     pub fn epoch(&self) -> Epoch {
         self.state().epoch
+    }
+
+    /// How far one named replica has confirmed it holds.
+    ///
+    /// This is what the coherence quorum in ADR 0001 is asked, and it is
+    /// separate from [`Wal::committed_lamport`] on purpose: durability counts
+    /// replicas and coherence names them.
+    #[must_use]
+    pub fn acked_through(&self, node: NodeId) -> Lamport {
+        self.state()
+            .acked
+            .get(&node)
+            .copied()
+            .unwrap_or(Lamport::ZERO)
+    }
+
+    /// Resolves once every node in `nodes` holds `lamport`.
+    ///
+    /// This never gives up on its own. The caller bounds it, because the only
+    /// sensible bound is the remaining life of the read lease the wait exists
+    /// to protect, and this crate does not know about leases.
+    pub async fn wait_until_acked(&self, nodes: &[NodeId], lamport: Lamport) -> Result<()> {
+        loop {
+            let notified = self.progress.notified();
+            let mut notified = std::pin::pin!(notified);
+            // Registered before the check so a wake that lands between the two
+            // is not lost.
+            notified.as_mut().enable();
+
+            {
+                let state = self.state();
+                if let Some(fatal) = &state.fatal {
+                    return Err(fatal.clone());
+                }
+                let behind = nodes
+                    .iter()
+                    .any(|node| state.acked.get(node).copied().unwrap_or(Lamport::ZERO) < lamport);
+                if !behind {
+                    return Ok(());
+                }
+            }
+
+            notified.await;
+        }
+    }
+
+    /// Records how far a replica has confirmed. An acknowledgement covers
+    /// everything below it, because the protocol refuses a batch that would
+    /// leave a hole.
+    fn record_ack(&self, node: NodeId, through: Lamport) {
+        {
+            let mut state = self.state();
+            let slot = state.acked.entry(node).or_insert(Lamport::ZERO);
+            if through > *slot {
+                *slot = through;
+            }
+        }
+        self.progress.notify_waiters();
     }
 
     /// What recovery found when the log was opened.
@@ -239,6 +307,10 @@ impl<R: Runtime> Wal<R> {
             state.pending.clear();
             state.inflight.clear();
             state.failed_through = Lamport::ZERO;
+            // A new epoch means the replicas are about to be told where
+            // history ends, so what they confirmed under the old owner says
+            // nothing about where they are now.
+            state.acked.clear();
             state.fatal = None;
         }
 
@@ -349,11 +421,15 @@ impl<R: Runtime> Wal<R> {
         // batch is written while this one is still in flight.
         drop(guard);
 
-        let epoch = self.state().epoch;
+        let (epoch, committed) = {
+            let state = self.state();
+            (state.epoch, state.replicated)
+        };
         let request = AppendRequest {
             partition: self.partition,
             epoch,
             prev_lamport: Lamport(first.get() - 1),
+            committed,
             entries: batch
                 .into_iter()
                 .map(|p| (p.entry, p.frame))
@@ -521,7 +597,12 @@ impl<R: Runtime> Wal<R> {
 
     async fn call_replica(&self, node: NodeId, request: AppendRequest) -> Outcome {
         match self.send(node, METHOD_APPEND, request.encode()).await {
-            Ok(WalResponse::Ok { .. }) => Outcome::Acked,
+            Ok(WalResponse::Ok {
+                durable_lamport, ..
+            }) => {
+                self.record_ack(node, durable_lamport);
+                Outcome::Acked
+            }
             Ok(WalResponse::StaleEpoch { current }) => {
                 tracing::warn!(
                     partition = self.partition.get(),
@@ -574,12 +655,18 @@ impl<R: Runtime> Wal<R> {
             partition: request.partition,
             epoch: request.epoch,
             prev_lamport: from,
+            committed: self.committed_lamport(),
             entries,
         }
         .encode();
 
         match self.send(node, METHOD_APPEND, payload).await {
-            Ok(WalResponse::Ok { .. }) => Outcome::Acked,
+            Ok(WalResponse::Ok {
+                durable_lamport, ..
+            }) => {
+                self.record_ack(node, durable_lamport);
+                Outcome::Acked
+            }
             Ok(WalResponse::StaleEpoch { current }) => Outcome::Stale(current),
             _ => Outcome::Failed,
         }

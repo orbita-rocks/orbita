@@ -60,7 +60,26 @@ pub trait Disk: Clone + Send + Sync + 'static {
 
     fn remove(&self, path: &str) -> impl Future<Output = DiskResult<()>> + Send;
 
-    fn list(&self, prefix: &str) -> impl Future<Output = DiskResult<Vec<String>>> + Send;
+    /// Lists the entries directly inside a directory.
+    ///
+    /// `dir` names a directory, not a prefix to match, and the result holds
+    /// bare entry names rather than paths: listing `wal/7` yields
+    /// `["000001.log"]`, not `["wal/7/000001.log"]`. A directory that does not
+    /// exist lists as empty rather than failing, because a node opening a log
+    /// for the first time is an ordinary case and not an error.
+    ///
+    /// Results are sorted. A real filesystem returns entries in whatever order
+    /// it likes, and recovery depends on segment order, so sorting here means
+    /// no caller has to remember to.
+    ///
+    /// This is spelled out because the two implementations once disagreed
+    /// about it, one matching a prefix and returning full paths and the other
+    /// listing a directory and returning bare names. The consequence was that
+    /// a log in a nested directory looked empty under simulation, so reopening
+    /// one silently started a new log. Nothing failed; the data was just gone.
+    /// An ambiguous contract between two implementations of the same trait is
+    /// worth more words than it looks like it deserves.
+    fn list(&self, dir: &str) -> impl Future<Output = DiskResult<Vec<String>>> + Send;
 }
 
 /// An append-only file with explicit durability.

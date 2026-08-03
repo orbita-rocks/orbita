@@ -47,6 +47,14 @@ impl ServerRuntime {
             clock,
         }
     }
+
+    /// Replaces the peer call timeout, which has to happen before anything is
+    /// registered on the transport because it builds a new one.
+    #[must_use]
+    pub fn with_peer_call_timeout(mut self, node: NodeId, timeout: std::time::Duration) -> Self {
+        self.transport = PeerTransport::with_timeout(node, timeout);
+        self
+    }
 }
 
 impl Runtime for ServerRuntime {

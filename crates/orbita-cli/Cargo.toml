@@ -26,11 +26,9 @@ bytes.workspace = true
 clap = { version = "4.6.5", features = ["derive", "wrap_help"] }
 orbita-core.workspace = true
 orbita-proto.workspace = true
+# The only thing that uses this is src/node.rs, which is the one place in the
+# crate that starts a server rather than dialing one.
 orbita-server = { version = "0.0.0", path = "../orbita-server" }
-# orbita-server is deliberately absent until it exposes Server::start. Adding
-# a dependency on a crate that is still being written means every unrelated
-# `orbita config show` waits on it, and a compile error over there stops work
-# over here. See src/node.rs, which is the one place it will be needed.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 tokio.workspace = true

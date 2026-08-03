@@ -363,6 +363,44 @@ async fn describing_the_cluster_shows_nodes_and_replica_lag() {
     assert!(text.contains("3(-10)"), "{text}");
 }
 
+/// The summary is what an operator reads first, so it has to be there before
+/// any table and it has to be right without reading one.
+#[tokio::test]
+async fn describing_the_cluster_leads_with_a_summary_of_what_is_wrong() {
+    let (config, _) = start(fake()).await;
+    let text = admin::cluster(
+        &config,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    let summary = text.find("CLUSTER").unwrap();
+    assert!(summary < text.find("NODES").unwrap(), "{text}");
+    assert!(text.contains("1 total, 1 healthy"), "{text}");
+    assert!(text.contains("raft leader  node 1"), "{text}");
+    // The partition is owned by node 2, which the cluster did not report, so
+    // that is worth saying rather than leaving to be noticed.
+    assert!(text.contains("2 (unknown)"), "{text}");
+}
+
+#[tokio::test]
+async fn the_describe_json_carries_the_summary_a_script_would_alert_on() {
+    let (config, _) = start(fake()).await;
+    let text = admin::cluster(
+        &config,
+        Format::Json,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["summary"]["healthy_nodes"], 1);
+    assert_eq!(json["summary"]["max_replica_lag"], 10);
+    assert_eq!(json["summary"]["partitions_with_an_unhealthy_owner"], 1);
+    assert_eq!(json["partitions"][0]["replicas"][0]["applied_lamport"], 490);
+}
+
 #[tokio::test]
 async fn a_get_that_found_the_key_exits_zero_and_prints_the_value_first() {
     let (config, _) = start(fake()).await;

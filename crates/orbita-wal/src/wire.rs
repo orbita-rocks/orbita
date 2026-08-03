@@ -44,6 +44,14 @@ pub(crate) struct AppendRequest {
     pub partition: PartitionId,
     pub epoch: Epoch,
     pub prev_lamport: Lamport,
+    /// How far the owner has acknowledged writes to clients.
+    ///
+    /// Carried on the message that already exists rather than on a message of
+    /// its own, for the same reason invalidation is: a replica needs to know
+    /// which entries the cluster has committed to, and the owner is sending it
+    /// entries anyway. A replica that applied on durability alone would hold a
+    /// write nobody was ever told about, and could serve it.
+    pub committed: Lamport,
     /// Entries paired with the exact frames they were decoded from.
     pub entries: Vec<(WalEntry, Bytes)>,
 }
@@ -54,6 +62,7 @@ impl AppendRequest {
         buf.put_u64_le(self.partition.get());
         buf.put_u64_le(self.epoch.get());
         buf.put_u64_le(self.prev_lamport.get());
+        buf.put_u64_le(self.committed.get());
         buf.put_u32_le(self.entries.len() as u32);
         for (_, frame) in &self.entries {
             buf.put_slice(frame);
@@ -66,6 +75,7 @@ impl AppendRequest {
         let partition = PartitionId(r.u64()?);
         let epoch = Epoch(r.u64()?);
         let prev_lamport = Lamport(r.u64()?);
+        let committed = Lamport(r.u64()?);
         let count = r.u32()? as usize;
 
         let mut entries = Vec::with_capacity(count.min(1024));
@@ -85,6 +95,7 @@ impl AppendRequest {
             partition,
             epoch,
             prev_lamport,
+            committed,
             entries,
         })
     }
@@ -245,6 +256,7 @@ mod tests {
             partition: PartitionId(1),
             epoch: Epoch(2),
             prev_lamport: Lamport(4),
+            committed: Lamport(3),
             entries: vec![entry(5), entry(6)],
         };
         let decoded = AppendRequest::decode(&request.encode()).expect("round trip");
@@ -257,6 +269,7 @@ mod tests {
             partition: PartitionId(1),
             epoch: Epoch(2),
             prev_lamport: Lamport(0),
+            committed: Lamport::ZERO,
             entries: vec![entry(1)],
         };
         let mut bytes = request.encode().to_vec();

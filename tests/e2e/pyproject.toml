@@ -1,0 +1,22 @@
+# Tooling for the end-to-end suite. This is not a package anyone installs, and
+# it is deliberately not a client library, so it declares dependencies and
+# pytest settings and nothing else.
+
+[project]
+name = "orbita-e2e"
+version = "0.0.0"
+description = "End-to-end tests that drive Orbita from a stock gRPC client."
+requires-python = ">=3.9"
+dependencies = [
+    # grpcio-tools carries its own protoc, so generating the stubs needs
+    # nothing installed on the machine.
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    "protobuf>=4.25",
+    "pytest>=7.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+# Failures here are usually about what came back over the wire, so show it.
+addopts = "-q -ra --showlocals"

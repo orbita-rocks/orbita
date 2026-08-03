@@ -27,7 +27,7 @@ use crate::client::{authed, channel};
 use crate::config::Config;
 use crate::output::{
     render, Ack, Blob, ClusterView, CredentialView, Format, KeyspaceConfigView, KeyspaceListView,
-    KeyspaceView, NodeView, PartitionResultView, PartitionView, ReplicaView, SplitView,
+    KeyspaceView, NodeView, PartitionResultView, PartitionView, PingView, ReplicaView, SplitView,
 };
 
 /// Opens an admin client against the configured endpoint.
@@ -154,6 +154,50 @@ pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -
             let response = client.describe_cluster(request).await?.into_inner();
             render(format, &cluster_view(&response))
         }
+        ClusterCommand::Ping => {
+            let request = authed(
+                config,
+                DescribeClusterRequest {
+                    keyspace: String::new(),
+                },
+            )?;
+            let result = client.describe_cluster(request).await;
+            let detail = match &result {
+                Ok(_) => "ok".to_owned(),
+                Err(status) => status.code().description().to_owned(),
+            };
+            // The endpoint is not repeated here. Every network command is
+            // wrapped with "while talking to <endpoint>" on the way out, and
+            // saying it twice in one line reads like two different addresses.
+            if !answered(&result) {
+                bail!("the node did not answer: {detail}");
+            }
+            render(
+                format,
+                &PingView {
+                    endpoint: config.client.endpoint.clone(),
+                    answered: true,
+                    detail,
+                },
+            )
+        }
+    }
+}
+
+/// Whether a node answered at all, as opposed to not being reachable.
+///
+/// A probe is asking whether the process is serving, and a node that returns an
+/// error has answered: it accepted a connection, read a request, and replied.
+/// Only the two statuses that mean nobody replied count as down. Treating any
+/// error as down would restart a node for returning a permission error, which
+/// is the sort of health check that turns one bad deploy into an outage.
+fn answered<T>(result: &Result<T, tonic::Status>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(status) => !matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+        ),
     }
 }
 
@@ -320,10 +364,10 @@ pub fn node_view(node: &Node) -> NodeView {
 /// Turns a cluster description into its view.
 #[must_use]
 pub fn cluster_view(response: &DescribeClusterResponse) -> ClusterView {
-    ClusterView {
-        nodes: response.nodes.iter().map(node_view).collect(),
-        partitions: response.partitions.iter().map(partition_view).collect(),
-    }
+    ClusterView::new(
+        response.nodes.iter().map(node_view).collect(),
+        response.partitions.iter().map(partition_view).collect(),
+    )
 }
 
 /// The wall clock, used only to turn a relative expiry into an absolute one.
@@ -398,6 +442,30 @@ mod tests {
             permission_code(PermissionArg::Write),
             Permission::Write as i32
         );
+    }
+
+    #[test]
+    fn a_node_that_replied_with_an_error_still_counts_as_answering() {
+        // A node running a build without the call, or refusing the credential,
+        // is a node that is up. Restarting it for that would turn one bad
+        // deploy into an outage.
+        for code in [
+            tonic::Code::Unimplemented,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Internal,
+        ] {
+            let result: Result<(), _> = Err(tonic::Status::new(code, ""));
+            assert!(answered(&result), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_connection_that_was_never_made_counts_as_not_answering() {
+        for code in [tonic::Code::Unavailable, tonic::Code::DeadlineExceeded] {
+            let result: Result<(), _> = Err(tonic::Status::new(code, ""));
+            assert!(!answered(&result), "{code:?}");
+        }
+        assert!(answered::<()>(&Ok(())));
     }
 
     #[test]

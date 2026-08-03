@@ -12,14 +12,22 @@
 //! because the distinction between "the owner said no" and "the network ate
 //! it" is what the origin node needs in order to decide whether to repair its
 //! map and try again.
+//!
+//! # The lease heartbeat travels here too
+//!
+//! ADR 0001 has the owner renew its replicas' read leases on a heartbeat. That
+//! is worker-to-worker traffic that belongs to no other subsystem, and
+//! `ServiceId` is fixed by the runtime contract, so it rides on this service
+//! under its own method rather than earning a service of its own.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use orbita_core::{Epoch, Error, NodeId, PartitionId, Result, Version};
+use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId, Result, Version};
 
 pub(crate) const METHOD_GET: u16 = 1;
 pub(crate) const METHOD_SET: u16 = 2;
 pub(crate) const METHOD_DELETE: u16 = 3;
 pub(crate) const METHOD_LIST: u16 = 4;
+pub(crate) const METHOD_LEASE: u16 = 5;
 
 const TAG_OK: u8 = 0;
 const TAG_ERROR: u8 = 1;
@@ -38,6 +46,74 @@ const CODE_PERMISSION_DENIED: u16 = 11;
 const CODE_UNAVAILABLE: u16 = 12;
 const CODE_INVALID_ARGUMENT: u16 = 13;
 const CODE_INTERNAL: u16 = 14;
+
+/// One renewal of one replica's read lease.
+///
+/// `through` is where the owner's log stood when it sent this. A replica takes
+/// the lease only if it holds everything up to there, which is what stops it
+/// serving a key it has not yet been told is changing. A zero duration is a
+/// probe: it takes no lease and says only that the replica is answering.
+///
+/// `committed` is how far the owner has acknowledged writes to clients. A
+/// replica applies nothing beyond it, so its storage never holds a write that
+/// no client was ever told about. Without that, a replica would serve a value
+/// from a write still in flight, and a read that saw it followed by one that
+/// did not is a history no order explains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeaseGrant {
+    pub partition: PartitionId,
+    pub epoch: Epoch,
+    pub through: Lamport,
+    pub committed: Lamport,
+    pub duration_millis: u64,
+}
+
+impl LeaseGrant {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut out = BytesMut::with_capacity(40);
+        out.put_u64(self.partition.get());
+        out.put_u64(self.epoch.get());
+        out.put_u64(self.through.get());
+        out.put_u64(self.committed.get());
+        out.put_u64(self.duration_millis);
+        out.freeze()
+    }
+
+    pub(crate) fn decode(mut raw: &[u8]) -> Result<Self> {
+        if raw.remaining() < 40 {
+            return Err(Error::InvalidArgument("truncated lease grant".to_string()));
+        }
+        Ok(Self {
+            partition: PartitionId(raw.get_u64()),
+            epoch: Epoch(raw.get_u64()),
+            through: Lamport(raw.get_u64()),
+            committed: Lamport(raw.get_u64()),
+            duration_millis: raw.get_u64(),
+        })
+    }
+}
+
+/// Encodes whether the replica took the lease, in the same envelope as every
+/// other reply so that a refusal and a failure stay distinguishable.
+pub(crate) fn encode_lease_reply(accepted: bool) -> Bytes {
+    let mut out = BytesMut::with_capacity(2);
+    out.put_u8(TAG_OK);
+    out.put_u8(u8::from(accepted));
+    out.freeze()
+}
+
+pub(crate) fn decode_lease_reply(raw: &[u8]) -> Result<bool> {
+    let mut buf = raw;
+    if buf.remaining() < 1 {
+        return Err(Error::Internal("empty lease reply".to_string()));
+    }
+    match buf.get_u8() {
+        TAG_OK if buf.remaining() >= 1 => Ok(buf.get_u8() != 0),
+        TAG_OK => Err(Error::Internal("truncated lease reply".to_string())),
+        TAG_ERROR => Err(decode_error(buf)?),
+        other => Err(Error::Internal(format!("unknown proxy tag {other}"))),
+    }
+}
 
 /// Encodes a successful response body.
 pub(crate) fn encode_ok(body: &impl prost::Message) -> Bytes {
@@ -244,6 +320,33 @@ mod tests {
         ] {
             assert_eq!(round_trip(&error), error, "{error}");
         }
+    }
+
+    #[test]
+    fn a_lease_grant_survives_the_hop() {
+        let grant = LeaseGrant {
+            partition: PartitionId(4),
+            epoch: Epoch(9),
+            through: Lamport(1234),
+            committed: Lamport(1200),
+            duration_millis: 500,
+        };
+        assert_eq!(LeaseGrant::decode(&grant.encode()).unwrap(), grant);
+    }
+
+    #[test]
+    fn a_refused_lease_is_distinguishable_from_a_failed_one() {
+        // The owner acts on the difference: a refusal means nothing there can
+        // serve a stale read, and a failure means it has to assume otherwise.
+        assert!(!decode_lease_reply(&encode_lease_reply(false)).unwrap());
+        assert!(decode_lease_reply(&encode_lease_reply(true)).unwrap());
+        assert!(decode_lease_reply(&encode_error(&Error::NotFound)).is_err());
+    }
+
+    #[test]
+    fn a_truncated_lease_grant_is_refused_rather_than_guessed_at() {
+        assert!(LeaseGrant::decode(&[0; 39]).is_err());
+        assert!(decode_lease_reply(&[]).is_err());
     }
 
     #[test]

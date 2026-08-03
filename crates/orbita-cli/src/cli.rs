@@ -13,11 +13,15 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::{ClientLayer, ClusterLayer, Layer, NodeLayer, Role, TelemetryLayer};
 use crate::output::Format;
+
+// The duration parser lives with the configuration because a duration in a
+// file and a duration on a flag have to mean the same thing. It is re-exported
+// here so that the value parsers below read as one piece.
+pub use crate::config::parse_duration_millis;
 
 /// Something went wrong, and the tool has said what.
 pub const EXIT_ERROR: i32 = 1;
@@ -168,11 +172,16 @@ A leader group member runs Raft and owns the partition map, keyspace metadata,
 and failover. A worker owns partitions and serves reads and writes. Both are
 this binary; nothing else is installed.
 
-A fresh leader node forms the initial Raft configuration from
-cluster.leader_peers, which must be identical on every leader. Once the data
-directory holds a Raft log that list is ignored, so it is safe to leave in a
-template forever. Workers do not need it: they register with the leader group
-and are told where everything is.")]
+A node binds two listeners. --listen carries client and admin gRPC, and is the
+one to expose. --peer-listen carries traffic from other nodes in a private
+framing, and belongs on a private network: it is compatible only within a
+cluster version window, and a peer port reachable from the internet is a hole.
+
+cluster.leader_peers is the leader group as peer advertise addresses, identical
+on every node. A fresh leader forms the initial Raft configuration from it and
+ignores it once the data directory holds a Raft log, so it is safe to leave in
+a template forever. A worker uses the same list to find a leader to register
+with, and retries until one answers or --join-timeout runs out.")]
     Serve(ServeArgs),
 
     /// Run a single node cluster with no configuration at all.
@@ -249,30 +258,59 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ROLE")]
     pub role: Option<Role>,
 
-    /// The address to bind. Client, admin, and peer traffic share one port.
+    /// The address to bind for client and admin gRPC traffic.
     #[arg(long, value_name = "ADDR")]
     pub listen: Option<String>,
 
-    /// The address other nodes should dial to reach this one. Required in any
-    /// deployment where listen is a wildcard, because no peer can dial
+    /// The address clients should dial to reach this one. Required in any
+    /// deployment where listen is a wildcard, because nothing can dial
     /// 0.0.0.0.
     #[arg(long, value_name = "ADDR")]
     pub advertise: Option<String>,
+
+    /// The address to bind for traffic from other nodes.
+    ///
+    /// This is a second listener, not the client port. Bind it to a private
+    /// interface: peer traffic carries WAL bytes and control plane messages in
+    /// a private framing, and a peer port reachable from the internet is a
+    /// hole.
+    #[arg(long, value_name = "ADDR")]
+    pub peer_listen: Option<String>,
+
+    /// The address other nodes should dial to reach this one, which is what
+    /// goes in every node's leader peer list.
+    #[arg(long, value_name = "ADDR")]
+    pub peer_advertise: Option<String>,
 
     /// Where the WAL, the local RocksDB, and the Raft log live.
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// The initial leader group membership, as advertise addresses. Identical
-    /// on every leader node, and ignored once the node has a Raft log.
+    /// The leader group, as peer advertise addresses.
+    ///
+    /// Identical on every node. A leader uses it as the initial Raft
+    /// membership and ignores it once it has a Raft log. A worker uses it as
+    /// the list of leaders to contact.
     #[arg(long, value_name = "ADDR", value_delimiter = ',')]
     pub leader_peers: Option<Vec<String>>,
 
+    /// How long to keep trying to reach the leader group before giving up,
+    /// such as 5m. Use 0 to retry forever.
+    ///
+    /// A worker that starts before the leader group retries rather than
+    /// failing, because start order in an orchestrator is nobody's choice.
+    /// Giving up eventually is deliberate: a crash loop is visible and a
+    /// process retrying silently for a day is not.
+    #[arg(long, value_name = "DURATION")]
+    pub join_timeout: Option<String>,
+
     /// Start even if the leader group runs an incompatible version.
     ///
-    /// Unsupported. The default is to refuse, which turns a rolling upgrade
-    /// into a decision somebody makes rather than an outage somebody
-    /// discovers.
+    /// Inert. Refusing to start on a version mismatch was replaced by a
+    /// cluster version window, under which a node outside the window starts,
+    /// reports itself not ready, and says why, because a pod that exits stalls
+    /// a rolling update with the cluster half upgraded. Nothing checks a
+    /// version yet, so this flag overrides nothing and will be removed.
     #[arg(long)]
     pub allow_version_skew: bool,
 }
@@ -287,11 +325,14 @@ impl ServeArgs {
                 role: self.role,
                 listen: self.listen.clone(),
                 advertise: self.advertise.clone(),
+                peer_listen: self.peer_listen.clone(),
+                peer_advertise: self.peer_advertise.clone(),
                 data_dir: self.data_dir.clone(),
             },
             cluster: ClusterLayer {
                 leader_peers: self.leader_peers.clone(),
                 allow_version_skew: self.allow_version_skew.then_some(true),
+                join_timeout: self.join_timeout.clone(),
                 ..ClusterLayer::default()
             },
             ..Layer::default()
@@ -301,7 +342,8 @@ impl ServeArgs {
 
 #[derive(Debug, Args)]
 pub struct DevArgs {
-    /// The port to listen on, bound to the loopback address only.
+    /// The client port, bound to the loopback address only. The peer listener
+    /// takes the port above it.
     #[arg(long, default_value_t = crate::config::DEFAULT_PORT, value_name = "PORT")]
     pub port: u16,
 
@@ -441,6 +483,20 @@ thing to look at during a failover.")]
         #[arg(long, value_name = "NAME")]
         keyspace: Option<String>,
     },
+
+    /// Check that a node is answering, for a container health check.
+    #[command(long_about = "\
+Ask a node whether it is up, and exit 0 if it answered.
+
+This is what a Docker health check or a Kubernetes probe should run. It is
+deliberately weaker than `cluster describe`: any answer at all counts, even an
+error, because the question is whether the process is serving rather than
+whether the cluster is well. Only a connection that could not be made or a
+request that timed out counts as down.
+
+Use `cluster describe` to find out whether the cluster is healthy. Use this to
+find out whether one node is.")]
+    Ping,
 }
 
 #[derive(Debug, Subcommand)]
@@ -572,34 +628,6 @@ pub enum ConfigCommand {
 
     /// List every environment variable the tool reads.
     Env,
-}
-
-/// Parses a duration such as `500ms`, `30s`, `5m`, `2h`, or `7d` into
-/// milliseconds.
-///
-/// A unit is required. A bare number would have to mean either seconds or
-/// milliseconds, and whichever we picked would be wrong by a factor of a
-/// thousand for somebody, on a TTL, silently.
-pub fn parse_duration_millis(text: &str) -> Result<u64> {
-    let text = text.trim();
-    let split = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (digits, unit) = text.split_at(split);
-    if digits.is_empty() {
-        bail!("expected a number and a unit, such as 30s, got {text:?}");
-    }
-    let value: u64 = digits.parse()?;
-    let millis = match unit {
-        "ms" => value,
-        "s" => value * 1_000,
-        "m" => value * 60_000,
-        "h" => value * 3_600_000,
-        "d" => value * 86_400_000,
-        "" => bail!("durations need a unit: ms, s, m, h, or d. Got {text:?}"),
-        other => bail!("unknown duration unit {other:?}. Use ms, s, m, h, or d"),
-    };
-    Ok(millis)
 }
 
 #[cfg(test)]

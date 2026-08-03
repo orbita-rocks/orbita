@@ -6,6 +6,7 @@
 
 use crate::lease::DEFAULT_LEASE_DURATION;
 use crate::map_source::{single_node_map, BoxedMapSource, StaticMapSource};
+use crate::transport::DEFAULT_PEER_CALL_TIMEOUT;
 
 use orbita_core::{KeyspaceName, NodeId};
 
@@ -17,6 +18,12 @@ use std::time::Duration;
 /// first request works without an admin call.
 pub const DEFAULT_KEYSPACE: &str = "default";
 
+/// How often a worker talks to the leader group by default.
+///
+/// This matches the control plane's own heartbeat interval, which is chosen so
+/// that twelve reports have to go missing before a node is declared dead.
+pub const DEFAULT_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// One worker's configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -27,6 +34,39 @@ pub struct ServerConfig {
     /// Where clients connect. Port zero binds an arbitrary free port, which is
     /// what tests use, and [`crate::Server::local_addr`] reports what it got.
     pub listen_addr: SocketAddr,
+
+    /// Where peers connect, which is a separate listener from the client one.
+    ///
+    /// ADR 0004 keeps the two apart because an operator wants the peer port on
+    /// a private network and the client port exposed, and because a peer port
+    /// reachable from the internet is a hole.
+    pub peer_listen_addr: SocketAddr,
+
+    /// Where this node reaches every other node it might talk to.
+    ///
+    /// Configuration rather than discovery: finding a peer's address requires
+    /// asking something, and everything worth asking is itself reached over
+    /// the peer transport.
+    pub peers: Vec<(NodeId, String)>,
+
+    /// How long a call to a peer waits before it is treated as failed.
+    pub peer_call_timeout: Duration,
+
+    /// The leader group this node belongs to.
+    ///
+    /// Empty means there is no control plane, which is the single-node and
+    /// test case: the map comes from [`ServerConfig::map_source`] and never
+    /// changes. Non-empty replaces the map source with one backed by the
+    /// leader group and starts the heartbeat that failover depends on.
+    pub leader_group: Vec<NodeId>,
+
+    /// How often this node refetches the map and reports its own progress.
+    ///
+    /// One timer for both because they answer each other: the report says how
+    /// far this node has got, and the fetch is how it learns that the answer
+    /// moved a partition to or from it. It has to be well inside the control
+    /// plane's death declaration or this node is failed over while healthy.
+    pub control_poll_interval: Duration,
 
     /// The root of everything this node writes: the write-ahead log under
     /// `wal/` and the storage engine under `storage/`.
@@ -54,6 +94,11 @@ impl Default for ServerConfig {
         Self {
             node_id,
             listen_addr: "127.0.0.1:7379".parse().expect("a literal address parses"),
+            peer_listen_addr: "127.0.0.1:7380".parse().expect("a literal address parses"),
+            peers: Vec::new(),
+            peer_call_timeout: DEFAULT_PEER_CALL_TIMEOUT,
+            leader_group: Vec::new(),
+            control_poll_interval: DEFAULT_CONTROL_POLL_INTERVAL,
             data_dir: PathBuf::from("data"),
             map_source: BoxedMapSource::new(StaticMapSource::new(single_node_map(
                 node_id,
@@ -102,11 +147,54 @@ impl ServerConfig {
         self
     }
 
-    /// The address to bind when the caller wants the operating system to
-    /// choose the port.
+    #[must_use]
+    pub fn with_peer_listen_addr(mut self, addr: SocketAddr) -> Self {
+        self.peer_listen_addr = addr;
+        self
+    }
+
+    /// Where this node reaches its peers, as pairs of node id and address.
+    #[must_use]
+    pub fn with_peers(mut self, peers: Vec<(NodeId, String)>) -> Self {
+        self.peers = peers;
+        self
+    }
+
+    /// Where the partition map comes from, for a node joined to a real
+    /// cluster.
+    #[must_use]
+    pub fn with_map_source(mut self, source: BoxedMapSource) -> Self {
+        self.map_source = source;
+        self
+    }
+
+    /// Joins this node to a leader group, which is what makes its map come
+    /// from the control plane and its failures visible to failover.
+    #[must_use]
+    pub fn with_leader_group(mut self, members: Vec<NodeId>) -> Self {
+        self.leader_group = members;
+        self
+    }
+
+    #[must_use]
+    pub fn with_control_poll_interval(mut self, interval: Duration) -> Self {
+        self.control_poll_interval = interval;
+        self
+    }
+
+    #[must_use]
+    pub fn with_lease_duration(mut self, duration: Duration) -> Self {
+        self.lease_duration = duration;
+        self
+    }
+
+    /// The addresses to bind when the caller wants the operating system to
+    /// choose both ports.
     #[must_use]
     pub fn on_ephemeral_port(self) -> Self {
-        self.with_listen_addr("127.0.0.1:0".parse().expect("a literal address parses"))
+        let ephemeral: SocketAddr = "127.0.0.1:0".parse().expect("a literal address parses");
+        self.with_listen_addr(ephemeral)
+            .with_peer_listen_addr(ephemeral)
     }
 }
 

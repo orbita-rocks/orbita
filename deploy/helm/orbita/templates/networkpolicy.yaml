@@ -1,0 +1,44 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+Only this release's own pods may open a peer connection.
+
+Leaving the peer port off the client Service keeps it from being exposed by
+accident. This closes the other half: anything already inside the cluster can
+reach any pod IP on any port unless a policy says otherwise, and the peer
+framing carries WAL bytes and control plane messages with no authentication of
+its own.
+
+The client port is left open to the whole cluster by default, because
+restricting it is a decision about who your callers are and the chart cannot
+guess. Add selectors under networkPolicy.clientFrom to narrow it.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "orbita.fullname" . }}-peer
+  labels:
+    {{- include "orbita.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "orbita.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: peer
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "orbita.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+    - ports:
+        - port: grpc
+          protocol: TCP
+      {{- with .Values.networkPolicy.clientFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

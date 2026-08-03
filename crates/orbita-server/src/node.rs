@@ -24,9 +24,11 @@
 //! connections rather than accumulating work that will be too late by the time
 //! it runs.
 
-use crate::host::{PartitionHost, PartitionPaths, WriteAck, WriteOp};
+use crate::host::{HostSpec, LeasePolicy, PartitionHost, PartitionPaths, Read, WriteAck, WriteOp};
+use crate::lease::DEFAULT_LEASE_MARGIN;
 use crate::map_source::{BoxedMapSource, MapSource};
 use crate::proxy;
+use crate::replication::{Applies, ReplicaBridge};
 use crate::validate;
 
 use bytes::Bytes;
@@ -44,7 +46,9 @@ use orbita_runtime::{
 use orbita_wal::WalService;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
+use std::time::Duration;
 
 /// Where a node's files go.
 ///
@@ -80,14 +84,48 @@ pub(crate) struct Node<R: Runtime> {
     source: BoxedMapSource,
     hosts: tokio::sync::RwLock<HashMap<PartitionId, Arc<PartitionHost<R>>>>,
     wal_service: WalService<R>,
+    /// What turns inbound replication into invalidations and applies. Held
+    /// here because it outlives any one partition and has to be handed the
+    /// hosts as they open.
+    bridge: Arc<ReplicaBridge<R>>,
+    /// The queue replicated entries are applied from. Held rather than read:
+    /// owning it is what makes the applier stop when this node does, instead
+    /// of when the transport that happens to hold the observer is torn down.
+    #[allow(dead_code)]
+    applies: Arc<Applies>,
+    lease: LeasePolicy,
+    /// How many reads this node answered from a partition it only replicates.
+    replica_reads: AtomicU64,
+    /// Whether the last attempt to match the open partitions to the map
+    /// failed, which is what makes the next refresh try again.
+    unreconciled: std::sync::atomic::AtomicBool,
 }
 
 /// Where a request has to go.
 enum Hop<R: Runtime> {
-    Local(Arc<PartitionHost<R>>),
+    /// This node can answer, and where the request would have gone if it could
+    /// not. A replica read carries that because it decides again once it has
+    /// read, and needs somewhere to send the request when the second look says
+    /// it may not answer after all.
+    Local(Arc<PartitionHost<R>>, Option<NodeId>, PartitionId),
     /// The owner, and the partition it owns. The partition travels with it so
     /// that a refusal can name what it is refusing.
     Forward(NodeId, PartitionId),
+}
+
+/// What a request needs from the partition, which decides whether a replica
+/// may answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// One key, which per-key invalidation can speak for.
+    Read,
+    /// A range, which it cannot. Invalidation names one key at a time, so a
+    /// replica has nothing that says a whole range is unchanged, and a scan
+    /// could return a key whose write it has been told about but not yet
+    /// applied. Scans therefore go to the owner. Making them serveable needs a
+    /// range-level guard, which is a design decision rather than an omission.
+    Scan,
+    Write,
 }
 
 impl<R: Runtime> Node<R> {
@@ -98,8 +136,15 @@ impl<R: Runtime> Node<R> {
         node_id: NodeId,
         layout: DataLayout,
         source: BoxedMapSource,
+        lease_duration: Duration,
     ) -> Result<Arc<Self>> {
         let map = source.fetch().await?;
+        let (bridge, applies) = ReplicaBridge::start(&runtime);
+        let wal_service = WalService::new();
+        // Registered before anything is opened, so the first batch a replica
+        // receives cannot land without having been invalidated for.
+        wal_service.observe(Arc::clone(&bridge) as Arc<dyn orbita_wal::ReplicaObserver>);
+
         let node = Arc::new(Self {
             runtime: runtime.clone(),
             node_id,
@@ -107,7 +152,15 @@ impl<R: Runtime> Node<R> {
             map: RwLock::new(Arc::new(map)),
             source,
             hosts: tokio::sync::RwLock::new(HashMap::new()),
-            wal_service: WalService::new(),
+            wal_service,
+            bridge,
+            applies,
+            lease: LeasePolicy {
+                duration: lease_duration,
+                margin: DEFAULT_LEASE_MARGIN,
+            },
+            replica_reads: AtomicU64::new(0),
+            unreconciled: std::sync::atomic::AtomicBool::new(false),
         });
         node.reconcile().await?;
 
@@ -133,16 +186,29 @@ impl<R: Runtime> Node<R> {
     /// An older map is ignored rather than applied, because updates can arrive
     /// out of order and applying one would resurrect a deposed owner in this
     /// node's routing table.
+    ///
+    /// A reconcile that fails is retried on the next refresh even though the
+    /// map has not moved again. Opening a partition can fail for reasons that
+    /// pass, the loudest being that the previous incarnation still has the
+    /// storage engine open, and a node that recorded the new map without
+    /// acting on it would refuse every request for a partition it was just
+    /// given and never try again.
     pub(crate) async fn refresh_map(&self) -> Result<()> {
         let fetched = self.source.fetch().await?;
         {
             let mut held = self.map.write().expect("partition map poisoned");
-            if fetched.version() <= held.version() {
+            if fetched.version() > held.version() {
+                *held = Arc::new(fetched);
+            } else if !self.unreconciled.load(Ordering::Acquire) {
                 return Ok(());
             }
-            *held = Arc::new(fetched);
         }
-        self.reconcile().await
+        let outcome = self.reconcile().await;
+        self.unreconciled.store(outcome.is_err(), Ordering::Release);
+        if let Err(error) = &outcome {
+            tracing::warn!(%error, "could not open every partition this node was given");
+        }
+        outcome
     }
 
     /// Brings the set of open partitions in line with the map.
@@ -151,36 +217,57 @@ impl<R: Runtime> Node<R> {
         let wanted: Vec<PartitionInfo> = map.held_by(self.node_id).cloned().collect();
 
         let mut hosts = self.hosts.write().await;
-        hosts.retain(|id, _| wanted.iter().any(|p| p.id == *id));
+        hosts.retain(|id, _| {
+            let keep = wanted.iter().any(|p| p.id == *id);
+            if !keep {
+                self.wal_service.unregister(*id);
+                self.bridge.unregister(*id);
+            }
+            keep
+        });
 
         for info in wanted {
-            // A host is reopened when its epoch moves, because ownership
-            // changing is exactly when the log has to be reopened at the new
-            // epoch and the pending set has to be thrown away.
-            if hosts.get(&info.id).is_some_and(|h| h.epoch() == info.epoch) {
+            // A host is reopened when its epoch moves or when this node's role
+            // in it changes, and both halves matter. The epoch moving is when
+            // the log has to be reopened and the pending set thrown away. The
+            // role changing at the same epoch is what a promotion looks like
+            // from here, because the control plane bumps the epoch when it
+            // fences the dead owner and then names the replacement without
+            // bumping it again. A node that only watched the epoch would stay
+            // a replica of a partition it now owns, and refuse every request
+            // for it.
+            let owned_here = info.owner == Some(self.node_id);
+            let unchanged = hosts
+                .get(&info.id)
+                .is_some_and(|held| held.epoch() == info.epoch && held.is_owner() == owned_here);
+            if unchanged {
                 continue;
             }
+            // The old incarnation is closed before the new one opens, because
+            // both want the same storage engine directory and RocksDB holds a
+            // lock on it. Opening first and replacing after would fail every
+            // promotion, which is the one time this path matters.
+            hosts.remove(&info.id);
+            self.wal_service.unregister(info.id);
+            self.bridge.unregister(info.id);
+
             let paths = self.layout.paths(info.id);
-            let host = if info.owner == Some(self.node_id) {
+            let spec = HostSpec {
+                id: info.id,
+                epoch: info.epoch,
+                range: info.range.clone(),
+                lease: self.lease,
+            };
+            let host = if owned_here {
                 self.wal_service.unregister(info.id);
-                PartitionHost::open_owner(
-                    self.runtime.clone(),
-                    info.id,
-                    info.epoch,
-                    info.range.clone(),
-                    &paths,
-                    info.replicas.clone(),
-                )
-                .await?
+                self.bridge.unregister(info.id);
+                PartitionHost::open_owner(self.runtime.clone(), spec, &paths, info.replicas.clone())
+                    .await?
             } else {
-                let host = PartitionHost::open_replica(
-                    self.runtime.clone(),
-                    info.id,
-                    info.epoch,
-                    info.range.clone(),
-                    &paths,
-                )
-                .await?;
+                let host = PartitionHost::open_replica(self.runtime.clone(), spec, &paths).await?;
+                // The bridge is registered before the log, so an entry cannot
+                // be accepted by the log with nothing watching it.
+                self.bridge.register(&host);
                 self.wal_service.register(host.log());
                 host
             };
@@ -199,7 +286,7 @@ impl<R: Runtime> Node<R> {
 
     /// Finds the partition owning `key` and decides whether this node can
     /// answer for it.
-    async fn hop(&self, keyspace: KeyspaceId, key: &[u8], for_write: bool) -> Result<Hop<R>> {
+    async fn hop(&self, keyspace: KeyspaceId, key: &[u8], purpose: Purpose) -> Result<Hop<R>> {
         let map = self.map();
         let info = map.lookup(keyspace, key).ok_or_else(|| {
             // A hole in the map is not something a retry fixes, so it is
@@ -209,10 +296,11 @@ impl<R: Runtime> Node<R> {
 
         let host = self.hosts.read().await.get(&info.id).cloned();
         if let Some(host) = host {
-            // The owner answers everything. A replica answers a read only
-            // under the conditions in ADR 0001, and never answers a write.
-            if host.is_owner() || (!for_write && host.may_serve(key)) {
-                return Ok(Hop::Local(host));
+            // The owner answers everything. A replica answers a single-key
+            // read only under the conditions in ADR 0001, and never answers a
+            // write or a scan.
+            if host.is_owner() || (purpose == Purpose::Read && host.might_serve(key)) {
+                return Ok(Hop::Local(host, info.owner, info.id));
             }
         }
         match info.owner {
@@ -257,24 +345,40 @@ impl<R: Runtime> Node<R> {
         let keyspace = self.keyspace(&request.keyspace)?;
         validate::key(&request.key)?;
 
-        match self.hop(keyspace.id, &request.key, false).await? {
-            Hop::Local(host) => {
-                let record = host.get(&request.key).await?;
-                Ok(match record {
-                    None => GetResponse::default(),
-                    Some(record) => GetResponse {
-                        found: true,
-                        value: record.value.to_vec(),
-                        version: record.version.get(),
-                        expires_at_millis: record.expires_at_millis,
-                    },
-                })
-            }
-            Hop::Forward(owner, partition) => {
-                self.refuse_second_hop(forwarded, owner, partition)?;
-                self.forward(owner, proxy::METHOD_GET, request).await
-            }
-        }
+        let (owner, partition) = match self.hop(keyspace.id, &request.key, Purpose::Read).await? {
+            Hop::Local(host, owner, partition) => match host.read(&request.key).await? {
+                Read::Served(record) => {
+                    if !host.is_owner() {
+                        // Counted because "replicas serve reads" is the claim
+                        // the read path exists to make, and it is otherwise
+                        // invisible from outside: a forwarded read and a
+                        // locally served one give the client the same answer.
+                        self.replica_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(match record {
+                        None => GetResponse::default(),
+                        Some(record) => GetResponse {
+                            found: true,
+                            value: record.value.to_vec(),
+                            version: record.version.get(),
+                            expires_at_millis: record.expires_at_millis,
+                        },
+                    });
+                }
+                // A write for this key landed while the read was in progress,
+                // so what was read is already old news. The owner answers it.
+                Read::MustForward => (owner, partition),
+            },
+            Hop::Forward(owner, partition) => (Some(owner), partition),
+        };
+
+        let Some(owner) = owner else {
+            return Err(Error::Unavailable(format!(
+                "partition {partition} has no owner"
+            )));
+        };
+        self.refuse_second_hop(forwarded, owner, partition)?;
+        self.forward(owner, proxy::METHOD_GET, request).await
     }
 
     pub(crate) async fn set(&self, request: SetRequest, forwarded: bool) -> Result<SetResponse> {
@@ -301,8 +405,8 @@ impl<R: Runtime> Node<R> {
             }
         }
 
-        match self.hop(keyspace.id, &request.key, true).await? {
-            Hop::Local(host) => {
+        match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
+            Hop::Local(host, ..) => {
                 let op = WriteOp::Put {
                     value: Bytes::from(request.value.clone()),
                     // A keyspace's default TTL applies to a write that did not
@@ -348,8 +452,8 @@ impl<R: Runtime> Node<R> {
         let keyspace = self.keyspace(&request.keyspace)?;
         validate::key(&request.key)?;
 
-        match self.hop(keyspace.id, &request.key, true).await? {
-            Hop::Local(host) => {
+        match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
+            Hop::Local(host, ..) => {
                 let ack: WriteAck = host
                     .write(
                         Bytes::from(request.key.clone()),
@@ -386,8 +490,11 @@ impl<R: Runtime> Node<R> {
         let limit = validate::list_limit(request.limit);
 
         let resume = Cursor::decode(&request.cursor, &request.prefix)?;
-        match self.hop(keyspace.id, &resume.route_key, false).await? {
-            Hop::Local(host) => {
+        match self
+            .hop(keyspace.id, &resume.route_key, Purpose::Scan)
+            .await?
+        {
+            Hop::Local(host, ..) => {
                 let page = host
                     .scan(&request.prefix, resume.inner.as_deref(), limit)
                     .await?;
@@ -467,6 +574,77 @@ impl<R: Runtime> Node<R> {
             tracing::warn!(%error, "could not refresh the partition map after a misroute");
         }
     }
+
+    /// Takes a read lease this node's owner offered for one partition.
+    ///
+    /// Answering `false` is not a failure: it is a replica saying it is not
+    /// caught up enough to serve reads, which the owner needs to know because
+    /// it decides what to wait for from the same answer.
+    async fn accept_lease(&self, grant: &proxy::LeaseGrant) -> Result<bool> {
+        let host = self.hosts.read().await.get(&grant.partition).cloned();
+        match host {
+            Some(host) => Ok(host.accept_lease(grant).await),
+            // A partition this node does not hold cannot serve a read from it
+            // either, so refusing is the whole answer.
+            None => Ok(false),
+        }
+    }
+
+    /// How many reads this node has answered from a partition it replicates
+    /// rather than owns.
+    ///
+    /// Zero on a node under write load means the read path is not doing its
+    /// job, which is otherwise invisible: a forwarded read returns the same
+    /// answer as a locally served one, only slower.
+    pub(crate) fn replica_reads(&self) -> u64 {
+        self.replica_reads.load(Ordering::Relaxed)
+    }
+
+    /// How far this node has got on every partition it holds.
+    ///
+    /// This is what the heartbeat to the leader group carries, and it is what
+    /// that group compares when it has to choose a replacement owner.
+    pub(crate) async fn progress(&self) -> Vec<orbita_control::PartitionProgress> {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self.hosts.read().await.values().cloned().collect();
+        let mut progress = Vec::with_capacity(hosts.len());
+        for host in hosts {
+            progress.push(orbita_control::PartitionProgress {
+                partition: host.id(),
+                durable_lamport: host.durable_lamport().await,
+                applied_lamport: host.committed_lamport().await.unwrap_or_default(),
+                size_bytes: host.size_bytes().await.unwrap_or_default(),
+            });
+        }
+        // Sorted so that two reports of the same state are the same bytes,
+        // which keeps a heartbeat from looking like a change.
+        progress.sort_unstable_by_key(|p| p.partition.get());
+        progress
+    }
+
+    /// How often the lease heartbeat has to run for this node's leases to stay
+    /// live.
+    pub(crate) fn lease_interval(&self) -> Duration {
+        self.lease.heartbeat_interval()
+    }
+
+    /// Renews every lease this node's owned partitions have out.
+    ///
+    /// One pass rather than a loop, following the control plane's `tick`, so
+    /// that a simulated run drives it explicitly and never has a timer that
+    /// keeps the world from going idle.
+    pub(crate) async fn renew_leases(&self) {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner())
+            .cloned()
+            .collect();
+        for host in hosts {
+            host.renew_leases().await;
+        }
+    }
 }
 
 /// Serves requests other nodes forwarded here.
@@ -502,6 +680,13 @@ async fn dispatch<R: Runtime>(node: &Node<R>, call: PeerCall) -> Bytes {
     }
 
     match call.method {
+        proxy::METHOD_LEASE => match proxy::LeaseGrant::decode(&call.payload) {
+            Ok(grant) => match node.accept_lease(&grant).await {
+                Ok(accepted) => proxy::encode_lease_reply(accepted),
+                Err(error) => proxy::encode_error(&error),
+            },
+            Err(error) => proxy::encode_error(&error),
+        },
         proxy::METHOD_GET => run!(GetRequest, get),
         proxy::METHOD_SET => run!(SetRequest, set),
         proxy::METHOD_DELETE => run!(DeleteRequest, delete),

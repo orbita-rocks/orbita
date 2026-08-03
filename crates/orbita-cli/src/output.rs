@@ -16,6 +16,7 @@
 //! to guess whether a string was text or a base64 blob that happened to look
 //! like text.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use anyhow::Result;
@@ -83,6 +84,18 @@ impl Blob {
             Err(_) => Self::Base64 {
                 value: BASE64.encode(bytes),
             },
+        }
+    }
+
+    /// The text a listing is ordered by.
+    ///
+    /// Ordering exists so that two runs of the same command diff cleanly, not
+    /// because anything depends on the order, so comparing the rendered form
+    /// is enough.
+    #[must_use]
+    pub fn sort_key(&self) -> &str {
+        match self {
+            Self::Utf8 { value } | Self::Base64 { value } => value,
         }
     }
 
@@ -349,6 +362,19 @@ pub struct PartitionView {
 }
 
 impl PartitionView {
+    /// The furthest any replica trails the owner.
+    ///
+    /// This is the number that decides how much a failover would lose, so it
+    /// gets a column of its own rather than being buried in the replica list.
+    #[must_use]
+    pub fn max_replica_lag(&self) -> u64 {
+        self.replicas
+            .iter()
+            .map(|r| self.committed_lamport.saturating_sub(r.applied_lamport))
+            .max()
+            .unwrap_or(0)
+    }
+
     fn range(&self) -> String {
         let mut start = self.start_key.display();
         if start.is_empty() {
@@ -378,35 +404,83 @@ impl PartitionView {
     }
 }
 
+/// The columns of the partition table, in one place so that the four commands
+/// that print partitions cannot drift apart.
+const PARTITION_COLUMNS: &[&str] = &[
+    "partition",
+    "keyspace",
+    "range",
+    "owner",
+    "epoch",
+    "lamport",
+    "size",
+    "lag",
+    "replicas",
+];
+
 impl Render for PartitionView {
     fn render_human(&self, out: &mut String) {
-        out.push_str(&table(
-            &[
-                "partition",
-                "keyspace",
-                "range",
-                "owner",
-                "epoch",
-                "lamport",
-                "size",
-                "replicas",
-            ],
-            &[partition_row(self)],
-        ));
+        out.push_str(&table(PARTITION_COLUMNS, &[partition_row(self, None)]));
     }
 }
 
-fn partition_row(p: &PartitionView) -> Vec<String> {
+/// One row of the partition table.
+///
+/// `health` is the node health lookup where there is one. A partition printed
+/// on its own, after a split or a transfer, has no node list to consult, and
+/// the owner is then just an id.
+fn partition_row(p: &PartitionView, health: Option<&BTreeMap<u64, String>>) -> Vec<String> {
+    let owner = match health.map(|h| h.get(&p.owner_node_id)) {
+        // An owner that is not healthy is the first thing to notice, so it is
+        // spelled out in the row rather than left to be joined by eye against
+        // the node table above.
+        Some(Some(state)) if state != "healthy" => format!("{} ({state})", p.owner_node_id),
+        Some(None) => format!("{} (unknown)", p.owner_node_id),
+        _ => p.owner_node_id.to_string(),
+    };
     vec![
         p.id.to_string(),
         p.keyspace_id.to_string(),
         p.range(),
-        p.owner_node_id.to_string(),
+        owner,
         p.epoch.to_string(),
         p.committed_lamport.to_string(),
         format_bytes(p.size_bytes),
+        p.max_replica_lag().to_string(),
         p.replica_summary(),
     ]
+}
+
+/// What is wrong with the cluster, counted.
+///
+/// The tables below it answer "which one", and this answers "is anything".
+/// During an incident that is the order the questions get asked in, and
+/// scrolling a hundred partitions to find out is not an answer.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterSummaryView {
+    pub node_count: usize,
+    pub healthy_nodes: usize,
+    pub suspect_nodes: usize,
+    pub dead_nodes: usize,
+    /// Absent means no node claims to be the Raft leader, which means the
+    /// control plane cannot accept a change right now.
+    pub raft_leader_node_id: Option<u64>,
+    pub partition_count: usize,
+    pub partitions_with_no_replica: usize,
+    pub partitions_with_an_unhealthy_owner: usize,
+    pub max_replica_lag: u64,
+}
+
+impl ClusterSummaryView {
+    /// Whether anything here is worth acting on.
+    #[must_use]
+    fn healthy(&self) -> bool {
+        self.suspect_nodes == 0
+            && self.dead_nodes == 0
+            && self.partitions_with_no_replica == 0
+            && self.partitions_with_an_unhealthy_owner == 0
+            && self.raft_leader_node_id.is_some()
+    }
 }
 
 /// The partition map and node health together.
@@ -415,13 +489,85 @@ fn partition_row(p: &PartitionView) -> Vec<String> {
 /// about both: a partition is only as available as the nodes holding it.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClusterView {
+    pub summary: ClusterSummaryView,
     pub nodes: Vec<NodeView>,
     pub partitions: Vec<PartitionView>,
 }
 
+impl ClusterView {
+    /// Sorts what came back and counts the summary.
+    ///
+    /// The order is imposed here rather than trusted from the server so that
+    /// running the command twice produces two outputs that diff cleanly.
+    /// Comparing two describes a minute apart is how an operator watches a
+    /// recovery, and it does not work if the rows move.
+    #[must_use]
+    pub fn new(mut nodes: Vec<NodeView>, mut partitions: Vec<PartitionView>) -> Self {
+        nodes.sort_by(|a, b| a.role.cmp(&b.role).then(a.id.cmp(&b.id)));
+        partitions.sort_by(|a, b| {
+            a.keyspace_id
+                .cmp(&b.keyspace_id)
+                .then_with(|| a.start_key.sort_key().cmp(b.start_key.sort_key()))
+                .then(a.id.cmp(&b.id))
+        });
+
+        let health: BTreeMap<u64, String> =
+            nodes.iter().map(|n| (n.id, n.health.clone())).collect();
+        let summary = ClusterSummaryView {
+            node_count: nodes.len(),
+            healthy_nodes: nodes.iter().filter(|n| n.health == "healthy").count(),
+            suspect_nodes: nodes.iter().filter(|n| n.health == "suspect").count(),
+            dead_nodes: nodes.iter().filter(|n| n.health == "dead").count(),
+            raft_leader_node_id: nodes.iter().find(|n| n.raft_leader).map(|n| n.id),
+            partition_count: partitions.len(),
+            partitions_with_no_replica: partitions.iter().filter(|p| p.replicas.is_empty()).count(),
+            partitions_with_an_unhealthy_owner: partitions
+                .iter()
+                .filter(|p| health.get(&p.owner_node_id).is_none_or(|h| h != "healthy"))
+                .count(),
+            max_replica_lag: partitions
+                .iter()
+                .map(PartitionView::max_replica_lag)
+                .max()
+                .unwrap_or(0),
+        };
+
+        Self {
+            summary,
+            nodes,
+            partitions,
+        }
+    }
+}
+
 impl Render for ClusterView {
     fn render_human(&self, out: &mut String) {
-        out.push_str("NODES\n");
+        let s = &self.summary;
+        out.push_str("CLUSTER\n");
+        let _ = writeln!(
+            out,
+            "  nodes        {} total, {} healthy, {} suspect, {} dead",
+            s.node_count, s.healthy_nodes, s.suspect_nodes, s.dead_nodes
+        );
+        let _ = writeln!(
+            out,
+            "  raft leader  {}",
+            s.raft_leader_node_id.map_or_else(
+                || "none, the control plane cannot accept changes".to_owned(),
+                |id| format!("node {id}")
+            )
+        );
+        let _ = writeln!(
+            out,
+            "  partitions   {} total, {} with an unhealthy owner, {} with no replica",
+            s.partition_count, s.partitions_with_an_unhealthy_owner, s.partitions_with_no_replica
+        );
+        let _ = writeln!(out, "  worst lag    {}", s.max_replica_lag);
+        if s.healthy() {
+            out.push_str("  everything reporting is healthy\n");
+        }
+
+        out.push_str("\nNODES\n");
         if self.nodes.is_empty() {
             out.push_str("  none\n");
         } else {
@@ -448,20 +594,22 @@ impl Render for ClusterView {
         if self.partitions.is_empty() {
             out.push_str("  none\n");
         } else {
-            let rows: Vec<Vec<String>> = self.partitions.iter().map(partition_row).collect();
-            out.push_str(&indent(&table(
-                &[
-                    "partition",
-                    "keyspace",
-                    "range",
-                    "owner",
-                    "epoch",
-                    "lamport",
-                    "size",
-                    "replicas",
-                ],
-                &rows,
-            )));
+            let health: BTreeMap<u64, String> = self
+                .nodes
+                .iter()
+                .map(|n| (n.id, n.health.clone()))
+                .collect();
+            let rows: Vec<Vec<String>> = self
+                .partitions
+                .iter()
+                .map(|p| partition_row(p, Some(&health)))
+                .collect();
+            out.push_str(&indent(&table(PARTITION_COLUMNS, &rows)));
+            out.push_str(
+                "\nLag is how far a replica trails the owner's committed lamport. A replica at \
+                 zero\ncan serve a linearizable read locally and would lose nothing if it were \
+                 promoted.\n",
+            );
         }
     }
 }
@@ -470,6 +618,24 @@ fn indent(text: &str) -> String {
     text.lines()
         .map(|line| format!("  {line}\n"))
         .collect::<String>()
+}
+
+/// Whether one node is answering.
+///
+/// `detail` names the status it answered with, because a node answering
+/// `Unimplemented` is up and running a build that does not have the call yet,
+/// and that is worth telling apart from a node answering normally.
+#[derive(Debug, Clone, Serialize)]
+pub struct PingView {
+    pub endpoint: String,
+    pub answered: bool,
+    pub detail: String,
+}
+
+impl Render for PingView {
+    fn render_human(&self, out: &mut String) {
+        let _ = write!(out, "{} is answering ({})", self.endpoint, self.detail);
+    }
 }
 
 /// A split, which turns one partition into two.
@@ -484,22 +650,10 @@ impl Render for SplitView {
         let rows: Vec<Vec<String>> = [self.lower.as_ref(), self.upper.as_ref()]
             .into_iter()
             .flatten()
-            .map(partition_row)
+            .map(|p| partition_row(p, None))
             .collect();
         out.push_str("split into\n");
-        out.push_str(&indent(&table(
-            &[
-                "partition",
-                "keyspace",
-                "range",
-                "owner",
-                "epoch",
-                "lamport",
-                "size",
-                "replicas",
-            ],
-            &rows,
-        )));
+        out.push_str(&indent(&table(PARTITION_COLUMNS, &rows)));
     }
 }
 
@@ -515,17 +669,8 @@ impl Render for PartitionResultView {
         let _ = writeln!(out, "{}", self.summary);
         if let Some(partition) = &self.partition {
             out.push_str(&indent(&table(
-                &[
-                    "partition",
-                    "keyspace",
-                    "range",
-                    "owner",
-                    "epoch",
-                    "lamport",
-                    "size",
-                    "replicas",
-                ],
-                &[partition_row(partition)],
+                PARTITION_COLUMNS,
+                &[partition_row(partition, None)],
             )));
         }
     }
@@ -671,12 +816,30 @@ impl Render for crate::config::Config {
         line("node.role", self.node.role.to_string());
         line("node.listen", self.node.listen.clone());
         line("node.advertise", self.node.advertise.clone());
+        line("node.peer_listen", self.node.peer_listen.clone());
+        line("node.peer_advertise", self.node.peer_advertise.clone());
         line("node.data_dir", self.node.data_dir.display().to_string());
         line("cluster.name", self.cluster.name.clone());
         line("cluster.leader_peers", self.cluster.leader_peers.join(", "));
         line(
             "cluster.allow_version_skew",
             self.cluster.allow_version_skew.to_string(),
+        );
+        line(
+            "cluster.join_backoff_initial",
+            format!("{} ms", self.cluster.join_backoff_initial_millis),
+        );
+        line(
+            "cluster.join_backoff_max",
+            format!("{} ms", self.cluster.join_backoff_max_millis),
+        );
+        line(
+            "cluster.join_timeout",
+            if self.cluster.join_timeout_millis == 0 {
+                "0 ms, retry forever".to_owned()
+            } else {
+                format!("{} ms", self.cluster.join_timeout_millis)
+            },
         );
         line(
             "object_store.endpoint",
@@ -850,23 +1013,92 @@ mod tests {
         assert!(text.contains("orbita keyspace create"), "{text}");
     }
 
+    fn node(id: u64, role: &str, health: &str, raft_leader: bool) -> NodeView {
+        NodeView {
+            id,
+            address: format!("10.0.0.{id}:7100"),
+            role: role.to_owned(),
+            health: health.to_owned(),
+            raft_leader,
+        }
+    }
+
     #[test]
     fn a_cluster_with_no_partitions_still_prints_both_sections() {
-        let view = ClusterView {
-            nodes: vec![NodeView {
-                id: 1,
-                address: "10.0.0.1:7100".to_owned(),
-                role: "leader".to_owned(),
-                health: "healthy".to_owned(),
-                raft_leader: true,
-            }],
-            partitions: Vec::new(),
-        };
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], Vec::new());
         let text = render(Format::Human, &view).unwrap();
         assert!(text.contains("NODES"), "{text}");
         assert!(text.contains("10.0.0.1:7100"), "{text}");
         assert!(text.contains("PARTITIONS"), "{text}");
         assert!(text.contains("none"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_counts_nodes_by_health_before_the_tables_have_to_be_read() {
+        let view = ClusterView::new(
+            vec![
+                node(1, "leader", "healthy", true),
+                node(2, "leader", "suspect", false),
+                node(3, "worker", "dead", false),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(view.summary.healthy_nodes, 1);
+        assert_eq!(view.summary.suspect_nodes, 1);
+        assert_eq!(view.summary.dead_nodes, 1);
+        assert_eq!(view.summary.raft_leader_node_id, Some(1));
+        let text = render(Format::Human, &view).unwrap();
+        assert!(
+            text.contains("3 total, 1 healthy, 1 suspect, 1 dead"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_with_no_raft_leader_says_the_control_plane_cannot_accept_changes() {
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", false)], Vec::new());
+        assert_eq!(view.summary.raft_leader_node_id, None);
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("cannot accept changes"), "{text}");
+    }
+
+    #[test]
+    fn a_partition_owned_by_a_node_that_is_not_healthy_says_so_in_its_row() {
+        let view = ClusterView::new(vec![node(3, "worker", "dead", false)], vec![partition(1)]);
+        assert_eq!(view.summary.partitions_with_an_unhealthy_owner, 1);
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("3 (dead)"), "{text}");
+    }
+
+    #[test]
+    fn a_partition_owned_by_a_node_the_cluster_never_reported_is_marked_unknown() {
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], vec![partition(1)]);
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("3 (unknown)"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_carries_the_worst_replica_lag_in_the_whole_cluster() {
+        let mut behind = partition(2);
+        behind.replicas[1].applied_lamport = 40;
+        let view = ClusterView::new(Vec::new(), vec![partition(1), behind]);
+        assert_eq!(view.summary.max_replica_lag, 60);
+    }
+
+    #[test]
+    fn two_describes_in_a_row_print_their_rows_in_the_same_order() {
+        let nodes = vec![
+            node(9, "worker", "healthy", false),
+            node(2, "leader", "healthy", true),
+        ];
+        let forward = ClusterView::new(nodes.clone(), vec![partition(7), partition(3)]);
+        let mut reversed_nodes = nodes;
+        reversed_nodes.reverse();
+        let backward = ClusterView::new(reversed_nodes, vec![partition(3), partition(7)]);
+        assert_eq!(
+            render(Format::Human, &forward).unwrap(),
+            render(Format::Human, &backward).unwrap()
+        );
     }
 
     #[test]
@@ -963,12 +1195,10 @@ mod tests {
 
     #[test]
     fn json_output_carries_the_same_fields_the_table_shows() {
-        let view = ClusterView {
-            nodes: Vec::new(),
-            partitions: vec![partition(9)],
-        };
+        let view = ClusterView::new(Vec::new(), vec![partition(9)]);
         let json: serde_json::Value =
             serde_json::from_str(&render(Format::Json, &view).unwrap()).unwrap();
+        assert_eq!(json["summary"]["max_replica_lag"], 9);
         assert_eq!(json["partitions"][0]["id"], 9);
         assert_eq!(json["partitions"][0]["epoch"], 2);
         assert_eq!(json["partitions"][0]["owner_node_id"], 3);

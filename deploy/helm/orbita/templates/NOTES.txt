@@ -15,6 +15,20 @@ From your laptop:
   orbita keyspace create demo
   orbita set demo greeting hello
   orbita get demo greeting
+
+Nodes talk to each other on port {{ .Values.service.peerPort }}, through the headless Services
+only. It is not on the client Service, so setting service.type to LoadBalancer
+exposes port {{ .Values.service.port }} and nothing else. Keep it that way: peer traffic uses a
+private framing that is compatible only within a cluster version window.
+{{ if not .Values.networkPolicy.enabled }}
+Nothing stops another pod in this cluster from connecting to port {{ .Values.service.peerPort }}. Set
+networkPolicy.enabled if your CNI enforces policy.
+{{- end }}
+
+Before you upgrade this release, read docs/UPGRADES.md. Readiness here means
+the process is answering, not that the node has rejoined and caught up, so a
+rolling update can advance faster than the data does. Stage it with the
+StatefulSet partition field rather than trusting the rollout.
 {{ if not .Values.objectStore.endpoint }}
 Warning: no object store is configured, so compacted data stays on local disks
 and replacing a worker means rehydrating it from its replicas. Set

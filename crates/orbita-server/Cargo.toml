@@ -8,13 +8,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# orbita-control is deliberately not a dependency yet. This crate consumes the
-# partition map through its own `MapSource` trait, so the two can be built at
-# the same time without either waiting on the other, and wiring `ControlClient`
-# in later is one adapter rather than a rewrite.
+# The dependency on orbita-control is one adapter, in `control.rs`. This crate
+# still consumes the partition map through its own `MapSource` trait, so a test
+# or a single node supplies a static map and nothing else in here knows the
+# difference.
 
 [dependencies]
 orbita-core.workspace = true
+orbita-control.workspace = true
 orbita-runtime.workspace = true
 orbita-proto.workspace = true
 orbita-storage.workspace = true
@@ -28,3 +29,4 @@ tonic = "0.12"
 
 [dev-dependencies]
 orbita-sim = { path = "../orbita-sim" }
+orbita-proto.workspace = true

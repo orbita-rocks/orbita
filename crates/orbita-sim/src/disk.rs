@@ -89,21 +89,44 @@ impl Disk for SimDisk {
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> DiskResult<Vec<String>> {
+    async fn list(&self, dir: &str) -> DiskResult<Vec<String>> {
         self.spin().await;
         let state = self.core.state();
         let node = state
             .nodes
             .get(&self.node)
             .ok_or_else(|| DiskError::Io(format!("node {} does not exist", self.node)))?;
-        // Sorted, because a caller recovering a log depends on segment order
-        // and a real directory listing is not ordered.
-        Ok(node
+
+        // Files here are stored under their full path, so a directory listing
+        // is the entries whose parent is this directory, reported as bare
+        // names. Matching a prefix instead would report a nested file as
+        // though it sat here, which is what this implementation used to do and
+        // why the trait now says so at length.
+        let prefix = if dir.is_empty() || dir.ends_with('/') {
+            dir.to_string()
+        } else {
+            format!("{dir}/")
+        };
+
+        let mut names: Vec<String> = node
             .files
             .keys()
-            .filter(|name| name.starts_with(prefix))
-            .cloned()
-            .collect())
+            .filter_map(|path| {
+                let rest = path.strip_prefix(&prefix)?;
+                // Anything with a separator left is in a subdirectory, and a
+                // listing does not recurse.
+                if rest.is_empty() || rest.contains('/') {
+                    None
+                } else {
+                    Some(rest.to_string())
+                }
+            })
+            .collect();
+
+        // A real directory listing has no order, and recovery depends on
+        // segment order, so sorting here means no caller has to remember to.
+        names.sort();
+        Ok(names)
     }
 }
 

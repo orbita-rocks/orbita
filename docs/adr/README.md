@@ -17,3 +17,5 @@ forward. The history of a wrong turn is worth more than a tidy directory.
 | [0001](0001-linearizable-reads-from-replicas.md) | Linearizable reads from replicas | Accepted |
 | [0002](0002-key-versions-are-partition-lamports.md) | Key versions are partition Lamports | Accepted, corrected |
 | [0003](0003-conditions-evaluate-against-pending-writes.md) | Conditions evaluate against pending writes | Accepted |
+| [0004](0004-peer-traffic-uses-private-framing.md) | Peer traffic uses private framing, not gRPC | Accepted, corrected by 0005 |
+| [0005](0005-upgrades-follow-kubernetes-rollouts.md) | Upgrades follow Kubernetes rollouts | Accepted |

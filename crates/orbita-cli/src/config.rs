@@ -56,13 +56,27 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
     ("ORBITA_NODE_ROLE", "node.role, one of leader or worker"),
     ("ORBITA_LISTEN", "node.listen"),
     ("ORBITA_ADVERTISE", "node.advertise"),
+    ("ORBITA_PEER_LISTEN", "node.peer_listen"),
+    ("ORBITA_PEER_ADVERTISE", "node.peer_advertise"),
     ("ORBITA_DATA_DIR", "node.data_dir"),
     ("ORBITA_CLUSTER_NAME", "cluster.name"),
     (
         "ORBITA_LEADER_PEERS",
-        "cluster.leader_peers, comma separated",
+        "cluster.leader_peers, comma separated peer addresses",
     ),
     ("ORBITA_ALLOW_VERSION_SKEW", "cluster.allow_version_skew"),
+    (
+        "ORBITA_JOIN_BACKOFF_INITIAL",
+        "cluster.join_backoff_initial, a duration such as 250ms",
+    ),
+    (
+        "ORBITA_JOIN_BACKOFF_MAX",
+        "cluster.join_backoff_max, a duration such as 10s",
+    ),
+    (
+        "ORBITA_JOIN_TIMEOUT",
+        "cluster.join_timeout, a duration, or 0 to retry forever",
+    ),
     ("ORBITA_OBJECT_STORE_ENDPOINT", "object_store.endpoint"),
     ("ORBITA_OBJECT_STORE_BUCKET", "object_store.bucket"),
     ("ORBITA_OBJECT_STORE_REGION", "object_store.region"),
@@ -96,12 +110,23 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
 /// directory beats a system-wide one.
 pub const DEFAULT_CONFIG_PATHS: &[&str] = &["orbita.toml", "/etc/orbita/orbita.toml"];
 
-/// The port a node listens on for client, admin, and peer traffic.
+/// The port a node listens on for client and admin gRPC traffic.
 ///
-/// One port carries all three because a second port is a second thing to
-/// expose, firewall, and get wrong, and gRPC multiplexes services on one
-/// connection anyway.
+/// This is the port that gets exposed. It speaks a versioned, published
+/// protocol, and it is the only thing a program outside the cluster ever needs
+/// to reach.
 pub const DEFAULT_PORT: u16 = 7100;
+
+/// The port a node listens on for traffic from other nodes.
+///
+/// Peer traffic is WAL replication, control plane messages, and proxied client
+/// requests, in a private length-prefixed framing rather than gRPC. See
+/// `docs/adr/0004-peer-traffic-uses-private-framing.md`. It is a separate
+/// listener from the client port so that an operator can put it on a private
+/// network, which is where it belongs: the framing carries no authentication
+/// of its own, nodes of different versions must not speak it, and a peer port
+/// reachable from the internet is a hole rather than a feature.
+pub const DEFAULT_PEER_PORT: u16 = 7101;
 
 /// Which half of the cluster this node belongs to.
 ///
@@ -143,22 +168,47 @@ pub struct Config {
 pub struct NodeConfig {
     pub id: u64,
     pub role: Role,
+    /// Where client and admin gRPC traffic is served.
     pub listen: String,
-    /// The address other nodes should use to reach this one. Inside a
-    /// container `listen` is usually `0.0.0.0`, which no peer can dial, so
+    /// The address clients should use to reach this one. Inside a
+    /// container `listen` is usually `0.0.0.0`, which nothing can dial, so
     /// this defaults to `listen` and has to be set in any real deployment.
     pub advertise: String,
+    /// Where peer traffic is served. Bind this to a private interface where
+    /// there is one, because nothing outside the cluster should be able to
+    /// open a peer connection.
+    pub peer_listen: String,
+    /// The address other nodes should dial to reach this one. It goes in
+    /// `cluster.leader_peers` on every node, so it has to be a name every peer
+    /// resolves to the same thing.
+    pub peer_advertise: String,
     pub data_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClusterConfig {
     pub name: String,
-    /// The initial leader group membership, identical on every leader node.
-    /// Ignored once the data directory holds a Raft log, so it is safe to
-    /// leave in a template forever. See [`crate::node`] for why.
+    /// The leader group, as peer addresses.
+    ///
+    /// On a leader this is the initial Raft membership, identical on every
+    /// leader node, and it is ignored once the data directory holds a Raft
+    /// log, so it is safe to leave in a template forever. On a worker it is
+    /// the list of leaders to contact in order to register and be told the
+    /// partition map. One list rather than two, because they are the same
+    /// addresses and an operator keeping two lists in sync will not.
+    /// See [`crate::node`] for why.
     pub leader_peers: Vec<String>,
     pub allow_version_skew: bool,
+    /// How long to wait before the first retry when the leader group is not
+    /// reachable yet.
+    pub join_backoff_initial_millis: u64,
+    /// The ceiling on that wait. Backoff doubles up to here and stops growing,
+    /// so a leader group that comes up after ten minutes is still found within
+    /// this long of coming up.
+    pub join_backoff_max_millis: u64,
+    /// How long to keep trying before giving up and exiting. Zero means retry
+    /// forever.
+    pub join_timeout_millis: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -227,15 +277,24 @@ pub struct NodeLayer {
     pub role: Option<Role>,
     pub listen: Option<String>,
     pub advertise: Option<String>,
+    pub peer_listen: Option<String>,
+    pub peer_advertise: Option<String>,
     pub data_dir: Option<PathBuf>,
 }
 
+/// The join durations are strings rather than numbers so that a file says
+/// `join_backoff_max = "10s"` and not `10000`. A bare number would have to
+/// mean either seconds or milliseconds, and either choice is wrong by a factor
+/// of a thousand for somebody.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterLayer {
     pub name: Option<String>,
     pub leader_peers: Option<Vec<String>>,
     pub allow_version_skew: Option<bool>,
+    pub join_backoff_initial: Option<String>,
+    pub join_backoff_max: Option<String>,
+    pub join_timeout: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -282,13 +341,26 @@ impl Layer {
     /// option it sets and leaves the rest alone.
     #[must_use]
     pub fn merge(mut self, other: Self) -> Self {
-        overlay!(self.node, other.node, id, role, listen, advertise, data_dir);
+        overlay!(
+            self.node,
+            other.node,
+            id,
+            role,
+            listen,
+            advertise,
+            peer_listen,
+            peer_advertise,
+            data_dir
+        );
         overlay!(
             self.cluster,
             other.cluster,
             name,
             leader_peers,
-            allow_version_skew
+            allow_version_skew,
+            join_backoff_initial,
+            join_backoff_max,
+            join_timeout
         );
         overlay!(
             self.object_store,
@@ -379,12 +451,17 @@ impl Layer {
                 role,
                 listen: get("ORBITA_LISTEN").map(str::to_owned),
                 advertise: get("ORBITA_ADVERTISE").map(str::to_owned),
+                peer_listen: get("ORBITA_PEER_LISTEN").map(str::to_owned),
+                peer_advertise: get("ORBITA_PEER_ADVERTISE").map(str::to_owned),
                 data_dir: get("ORBITA_DATA_DIR").map(PathBuf::from),
             },
             cluster: ClusterLayer {
                 name: get("ORBITA_CLUSTER_NAME").map(str::to_owned),
                 leader_peers: get("ORBITA_LEADER_PEERS").map(parse_list),
                 allow_version_skew: flag("ORBITA_ALLOW_VERSION_SKEW")?,
+                join_backoff_initial: get("ORBITA_JOIN_BACKOFF_INITIAL").map(str::to_owned),
+                join_backoff_max: get("ORBITA_JOIN_BACKOFF_MAX").map(str::to_owned),
+                join_timeout: get("ORBITA_JOIN_TIMEOUT").map(str::to_owned),
             },
             object_store: ObjectStoreLayer {
                 endpoint: get("ORBITA_OBJECT_STORE_ENDPOINT").map(str::to_owned),
@@ -420,7 +497,59 @@ impl Layer {
             .parse::<SocketAddr>()
             .with_context(|| format!("node.listen must be an address and port, got {listen:?}"))?;
 
+        let advertise_was_set = self.node.advertise.is_some();
         let advertise = self.node.advertise.unwrap_or_else(|| listen.clone());
+
+        let peer_listen = self
+            .node
+            .peer_listen
+            .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_PEER_PORT}"));
+        let parsed_peer: SocketAddr = peer_listen.parse().with_context(|| {
+            format!("node.peer_listen must be an address and port, got {peer_listen:?}")
+        })?;
+        // Two listeners cannot share a port, and the failure if they try is a
+        // bind error minutes into a rollout rather than a sentence now. Port
+        // zero is exempt, because it means "whichever one is free" and two of
+        // them are two different ports.
+        if parsed_peer.port() != 0
+            && parsed_peer == listen.parse::<SocketAddr>().unwrap_or(parsed_peer)
+        {
+            bail!(
+                "node.listen and node.peer_listen are both {listen}, and a node needs two \
+                 listeners: one for clients and one for peers"
+            );
+        }
+        let peer_advertise = self.node.peer_advertise.unwrap_or_else(|| {
+            // Falling back to the client advertise address with the peer port
+            // is the answer that is right in a container, where the host name
+            // is the same for both and only the port differs.
+            match advertise.rsplit_once(':') {
+                Some((host, _)) if advertise_was_set => format!("{host}:{}", parsed_peer.port()),
+                _ => peer_listen.clone(),
+            }
+        });
+
+        let join_backoff_initial_millis = duration_millis(
+            "cluster.join_backoff_initial",
+            self.cluster.join_backoff_initial,
+        )?
+        .unwrap_or(250);
+        let join_backoff_max_millis =
+            duration_millis("cluster.join_backoff_max", self.cluster.join_backoff_max)?
+                .unwrap_or(10_000);
+        // Five minutes rather than forever. A worker that cannot find the
+        // leader group should exit and let the orchestrator restart it, because
+        // a crash loop is visible in `kubectl get pods` and a process retrying
+        // silently for a day is not.
+        let join_timeout_millis =
+            duration_millis("cluster.join_timeout", self.cluster.join_timeout)?.unwrap_or(300_000);
+        if join_backoff_max_millis < join_backoff_initial_millis {
+            bail!(
+                "cluster.join_backoff_max is {join_backoff_max_millis} ms, below \
+                 cluster.join_backoff_initial at {join_backoff_initial_millis} ms, so the backoff \
+                 would shrink rather than grow"
+            );
+        }
 
         let trace_sample_ratio = self.telemetry.trace_sample_ratio.unwrap_or(1.0);
         if !(0.0..=1.0).contains(&trace_sample_ratio) {
@@ -441,6 +570,8 @@ impl Layer {
                 role: self.node.role.unwrap_or(Role::Worker),
                 listen,
                 advertise,
+                peer_listen,
+                peer_advertise,
                 data_dir: self
                     .node
                     .data_dir
@@ -450,6 +581,9 @@ impl Layer {
                 name: self.cluster.name.unwrap_or_else(|| "orbita".to_owned()),
                 leader_peers: self.cluster.leader_peers.unwrap_or_default(),
                 allow_version_skew: self.cluster.allow_version_skew.unwrap_or(false),
+                join_backoff_initial_millis,
+                join_backoff_max_millis,
+                join_timeout_millis,
             },
             object_store: ObjectStoreConfig {
                 endpoint: self.object_store.endpoint,
@@ -484,6 +618,46 @@ impl Layer {
             },
         })
     }
+}
+
+/// Parses a duration such as `500ms`, `30s`, `5m`, `2h`, or `7d` into
+/// milliseconds.
+///
+/// A unit is required. A bare number would have to mean either seconds or
+/// milliseconds, and whichever we picked would be wrong by a factor of a
+/// thousand for somebody, on a TTL, silently. A bare `0` is the one exception,
+/// because zero of anything is zero and an operator writing "no timeout" will
+/// write `0`.
+pub fn parse_duration_millis(text: &str) -> Result<u64> {
+    let text = text.trim();
+    if text == "0" {
+        return Ok(0);
+    }
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, unit) = text.split_at(split);
+    if digits.is_empty() {
+        bail!("expected a number and a unit, such as 30s, got {text:?}");
+    }
+    let value: u64 = digits.parse()?;
+    let millis = match unit {
+        "ms" => value,
+        "s" => value * 1_000,
+        "m" => value * 60_000,
+        "h" => value * 3_600_000,
+        "d" => value * 86_400_000,
+        "" => bail!("durations need a unit: ms, s, m, h, or d. Got {text:?}"),
+        other => bail!("unknown duration unit {other:?}. Use ms, s, m, h, or d"),
+    };
+    Ok(millis)
+}
+
+/// Parses an optional duration option, naming the option when it is wrong.
+fn duration_millis(option: &str, value: Option<String>) -> Result<Option<u64>> {
+    value
+        .map(|v| parse_duration_millis(&v).with_context(|| format!("{option} is not a duration")))
+        .transpose()
 }
 
 fn parse_list(value: &str) -> Vec<String> {
@@ -579,6 +753,11 @@ pub fn load_with_base(
 /// nothing to bootstrap and no peers to list. The data directory is relative
 /// so that deleting it is obvious, and there is no object store because a
 /// laptop does not need bulk durability to try the thing out.
+///
+/// The peer listener still exists and still binds, on the port above the
+/// client one, so that the development path exercises the same two-listener
+/// shape a real deployment has. Both are on the loopback address, because
+/// nothing outside this machine has any business reaching either.
 #[must_use]
 pub fn dev_defaults(port: u16, data_dir: PathBuf) -> Layer {
     Layer {
@@ -587,12 +766,15 @@ pub fn dev_defaults(port: u16, data_dir: PathBuf) -> Layer {
             role: Some(Role::Leader),
             listen: Some(format!("127.0.0.1:{port}")),
             advertise: Some(format!("127.0.0.1:{port}")),
+            peer_listen: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
+            peer_advertise: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
             data_dir: Some(data_dir),
         },
         cluster: ClusterLayer {
             name: Some("dev".to_owned()),
             leader_peers: Some(Vec::new()),
             allow_version_skew: Some(false),
+            ..ClusterLayer::default()
         },
         ..Layer::default()
     }
@@ -616,6 +798,8 @@ mod tests {
         assert_eq!(config.node.role, Role::Worker);
         assert_eq!(config.node.listen, "0.0.0.0:7100");
         assert_eq!(config.node.advertise, "0.0.0.0:7100");
+        assert_eq!(config.node.peer_listen, "0.0.0.0:7101");
+        assert_eq!(config.node.peer_advertise, "0.0.0.0:7101");
         assert_eq!(config.client.endpoint, "http://127.0.0.1:7100");
         assert_eq!(config.telemetry.log_level, "info");
         assert!(config.object_store.endpoint.is_none());
@@ -793,6 +977,118 @@ mod tests {
     }
 
     #[test]
+    fn the_client_and_peer_listeners_get_different_ports_by_default() {
+        let config = Layer::default().resolve().unwrap();
+        assert_ne!(config.node.listen, config.node.peer_listen);
+        assert_eq!(DEFAULT_PEER_PORT, DEFAULT_PORT + 1);
+    }
+
+    #[test]
+    fn both_listeners_on_one_address_is_refused_before_anything_tries_to_bind() {
+        let layer = Layer {
+            node: NodeLayer {
+                listen: Some("0.0.0.0:7100".to_owned()),
+                peer_listen: Some("0.0.0.0:7100".to_owned()),
+                ..NodeLayer::default()
+            },
+            ..Layer::default()
+        };
+        let err = layer.resolve().unwrap_err();
+        assert!(format!("{err:#}").contains("two listeners"), "{err:#}");
+    }
+
+    #[test]
+    fn two_listeners_on_port_zero_are_allowed_because_that_is_two_free_ports() {
+        let layer = Layer {
+            node: NodeLayer {
+                listen: Some("127.0.0.1:0".to_owned()),
+                peer_listen: Some("127.0.0.1:0".to_owned()),
+                ..NodeLayer::default()
+            },
+            ..Layer::default()
+        };
+        assert!(layer.resolve().is_ok());
+    }
+
+    #[test]
+    fn the_peer_advertise_address_keeps_the_advertise_host_and_takes_the_peer_port() {
+        let layer = Layer {
+            node: NodeLayer {
+                listen: Some("0.0.0.0:7100".to_owned()),
+                advertise: Some("worker-1.orbita:7100".to_owned()),
+                ..NodeLayer::default()
+            },
+            ..Layer::default()
+        };
+        assert_eq!(
+            layer.resolve().unwrap().node.peer_advertise,
+            "worker-1.orbita:7101"
+        );
+    }
+
+    #[test]
+    fn the_peer_addresses_come_from_the_environment_like_every_other_option() {
+        let environment = Layer::from_env(&env(&[
+            ("ORBITA_PEER_LISTEN", "10.1.0.4:9101"),
+            ("ORBITA_PEER_ADVERTISE", "node-a.internal:9101"),
+        ]))
+        .unwrap();
+        let config = Layer::default().merge(environment).resolve().unwrap();
+        assert_eq!(config.node.peer_listen, "10.1.0.4:9101");
+        assert_eq!(config.node.peer_advertise, "node-a.internal:9101");
+    }
+
+    #[test]
+    fn join_durations_are_written_with_a_unit_rather_than_a_bare_number() {
+        let file = Layer::from_toml(
+            "[cluster]\njoin_backoff_initial = \"500ms\"\njoin_backoff_max = \"1m\"\n\
+             join_timeout = \"10m\"\n",
+        )
+        .unwrap();
+        let config = Layer::default().merge(file).resolve().unwrap();
+        assert_eq!(config.cluster.join_backoff_initial_millis, 500);
+        assert_eq!(config.cluster.join_backoff_max_millis, 60_000);
+        assert_eq!(config.cluster.join_timeout_millis, 600_000);
+    }
+
+    #[test]
+    fn a_zero_join_timeout_is_accepted_and_means_retry_forever() {
+        let file = Layer::from_toml("[cluster]\njoin_timeout = \"0\"\n").unwrap();
+        assert_eq!(
+            Layer::default()
+                .merge(file)
+                .resolve()
+                .unwrap()
+                .cluster
+                .join_timeout_millis,
+            0
+        );
+    }
+
+    #[test]
+    fn a_join_backoff_maximum_below_the_initial_wait_is_refused() {
+        let file = Layer::from_toml(
+            "[cluster]\njoin_backoff_initial = \"10s\"\njoin_backoff_max = \"1s\"\n",
+        )
+        .unwrap();
+        let err = Layer::default().merge(file).resolve().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("shrink rather than grow"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_join_duration_without_a_unit_names_the_option_it_came_from() {
+        let environment = Layer::from_env(&env(&[("ORBITA_JOIN_TIMEOUT", "300")])).unwrap();
+        let err = Layer::default().merge(environment).resolve().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cluster.join_timeout"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn an_explicit_config_path_that_does_not_exist_is_an_error() {
         let err =
             locate_file(Some(Path::new("/nowhere/orbita.toml")), &BTreeMap::new()).unwrap_err();
@@ -819,6 +1115,9 @@ mod tests {
         assert_eq!(config.node.role, Role::Leader);
         assert!(config.cluster.leader_peers.is_empty());
         assert_eq!(config.node.listen, "127.0.0.1:7100");
+        // Both listeners are on the loopback address, because nothing outside
+        // the laptop has any business reaching either of them.
+        assert_eq!(config.node.peer_listen, "127.0.0.1:7101");
     }
 
     #[test]

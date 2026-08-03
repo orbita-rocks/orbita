@@ -141,8 +141,8 @@ fn serve(config: &Config, args: &ServeArgs) -> Result<Outcome> {
     };
     if args.allow_version_skew {
         tracing::warn!(
-            "starting with --allow-version-skew. Compatibility with the leader group is not \
-             checked, and this is unsupported"
+            "--allow-version-skew does nothing. Compatibility is a cluster version window now, \
+             and no node checks a version yet"
         );
     }
     node::preflight(config, &options)?;

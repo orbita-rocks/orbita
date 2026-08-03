@@ -115,4 +115,4 @@ pub use membership::{NodeHealth, NodeRole, NodeStatus, PartitionProgress};
 pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 pub use service::ControlService;
 pub use state::{ClusterState, NodeRecord, PartitionPhase};
-pub use wire::{METHOD_FETCH_MAP, METHOD_REPORT_STATUS};
+pub use wire::{METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS};

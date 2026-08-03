@@ -25,27 +25,37 @@
 //! # }
 //! ```
 //!
+//! # The two listeners
+//!
+//! A node binds two ports. Clients speak gRPC on one, because that is where
+//! compatibility is a promise to strangers. Peers speak the private framing in
+//! [`crate::frame`] on the other, per ADR 0004, so that an operator can keep
+//! peer traffic on a private network and expose only the client port.
+//!
 //! # What is built and what is not
 //!
-//! A single node serves the whole `Kv` API end to end: conditional writes,
-//! TTLs, prefix scans with pagination, and the size limits, over real gRPC.
-//! Routing and proxying to a partition owner are built and are exercised
-//! through the runtime's transport seam.
+//! A cluster works end to end: writes replicate over real sockets, replicas
+//! serve reads under a lease with per-key invalidation, the map comes from the
+//! control plane, and losing an owner promotes a replica without losing an
+//! acknowledged write. `tests/multi_node.rs` is that claim as a test.
 //!
-//! Two pieces are deliberately unfinished rather than half-done, and both are
-//! called out where they live. Dialling a remote peer is missing from
-//! [`PeerTransport`], so a production multi-node cluster cannot forward yet
-//! even though everything above the transport can. And a replica never
-//! receives an invalidation, because `orbita_wal::WalService` has no hook to
-//! deliver one, so a replica holds no lease and forwards every read. Both fail
-//! in the safe direction: a request is refused or forwarded, never answered
-//! from state that might be stale.
+//! A node joined to a leader group is told only where that group is. It
+//! reports its own peer address on its heartbeat and reads the other nodes'
+//! back on the same timer, so peer addresses are discovered rather than
+//! configured. [`ServerConfig::peers`] still seeds the directory, which is
+//! what a node that starts before the control plane needs.
+//!
+//! What is not built is a snapshot. A replica that falls further behind than
+//! its owner's log still holds cannot be caught up, and says so rather than
+//! pretending; the owner logs it and the partition runs on the copies it has.
 
 #![forbid(unsafe_code)]
 
 mod config;
+mod control;
 #[cfg(test)]
 mod forwarding;
+mod frame;
 mod host;
 mod lease;
 #[cfg(test)]
@@ -54,27 +64,32 @@ mod map_source;
 mod node;
 mod pending;
 mod proxy;
+mod replication;
 mod runtime;
 mod service;
 mod status;
 mod transport;
 mod validate;
 
-pub use config::{ServerConfig, DEFAULT_KEYSPACE};
+pub use config::{ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL, DEFAULT_KEYSPACE};
+pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 pub use map_source::{single_node_map, BoxedMapSource, MapSource, StaticMapSource};
 pub use runtime::ServerRuntime;
 pub use status::to_status;
-pub use transport::PeerTransport;
+pub use transport::{PeerListener, PeerTransport, DEFAULT_PEER_CALL_TIMEOUT};
 
 use crate::node::{DataLayout, Node};
 use crate::service::KvService;
 
+use orbita_control::ControlClient;
 use orbita_core::{Error, Result};
 use orbita_proto::v1::kv_server::KvServer;
+use orbita_runtime::Runtime;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A running worker.
 ///
@@ -83,7 +98,13 @@ use std::sync::Arc;
 /// which is fine for a binary and not what a test wants.
 pub struct Server {
     local_addr: SocketAddr,
+    peer_addr: SocketAddr,
     node: Arc<Node<ServerRuntime>>,
+    transport: PeerTransport,
+    peers: PeerListener,
+    heartbeat: tokio::task::JoinHandle<()>,
+    /// Present only for a node joined to a leader group.
+    reporting: Option<tokio::task::JoinHandle<()>>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     serving: tokio::task::JoinHandle<()>,
 }
@@ -99,12 +120,69 @@ impl Server {
         std::fs::create_dir_all(&storage_root)
             .map_err(|e| Error::Internal(format!("creating {}: {e}", storage_root.display())))?;
 
-        let runtime = ServerRuntime::new(config.node_id, &config.data_dir, config.rng_seed);
+        let runtime = ServerRuntime::new(config.node_id, &config.data_dir, config.rng_seed)
+            .with_peer_call_timeout(config.node_id, config.peer_call_timeout);
+        for (node, address) in &config.peers {
+            runtime.transport().set_peer(*node, address.clone());
+        }
         let layout = DataLayout {
             storage_root,
             wal_root: "wal".to_string(),
         };
-        let node = Node::start(runtime, config.node_id, layout, config.map_source).await?;
+
+        // A node in a real cluster takes its map from the leader group, and
+        // the same client carries the heartbeat that failover watches for.
+        let control = (!config.leader_group.is_empty())
+            .then(|| ControlClient::new(runtime.clone(), config.leader_group.clone()));
+        let map_source = match &control {
+            Some(client) => BoxedMapSource::new(ControlMapSource::new(client.clone())),
+            None => config.map_source,
+        };
+
+        let node = Node::start(
+            runtime.clone(),
+            config.node_id,
+            layout,
+            map_source,
+            config.lease_duration,
+        )
+        .await?;
+
+        // Peers are served only once every handler is registered, so a peer
+        // that connects the instant the port opens cannot be told that a
+        // service this node does serve is missing.
+        let peers = runtime
+            .transport()
+            .listen(config.peer_listen_addr)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "binding peer port {}: {e}",
+                    config.peer_listen_addr
+                ))
+            })?;
+        let peer_addr = peers.local_addr();
+
+        // The lease heartbeat is a production loop rather than something the
+        // node starts for itself, so that a simulated run drives it a step at
+        // a time and never has a timer keeping the world from going idle.
+        let heartbeat = tokio::spawn(Self::renew_leases_loop(
+            Arc::downgrade(&node),
+            node.lease_interval(),
+        ));
+
+        let reporting = control.map(|client| {
+            let reporter =
+                StatusReporter::new(client.clone(), config.node_id, peer_addr.to_string());
+            let directory =
+                PeerDirectorySync::new(client, runtime.transport().clone(), config.node_id);
+            tokio::spawn(Self::control_loop(
+                Arc::downgrade(&node),
+                reporter,
+                directory,
+                config.control_poll_interval,
+            ))
+        });
 
         let listener = tokio::net::TcpListener::bind(config.listen_addr)
             .await
@@ -131,10 +209,15 @@ impl Server {
             }
         });
 
-        tracing::info!(node = config.node_id.get(), %local_addr, "orbita worker is serving");
+        tracing::info!(node = config.node_id.get(), %local_addr, %peer_addr, "orbita worker is serving");
         Ok(Self {
             local_addr,
+            peer_addr,
             node,
+            transport: runtime.transport().clone(),
+            peers,
+            heartbeat,
+            reporting,
             shutdown,
             serving,
         })
@@ -147,9 +230,21 @@ impl Server {
         self.local_addr
     }
 
+    /// The address peers connect to, which is what this node advertises to the
+    /// rest of the cluster.
+    #[must_use]
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
     /// Stops serving and waits for in-flight requests to finish.
     pub async fn shutdown(self) -> Result<()> {
         let _ = self.shutdown.send(());
+        self.heartbeat.abort();
+        if let Some(reporting) = &self.reporting {
+            reporting.abort();
+        }
+        self.peers.shutdown().await;
         self.serving
             .await
             .map_err(|e| Error::Internal(format!("the client listener panicked: {e}")))
@@ -162,9 +257,68 @@ impl Server {
             .map_err(|e| Error::Internal(format!("the client listener panicked: {e}")))
     }
 
+    /// Renews the read leases this node's partitions have out, forever.
+    ///
+    /// A weak reference, so a node that is dropped stops heartbeating rather
+    /// than keeping itself alive through its own background task.
+    async fn renew_leases_loop(node: std::sync::Weak<Node<ServerRuntime>>, interval: Duration) {
+        loop {
+            let Some(live) = node.upgrade() else {
+                return;
+            };
+            live.renew_leases().await;
+            drop(live);
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// Reports this node's progress to the leader group and refetches the map,
+    /// forever.
+    ///
+    /// The two are one loop because they are two halves of the same
+    /// conversation: the report is what keeps this node out of the failure
+    /// detector, and the fetch is how it learns that a partition moved to or
+    /// from it without a client request having to discover it first.
+    async fn control_loop(
+        node: std::sync::Weak<Node<ServerRuntime>>,
+        reporter: StatusReporter<ServerRuntime>,
+        directory: PeerDirectorySync<ServerRuntime>,
+        interval: Duration,
+    ) {
+        loop {
+            let Some(live) = node.upgrade() else {
+                return;
+            };
+            let version = live.map().version();
+            let progress = live.progress().await;
+            // Reported before the directory is read, so that this node's own
+            // address is in the answer the other nodes get on their next poll.
+            reporter.report(version, progress).await;
+            directory.refresh().await;
+            if let Err(error) = live.refresh_map().await {
+                tracing::debug!(%error, "could not refresh the partition map");
+            }
+            drop(live);
+            tokio::time::sleep(interval).await;
+        }
+    }
+
     /// Refetches the partition map now rather than waiting for a misrouted
     /// request to trigger the repair. This is what an admin command calls.
     pub async fn refresh_map(&self) -> Result<()> {
         self.node.refresh_map().await
+    }
+
+    /// Tells this node where a peer is, for a peer whose address was not known
+    /// when the node started.
+    pub fn add_peer(&self, node: orbita_core::NodeId, address: impl Into<String>) {
+        self.transport.set_peer(node, address);
+    }
+
+    /// How many reads this node has answered from a partition it replicates
+    /// rather than owns, which is the read path's whole reason to exist.
+    #[must_use]
+    pub fn replica_reads(&self) -> u64 {
+        self.node.replica_reads()
     }
 }

@@ -48,12 +48,23 @@ pub trait ReplicaObserver: Send + Sync + 'static {
     /// set in `invalidating` once it has.
     fn durable(&self, entries: &[WalEntry]);
 
+    /// The owner has acknowledged everything up to `through` to its clients.
+    ///
+    /// An observer that applies replicated entries to a storage engine must
+    /// not run ahead of this, or it will hold, and can serve, a write that was
+    /// never acknowledged to anybody.
+    fn committed(&self, partition: PartitionId, through: Lamport);
+
     /// Everything above `above` has been discarded, because a newer owner said
     /// history ends there.
     ///
     /// An observer holding marks for those entries has to drop them, or it
     /// will wait forever for writes that are never going to arrive.
-    fn truncated(&self, above: Lamport);
+    ///
+    /// The partition is named because one service handles every partition this
+    /// node replicates, and a Lamport on its own does not say which log it
+    /// belongs to.
+    fn truncated(&self, partition: PartitionId, above: Lamport);
 }
 
 /// Serves inbound WAL traffic for every partition this node holds.
@@ -63,6 +74,15 @@ pub trait ReplicaObserver: Send + Sync + 'static {
 pub struct WalService<R: Runtime> {
     logs: Arc<Mutex<HashMap<PartitionId, Arc<PartitionLog<R>>>>>,
     observer: Arc<Mutex<Option<Arc<dyn ReplicaObserver>>>>,
+    /// One gate per partition, held across a whole append.
+    ///
+    /// An owner pipelines: it releases its flush lock before replicating, so
+    /// two batches for one partition are in flight at once and arrive here
+    /// concurrently. Without this, both would read the same durable Lamport,
+    /// and the one that lost the race would be rejected as non contiguous even
+    /// though it was perfectly in order. The log is a sequence, so appending
+    /// to it is one at a time by nature; the gate only makes that explicit.
+    gates: Arc<Mutex<HashMap<PartitionId, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl<R: Runtime> Clone for WalService<R> {
@@ -70,6 +90,7 @@ impl<R: Runtime> Clone for WalService<R> {
         Self {
             logs: Arc::clone(&self.logs),
             observer: Arc::clone(&self.observer),
+            gates: Arc::clone(&self.gates),
         }
     }
 }
@@ -86,6 +107,7 @@ impl<R: Runtime> WalService<R> {
         Self {
             logs: Arc::new(Mutex::new(HashMap::new())),
             observer: Arc::new(Mutex::new(None)),
+            gates: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -123,6 +145,10 @@ impl<R: Runtime> WalService<R> {
             .lock()
             .expect("wal service registry poisoned")
             .remove(&partition);
+        self.gates
+            .lock()
+            .expect("wal service gate registry poisoned")
+            .remove(&partition);
     }
 
     /// The log this node holds for a partition, for the code that applies
@@ -134,6 +160,16 @@ impl<R: Runtime> WalService<R> {
             .expect("wal service registry poisoned")
             .get(&partition)
             .cloned()
+    }
+
+    fn gate(&self, partition: PartitionId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.gates
+                .lock()
+                .expect("wal service gate registry poisoned")
+                .entry(partition)
+                .or_default(),
+        )
     }
 
     async fn dispatch(&self, call: PeerCall) -> WalResponse {
@@ -158,6 +194,11 @@ impl<R: Runtime> WalService<R> {
         let Some(log) = self.log(request.partition) else {
             return WalResponse::Error(format!("partition {} not held here", request.partition));
         };
+        // Held for the whole of the decision and the write. See the gate's own
+        // documentation for why reading the durable Lamport and appending have
+        // to be one step.
+        let gate = self.gate(request.partition);
+        let _ordered = gate.lock().await;
 
         let current = log.epoch().await;
         if request.epoch < current {
@@ -179,11 +220,19 @@ impl<R: Runtime> WalService<R> {
             if let Err(e) = log.record_fence(request.epoch).await {
                 return WalResponse::Error(e.to_string());
             }
+            let held = log.durable_lamport().await;
             if let Err(e) = log.truncate_above(request.prev_lamport).await {
                 return WalResponse::Error(e.to_string());
             }
-            if let Some(observer) = self.observer() {
-                observer.truncated(request.prev_lamport);
+            // Only a truncation that discarded something is one the observer
+            // has to hear about. Every replica meets its owner at an epoch
+            // above the one its own log records, so the first append of a
+            // partition's life takes this path with nothing above the cut, and
+            // an observer told about it would throw away state it still needs.
+            if held > request.prev_lamport {
+                if let Some(observer) = self.observer() {
+                    observer.truncated(request.partition, request.prev_lamport);
+                }
             }
         }
 
@@ -247,6 +296,9 @@ impl<R: Runtime> WalService<R> {
             if !accepted.is_empty() {
                 observer.durable(&accepted);
             }
+            // After the entries, so an observer that queues them sees the
+            // release behind whatever it is releasing.
+            observer.committed(request.partition, request.committed);
         }
 
         WalResponse::Ok {
@@ -259,6 +311,10 @@ impl<R: Runtime> WalService<R> {
         let Some(log) = self.log(request.partition) else {
             return WalResponse::Error(format!("partition {} not held here", request.partition));
         };
+        // The same gate as an append, because truncating the tail while one is
+        // being written would leave the log describing neither history.
+        let gate = self.gate(request.partition);
+        let _ordered = gate.lock().await;
 
         let current = log.epoch().await;
         if request.epoch < current {
@@ -268,11 +324,14 @@ impl<R: Runtime> WalService<R> {
             if let Err(e) = log.record_fence(request.epoch).await {
                 return WalResponse::Error(e.to_string());
             }
+            let held = log.durable_lamport().await;
             if let Err(e) = log.truncate_above(request.truncate_above).await {
                 return WalResponse::Error(e.to_string());
             }
-            if let Some(observer) = self.observer() {
-                observer.truncated(request.truncate_above);
+            if held > request.truncate_above {
+                if let Some(observer) = self.observer() {
+                    observer.truncated(request.partition, request.truncate_above);
+                }
             }
         }
         WalResponse::Ok {

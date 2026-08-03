@@ -238,6 +238,23 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.inner.lock().await.state.map_version()
     }
 
+    /// Every node the cluster knows, and where peers reach it.
+    ///
+    /// Addresses are what each node reported about itself, so a node that
+    /// moves corrects this on its next heartbeat without an operator having to
+    /// notice. Workers poll it to fill in their peer directory, since the
+    /// partition map names owners by id and nothing else says how to dial one.
+    pub async fn node_addresses(&self) -> Vec<(NodeId, String)> {
+        self.inner
+            .lock()
+            .await
+            .state
+            .nodes()
+            .filter(|record| !record.address.is_empty())
+            .map(|record| (record.id, record.address.clone()))
+            .collect()
+    }
+
     /// A snapshot of the agreed state, for callers that need more than the
     /// map.
     pub async fn snapshot(&self) -> ClusterState {

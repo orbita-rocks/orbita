@@ -2,8 +2,14 @@
 Three Services with three different jobs.
 
 The two headless ones give every pod a stable DNS name, which is what the
-bootstrap peer list and partition ownership both depend on. The third is the
-one clients use.
+bootstrap peer list and partition ownership both depend on. They carry both
+ports, because a node reaches another node on the peer port and an operator
+port-forwarding to one pod reaches it on the client port.
+
+The third is the one clients use, and it carries the client port only. Peer
+traffic uses a private framing that is compatible only within a cluster version
+window, so the peer port must never end up behind a LoadBalancer or an Ingress.
+Leaving it off this Service is what makes changing service.type safe.
 */}}
 apiVersion: v1
 kind: Service
@@ -25,6 +31,9 @@ spec:
     - name: grpc
       port: {{ .Values.service.port }}
       targetPort: grpc
+    - name: peer
+      port: {{ .Values.service.peerPort }}
+      targetPort: peer
 ---
 apiVersion: v1
 kind: Service
@@ -44,6 +53,9 @@ spec:
     - name: grpc
       port: {{ .Values.service.port }}
       targetPort: grpc
+    - name: peer
+      port: {{ .Values.service.peerPort }}
+      targetPort: peer
 ---
 apiVersion: v1
 kind: Service
@@ -64,6 +76,7 @@ spec:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: worker
   ports:
+    # The client port only. Do not add the peer port here.
     - name: grpc
       port: {{ .Values.service.port }}
       targetPort: grpc

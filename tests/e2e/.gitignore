@@ -1,0 +1,6 @@
+# Stubs are regenerated on every run. Committing them would defeat the purpose,
+# because a committed stub only proves the protos compiled once.
+.generated/
+.pytest_cache/
+__pycache__/
+.venv/

@@ -13,12 +13,19 @@ data:
   orbita.toml: |
     [node]
     listen = "0.0.0.0:{{ .Values.service.port }}"
+    # The peer listener. It is only reachable through the headless Services,
+    # which is where it should stay: peer traffic is compatible only within a
+    # cluster version window and has no business leaving the cluster.
+    peer_listen = "0.0.0.0:{{ .Values.service.peerPort }}"
     data_dir = "/var/lib/orbita"
 
     [cluster]
     name = {{ .Values.cluster.name | quote }}
     leader_peers = [{{ range $i, $peer := splitList "," (include "orbita.leaderPeers" .) }}{{ if $i }}, {{ end }}{{ $peer | quote }}{{ end }}]
     allow_version_skew = {{ .Values.cluster.allowVersionSkew }}
+    join_backoff_initial = {{ .Values.cluster.joinBackoffInitial | quote }}
+    join_backoff_max = {{ .Values.cluster.joinBackoffMax | quote }}
+    join_timeout = {{ .Values.cluster.joinTimeout | quote }}
 
     [object_store]
     {{- if .Values.objectStore.endpoint }}

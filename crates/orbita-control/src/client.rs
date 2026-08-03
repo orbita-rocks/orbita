@@ -10,7 +10,8 @@ use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::membership::NodeStatus;
 use crate::wire::{
-    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_REPORT_STATUS,
+    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
+    METHOD_REPORT_STATUS,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
@@ -70,6 +71,19 @@ impl<R: Runtime> ControlClient<R> {
         let payload = FetchMapRequest { have }.encode();
         match self.call(METHOD_FETCH_MAP, payload).await? {
             ControlResponse::Map(map) => Ok(map),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Every node the cluster knows, and where peers reach it.
+    ///
+    /// A worker calls this on the same timer as its heartbeat. The map names
+    /// the owner of a partition by id, and this is the only thing that turns
+    /// that id into an address, so without it a node can route a request and
+    /// still not be able to send it.
+    pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
+        match self.call(METHOD_FETCH_NODES, bytes::Bytes::new()).await? {
+            ControlResponse::Nodes(nodes) => Ok(nodes),
             other => Err(unexpected(&other)),
         }
     }
@@ -218,6 +232,10 @@ impl<R: Runtime, L: ConsensusLog> LocalControlClient<R, L> {
             .record_status(node, status)
             .await
             .map(|_| ())
+    }
+
+    pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
+        Ok(self.controller.node_addresses().await)
     }
 }
 

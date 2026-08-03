@@ -280,7 +280,17 @@ impl<R: Runtime> PartitionLog<R> {
     /// Public because a node that restarts has to replay into its storage
     /// engine from wherever that engine got to, which is not something this
     /// crate can do for it.
+    ///
+    /// The append lock is held across the scan. This reads the same files an
+    /// append is writing, and a scan that catches an append midway sees the
+    /// tail as torn and stops there, which is indistinguishable from a log
+    /// that really does end early. The caller then concludes the replica is
+    /// beyond what the log holds and gives up on it, so an owner under load
+    /// could never catch up a replica that fell behind, and the partition
+    /// would run on one copy until the owner restarted. Blocking appends for
+    /// the length of a scan is the price, and catching up is rare.
     pub async fn entries_after(&self, after: Lamport) -> Result<Option<Vec<WalEntry>>> {
+        let _ordered = self.inner.lock().await;
         let scan = scan_directory(&self.runtime, &self.dir, self.partition).await?;
         let entries: Vec<WalEntry> = scan
             .all_entries
@@ -614,7 +624,18 @@ fn segment_path(dir: &str, seq: u64) -> String {
     format!("{dir}/{seq:012}.wal")
 }
 
+/// Reads a segment sequence out of whatever a directory listing called it.
+///
+/// The last path component is taken first because `Disk::list` is implemented
+/// twice and the two do not agree on what they return: the Tokio disk lists a
+/// directory and gives back bare file names, and the simulator matches a string
+/// prefix and gives back full paths. Parsing only the bare form made every log
+/// in a nested directory look empty under simulation, which meant reopening one
+/// silently started a new log and catching a replica up always reported that
+/// the entries were gone. Accepting both is a one line fix here; agreeing on
+/// the contract is a change to orbita-runtime, which this crate does not own.
 fn parse_segment_name(name: &str) -> Option<u64> {
+    let name = name.rsplit('/').next().unwrap_or(name);
     let stem = name.strip_suffix(".wal")?;
     if stem.len() != 12 || !stem.bytes().all(|b| b.is_ascii_digit()) {
         return None;

@@ -30,17 +30,19 @@
 //! it is the fsync and the round trip to the replicas, which happens after the
 //! lock is gone.
 
-use crate::lease::{LeaseTable, ReplicaReadState};
+use crate::lease::{LeaseTable, ReplicaReadState, DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 use crate::pending::{self, PendingRecord, PendingSet};
+use crate::proxy::{self, LeaseGrant};
 
 use bytes::Bytes;
 use orbita_core::{
-    Epoch, Error, KeyRange, Lamport, PartitionId, Record, Result, Version, WriteCondition,
+    Epoch, Error, KeyRange, Lamport, NodeId, PartitionId, Record, Result, Version, WriteCondition,
 };
-use orbita_runtime::{timeout, Clock, Runtime};
+use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_storage::{Mutation, Partition, ScanPage, TOMBSTONE_RETENTION_MILLIS};
 use orbita_wal::{PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
@@ -54,6 +56,65 @@ use std::time::Duration;
 /// queue drains in the time an apply takes, and a scan is already the
 /// expensive path.
 const SCAN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many keys a replica may hold unreadable before it is worth saying so.
+///
+/// There is no correct number here. It is set well above what replication lag
+/// produces in a healthy cluster, so that crossing it means something is wrong
+/// rather than that the cluster is busy.
+const INVALID_SET_WARN: usize = 10_000;
+
+/// The lease timings this partition runs on.
+///
+/// The two numbers travel together because they are one decision: the margin
+/// only has to cover the difference in rate between two monotonic clocks over
+/// one lease duration, so changing the duration without looking at the margin
+/// is how the safety argument in ADR 0001 quietly stops holding.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LeasePolicy {
+    pub duration: Duration,
+    pub margin: Duration,
+}
+
+impl Default for LeasePolicy {
+    fn default() -> Self {
+        Self {
+            duration: DEFAULT_LEASE_DURATION,
+            margin: DEFAULT_LEASE_MARGIN,
+        }
+    }
+}
+
+impl LeasePolicy {
+    /// How often the owner renews, which has to be well inside the duration or
+    /// a replica drops out of the read set between two heartbeats.
+    pub(crate) fn heartbeat_interval(&self) -> Duration {
+        // Three renewals per lease means two can be lost before a replica
+        // stops serving, which keeps a single dropped message from costing
+        // read capacity.
+        self.duration / 3
+    }
+}
+
+/// What a partition is, as far as opening one goes.
+///
+/// The four travel together because both constructors and the assembly step
+/// all need the same set, and threading them individually is how a function
+/// grows an argument list nobody can read.
+#[derive(Debug, Clone)]
+pub(crate) struct HostSpec {
+    pub id: PartitionId,
+    pub epoch: Epoch,
+    pub range: KeyRange,
+    pub lease: LeasePolicy,
+}
+
+/// What a read of a replica came back with.
+pub(crate) enum Read {
+    Served(Option<Record>),
+    /// This node cannot answer for the key after all, so the owner has to.
+    MustForward,
+}
 
 /// What a write does to its key.
 #[derive(Debug, Clone)]
@@ -105,8 +166,22 @@ pub(crate) struct PartitionHost<R: Runtime> {
     applies: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<Option<Mutation>>>,
     drained: Arc<tokio::sync::Notify>,
     read_state: Mutex<ReplicaReadState>,
-    #[allow(dead_code)]
     leases: Mutex<LeaseTable>,
+    lease: LeasePolicy,
+    /// The peers this node replicates to, when it owns the partition.
+    replicas: Vec<NodeId>,
+    /// Replicas this owner is willing to grant a lease to. A replica drops out
+    /// when a renewal fails, because an owner that keeps granting to a node it
+    /// cannot reach would wait out a lease on every write forever.
+    grantable: Mutex<HashSet<NodeId>>,
+    /// How far the owner has acknowledged to clients, as last heard. Nothing
+    /// above this is applied on a replica.
+    committed: Mutex<Lamport>,
+    /// Entries that are durable here and waiting for that watermark.
+    withheld: Mutex<VecDeque<WalEntry>>,
+    /// Serialises releasing them, since the storage engine requires Lamport
+    /// order and discards anything that arrives out of it.
+    applying: tokio::sync::Mutex<()>,
 }
 
 impl<R: Runtime> PartitionHost<R> {
@@ -114,14 +189,16 @@ impl<R: Runtime> PartitionHost<R> {
     /// anything the log holds that storage has not applied.
     pub(crate) async fn open_owner(
         runtime: R,
-        id: PartitionId,
-        epoch: Epoch,
-        range: KeyRange,
+        spec: HostSpec,
         paths: &PartitionPaths,
-        replicas: Vec<orbita_core::NodeId>,
+        replicas: Vec<NodeId>,
     ) -> Result<Arc<Self>> {
+        let HostSpec {
+            id, epoch, range, ..
+        } = spec.clone();
         let storage = Arc::new(Partition::open(runtime.clone(), &paths.storage_path, range).await?);
-        let config = WalConfig::new(id, paths.wal_dir.clone(), epoch).with_replicas(replicas);
+        let config =
+            WalConfig::new(id, paths.wal_dir.clone(), epoch).with_replicas(replicas.clone());
         let wal = Wal::open(runtime.clone(), config).await?;
 
         // A restart finds entries that were durable and never applied, because
@@ -141,7 +218,14 @@ impl<R: Runtime> PartitionHost<R> {
         }
 
         let log = wal.log();
-        Ok(Self::assemble(runtime, id, epoch, storage, Some(wal), log))
+        Ok(Self::assemble(
+            runtime,
+            &spec,
+            storage,
+            Some(wal),
+            log,
+            replicas,
+        ))
     }
 
     /// Opens a partition this node replicates but does not own.
@@ -152,12 +236,13 @@ impl<R: Runtime> PartitionHost<R> {
     /// time.
     pub(crate) async fn open_replica(
         runtime: R,
-        id: PartitionId,
-        epoch: Epoch,
-        range: KeyRange,
+        spec: HostSpec,
         paths: &PartitionPaths,
     ) -> Result<Arc<Self>> {
-        let storage = Arc::new(Partition::open(runtime.clone(), &paths.storage_path, range).await?);
+        let id = spec.id;
+        let storage = Arc::new(
+            Partition::open(runtime.clone(), &paths.storage_path, spec.range.clone()).await?,
+        );
         let log = PartitionLog::open(
             runtime.clone(),
             paths.wal_dir.clone(),
@@ -169,19 +254,23 @@ impl<R: Runtime> PartitionHost<R> {
             storage.apply(&mutation_of(entry)).await?;
         }
 
-        let host = Self::assemble(runtime, id, epoch, storage, None, log);
-        let applied = host.storage.committed_lamport().await?;
-        *host.read_state.lock().expect("read state poisoned") = ReplicaReadState::new(applied);
+        let host = Self::assemble(runtime, &spec, storage, None, log, Vec::new());
+        // The invalidation stream continues from where the log is, not from
+        // where storage is. The two differ whenever entries are durable and
+        // not yet applied, and starting from storage would make the next
+        // invalidation look like a gap.
+        let held = host.log.durable_lamport().await;
+        *host.read_state.lock().expect("read state poisoned") = ReplicaReadState::new(held);
         Ok(host)
     }
 
     fn assemble(
         runtime: R,
-        id: PartitionId,
-        epoch: Epoch,
+        spec: &HostSpec,
         storage: Arc<Partition<R>>,
         wal: Option<Arc<Wal<R>>>,
         log: Arc<PartitionLog<R>>,
+        replicas: Vec<NodeId>,
     ) -> Arc<Self> {
         let (applies, queue) = tokio::sync::mpsc::unbounded_channel();
         let pending = Arc::new(Mutex::new(PendingSet::default()));
@@ -192,7 +281,7 @@ impl<R: Runtime> PartitionHost<R> {
         // engine alive would make a restart fail to acquire the lock on files
         // the previous incarnation has already finished with.
         runtime.spawn(apply_loop(
-            id,
+            spec.id,
             Arc::downgrade(&storage),
             Arc::downgrade(&pending),
             Arc::downgrade(&drained),
@@ -200,8 +289,8 @@ impl<R: Runtime> PartitionHost<R> {
         ));
 
         Arc::new(Self {
-            id,
-            epoch,
+            id: spec.id,
+            epoch: spec.epoch,
             runtime,
             storage,
             wal,
@@ -212,6 +301,12 @@ impl<R: Runtime> PartitionHost<R> {
             drained,
             read_state: Mutex::new(ReplicaReadState::new(Lamport::ZERO)),
             leases: Mutex::new(LeaseTable::default()),
+            lease: spec.lease,
+            grantable: Mutex::new(replicas.iter().copied().collect()),
+            replicas,
+            committed: Mutex::new(Lamport::ZERO),
+            withheld: Mutex::new(VecDeque::new()),
+            applying: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -237,12 +332,15 @@ impl<R: Runtime> PartitionHost<R> {
         self.wal.is_some()
     }
 
-    /// Whether this node may answer a read for `key` without asking the owner.
+    /// Whether this node might answer a read for `key` without asking the
+    /// owner.
     ///
     /// The owner always may. A replica may only under a live lease with no gap
     /// in its invalidation stream and no invalidation outstanding for this
-    /// key, which is the whole of the ADR 0001 read path.
-    pub(crate) fn may_serve(&self, key: &[u8]) -> bool {
+    /// key, which is the ADR 0001 read path. This is the first half of that
+    /// decision, and the answer is provisional: [`PartitionHost::read`] checks
+    /// again against what it actually read.
+    pub(crate) fn might_serve(&self, key: &[u8]) -> bool {
         if self.is_owner() {
             return true;
         }
@@ -251,6 +349,45 @@ impl<R: Runtime> PartitionHost<R> {
             .lock()
             .expect("read state poisoned")
             .may_serve(now, key)
+            .is_some()
+    }
+
+    /// Reads a key, or reports that this node turned out not to be allowed to
+    /// answer for it after all.
+    ///
+    /// A replica decides twice, before and after reading storage, because the
+    /// two are not one step. Between them the owner can replicate a write for
+    /// this key, be told it is durable, and acknowledge it to its client, and a
+    /// reader that checked only beforehand would then answer with the value
+    /// that write replaced. That is precisely the stale read ADR 0001 exists to
+    /// prevent, and the deterministic simulator's linearizability checker found
+    /// it here rather than anyone reasoning it out.
+    pub(crate) async fn read(&self, key: &[u8]) -> Result<Read> {
+        if self.is_owner() {
+            return Ok(Read::Served(self.get(key).await?));
+        }
+        let now = self.runtime.clock().monotonic_nanos();
+        let Some(generation) = self
+            .read_state
+            .lock()
+            .expect("read state poisoned")
+            .may_serve(now, key)
+        else {
+            return Ok(Read::MustForward);
+        };
+
+        let record = self.get(key).await?;
+
+        let now = self.runtime.clock().monotonic_nanos();
+        if !self
+            .read_state
+            .lock()
+            .expect("read state poisoned")
+            .still_serving(now, key, generation)
+        {
+            return Ok(Read::MustForward);
+        }
+        Ok(Read::Served(record))
     }
 
     /// The key's current value, from storage overlaid with anything committed
@@ -287,9 +424,23 @@ impl<R: Runtime> PartitionHost<R> {
 
     /// The highest Lamport this partition has applied, which is what a replica
     /// reports about how caught up it is.
-    #[allow(dead_code)]
     pub(crate) async fn committed_lamport(&self) -> Result<Lamport> {
         self.storage.committed_lamport().await
+    }
+
+    /// The highest Lamport this node has on stable storage for this partition.
+    ///
+    /// This is the promotion input rather than the applied Lamport, because an
+    /// acknowledgement is paid for by durability and not by application, so
+    /// this is what bounds the writes the cluster has promised.
+    pub(crate) async fn durable_lamport(&self) -> Lamport {
+        self.log.durable_lamport().await
+    }
+
+    /// How much disk this partition is using, which is what the control plane
+    /// compares against the split threshold.
+    pub(crate) async fn size_bytes(&self) -> Result<u64> {
+        self.storage.size_bytes().await
     }
 
     /// Evaluates the condition, commits through the log, and answers the
@@ -369,6 +520,11 @@ impl<R: Runtime> PartitionHost<R> {
                 if queued {
                     let _ = resolved.send(Some(mutation_of_op(lamport, &key, &wal_op)));
                 }
+                // Durable is not enough to answer the client. Every replica
+                // that could still serve a read has to have the invalidation
+                // too, or the client would be told about a value another node
+                // is still hiding.
+                self.await_coherence(wal, lamport).await;
                 Ok(WriteAck {
                     applied: true,
                     version: Some(Version(lamport.get())),
@@ -387,49 +543,316 @@ impl<R: Runtime> PartitionHost<R> {
         }
     }
 
-    /// Grants a replica a read lease, which the owner does on its heartbeat.
+    /// Renews every replica's read lease, which is the owner's half of the
+    /// ADR 0001 read path.
     ///
-    /// Unused until there is a heartbeat to carry it. See the lease module.
-    #[allow(dead_code)]
-    pub(crate) fn grant_lease(&self, node: orbita_core::NodeId, duration: Duration) {
-        let now = self.runtime.clock().monotonic_nanos();
-        self.leases
-            .lock()
-            .expect("lease table poisoned")
-            .grant(node, now, duration);
+    /// A lease is recorded before it is sent and dropped only when the replica
+    /// says in as many words that it did not take it. A renewal whose reply is
+    /// lost may well have been received, and an owner that assumed otherwise
+    /// would stop waiting for a replica that is still serving reads.
+    ///
+    /// A replica whose renewal fails stops being granted anything, and is sent
+    /// a zero-length grant instead. That doubles as a probe: it takes no lease,
+    /// so an answer to it proves the replica has none, which is what lets the
+    /// owner start granting again.
+    pub(crate) async fn renew_leases(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        if self.replicas.is_empty() {
+            return;
+        }
+        // Where the log stands now. A replica takes the lease only if it is
+        // past this, which is what stops it serving a key it has not been told
+        // about. Reading it before the calls go out is the conservative order:
+        // anything committed after this only makes the offer harder to accept.
+        let through = wal.durable_lamport();
+        // What clients have been told about, which is what a replica may
+        // apply. Read after the durable position so it can never name a
+        // Lamport the replica has not been offered.
+        let committed = wal.committed_lamport();
+        let epoch = self.epoch;
+
+        let renewals: Vec<_> = self
+            .replicas
+            .iter()
+            .map(|node| self.renew_one(*node, epoch, through, committed))
+            .collect();
+        join_all(renewals).await;
     }
 
-    /// The replicas a write must hear from before it is acknowledged, per the
-    /// coherence quorum in ADR 0001.
-    #[allow(dead_code)]
-    pub(crate) fn lease_holders(&self) -> Vec<orbita_core::NodeId> {
-        let now = self.runtime.clock().monotonic_nanos();
-        self.leases
+    async fn renew_one(&self, node: NodeId, epoch: Epoch, through: Lamport, committed: Lamport) {
+        let granting = self
+            .grantable
             .lock()
-            .expect("lease table poisoned")
-            .holders(now)
+            .expect("grantable set poisoned")
+            .contains(&node);
+        let duration = if granting {
+            self.lease.duration
+        } else {
+            Duration::ZERO
+        };
+
+        let sent = self.runtime.clock().monotonic_nanos();
+        if granting {
+            // The owner counts the lease from when it sent the offer, which is
+            // earlier than the replica counts its own from. That ordering is
+            // what makes the replica give up first.
+            self.leases
+                .lock()
+                .expect("lease table poisoned")
+                .grant(node, sent, duration);
+        }
+
+        let call = PeerCall {
+            service: ServiceId::Proxy,
+            method: proxy::METHOD_LEASE,
+            payload: LeaseGrant {
+                partition: self.id,
+                epoch,
+                through,
+                committed,
+                duration_millis: duration.as_millis() as u64,
+            }
+            .encode(),
+        };
+
+        let answered = self
+            .runtime
+            .transport()
+            .call(node, call)
+            .await
+            .map_err(|e| Error::Unavailable(e.to_string()))
+            .and_then(|reply| proxy::decode_lease_reply(&reply));
+
+        match answered {
+            Ok(true) if granting => {}
+            Ok(_) => {
+                // Either the replica refused the lease, or this was a probe
+                // and it has confirmed it holds none. Both mean nothing there
+                // can serve a stale read, so the wait can stop counting it.
+                self.leases
+                    .lock()
+                    .expect("lease table poisoned")
+                    .revoke(node);
+                self.grantable
+                    .lock()
+                    .expect("grantable set poisoned")
+                    .insert(node);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    partition = self.id.get(),
+                    node = node.get(),
+                    %error,
+                    "renewing a read lease failed"
+                );
+                self.grantable
+                    .lock()
+                    .expect("grantable set poisoned")
+                    .remove(&node);
+            }
+        }
+    }
+
+    /// Waits until no replica that could still be serving reads is missing
+    /// this write.
+    ///
+    /// This is the coherence quorum, which ADR 0001 keeps separate from the
+    /// durability quorum. Durability asks whether the write survives and is
+    /// satisfied by two of three; coherence asks whether anyone can still hand
+    /// out the old value, and that is a question about named lease holders.
+    ///
+    /// The wait is bounded by the leases themselves. A replica that does not
+    /// answer stops being a lease holder when its lease runs out, so the worst
+    /// case is one lease duration, once, and then the replica is out of the
+    /// read set.
+    async fn await_coherence(&self, wal: &Arc<Wal<R>>, lamport: Lamport) {
+        loop {
+            let now = self.runtime.clock().monotonic_nanos();
+            let behind: Vec<(NodeId, u64)> = self
+                .leases
+                .lock()
+                .expect("lease table poisoned")
+                .holders_with_expiry(now)
+                .into_iter()
+                .filter(|(node, _)| wal.acked_through(*node) < lamport)
+                .collect();
+            if behind.is_empty() {
+                return;
+            }
+
+            let nodes: Vec<NodeId> = behind.iter().map(|(node, _)| *node).collect();
+            let until = behind
+                .iter()
+                .map(|(_, until)| *until)
+                .max()
+                .expect("the list is not empty");
+            let wait = Duration::from_nanos(until.saturating_sub(now));
+
+            match timeout(
+                self.runtime.clock(),
+                wait,
+                wal.wait_until_acked(&nodes, lamport),
+            )
+            .await
+            {
+                Ok(Ok(())) => return,
+                // The log has given up on this owner. The replicas are being
+                // fenced by whoever replaced it, which takes their leases with
+                // it, so there is nothing left to wait for.
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    tracing::warn!(
+                        partition = self.id.get(),
+                        lamport = lamport.get(),
+                        "waited out a read lease for a replica that did not acknowledge"
+                    );
+                    let mut leases = self.leases.lock().expect("lease table poisoned");
+                    let mut grantable = self.grantable.lock().expect("grantable set poisoned");
+                    for node in nodes {
+                        leases.revoke(node);
+                        grantable.remove(&node);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes a read lease this partition's owner offered, or refuses it.
+    ///
+    /// Refusing is the answer whenever anything is unclear, because a replica
+    /// that holds no lease costs one extra hop per read and a replica that
+    /// holds one it should not have breaks linearizability.
+    ///
+    /// The same message carries how far the owner has acknowledged, which is
+    /// what releases entries this node is holding back.
+    pub(crate) async fn accept_lease(&self, grant: &LeaseGrant) -> bool {
+        if self.is_owner() || grant.epoch < self.epoch {
+            return false;
+        }
+        self.commit_through(grant.committed).await;
+
+        let now = self.runtime.clock().monotonic_nanos();
+        self.read_state
+            .lock()
+            .expect("read state poisoned")
+            .accept_grant(
+                now,
+                grant.through,
+                Duration::from_millis(grant.duration_millis),
+                self.lease.margin,
+            )
+    }
+
+    /// Releases everything the owner has acknowledged to a client.
+    ///
+    /// A replica makes an entry durable long before the owner decides the
+    /// write succeeded, so applying on durability alone would put a write into
+    /// this node's storage that no client was ever told about. A read that saw
+    /// one, followed by a read that did not, is a history no sequential order
+    /// explains, which is what the simulator's linearizability checker
+    /// reported before this existed.
+    pub(crate) async fn commit_through(&self, committed: Lamport) {
+        {
+            let mut held = self.committed.lock().expect("committed watermark poisoned");
+            if committed <= *held {
+                return;
+            }
+            *held = committed;
+        }
+        self.release_applies().await;
+    }
+
+    /// Applies whatever is now below the watermark, in Lamport order.
+    ///
+    /// One at a time, because the storage engine ignores a mutation at or
+    /// below its committed Lamport, so an apply that runs out of order is
+    /// discarded rather than merely late.
+    async fn release_applies(&self) {
+        let _ordered = self.applying.lock().await;
+        loop {
+            let committed = *self.committed.lock().expect("committed watermark poisoned");
+            let next = {
+                let mut waiting = self.withheld.lock().expect("withheld entries poisoned");
+                match waiting.front() {
+                    Some(entry) if entry.lamport <= committed => {
+                        waiting.pop_front().expect("the front is there")
+                    }
+                    _ => return,
+                }
+            };
+
+            let mutation = mutation_of(&next);
+            if let Err(error) = self.storage.apply(&mutation).await {
+                tracing::error!(
+                    partition = self.id.get(),
+                    lamport = next.lamport.get(),
+                    %error,
+                    "applying a replicated entry to storage failed"
+                );
+                continue;
+            }
+            self.read_state
+                .lock()
+                .expect("read state poisoned")
+                .applied(&mutation.key, mutation.lamport);
+        }
     }
 
     /// Records that the owner has told this replica a key is changing.
-    #[allow(dead_code)]
     pub(crate) fn invalidate(&self, key: Bytes, lamport: Lamport) {
-        self.read_state
-            .lock()
-            .expect("read state poisoned")
-            .invalidate(key, lamport);
+        let outstanding = {
+            let mut state = self.read_state.lock().expect("read state poisoned");
+            state.invalidate(key, lamport);
+            state.invalid_len()
+        };
+        // The invalid set is bounded by replication lag rather than by the
+        // size of the keyspace, so it stays small when things are healthy.
+        // Growth means this replica is falling behind its owner, and it shows
+        // up here before it shows up as a read that forwards.
+        if outstanding > INVALID_SET_WARN {
+            tracing::warn!(
+                partition = self.id.get(),
+                outstanding,
+                "this replica is holding an unusual number of unreadable keys"
+            );
+        }
     }
 
-    /// Applies an entry this node received as a replica, and clears the key's
-    /// invalidation once storage has it.
-    #[allow(dead_code)]
-    pub(crate) async fn apply_replicated(&self, entry: &WalEntry) -> Result<()> {
-        let mutation = mutation_of(entry);
-        self.storage.apply(&mutation).await?;
+    /// A newer owner said this replica's history ends at `above`.
+    pub(crate) fn truncated(&self, above: Lamport) {
         self.read_state
             .lock()
             .expect("read state poisoned")
-            .applied(&mutation.key, mutation.lamport);
+            .truncated(above);
+    }
+
+    /// Takes an entry this node received as a replica.
+    ///
+    /// It is queued rather than applied. The key stays unreadable here until
+    /// the owner says the write was acknowledged, so a read of it forwards in
+    /// the meantime, which is the conservative direction.
+    pub(crate) async fn apply_replicated(&self, entry: &WalEntry) -> Result<()> {
+        self.withheld
+            .lock()
+            .expect("withheld entries poisoned")
+            .push_back(entry.clone());
+        self.release_applies().await;
         Ok(())
+    }
+
+    /// How many replicated entries are durable here and not yet released.
+    ///
+    /// Bounded by how far ahead the owner is of its own acknowledgements,
+    /// which is one heartbeat in the healthy case and a useful signal when it
+    /// is not.
+    #[allow(dead_code)]
+    pub(crate) fn withheld_len(&self) -> usize {
+        self.withheld
+            .lock()
+            .expect("withheld entries poisoned")
+            .len()
     }
 
     async fn wait_for_applies(&self) {

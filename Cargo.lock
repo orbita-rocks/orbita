@@ -899,6 +899,7 @@ name = "orbita-server"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "orbita-control",
  "orbita-core",
  "orbita-proto",
  "orbita-runtime",
