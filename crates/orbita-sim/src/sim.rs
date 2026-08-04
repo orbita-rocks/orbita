@@ -117,11 +117,25 @@ impl Simulation {
                 file.durable.extend_from_slice(&file.visible);
             }
         }
-        state.handlers.retain(|(owner, _), _| *owner != node);
+        // Removed handlers are collected and dropped after the lock is
+        // released, the same rule task futures and re-registered handlers
+        // follow: a handler's destructor can reach back into the world, for
+        // example by waking the task that owned the other end of a channel.
+        let mut doomed = Vec::new();
+        state.handlers.retain(|(owner, _), handler| {
+            if *owner == node {
+                doomed.push(handler.clone());
+                false
+            } else {
+                true
+            }
+        });
         for (path, keep) in torn_bytes {
             state.record(format!("torn tail node={node} path={path} bytes={keep}"));
         }
         state.record(format!("node {node} crashed"));
+        drop(state);
+        drop(doomed);
     }
 
     /// Brings a node back, with or without its data.
