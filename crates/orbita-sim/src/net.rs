@@ -174,11 +174,18 @@ impl Transport for SimTransport {
     }
 
     fn register(&self, service: ServiceId, handler: impl PeerHandler) {
-        let mut state = self.core.state();
-        state
-            .handlers
-            .insert((self.node, service as u16), Arc::new(handler));
-        state.record(format!("register node={} service={service:?}", self.node));
+        let replaced;
+        {
+            let mut state = self.core.state();
+            replaced = state
+                .handlers
+                .insert((self.node, service as u16), Arc::new(handler));
+            state.record(format!("register node={} service={service:?}", self.node));
+        }
+        // A replaced handler is dropped outside the lock, because its
+        // destructor can reach back into the world: a restarted node's new
+        // handler displaces the old one, whose drop may wake a task.
+        drop(replaced);
     }
 
     fn local_node(&self) -> NodeId {
