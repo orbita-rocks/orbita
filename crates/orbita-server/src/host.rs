@@ -187,6 +187,8 @@ pub(crate) struct PartitionHost<R: Runtime> {
     /// Serialises releasing them, since the storage engine requires Lamport
     /// order and discards anything that arrives out of it.
     applying: tokio::sync::Mutex<()>,
+    /// Serializes segment publication with the WAL checkpoint it permits.
+    flushing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<R: Runtime> PartitionHost<R> {
@@ -296,6 +298,7 @@ impl<R: Runtime> PartitionHost<R> {
         let (applies, queue) = tokio::sync::mpsc::unbounded_channel();
         let pending = Arc::new(Mutex::new(PendingSet::default()));
         let drained = Arc::new(tokio::sync::Notify::new());
+        let flushing = Arc::new(tokio::sync::Mutex::new(()));
 
         // The applier holds weak references so that dropping a host retires
         // its storage engine there and then. A background task keeping the
@@ -303,9 +306,14 @@ impl<R: Runtime> PartitionHost<R> {
         // its replacement has opened the same partition.
         runtime.spawn(apply_loop(
             spec.id,
-            Arc::downgrade(&storage),
-            Arc::downgrade(&pending),
-            Arc::downgrade(&drained),
+            ApplyTarget {
+                storage: Arc::downgrade(&storage),
+                pending: Arc::downgrade(&pending),
+                drained: Arc::downgrade(&drained),
+                log: Arc::downgrade(&log),
+                flushing: Arc::downgrade(&flushing),
+                flush_on_trigger: wal.is_some(),
+            },
             queue,
         ));
 
@@ -328,6 +336,7 @@ impl<R: Runtime> PartitionHost<R> {
             committed: Mutex::new(Lamport::ZERO),
             withheld: Mutex::new(VecDeque::new()),
             applying: tokio::sync::Mutex::new(()),
+            flushing,
         })
     }
 
@@ -462,6 +471,16 @@ impl<R: Runtime> PartitionHost<R> {
     /// compares against the split threshold.
     pub(crate) async fn size_bytes(&self) -> Result<u64> {
         self.storage.size_bytes().await
+    }
+
+    /// Publishes every applied write and checkpoints only after the manifest
+    /// swap is durable.
+    pub(crate) async fn flush(&self) -> Result<()> {
+        if !self.is_owner() {
+            return Ok(());
+        }
+        self.wait_for_applies().await;
+        flush_and_checkpoint(&self.storage, &self.log, &self.flushing, true).await
     }
 
     /// Evaluates the condition, commits through the log, and answers the
@@ -814,6 +833,13 @@ impl<R: Runtime> PartitionHost<R> {
                 );
                 continue;
             }
+            if let Err(error) = self.storage.reclaim_published_if_needed().await {
+                tracing::warn!(
+                    partition = self.id.get(),
+                    %error,
+                    "replica could not reclaim entries covered by the published manifest"
+                );
+            }
             self.read_state
                 .lock()
                 .expect("read state poisoned")
@@ -913,11 +939,18 @@ impl<R: Runtime> PartitionHost<R> {
 /// Order is not an optimisation here. The storage engine tracks one committed
 /// Lamport per partition and ignores anything at or below it, so an apply that
 /// runs out of order does not merely land late, it is discarded.
-async fn apply_loop<R: Runtime>(
-    partition: PartitionId,
+struct ApplyTarget<R: Runtime> {
     storage: Weak<Partition<R>>,
     pending: Weak<Mutex<PendingSet>>,
     drained: Weak<tokio::sync::Notify>,
+    log: Weak<PartitionLog<R>>,
+    flushing: Weak<tokio::sync::Mutex<()>>,
+    flush_on_trigger: bool,
+}
+
+async fn apply_loop<R: Runtime>(
+    partition: PartitionId,
+    target: ApplyTarget<R>,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<
         tokio::sync::oneshot::Receiver<Option<Mutation>>,
     >,
@@ -930,27 +963,68 @@ async fn apply_loop<R: Runtime>(
         let Ok(Some(mutation)) = slot.await else {
             continue;
         };
-        let (Some(storage), Some(pending)) = (storage.upgrade(), pending.upgrade()) else {
+        let (Some(storage), Some(pending)) = (target.storage.upgrade(), target.pending.upgrade())
+        else {
             // The partition closed underneath us. Anything unapplied is still
             // in the log, and recovery replays it.
             return;
         };
-        if let Err(error) = storage.apply(&mutation).await {
-            tracing::error!(
-                partition = partition.get(),
-                lamport = mutation.lamport.get(),
-                %error,
-                "applying an acknowledged write to storage failed"
-            );
+        let applied = match storage.apply(&mutation).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(
+                    partition = partition.get(),
+                    lamport = mutation.lamport.get(),
+                    %error,
+                    "applying an acknowledged write to storage failed"
+                );
+                false
+            }
+        };
+        if applied && target.flush_on_trigger {
+            if let (Some(log), Some(flushing)) = (target.log.upgrade(), target.flushing.upgrade()) {
+                if let Err(error) = flush_and_checkpoint(&storage, &log, &flushing, false).await {
+                    tracing::warn!(
+                        partition = partition.get(),
+                        %error,
+                        "size-triggered flush failed; the WAL remains replayable"
+                    );
+                }
+            }
         }
         pending
             .lock()
             .expect("pending set poisoned")
             .applied(&mutation.key, mutation.lamport);
-        if let Some(drained) = drained.upgrade() {
+        if let Some(drained) = target.drained.upgrade() {
             drained.notify_waiters();
         }
     }
+}
+
+/// Keeps the manifest horizon and WAL checkpoint in their required order.
+async fn flush_and_checkpoint<R: Runtime>(
+    storage: &Partition<R>,
+    log: &PartitionLog<R>,
+    flushing: &tokio::sync::Mutex<()>,
+    force: bool,
+) -> Result<()> {
+    let _ordered = flushing.lock().await;
+    if force {
+        storage.flush().await?;
+    } else {
+        storage.flush_if_needed().await?;
+    }
+
+    let flushed = storage.flushed_lamport().await?;
+    // A promoted node may open a manifest ahead of the WAL it retained. The
+    // manifest proves that every local entry is durable, but the checkpoint
+    // record cannot claim a Lamport this log has never held.
+    let checkpoint = flushed.min(log.durable_lamport().await);
+    if checkpoint > log.applied_through().await {
+        log.checkpoint(checkpoint).await?;
+    }
+    Ok(())
 }
 
 /// Polls a future once and reports whether it finished.
@@ -1059,12 +1133,509 @@ fn mutation_of_op(lamport: Lamport, key: &Bytes, op: &WalOp) -> Mutation {
 mod tests {
     use super::*;
 
+    use async_trait::async_trait;
+    use orbita_core::{KeyspaceId, NodeId};
+    use orbita_format::segment::Segment;
+    use orbita_format::testing::MemoryStore;
+    use orbita_format::{load_manifest, PartitionPath};
+    use orbita_objectstore::{ETag, ObjectError, ObjectMeta, ObjectResult, Precondition};
+    use orbita_sim::{SimRuntime, Simulation};
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     fn record(version: u64) -> Record {
         Record {
             value: Bytes::from_static(b"v"),
             version: Version(version),
             expires_at_millis: None,
         }
+    }
+
+    struct FaultStore {
+        inner: MemoryStore,
+        fail_segment: AtomicBool,
+        fail_manifest: AtomicBool,
+        range_reads: AtomicUsize,
+    }
+
+    impl FaultStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_segment: AtomicBool::new(false),
+                fail_manifest: AtomicBool::new(false),
+                range_reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_next_segment(&self) {
+            self.fail_segment.store(true, Ordering::Release);
+        }
+
+        fn fail_next_manifest(&self) {
+            self.fail_manifest.store(true, Ordering::Release);
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FaultStore {
+        async fn put(&self, key: &str, data: Bytes) -> ObjectResult<ETag> {
+            if key.contains("/segments/") && self.fail_segment.swap(false, Ordering::AcqRel) {
+                return Err(ObjectError::Transient(
+                    "injected segment failure".to_string(),
+                ));
+            }
+            self.inner.put(key, data).await
+        }
+
+        async fn put_if(
+            &self,
+            key: &str,
+            data: Bytes,
+            precondition: Precondition,
+        ) -> ObjectResult<ETag> {
+            if key.ends_with("manifest.json") && self.fail_manifest.swap(false, Ordering::AcqRel) {
+                return Err(ObjectError::Transient(
+                    "injected manifest failure".to_string(),
+                ));
+            }
+            self.inner.put_if(key, data, precondition).await
+        }
+
+        async fn get(&self, key: &str) -> ObjectResult<(Bytes, ETag)> {
+            self.inner.get(key).await
+        }
+
+        async fn get_range(&self, key: &str, range: Range<u64>) -> ObjectResult<Bytes> {
+            self.range_reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_range(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> ObjectResult<ObjectMeta> {
+            self.inner.head(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> ObjectResult<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> ObjectResult<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    fn partition_path() -> PartitionPath {
+        PartitionPath::new("", KeyspaceId(1), PartitionId(1))
+    }
+
+    fn start_host(
+        sim: &Simulation,
+        runtime: SimRuntime,
+        store: Arc<FaultStore>,
+    ) -> Arc<PartitionHost<SimRuntime>> {
+        let paths = PartitionPaths {
+            store,
+            path: partition_path(),
+            wal_dir: "wal/p1".to_string(),
+        };
+        sim.block_on(async move {
+            PartitionHost::open_owner(
+                runtime,
+                HostSpec {
+                    id: PartitionId(1),
+                    epoch: Epoch(1),
+                    range: KeyRange::unbounded(),
+                    lease: LeasePolicy::default(),
+                },
+                &paths,
+                Vec::new(),
+            )
+            .await
+            .expect("the owner opens")
+        })
+    }
+
+    fn start_replica(
+        sim: &Simulation,
+        runtime: SimRuntime,
+        store: Arc<FaultStore>,
+    ) -> Arc<PartitionHost<SimRuntime>> {
+        let paths = PartitionPaths {
+            store,
+            path: partition_path(),
+            wal_dir: "wal/replica-p1".to_string(),
+        };
+        sim.block_on(async move {
+            PartitionHost::open_replica(
+                runtime,
+                HostSpec {
+                    id: PartitionId(1),
+                    epoch: Epoch(1),
+                    range: KeyRange::unbounded(),
+                    lease: LeasePolicy::default(),
+                },
+                &paths,
+            )
+            .await
+            .expect("the replica opens")
+        })
+    }
+
+    fn write_one(sim: &Simulation, host: &Arc<PartitionHost<SimRuntime>>) {
+        let host = Arc::clone(host);
+        sim.block_on(async move {
+            host.write(
+                Bytes::from_static(b"key"),
+                WriteOp::Put {
+                    value: Bytes::from_static(b"value"),
+                    ttl_millis: None,
+                },
+                WriteCondition::None,
+            )
+            .await
+            .expect("the WAL commit succeeds")
+        });
+    }
+
+    fn publish_horizon(
+        sim: &Simulation,
+        runtime: SimRuntime,
+        store: Arc<FaultStore>,
+        horizon: Lamport,
+    ) {
+        sim.block_on(async move {
+            let partition = Partition::open(
+                runtime,
+                store as Arc<dyn ObjectStore>,
+                partition_path(),
+                Epoch(1),
+                KeyRange::unbounded(),
+            )
+            .await
+            .unwrap();
+            partition
+                .apply(&Mutation::put(
+                    horizon,
+                    Bytes::from_static(b"published"),
+                    Bytes::from_static(b"value"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            partition.flush().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_successful_live_flush_publishes_partition_v1_before_checkpointing_the_wal() {
+        let sim = Simulation::new(16);
+        let store = Arc::new(FaultStore::new());
+        let host = start_host(&sim, sim.add_node(NodeId(1)), Arc::clone(&store));
+        write_one(&sim, &host);
+
+        let flushing = Arc::clone(&host);
+        sim.block_on(async move { flushing.flush().await.expect("the flush succeeds") });
+
+        let (manifest, checkpoint, segment) = sim.block_on({
+            let host = Arc::clone(&host);
+            let store = Arc::clone(&store);
+            async move {
+                let manifest = load_manifest(store.as_ref(), &partition_path())
+                    .await
+                    .expect("the manifest reads")
+                    .expect("the manifest was published")
+                    .0;
+                let (bytes, _) = store
+                    .get(&partition_path().object(&manifest.segments[0].name))
+                    .await
+                    .expect("the manifest's segment exists");
+                let segment = Segment::decode(&bytes).expect("production wrote partition-v1");
+                (manifest, host.log.applied_through().await, segment)
+            }
+        });
+        assert_eq!(manifest.committed_lamport, Lamport(1));
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(checkpoint, manifest.committed_lamport);
+        assert_eq!(segment.records()[0].key, Bytes::from_static(b"key"));
+    }
+
+    #[test]
+    fn committed_replica_applies_reclaim_the_owners_published_horizon() {
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        let replica = start_replica(&sim, runtime.clone(), Arc::clone(&store));
+
+        let entries: Vec<WalEntry> = (1..=32)
+            .map(|lamport| WalEntry {
+                lamport: Lamport(lamport),
+                epoch: Epoch(1),
+                partition: PartitionId(1),
+                op: WalOp::Put {
+                    key: Bytes::from(format!("k{lamport}")),
+                    value: Bytes::from(vec![lamport as u8; orbita_core::MAX_VALUE_BYTES]),
+                    expires_at_millis: None,
+                },
+            })
+            .collect();
+        for entry in &entries {
+            let replica = Arc::clone(&replica);
+            let entry = entry.clone();
+            sim.block_on(async move { replica.apply_replicated(&entry).await.unwrap() });
+        }
+
+        sim.block_on({
+            let store = Arc::clone(&store);
+            let entries = entries.clone();
+            async move {
+                let owner = Partition::open(
+                    runtime,
+                    store as Arc<dyn ObjectStore>,
+                    partition_path(),
+                    Epoch(1),
+                    KeyRange::unbounded(),
+                )
+                .await
+                .unwrap();
+                for entry in &entries {
+                    owner.apply(&mutation_of(entry)).await.unwrap();
+                }
+                owner.flush().await.unwrap();
+            }
+        });
+
+        let replica_to_commit = Arc::clone(&replica);
+        sim.block_on(async move { replica_to_commit.commit_through(Lamport(32)).await });
+        let replica_to_read = Arc::clone(&replica);
+        sim.block_on(async move {
+            assert!(replica_to_read.get(b"k32").await.unwrap().is_some());
+        });
+        assert!(
+            store.range_reads.load(Ordering::Relaxed) > 0,
+            "the host's production release path replaced the memtable with the published index"
+        );
+    }
+
+    #[test]
+    fn a_failed_segment_upload_keeps_the_write_in_the_wal_and_memtable() {
+        let sim = Simulation::new(16);
+        let store = Arc::new(FaultStore::new());
+        let host = start_host(&sim, sim.add_node(NodeId(1)), Arc::clone(&store));
+        write_one(&sim, &host);
+        store.fail_next_segment();
+
+        let flushing = Arc::clone(&host);
+        assert!(sim.block_on(async move { flushing.flush().await }).is_err());
+
+        let host = Arc::clone(&host);
+        let store = Arc::clone(&store);
+        sim.block_on(async move {
+            assert_eq!(host.log.applied_through().await, Lamport::ZERO);
+            assert!(host.get(b"key").await.unwrap().is_some());
+            assert!(load_manifest(store.as_ref(), &partition_path())
+                .await
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn a_fresh_promoted_wal_does_not_checkpoint_beyond_the_manifest_it_opened() {
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        publish_horizon(&sim, runtime.clone(), Arc::clone(&store), Lamport(9));
+
+        let host = start_host(&sim, runtime, store);
+        let flushing = Arc::clone(&host);
+        sim.block_on(async move { flushing.flush().await.expect("an empty WAL is valid") });
+
+        let host = Arc::clone(&host);
+        assert_eq!(
+            sim.block_on(async move { host.log.applied_through().await }),
+            Lamport::ZERO,
+            "a checkpoint never names a Lamport the local WAL did not hold"
+        );
+    }
+
+    #[test]
+    fn a_truncated_promoted_wal_checkpoints_only_its_local_durable_prefix() {
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        let wal = sim.block_on({
+            let runtime = runtime.clone();
+            async move {
+                Wal::open(runtime, WalConfig::new(PartitionId(1), "wal/p1", Epoch(1)))
+                    .await
+                    .unwrap()
+            }
+        });
+        for key in ["a", "b", "c"] {
+            let wal = Arc::clone(&wal);
+            sim.block_on(async move {
+                wal.commit(WalOp::Put {
+                    key: Bytes::copy_from_slice(key.as_bytes()),
+                    value: Bytes::from_static(b"value"),
+                    expires_at_millis: None,
+                })
+                .await
+                .unwrap();
+            });
+        }
+        drop(wal);
+        publish_horizon(&sim, runtime.clone(), Arc::clone(&store), Lamport(9));
+
+        let host = start_host(&sim, runtime, store);
+        let flushing = Arc::clone(&host);
+        sim.block_on(async move { flushing.flush().await.expect("the prefix is covered") });
+
+        let host = Arc::clone(&host);
+        assert_eq!(
+            sim.block_on(async move { host.log.applied_through().await }),
+            Lamport(3),
+            "the checkpoint is capped at the local WAL's durable end"
+        );
+    }
+
+    #[test]
+    fn a_failed_manifest_publication_never_checkpoints_past_the_unpublished_segment() {
+        let sim = Simulation::new(16);
+        let store = Arc::new(FaultStore::new());
+        let host = start_host(&sim, sim.add_node(NodeId(1)), Arc::clone(&store));
+        write_one(&sim, &host);
+        store.fail_next_manifest();
+
+        let flushing = Arc::clone(&host);
+        assert!(sim.block_on(async move { flushing.flush().await }).is_err());
+
+        let host = Arc::clone(&host);
+        sim.block_on(async move {
+            assert_eq!(host.log.applied_through().await, Lamport::ZERO);
+            assert!(host.get(b"key").await.unwrap().is_some());
+        });
+        assert_eq!(
+            store
+                .inner
+                .keys()
+                .iter()
+                .filter(|key| key.contains("/segments/"))
+                .count(),
+            1,
+            "the uploaded object is an orphan until a retry publishes another segment"
+        );
+    }
+
+    #[test]
+    fn restart_after_a_failed_publication_replays_and_retries_without_reusing_the_orphan_name() {
+        let sim = Simulation::new(16);
+        let store = Arc::new(FaultStore::new());
+        let runtime = sim.add_node(NodeId(1));
+        let host = start_host(&sim, runtime.clone(), Arc::clone(&store));
+        write_one(&sim, &host);
+        store.fail_next_manifest();
+        let flushing = Arc::clone(&host);
+        assert!(sim.block_on(async move { flushing.flush().await }).is_err());
+        drop(host);
+
+        let restarted = start_host(&sim, runtime, Arc::clone(&store));
+        let flushing = Arc::clone(&restarted);
+        sim.block_on(async move { flushing.flush().await.expect("the retry succeeds") });
+
+        let manifest = sim.block_on({
+            let store = Arc::clone(&store);
+            async move {
+                load_manifest(store.as_ref(), &partition_path())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0
+            }
+        });
+        assert_eq!(manifest.committed_lamport, Lamport(1));
+        assert!(manifest.segments[0].name.ends_with("0000000000000001.oseg"));
+        assert_eq!(
+            store
+                .inner
+                .keys()
+                .iter()
+                .filter(|key| key.contains("/segments/"))
+                .count(),
+            2,
+            "the failed attempt's sequence zero object was not overwritten"
+        );
+    }
+
+    #[test]
+    fn a_stale_live_writer_cannot_replace_the_new_epochs_manifest() {
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        let path = partition_path();
+
+        let (stale, replacement) = sim.block_on({
+            let runtime = runtime.clone();
+            let store = Arc::clone(&store);
+            let path = path.clone();
+            async move {
+                let stale = Partition::open(
+                    runtime.clone(),
+                    Arc::clone(&store) as Arc<dyn ObjectStore>,
+                    path.clone(),
+                    Epoch(6),
+                    KeyRange::unbounded(),
+                )
+                .await
+                .unwrap();
+                let replacement = Partition::open(
+                    runtime,
+                    store as Arc<dyn ObjectStore>,
+                    path,
+                    Epoch(7),
+                    KeyRange::unbounded(),
+                )
+                .await
+                .unwrap();
+                (stale, replacement)
+            }
+        });
+
+        sim.block_on(async move {
+            replacement
+                .apply(&Mutation::put(
+                    Lamport(9),
+                    Bytes::from_static(b"winner"),
+                    Bytes::from_static(b"v"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            replacement.flush().await.unwrap();
+
+            stale
+                .apply(&Mutation::put(
+                    Lamport(3),
+                    Bytes::from_static(b"stale"),
+                    Bytes::from_static(b"v"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert!(stale.flush().await.is_err(), "epoch 6 was deposed");
+        });
+
+        let manifest = sim.block_on({
+            let store = Arc::clone(&store);
+            async move {
+                load_manifest(store.as_ref(), &path)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0
+            }
+        });
+        assert_eq!(manifest.epoch, Epoch(7));
+        assert_eq!(manifest.committed_lamport, Lamport(9));
     }
 
     #[test]

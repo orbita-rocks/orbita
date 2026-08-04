@@ -85,7 +85,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use orbita_core::{KeyspaceName, NodeId};
-use orbita_server::{Server, ServerConfig};
+use orbita_objectstore::s3::Credentials;
+use orbita_server::{S3StorageConfig, Server, ServerConfig};
 
 use crate::config::{ClusterConfig, Config, Role};
 
@@ -190,6 +191,30 @@ fn server_config(
             .with_peers(peers)
             .with_leader_group(voters)
             .with_leader_member(config.node.role == Role::Leader);
+    }
+
+    if let Some(endpoint) = &config.object_store.endpoint {
+        let credentials = match (
+            config.object_store.access_key_id.clone(),
+            config.object_store.secret_access_key.clone(),
+        ) {
+            (Some(access_key_id), Some(secret_access_key)) => Some(Credentials {
+                access_key_id,
+                secret_access_key,
+                session_token: None,
+            }),
+            (None, None) => None,
+            _ => bail!(
+                "object_store.access_key_id and object_store.secret_access_key must be set together"
+            ),
+        };
+        server_config = server_config.with_object_store(S3StorageConfig {
+            endpoint: endpoint.clone(),
+            bucket: config.object_store.bucket.clone(),
+            region: config.object_store.region.clone(),
+            credentials,
+            force_path_style: config.object_store.force_path_style,
+        });
     }
 
     // The keyspace has to exist before the node serves, because the map a
@@ -480,7 +505,7 @@ pub fn version_skew_message(ours: &str, theirs: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClusterLayer, Layer, NodeLayer};
+    use crate::config::{ClusterLayer, Layer, NodeLayer, ObjectStoreLayer};
 
     fn options() -> NodeOptions {
         NodeOptions {
@@ -559,6 +584,74 @@ mod tests {
     fn the_peer_advertise_address_defaults_to_the_client_host_and_the_peer_port() {
         let config = config(Role::Worker, &[], "worker-1:7100");
         assert_eq!(config.node.peer_advertise, "worker-1:7101");
+    }
+
+    #[test]
+    fn configured_object_storage_reaches_the_server_startup_config() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store = ObjectStoreLayer {
+            endpoint: Some("http://minio:9000".to_string()),
+            bucket: Some("orbita".to_string()),
+            region: Some("us-east-1".to_string()),
+            access_key_id: Some("orbita".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            force_path_style: Some(true),
+        };
+        let config = layer.resolve().unwrap();
+
+        let server = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+
+        let object_store = server.object_store.expect("S3 was selected");
+        assert_eq!(object_store.endpoint, "http://minio:9000");
+        assert_eq!(object_store.bucket, "orbita");
+        assert!(object_store.credentials.is_some());
+        assert!(object_store.force_path_style);
+    }
+
+    #[test]
+    fn an_object_store_endpoint_without_static_keys_uses_the_aws_chain() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+        layer.object_store.force_path_style = Some(false);
+        let config = layer.resolve().unwrap();
+
+        let server = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert!(server
+            .object_store
+            .expect("S3 was selected")
+            .credentials
+            .is_none());
+    }
+
+    #[test]
+    fn partial_static_object_store_credentials_fail_before_startup() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("http://minio:9000".to_string());
+        layer.object_store.access_key_id = Some("orbita".to_string());
+        let config = layer.resolve().unwrap();
+
+        let error = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("must be set together"));
     }
 
     fn backoff(initial: u64, max: u64, timeout: u64) -> JoinBackoff {

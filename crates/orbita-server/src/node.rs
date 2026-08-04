@@ -723,6 +723,30 @@ impl<R: Runtime> Node<R> {
             host.renew_leases().await;
         }
     }
+
+    /// Flushes every partition this node currently owns once.
+    ///
+    /// One pass rather than an internal timer keeps the same production code
+    /// directly drivable under deterministic simulation.
+    pub(crate) async fn flush_owned(&self) {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner())
+            .cloned()
+            .collect();
+        for host in hosts {
+            if let Err(error) = host.flush().await {
+                tracing::warn!(
+                    partition = host.id().get(),
+                    %error,
+                    "periodic flush failed; the WAL remains replayable"
+                );
+            }
+        }
+    }
 }
 
 /// Serves requests other nodes forwarded here.
