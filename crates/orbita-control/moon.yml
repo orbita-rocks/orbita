@@ -9,3 +9,5 @@ dependsOn:
   - 'orbita-proto'
   - id: 'orbita-sim'
     scope: 'development'
+  - id: 'orbita-wal'
+    scope: 'development'

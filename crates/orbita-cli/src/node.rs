@@ -13,21 +13,17 @@
 //! wrong at exactly the moment somebody is deciding whether to keep going.
 //! Orbita does neither.
 //!
-//! - A leader node reads `cluster.leader_peers`, which is the complete initial
+//! - A leader node reads `cluster.leader_peers`, which is the complete fixed
 //!   membership and is identical on every leader. It is a static list because
 //!   it has to be knowable before anything is running, and every orchestrator
 //!   can already produce a stable list of names for a StatefulSet.
-//! - If the data directory already holds a Raft log, the list is ignored
-//!   entirely and membership comes from the log. This matters more than it
-//!   looks: it means the list can stay in a Helm template forever, and that
-//!   adding a fourth leader later does not conflict with what the template
-//!   says.
-//! - On a genuinely fresh start, the node with the lowest address in the list
-//!   creates the initial Raft configuration containing all of the peers, and
-//!   the others wait to hear from it. Choosing by a total order over the list
-//!   rather than by a race is what prevents two nodes from each forming a
-//!   single-node cluster and both believing they are the leader group. Every
-//!   node computes the same answer from the same list with no coordination.
+//! - The voter IDs are persisted beside the Raft log and checked on every
+//!   restart. A changed template cannot silently redefine an existing cluster;
+//!   dynamic membership is deliberately outside this fixed-voter boundary.
+//! - On a genuinely fresh start, the configured voters elect one leader and
+//!   only that leader creates the initial control state. A lone member of a
+//!   three-voter set cannot bootstrap, so it cannot accidentally form a second
+//!   cluster while its peers are unavailable.
 //! - Workers do not bootstrap. A worker dials any leader address, registers,
 //!   and is told the partition map. A worker that starts before the leader
 //!   group exists retries rather than failing, because in a container
@@ -82,6 +78,7 @@
 //! 0004: peer framing is compatible within a cluster version window rather
 //! than not at all, which is what makes a rolling upgrade possible.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
@@ -109,32 +106,12 @@ pub struct NodeOptions {
 /// Every other command is a network client, so a change to the server's API is
 /// a change to this one function rather than to twenty.
 ///
-/// The client listener, the data directory, the node id, and the startup
-/// keyspace are wired up. The peer listener and the leader peer list are
-/// resolved and validated here but not yet handed to the server, because the
-/// server does not accept them yet. The `TODO(peer-listener)` below is the
-/// single place that changes when it does.
 pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
     preflight(config, options)?;
     prepare_data_dir(&config.node.data_dir, false)?;
 
     let listen = resolve("node.listen", &config.node.listen)?;
     let peer_listen = resolve("node.peer_listen", &config.node.peer_listen)?;
-
-    // TODO(leader-peers): the leader peer list does not reach the server yet.
-    // `ServerConfig::with_peers` wants pairs of node id and address, and
-    // `cluster.leader_peers` is addresses alone, because an operator writing a
-    // peer list should not also have to keep a node id table in sync with it.
-    // Closing that gap is a question for the server's registration path, not
-    // for this crate to guess at, so the list is carried and logged here and
-    // wired up when there is somewhere to put it.
-    if !config.cluster.leader_peers.is_empty() {
-        tracing::info!(
-            leader_peers = %config.cluster.leader_peers.join(","),
-            peer_advertise = %config.node.peer_advertise,
-            "the leader group is configured but this build does not yet register with it"
-        );
-    }
 
     // A worker whose leader group is not up yet retries instead of failing.
     // Nobody chooses start order in an orchestrator, and a worker that exits
@@ -203,7 +180,17 @@ fn server_config(
     let mut server_config = ServerConfig::single_node(&config.node.data_dir)
         .with_node_id(NodeId(config.node.id))
         .with_listen_addr(listen)
-        .with_peer_listen_addr(peer_listen);
+        .with_peer_listen_addr(peer_listen)
+        .with_peer_advertise_addr(config.node.peer_advertise.clone());
+
+    let peers = parse_leader_peers(&config.cluster.leader_peers)?;
+    if !peers.is_empty() {
+        let voters = peers.iter().map(|(node, _)| *node).collect();
+        server_config = server_config
+            .with_peers(peers)
+            .with_leader_group(voters)
+            .with_leader_member(config.node.role == Role::Leader);
+    }
 
     // The keyspace has to exist before the node serves, because the map a
     // worker opens its partitions from is built at start. Creating it after
@@ -300,6 +287,46 @@ pub fn preflight(config: &Config, options: &NodeOptions) -> Result<()> {
         );
     }
     if !options.dev {
+        let peers = parse_leader_peers(&config.cluster.leader_peers)?;
+        if config.node.role == Role::Worker
+            && peers.iter().any(|(node, _)| node.get() == config.node.id)
+        {
+            bail!(
+                "worker node id {} is also a fixed leader voter id in cluster.leader_peers; \
+                 assign the worker an id outside the voter set",
+                config.node.id
+            );
+        }
+        if config.node.role == Role::Leader {
+            let local = NodeId(config.node.id);
+            let configured = peers
+                .iter()
+                .find_map(|(node, address)| (*node == local).then_some(address));
+            let Some(configured) = configured else {
+                bail!(
+                    "leader node {} is missing from cluster.leader_peers; add {}={}",
+                    config.node.id,
+                    config.node.id,
+                    config.node.peer_advertise
+                );
+            };
+            if configured != &config.node.peer_advertise {
+                bail!(
+                    "leader node {} advertises {}, but cluster.leader_peers maps it to {}; make \
+                     the complete peer set identical on every node",
+                    config.node.id,
+                    config.node.peer_advertise,
+                    configured
+                );
+            }
+        }
+        if !peers.is_empty() && peers.len() < 3 {
+            bail!(
+                "cluster.leader_peers has {} voters, but a production leader group needs at \
+                 least 3. Use `orbita dev` for a supported single-node cluster",
+                peers.len()
+            );
+        }
         if let Some(option) = unroutable("node.advertise", &config.node.advertise) {
             bail!(
                 "{option} is {}, which nothing can dial. Set it to an address clients can reach",
@@ -323,6 +350,58 @@ pub fn preflight(config: &Config, options: &NodeOptions) -> Result<()> {
                 config.node.advertise
             );
         }
+    }
+    Ok(())
+}
+
+/// Parses the fixed leader voter set while preserving its configured addresses.
+pub fn parse_leader_peers(entries: &[String]) -> Result<Vec<(NodeId, String)>> {
+    let mut by_id = BTreeMap::new();
+    let mut addresses = BTreeSet::new();
+    for entry in entries {
+        let Some((id, address)) = entry.split_once('=') else {
+            bail!(
+                "cluster.leader_peers entry {entry:?} is malformed; expected NODE_ID=HOST:PORT, \
+                 for example 1=leader-0:7101"
+            );
+        };
+        let id: u64 = id.parse().with_context(|| {
+            format!("cluster.leader_peers entry {entry:?} has an invalid node id")
+        })?;
+        if id == 0 {
+            bail!("cluster.leader_peers node ids must be greater than zero, got {entry:?}");
+        }
+        validate_host_port(entry, address)?;
+        if by_id.insert(NodeId(id), address.to_owned()).is_some() {
+            bail!("cluster.leader_peers contains node id {id} more than once");
+        }
+        if !addresses.insert(address) {
+            bail!("cluster.leader_peers contains address {address:?} more than once");
+        }
+    }
+    Ok(by_id.into_iter().collect())
+}
+
+fn validate_host_port(entry: &str, address: &str) -> Result<()> {
+    let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            bail!("cluster.leader_peers entry {entry:?} needs an IPv6 address in [HOST]:PORT form");
+        };
+        (host, port)
+    } else {
+        let Some((host, port)) = address.rsplit_once(':') else {
+            bail!("cluster.leader_peers entry {entry:?} is missing its port");
+        };
+        (host, port)
+    };
+    if host.is_empty() {
+        bail!("cluster.leader_peers entry {entry:?} is missing its host");
+    }
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("cluster.leader_peers entry {entry:?} has an invalid port"))?;
+    if port == 0 {
+        bail!("cluster.leader_peers entry {entry:?} cannot advertise port zero");
     }
     Ok(())
 }
@@ -519,7 +598,12 @@ mod tests {
 
     #[test]
     fn giving_up_names_the_addresses_that_were_tried_and_how_to_wait_longer() {
-        let cluster = config(Role::Worker, &["leader-1:7101", "leader-2:7101"], "w:7100").cluster;
+        let cluster = config(
+            Role::Worker,
+            &["1=leader-1:7101", "2=leader-2:7101"],
+            "w:7100",
+        )
+        .cluster;
         let message = join_give_up_message(&cluster);
         assert!(message.contains("leader-1:7101"), "{message}");
         assert!(message.contains("leader-2:7101"), "{message}");
@@ -533,6 +617,80 @@ mod tests {
             dev: true,
         };
         assert!(preflight(&config(Role::Leader, &[], "0.0.0.0:7100"), &dev).is_ok());
+    }
+
+    #[test]
+    fn a_peer_entry_without_a_stable_node_id_is_rejected_actionably() {
+        let error = parse_leader_peers(&["leader-1:7101".to_owned()]).unwrap_err();
+        assert!(format!("{error:#}").contains("NODE_ID=HOST:PORT"));
+    }
+
+    #[test]
+    fn duplicate_peer_ids_are_rejected() {
+        let error =
+            parse_leader_peers(&["1=leader-1:7101".to_owned(), "1=leader-2:7101".to_owned()])
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("node id 1 more than once"));
+    }
+
+    #[test]
+    fn duplicate_peer_addresses_are_rejected() {
+        let error =
+            parse_leader_peers(&["1=leader-1:7101".to_owned(), "2=leader-1:7101".to_owned()])
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("address \"leader-1:7101\" more than once"));
+    }
+
+    #[test]
+    fn a_leader_missing_itself_from_the_complete_set_is_rejected() {
+        let mut layer = layer(Role::Leader, &["2=leader-2:7101"], "leader-1:7100");
+        layer.node.id = Some(1);
+        layer.node.peer_advertise = Some("leader-1:7101".to_owned());
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("leader node 1 is missing"));
+    }
+
+    #[test]
+    fn a_leaders_advertised_address_must_match_the_complete_set() {
+        let mut layer = layer(Role::Leader, &["1=old-leader:7101"], "leader-1:7100");
+        layer.node.id = Some(1);
+        layer.node.peer_advertise = Some("leader-1:7101".to_owned());
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("maps it to old-leader:7101"));
+    }
+
+    #[test]
+    fn a_worker_cannot_reuse_a_fixed_voter_id() {
+        let mut layer = layer(
+            Role::Worker,
+            &["1=leader-1:7101", "2=leader-2:7101", "3=leader-3:7101"],
+            "worker-1:7100",
+        );
+        layer.node.id = Some(2);
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("also a fixed leader voter id"));
+    }
+
+    #[test]
+    fn a_production_leader_group_needs_at_least_three_voters() {
+        let mut layer = layer(
+            Role::Leader,
+            &["1=leader-1:7101", "2=leader-2:7101"],
+            "leader-1:7100",
+        );
+        layer.node.id = Some(1);
+        layer.node.peer_advertise = Some("leader-1:7101".to_owned());
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("needs at least 3"));
+    }
+
+    #[test]
+    fn dev_remains_the_explicit_single_node_exemption() {
+        let dev = NodeOptions {
+            create_keyspace: Some("default".to_owned()),
+            dev: true,
+        };
+        assert!(preflight(&config(Role::Leader, &[], "127.0.0.1:7100"), &dev).is_ok());
     }
 
     #[test]

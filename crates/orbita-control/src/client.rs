@@ -11,8 +11,8 @@ use crate::controller::Controller;
 use crate::membership::NodeStatus;
 use crate::version::{ClusterVersion, CompatibilityRefusal};
 use crate::wire::{
-    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
@@ -95,6 +95,21 @@ impl<R: Runtime> ControlClient<R> {
     pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
         match self.call(METHOD_FETCH_NODES, bytes::Bytes::new()).await? {
             ControlResponse::Nodes(nodes) => Ok(nodes),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The current leader's committed control-command index.
+    ///
+    /// A voter compares this authority with its own log and applied state
+    /// before becoming Ready. Merely observing a leader does not prove the
+    /// voter has the decisions that leader may need for the next quorum.
+    pub async fn fetch_commit_index(&self) -> Result<crate::LogIndex> {
+        match self
+            .call(METHOD_FETCH_COMMIT_INDEX, bytes::Bytes::new())
+            .await?
+        {
+            ControlResponse::CommitIndex(index) => Ok(index),
             other => Err(unexpected(&other)),
         }
     }
@@ -220,6 +235,9 @@ impl<R: Runtime> ControlClient<R> {
                     // another member would get the same answer.
                     return Err(Error::Internal(message));
                 }
+                Ok(ControlResponse::Unavailable(message)) => {
+                    last = Some(Error::Unavailable(message));
+                }
                 Ok(response) => {
                     *self.preferred.lock().expect("control client lock poisoned") = Some(target);
                     return Ok(response);
@@ -277,14 +295,17 @@ impl<R: Runtime, L: ConsensusLog> LocalControlClient<R, L> {
     }
 
     pub async fn fetch_map(&self) -> Result<PartitionMap> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.partition_map().await)
     }
 
     pub async fn fetch_map_if_newer(&self, have: MapVersion) -> Result<Option<PartitionMap>> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.partition_map_if_newer(have).await)
     }
 
     pub async fn report_status(&self, node: NodeId, status: NodeStatus) -> Result<()> {
+        self.controller.ensure_leader_ready().await?;
         match self.controller.record_status(node, status).await? {
             crate::controller::RegistrationOutcome::Accepted(_) => Ok(()),
             crate::controller::RegistrationOutcome::Incompatible(refusal) => {
@@ -294,6 +315,7 @@ impl<R: Runtime, L: ConsensusLog> LocalControlClient<R, L> {
     }
 
     pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.node_addresses().await)
     }
 }

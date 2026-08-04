@@ -26,9 +26,26 @@ networkPolicy.enabled if your CNI enforces policy.
 {{- end }}
 
 Before you upgrade this release, read docs/UPGRADES.md. Readiness here means
-the process is answering, not that the node has rejoined and caught up, so a
-rolling update can advance faster than the data does. Stage it with the
-StatefulSet partition field rather than trusting the rollout.
+the node has rejoined and caught up, while liveness means only that the process
+answers. Keep those two checks separate during an incident.
+{{- if .Values.leader.firstRaftUpgrade }}
+
+FIRST RAFT UPGRADE: the leader StatefulSet is OnDelete because the old pods
+cannot vote for the first new pod during a normal rolling update.
+
+Replace two voters together, then wait for their two-of-three quorum:
+
+  kubectl --namespace {{ .Release.Namespace }} delete pod {{ include "orbita.fullname" . }}-leader-1 {{ include "orbita.fullname" . }}-leader-2
+  kubectl --namespace {{ .Release.Namespace }} wait --for=condition=Ready pod/{{ include "orbita.fullname" . }}-leader-1 pod/{{ include "orbita.fullname" . }}-leader-2 --timeout=10m
+
+Replace the last old voter and wait for it to catch up:
+
+  kubectl --namespace {{ .Release.Namespace }} delete pod {{ include "orbita.fullname" . }}-leader-0
+  kubectl --namespace {{ .Release.Namespace }} wait --for=condition=Ready pod/{{ include "orbita.fullname" . }}-leader-0 --timeout=10m
+
+Then run Helm again with leader.firstRaftUpgrade=false. This restores ordinary
+readiness-gated RollingUpdate for every later release.
+{{- end }}
 {{ if not .Values.objectStore.endpoint }}
 Warning: no object store is configured, so compacted data stays on local disks
 and replacing a worker means rehydrating it from its replicas. Set

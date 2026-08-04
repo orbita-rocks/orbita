@@ -30,13 +30,18 @@ pub const METHOD_FETCH_NODES: u16 = 3;
 /// back to [`METHOD_REPORT_STATUS`], which is how a new worker heartbeats an
 /// old leader mid-rollout.
 pub const METHOD_REPORT_STATUS_V2: u16 = 4;
+/// Reads the leader's committed control-command index. A restarting voter uses
+/// this as catch-up authority before it reports Ready.
+pub const METHOD_FETCH_COMMIT_INDEX: u16 = 5;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
 const STATUS_NOT_LEADER: u8 = 2;
 const STATUS_ERROR: u8 = 3;
 const STATUS_NODES: u8 = 4;
-const STATUS_INCOMPATIBLE: u8 = 5;
+const STATUS_COMMIT_INDEX: u8 = 5;
+const STATUS_UNAVAILABLE: u8 = 6;
+const STATUS_INCOMPATIBLE: u8 = 7;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -130,6 +135,11 @@ pub(crate) enum ControlResponse {
     /// answer, and handing it back is what lets an operator configure the
     /// leader group and nothing else.
     Nodes(Vec<(NodeId, String)>),
+    /// The leader's committed control-command index.
+    CommitIndex(crate::LogIndex),
+    /// This member cannot establish leader authority right now. Unlike a
+    /// command refusal, callers may try another member or retry later.
+    Unavailable(String),
     Incompatible(CompatibilityRefusal),
     Error(String),
 }
@@ -174,8 +184,14 @@ impl ControlResponse {
                 refusal.speaks.encode(&mut w);
                 refusal.active.encode(&mut w);
             }
+            ControlResponse::CommitIndex(index) => {
+                w.u8(STATUS_COMMIT_INDEX).u64(*index);
+            }
             ControlResponse::Error(message) => {
                 w.u8(STATUS_ERROR).str(message);
+            }
+            ControlResponse::Unavailable(message) => {
+                w.u8(STATUS_UNAVAILABLE).str(message);
             }
         }
         w.finish()
@@ -210,7 +226,9 @@ impl ControlResponse {
                 speaks: VersionRange::decode(&mut r)?,
                 active: ClusterVersion::decode(&mut r)?,
             }),
+            STATUS_COMMIT_INDEX => ControlResponse::CommitIndex(r.u64()?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
+            STATUS_UNAVAILABLE => ControlResponse::Unavailable(r.string()?),
             tag => {
                 return Err(CodecError::UnknownTag {
                     what: "control response",
@@ -384,7 +402,9 @@ mod tests {
                 speaks: VersionRange::new(ClusterVersion::new(0, 3), ClusterVersion::new(0, 4)),
                 active: ClusterVersion::new(0, 2),
             }),
+            ControlResponse::Unavailable("catching up".into()),
             ControlResponse::Error("no".into()),
+            ControlResponse::CommitIndex(42),
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),

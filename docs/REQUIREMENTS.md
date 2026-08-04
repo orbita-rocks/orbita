@@ -237,6 +237,17 @@ Object storage access goes through a pluggable storage trait. v1 ships and
 supports the S3-compatible API only (AWS S3, MinIO, R2); other backends are
 the community's to add through the trait.
 
+Credentials for the S3 backend cannot be limited to static keys. On AWS the
+node must be able to assume an IAM role, and it must be able to source
+credentials from the instance profile via the instance metadata service, with
+role assumption as the preferred deployment and instance profiles required.
+Both hand out short-lived session credentials, so the node has to refresh them
+before expiry without interrupting in-flight work. This matters because
+long-lived access keys in a Secret are exactly what security-conscious AWS
+shops prohibit; without keyless credential sourcing, a real AWS deployment of
+Orbita fails their review before it starts. Static keys stay supported,
+because MinIO and R2 offer nothing else.
+
 ### Failure handling
 
 When a partition owner dies, the leader group detects it via missed

@@ -1,39 +1,21 @@
-//! The seam where Raft goes.
-//!
-//! # This is staging, not an oversight
-//!
-//! `docs/plan/03-control.md` says the leader group runs Raft, and it will.
-//! What ships here is the replicated state machine, the failover protocol, the
-//! partition map, and the admin surface, with consensus behind
-//! [`ConsensusLog`] and a single-node implementation underneath it. That order
-//! is deliberate. Everything above the trait is where the correctness argument
-//! lives, and none of it gets easier to write or to test with a real Raft
-//! underneath. A single-node log is a correct implementation of the trait for
-//! a cluster of one, which is what `orbita dev` runs and what most of the
-//! simulator scenarios need, so the staging buys a working system now without
-//! costing anything later.
-//!
-//! What it does not do is survive the loss of the leader group node, and
-//! nothing in this crate pretends otherwise. A single-node control plane is
-//! not a production configuration.
-//!
-//! # How Raft slots in
+//! The seam consensus lives behind.
 //!
 //! [`ConsensusLog`] is three operations: propose a command and learn when it
 //! is committed, read the commit index, and read committed entries after a
-//! given index. That is deliberately the intersection of what `openraft` and
-//! `raft-rs` both offer.
+//! given index. Everything above the trait, meaning [`crate::state`],
+//! [`crate::controller`], and [`crate::client`], is where the correctness
+//! argument lives, and none of it knows how a command became committed.
 //!
-//! With `openraft`, `propose` becomes `Raft::client_write`, whose response
-//! already carries the log index, and `subscribe` is served from the state
-//! machine store's committed entries. `openraft`'s `RaftLogStorage` and
-//! `RaftNetwork` are implemented against `orbita_runtime::Disk` and
-//! `orbita_runtime::Transport`, which is the seam the brief calls out as the
-//! reason to adopt rather than build. Nothing in [`crate::state`],
-//! [`crate::controller`], or [`crate::client`] changes, because none of them
-//! knows how a command became committed.
+//! Two implementations sit underneath it. [`SingleNodeLog`], here, is the
+//! durable log for a cluster of one: it is what `orbita dev` runs and what
+//! most simulator scenarios need, and it is a correct implementation of the
+//! trait for that cluster size. [`crate::RaftLog`] is the replicated one, a
+//! Raft group run by `raft-rs` with its clock, network, storage, and
+//! randomness all routed through `orbita_runtime`, which is what lets the
+//! deterministic simulator drive its elections; the `raft` module documents
+//! that mapping.
 //!
-//! The one thing that does change is that `propose` starts failing with
+//! The one observable difference between them is that `propose` fails with
 //! "not the leader" on a follower. [`crate::controller::Controller`] already
 //! surfaces that, and [`crate::client::ControlClient`] already follows the
 //! redirect, because a single-node log is the degenerate case of a leader and
@@ -86,6 +68,15 @@ pub trait ConsensusLog: Send + Sync + 'static {
     /// polls anyway: the state machine applies on demand and a follower
     /// catches up on a timer.
     fn subscribe(&self, after: LogIndex) -> impl Future<Output = Result<Vec<LogEntry>>> + Send;
+
+    /// Confirms this node is still leader after processing its current
+    /// consensus work, and returns the command index visible at that point.
+    ///
+    /// Leader-facing reads apply through this index and confirm a second
+    /// barrier before answering. A plain `is_leader` check is insufficient:
+    /// election can become visible before the state machine has applied the
+    /// committed prefix inherited from the previous leader.
+    fn leader_barrier(&self) -> impl Future<Output = Result<LogIndex>> + Send;
 
     /// Whether this node may propose. Always true for a single-node log.
     fn is_leader(&self) -> impl Future<Output = bool> + Send;
@@ -219,6 +210,10 @@ impl<R: Runtime> ConsensusLog for SingleNodeLog<R> {
                 command: command.clone(),
             })
             .collect())
+    }
+
+    async fn leader_barrier(&self) -> Result<LogIndex> {
+        Ok(self.commit_index().await)
     }
 
     async fn is_leader(&self) -> bool {

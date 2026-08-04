@@ -361,6 +361,7 @@ impl SimCore {
     /// state does not leak. Called when the driving `Simulation` is dropped.
     pub fn clear(&self) {
         let mut orphans = Vec::new();
+        let handlers;
         {
             let mut state = self.state();
             let ids: Vec<TaskId> = state.tasks.keys().copied().collect();
@@ -371,9 +372,14 @@ impl SimCore {
             }
             state.ready.clear();
             state.timers.clear();
-            state.handlers.clear();
+            // Taken rather than cleared: a handler's destructor can reach
+            // back into the world too, for example by dropping the last
+            // sender of a channel whose receiver's waker is a task waker, so
+            // it must run outside the lock like the futures do.
+            handlers = std::mem::take(&mut state.handlers);
         }
         drop(orphans);
+        drop(handlers);
     }
 }
 

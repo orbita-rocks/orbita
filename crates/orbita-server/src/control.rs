@@ -136,6 +136,7 @@ impl<R: Runtime> PeerDirectorySync<R> {
 pub struct StatusReporter<R: Runtime> {
     client: ControlClient<R>,
     node: NodeId,
+    role: NodeRole,
     address: String,
     /// The active cluster version, as of the last heartbeat that landed.
     ///
@@ -150,6 +151,7 @@ impl<R: Runtime> Clone for StatusReporter<R> {
         Self {
             client: self.client.clone(),
             node: self.node,
+            role: self.role,
             address: self.address.clone(),
             active: Arc::clone(&self.active),
         }
@@ -159,9 +161,21 @@ impl<R: Runtime> Clone for StatusReporter<R> {
 impl<R: Runtime> StatusReporter<R> {
     #[must_use]
     pub fn new(client: ControlClient<R>, node: NodeId, address: impl Into<String>) -> Self {
+        Self::new_with_role(client, node, NodeRole::Worker, address)
+    }
+
+    /// Builds a reporter for a node whose cluster role is already known.
+    #[must_use]
+    pub fn new_with_role(
+        client: ControlClient<R>,
+        node: NodeId,
+        role: NodeRole,
+        address: impl Into<String>,
+    ) -> Self {
         Self {
             client,
             node,
+            role,
             address: address.into(),
             active: Arc::new(Mutex::new(None)),
         }
@@ -186,7 +200,7 @@ impl<R: Runtime> StatusReporter<R> {
         partitions: Vec<PartitionProgress>,
     ) -> Result<StatusReportResponse> {
         let status = NodeStatus {
-            role: NodeRole::Worker,
+            role: self.role,
             address: self.address.clone(),
             map_version,
             speaks: binary_speaks(),

@@ -3,6 +3,9 @@ Everything that is not a secret and not per-pod goes in the file. Node id and
 advertise address are per-pod and come from the environment instead, which is
 exactly the split the configuration precedence was designed for.
 */}}
+{{- if lt (int .Values.leader.replicas) 3 -}}
+{{- fail "leader.replicas must be at least 3; use `orbita dev` for a supported single-node cluster" -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
