@@ -9,13 +9,10 @@ dependsOn:
   - 'orbita-cli'
 
 tasks:
-  # A virtualenv under tests/e2e rather than `pip install` into whatever python
-  # happens to be first on PATH. Running the end-to-end suite should not change
-  # the machine it ran on.
-  #
-  # Not cached: it is cheap when everything is already installed, and a cache
-  # hit over a .venv somebody deleted would fail in a much more confusing place
-  # than here.
+  # The toolchain pins and installs Python, but its package-manager plugins are
+  # not usable yet, so the virtualenv is still made here. Not cached: cheap when
+  # everything is installed, and a cache hit over a .venv somebody deleted fails
+  # somewhere far more confusing than here.
   setup:
     script: 'python3 -m venv .venv && .venv/bin/pip install --quiet --disable-pip-version-check -r requirements.txt'
     inputs:
@@ -25,7 +22,9 @@ tasks:
       cache: false
 
   test:
-    command: '.venv/bin/python -m pytest'
+    # Just `pytest`, because the Python toolchain puts the virtualenv's bin
+    # directory on PATH once `setup` has made it.
+    command: 'pytest'
     deps:
       - 'setup'
       # The suite starts the shipped binary as a subprocess. Building it here

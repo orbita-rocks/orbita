@@ -2,4 +2,4 @@
 # the build environment CI runs. Rust is deliberately not listed here.
 # rust-toolchain.toml pins the compiler and rustup installs it, and routing that
 # through proto instead means two installers for one version.
-moon = "1.41.7"
+moon = "2.4.6"

@@ -74,9 +74,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # No setup-python step. The Python version is pinned in
+      # .moon/toolchains.yml and moon installs it, so it is written down once
+      # rather than here and nowhere else.
 
       # This one target builds the binary, creates the virtualenv, installs the
       # test dependencies, and runs the suite, because the task graph says those

@@ -45,10 +45,17 @@ anything. `protoc` is a system dependency moon does not manage, and
 `orbita-proto` compiles the wire definitions at build time. On a Mac that is
 `brew install protobuf`.
 
+You do not need a Python. The end-to-end suite pins one in
+`.moon/toolchains.yml` and moon installs it, so the suite runs against the same
+interpreter everywhere rather than whatever `python3` points at on your
+machine.
+
 ## The tasks
 
 Every crate under `crates/` gets `fmt`, `lint`, `test`, and `build` without a
-config file of its own. A new crate is a new directory, and that is all.
+config file of its own. A new crate is a new directory, plus a `dependsOn` in
+its `moon.yml` listing the other crates it uses, which the next section is
+about.
 
 ```
 moon run :test                       every crate, and the end-to-end suite
@@ -66,9 +73,27 @@ moon run :test --affected
 ```
 
 That runs the tests for the crates your working tree actually changes, plus
-everything downstream of them. moon reads the dependency graph out of the
-`Cargo.toml` files, so it is the same graph cargo builds from and there is no
-second copy to keep current.
+everything downstream of them.
+
+## The one duplicated thing
+
+Each crate lists its internal dependencies in a `dependsOn` in its `moon.yml`,
+which its `Cargo.toml` already says. That is a second copy of the graph, and it
+is here because moon will not build the first one.
+
+moon infers dependencies from the language's manifest, but its Rust toolchain
+plugin only follows a dependency written as `path = "..."` in the crate's own
+manifest ([source](https://github.com/moonrepo/plugins/blob/master/toolchains/rust/src/tier2.rs)).
+Every internal dependency here is written `orbita-core.workspace = true`, so
+the path lives in the root manifest under `[workspace.dependencies]` and the
+plugin skips it. Without `dependsOn`, moon sees ten crates that depend on
+nothing.
+
+CI is unaffected, because it runs every crate every time. What breaks is
+`--affected`: a graph with no edges means a change to `orbita-core` looks like
+it touches nothing downstream, and you get told your change is tested when it
+is not. So if you add a crate dependency to a `Cargo.toml`, add it to the
+`moon.yml` next to it.
 
 ## Things that are deliberately not cached
 
@@ -85,10 +110,14 @@ time. "Nothing changed" is not a reason to skip it.
 
 ## The end-to-end suite
 
-`moon run e2e:test` builds the binary, creates a virtualenv under `tests/e2e`,
-installs the test dependencies into it, and runs pytest. The virtualenv is
-deliberate: running the suite should not install anything into whichever python
-is first on your PATH.
+`moon run e2e:test` installs the pinned Python, builds the binary, creates a
+virtualenv under `tests/e2e`, installs the test dependencies into it, and runs
+pytest. The virtualenv is deliberate: running the suite should not install
+anything into whichever python is first on your PATH.
+
+moon has plugins that would own the virtualenv and the install too, which would
+delete the `setup` task. They are not usable yet, and
+[.moon/toolchains.yml](../.moon/toolchains.yml) says why.
 
 ## Denying warnings
 

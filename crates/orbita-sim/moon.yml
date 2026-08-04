@@ -1,6 +1,12 @@
 # https://moonrepo.dev/docs/config/project
 $schema: 'https://moonrepo.dev/schemas/project.json'
 
+# Mirrors this crate's Cargo dependencies. See .moon/tasks/rust.yml for why
+# these are written out by hand rather than inferred.
+dependsOn:
+  - 'orbita-core'
+  - 'orbita-runtime'
+
 tasks:
   # The simulation is the one suite where the release profile is not an
   # optimisation but a requirement: seeds per hour is what decides how much of
