@@ -137,10 +137,12 @@ Services and leaves it off the client Service, so setting `service.type` to
 `LoadBalancer` exposes 7100 and nothing else. The reasoning is in
 `docs/adr/0004-peer-traffic-uses-private-framing.md`.
 
-`cluster.leader_peers` is a list of peer addresses on 7101, identical on every
-node. A leader forms its initial Raft configuration from it and ignores it once
-it has a Raft log. A worker uses it to find a leader to register with, retrying
-until one answers, because start order in an orchestrator is nobody's choice.
+`cluster.leader_peers` is a list of `NODE_ID=ADDR` entries on 7101, identical
+on every node. A leader uses the IDs as its fixed Raft voter set and persists
+them with its log, so a changed set is rejected on restart rather than forming
+a second cluster. A worker uses the entries to find a leader to register with,
+retrying until one answers, because start order in an orchestrator is nobody's
+choice.
 The most common way to get this wrong is to list the client port, which looks
 almost right and never forms a quorum.
 

@@ -42,6 +42,11 @@ pub struct ServerConfig {
     /// reachable from the internet is a hole.
     pub peer_listen_addr: SocketAddr,
 
+    /// The stable address this node publishes to peers. This differs from the
+    /// bind address in containers, where the listener uses a wildcard and the
+    /// advertised address is the StatefulSet DNS name.
+    pub peer_advertise_addr: Option<String>,
+
     /// Where this node reaches every other node it might talk to.
     ///
     /// Configuration rather than discovery: finding a peer's address requires
@@ -59,6 +64,10 @@ pub struct ServerConfig {
     /// changes. Non-empty replaces the map source with one backed by the
     /// leader group and starts the heartbeat that failover depends on.
     pub leader_group: Vec<NodeId>,
+
+    /// Whether this node is one of the fixed voters and therefore hosts the
+    /// replicated control plane rather than only consuming it.
+    pub leader_member: bool,
 
     /// How often this node refetches the map and reports its own progress.
     ///
@@ -95,9 +104,11 @@ impl Default for ServerConfig {
             node_id,
             listen_addr: "127.0.0.1:7379".parse().expect("a literal address parses"),
             peer_listen_addr: "127.0.0.1:7380".parse().expect("a literal address parses"),
+            peer_advertise_addr: None,
             peers: Vec::new(),
             peer_call_timeout: DEFAULT_PEER_CALL_TIMEOUT,
             leader_group: Vec::new(),
+            leader_member: false,
             control_poll_interval: DEFAULT_CONTROL_POLL_INTERVAL,
             data_dir: PathBuf::from("data"),
             map_source: BoxedMapSource::new(StaticMapSource::new(single_node_map(
@@ -153,6 +164,12 @@ impl ServerConfig {
         self
     }
 
+    #[must_use]
+    pub fn with_peer_advertise_addr(mut self, addr: impl Into<String>) -> Self {
+        self.peer_advertise_addr = Some(addr.into());
+        self
+    }
+
     /// Where this node reaches its peers, as pairs of node id and address.
     #[must_use]
     pub fn with_peers(mut self, peers: Vec<(NodeId, String)>) -> Self {
@@ -173,6 +190,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_leader_group(mut self, members: Vec<NodeId>) -> Self {
         self.leader_group = members;
+        self
+    }
+
+    /// Hosts the fixed leader group on this node.
+    #[must_use]
+    pub fn with_leader_member(mut self, leader_member: bool) -> Self {
+        self.leader_member = leader_member;
         self
     }
 

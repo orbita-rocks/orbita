@@ -99,6 +99,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The end-to-end suite renders both ordinary and first-Raft upgrade
+      # shapes and simulates their readiness progression.
+      - uses: azure/setup-helm@v4
+
       # No setup-python step. The Python version is pinned in
       # .moon/toolchains.yml and moon installs it, so it is written down once
       # rather than here and nowhere else.
