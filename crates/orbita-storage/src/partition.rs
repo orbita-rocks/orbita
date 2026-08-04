@@ -22,9 +22,11 @@
 //!
 //! A lookup never consults more than one segment, so the only reason to merge
 //! is to reclaim space: expired records, aged tombstones, and shadowed
-//! versions. It runs when the segment count crosses a threshold and on
-//! explicit request, and it republishes through the same manifest swap as a
-//! flush, so a compaction that dies half way costs objects rather than data.
+//! versions. It runs after enough full, size-triggered flushes amortise a
+//! rewrite and on explicit request. Timer flushes do not count, because a tiny
+//! durability segment should not cause a whole-partition rewrite. Compaction
+//! republishes through the same manifest swap as a flush, so one that dies
+//! half way costs objects rather than data.
 //! The objects it replaces are deleted once the new manifest is committed;
 //! anything a crash strands is left for a sweep, which does not exist yet and
 //! is deliberate scope for later, as is a cache for values read back out of
@@ -67,13 +69,13 @@ pub const TOMBSTONE_RETENTION_MILLIS: u64 = 24 * 60 * 60 * 1000;
 /// flush amortises over many writes rather than chasing each one.
 const FLUSH_TRIGGER_BYTES: u64 = 8 * 1024 * 1024;
 
-/// How many segments may accumulate before a flush triggers a compaction.
+/// How many full, size-triggered flushes amortise one compaction.
 ///
 /// Reads never pay for segment count, so this is purely about space: every
 /// overwrite strands a shadowed record until a merge reclaims it. Sixteen
 /// flush-sized segments bound that waste at roughly the cost of one merge per
 /// sixteen flushes.
-const COMPACT_TRIGGER_SEGMENTS: usize = 16;
+const COMPACT_TRIGGER_FULL_FLUSHES: usize = 16;
 
 /// The bookkeeping cost charged to the flush trigger per entry, on top of the
 /// key and value bytes. An estimate is all a trigger needs.
@@ -211,6 +213,10 @@ struct State {
     segments: Vec<SegmentEntry>,
     /// Every flushed key and where its winning record lives.
     index: BTreeMap<Bytes, Loc>,
+    /// Timer flushes can be tiny, so only full memtables pay toward a rewrite.
+    full_flushes_since_compaction: usize,
+    /// Memtable size at the last replica manifest refresh attempt.
+    reclaim_attempted_at_bytes: u64,
 }
 
 /// A single partition of one keyspace.
@@ -259,6 +265,8 @@ impl<R: Runtime> Partition<R> {
             flushed: Lamport::ZERO,
             segments: Vec::new(),
             index: BTreeMap::new(),
+            full_flushes_since_compaction: 0,
+            reclaim_attempted_at_bytes: 0,
         };
         if let Some(snapshot) = Snapshot::open(Arc::clone(&store), path.clone())
             .await
@@ -588,7 +596,7 @@ impl<R: Runtime> Partition<R> {
     /// names; the size trigger calls the same path from inside a write.
     pub async fn flush(&self) -> Result<()> {
         let mut state = self.state.write().await;
-        self.flush_locked(&mut state).await
+        self.flush_locked(&mut state, false).await
     }
 
     /// Flushes only when the mutable table has crossed the size trigger.
@@ -600,19 +608,76 @@ impl<R: Runtime> Partition<R> {
         if state.memtable_bytes < FLUSH_TRIGGER_BYTES {
             return Ok(());
         }
-        self.flush_locked(&mut state).await
+        self.flush_locked(&mut state, true).await
+    }
+
+    /// Reclaims replica memtable entries covered by a manifest the owner has
+    /// already published.
+    ///
+    /// This never writes the manifest. If publication has not advanced, every
+    /// entry stays in memory and the next attempt waits for another
+    /// flush-sized interval of growth.
+    pub async fn reclaim_published_if_needed(&self) -> Result<()> {
+        {
+            let mut state = self.state.write().await;
+            let retry_at = state
+                .reclaim_attempted_at_bytes
+                .saturating_add(FLUSH_TRIGGER_BYTES);
+            if state.memtable_bytes < FLUSH_TRIGGER_BYTES || state.memtable_bytes < retry_at {
+                return Ok(());
+            }
+            state.reclaim_attempted_at_bytes = state.memtable_bytes;
+        }
+
+        let Some(snapshot) = Snapshot::open(Arc::clone(&self.store), self.path.clone())
+            .await
+            .map_err(format_error)?
+        else {
+            return Ok(());
+        };
+        let horizon = snapshot.committed_lamport();
+        let mut state = self.state.write().await;
+        if horizon <= state.flushed {
+            return Ok(());
+        }
+
+        state.index = snapshot
+            .locations()
+            .map(|(key, at)| {
+                (
+                    key.clone(),
+                    Loc {
+                        segment: at.segment,
+                        offset: at.offset,
+                        record_length: at.record_length,
+                    },
+                )
+            })
+            .collect();
+        state.segments = snapshot.manifest().segments.clone();
+        state.flushed = horizon;
+        state
+            .memtable
+            .retain(|_, entry| Lamport(entry.version.get()) > horizon);
+        state.memtable_bytes = state
+            .memtable
+            .iter()
+            .map(|(key, entry)| entry_cost(key, entry))
+            .sum();
+        state.reclaim_attempted_at_bytes = state.memtable_bytes;
+        Ok(())
     }
 
     /// Merges every segment into one, which is what physically reclaims
     /// expired records, aged tombstones, and shadowed versions.
     ///
-    /// Reclamation otherwise waits for the segment-count trigger, and the
+    /// Reclamation otherwise waits for the full-flush trigger, and the
     /// product promises "eventually" rather than a bound. This exists so an
     /// operator, or a test, can ask for the sweep now. The mutable table is
     /// flushed first so the merge sees everything.
     pub async fn compact(&self) -> Result<()> {
         let mut state = self.state.write().await;
-        self.flush_locked(&mut state).await?;
+        self.flush_locked(&mut state, false).await?;
         self.compact_locked(&mut state).await
     }
 
@@ -729,7 +794,7 @@ impl<R: Runtime> Partition<R> {
         // trade: the alternative is refusing durable writes because space
         // reclamation is behind, and refusal is the worse lie.
         if flush_on_trigger && state.memtable_bytes >= FLUSH_TRIGGER_BYTES {
-            if let Err(error) = self.flush_locked(state).await {
+            if let Err(error) = self.flush_locked(state, true).await {
                 tracing::warn!(
                     %error,
                     memtable_bytes = state.memtable_bytes,
@@ -740,7 +805,7 @@ impl<R: Runtime> Partition<R> {
         Ok(())
     }
 
-    async fn flush_locked(&self, state: &mut State) -> Result<()> {
+    async fn flush_locked(&self, state: &mut State, full_flush: bool) -> Result<()> {
         if state.memtable.is_empty() {
             return Ok(());
         }
@@ -793,12 +858,15 @@ impl<R: Runtime> Partition<R> {
         state.memtable.clear();
         state.memtable_bytes = 0;
         state.flushed = committed;
+        if full_flush {
+            state.full_flushes_since_compaction += 1;
+        }
 
         // The flush's own promise, meaning the horizon advance, has already
         // held by here; compaction is space reclamation on top of it. A
         // failed compaction therefore does not fail the flush: the segments
         // stay as they are and the next flush crosses the threshold again.
-        if state.segments.len() >= COMPACT_TRIGGER_SEGMENTS {
+        if state.full_flushes_since_compaction >= COMPACT_TRIGGER_FULL_FLUSHES {
             if let Err(error) = self.compact_locked(state).await {
                 tracing::warn!(
                     %error,
@@ -889,6 +957,7 @@ impl<R: Runtime> Partition<R> {
             .map_err(format_error)?;
         state.segments = manifest.segments;
         state.index = index;
+        state.full_flushes_since_compaction = 0;
 
         // The replaced objects are unreferenced the moment the manifest
         // swapped, and this is the only writer, so deleting them now is safe.
@@ -928,6 +997,11 @@ impl<R: Runtime> Partition<R> {
     #[cfg(test)]
     pub(crate) async fn segment_count(&self) -> usize {
         self.state.read().await.segments.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn memtable_bytes(&self) -> u64 {
+        self.state.read().await.memtable_bytes
     }
 }
 
@@ -1004,7 +1078,10 @@ fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{owner, owner_in_range, owner_with_clock, partition_with_clock, reopened};
+    use crate::testing::{
+        owner, owner_in_range, owner_with_clock, partition_pair_with_clock, partition_with_clock,
+        reopened,
+    };
 
     fn bytes(s: &str) -> Bytes {
         Bytes::copy_from_slice(s.as_bytes())
@@ -2200,5 +2277,76 @@ mod tests {
         let stored = p.stored_entry(b"k").await.unwrap().unwrap();
         assert!(stored.deleted);
         assert_eq!(stored.version, Version(2));
+    }
+
+    #[tokio::test]
+    async fn tiny_timed_flushes_do_not_trigger_full_partition_compaction() {
+        let (p, _clock) = partition_with_clock().await;
+        for lamport in 1..=COMPACT_TRIGGER_FULL_FLUSHES as u64 {
+            p.apply(&Mutation::put(
+                Lamport(lamport),
+                bytes(&format!("k{lamport:02}")),
+                bytes("v"),
+                None,
+            ))
+            .await
+            .unwrap();
+            p.flush().await.unwrap();
+        }
+
+        assert_eq!(
+            p.segment_count().await,
+            COMPACT_TRIGGER_FULL_FLUSHES,
+            "time-based durability must not turn sixteen tiny writes into a full rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replica_reclaims_only_entries_covered_by_the_owners_manifest() {
+        let (owner, replica, _clock) = partition_pair_with_clock().await;
+        for lamport in 1..=32 {
+            let mutation = Mutation::put(
+                Lamport(lamport),
+                bytes(&format!("k{lamport}")),
+                Bytes::from(vec![lamport as u8; MAX_VALUE_BYTES]),
+                None,
+            );
+            owner.apply(&mutation).await.unwrap();
+            replica.apply(&mutation).await.unwrap();
+        }
+        assert!(replica.memtable_bytes().await >= FLUSH_TRIGGER_BYTES);
+
+        owner.flush().await.unwrap();
+        replica
+            .apply(&Mutation::put(
+                Lamport(33),
+                bytes("above"),
+                Bytes::from(vec![33; MAX_VALUE_BYTES]),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            replica.stored_entry(b"above").await.unwrap().is_some(),
+            "the entry above the horizon starts in the memtable"
+        );
+        replica.reclaim_published_if_needed().await.unwrap();
+
+        assert!(replica.memtable_bytes().await < FLUSH_TRIGGER_BYTES);
+        assert_eq!(
+            replica.get(b"k32").await.unwrap().unwrap().value.len(),
+            MAX_VALUE_BYTES,
+            "reclamation replaces the memtable with the published index"
+        );
+        assert_eq!(
+            replica
+                .stored_entry(b"above")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            Version(33),
+            "an entry above the manifest horizon remains in the memtable"
+        );
     }
 }

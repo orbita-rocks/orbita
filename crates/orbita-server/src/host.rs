@@ -984,6 +984,14 @@ async fn apply_loop<R: Runtime>(
                     );
                 }
             }
+        } else if applied {
+            if let Err(error) = storage.reclaim_published_if_needed().await {
+                tracing::warn!(
+                    partition = partition.get(),
+                    %error,
+                    "replica could not reclaim entries covered by the published manifest"
+                );
+            }
         }
         pending
             .lock()
@@ -1010,8 +1018,12 @@ async fn flush_and_checkpoint<R: Runtime>(
     }
 
     let flushed = storage.flushed_lamport().await?;
-    if flushed > log.applied_through().await {
-        log.checkpoint(flushed).await?;
+    // A promoted node may open a manifest ahead of the WAL it retained. The
+    // manifest proves that every local entry is durable, but the checkpoint
+    // record cannot claim a Lamport this log has never held.
+    let checkpoint = flushed.min(log.durable_lamport().await);
+    if checkpoint > log.applied_through().await {
+        log.checkpoint(checkpoint).await?;
     }
     Ok(())
 }
@@ -1257,6 +1269,35 @@ mod tests {
         });
     }
 
+    fn publish_horizon(
+        sim: &Simulation,
+        runtime: SimRuntime,
+        store: Arc<FaultStore>,
+        horizon: Lamport,
+    ) {
+        sim.block_on(async move {
+            let partition = Partition::open(
+                runtime,
+                store as Arc<dyn ObjectStore>,
+                partition_path(),
+                Epoch(1),
+                KeyRange::unbounded(),
+            )
+            .await
+            .unwrap();
+            partition
+                .apply(&Mutation::put(
+                    horizon,
+                    Bytes::from_static(b"published"),
+                    Bytes::from_static(b"value"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            partition.flush().await.unwrap();
+        });
+    }
+
     #[test]
     fn a_successful_live_flush_publishes_partition_v1_before_checkpointing_the_wal() {
         let sim = Simulation::new(16);
@@ -1311,6 +1352,65 @@ mod tests {
                 .unwrap()
                 .is_none());
         });
+    }
+
+    #[test]
+    fn a_fresh_promoted_wal_does_not_checkpoint_beyond_the_manifest_it_opened() {
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        publish_horizon(&sim, runtime.clone(), Arc::clone(&store), Lamport(9));
+
+        let host = start_host(&sim, runtime, store);
+        let flushing = Arc::clone(&host);
+        sim.block_on(async move { flushing.flush().await.expect("an empty WAL is valid") });
+
+        let host = Arc::clone(&host);
+        assert_eq!(
+            sim.block_on(async move { host.log.applied_through().await }),
+            Lamport::ZERO,
+            "a checkpoint never names a Lamport the local WAL did not hold"
+        );
+    }
+
+    #[test]
+    fn a_truncated_promoted_wal_checkpoints_only_its_local_durable_prefix() {
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        let wal = sim.block_on({
+            let runtime = runtime.clone();
+            async move {
+                Wal::open(runtime, WalConfig::new(PartitionId(1), "wal/p1", Epoch(1)))
+                    .await
+                    .unwrap()
+            }
+        });
+        for key in ["a", "b", "c"] {
+            let wal = Arc::clone(&wal);
+            sim.block_on(async move {
+                wal.commit(WalOp::Put {
+                    key: Bytes::copy_from_slice(key.as_bytes()),
+                    value: Bytes::from_static(b"value"),
+                    expires_at_millis: None,
+                })
+                .await
+                .unwrap();
+            });
+        }
+        drop(wal);
+        publish_horizon(&sim, runtime.clone(), Arc::clone(&store), Lamport(9));
+
+        let host = start_host(&sim, runtime, store);
+        let flushing = Arc::clone(&host);
+        sim.block_on(async move { flushing.flush().await.expect("the prefix is covered") });
+
+        let host = Arc::clone(&host);
+        assert_eq!(
+            sim.block_on(async move { host.log.applied_through().await }),
+            Lamport(3),
+            "the checkpoint is capped at the local WAL's durable end"
+        );
     }
 
     #[test]

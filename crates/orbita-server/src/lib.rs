@@ -52,6 +52,9 @@
 //! Owners periodically publish applied writes as partition-v1 segments. A WAL
 //! checkpoint follows only after the manifest compare-and-swap succeeds, so a
 //! failed or deposed writer always retains the log range recovery still needs.
+//! Until hydration lands in issue #17, a replica that misses beyond the
+//! retained WAL cannot catch up from the manifest and stays unavailable. WAL
+//! truncation is live now; snapshot recovery is deliberately not implied.
 
 #![forbid(unsafe_code)]
 

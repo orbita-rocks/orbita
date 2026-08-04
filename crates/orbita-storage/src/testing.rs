@@ -217,6 +217,53 @@ pub(crate) async fn partition_with_clock() -> (TempPartition, ManualClock) {
     open_partition(KeyRange::unbounded(), ManualClock::default()).await
 }
 
+/// Two incarnations over one object namespace, standing in for an owner and a
+/// replica that must observe publication without publishing itself.
+pub(crate) async fn partition_pair_with_clock() -> (TempPartition, TempPartition, ManualClock) {
+    let clock = ManualClock::default();
+    let store = Arc::new(MemoryStore::new());
+    let runtime = TestRuntime {
+        clock: clock.clone(),
+        disk: NoDisk,
+        transport: NoTransport,
+        rng: SharedRng(Arc::new(SeededRng::new(0))),
+    };
+    let range = KeyRange::unbounded();
+    let first = crate::Partition::open(
+        runtime.clone(),
+        store.clone(),
+        partition_path(),
+        Epoch(1),
+        range.clone(),
+    )
+    .await
+    .expect("opening the owner");
+    let second = crate::Partition::open(
+        runtime.clone(),
+        store.clone(),
+        partition_path(),
+        Epoch(1),
+        range.clone(),
+    )
+    .await
+    .expect("opening the replica");
+    (
+        TempPartition {
+            inner: first,
+            store: store.clone(),
+            runtime: runtime.clone(),
+            range: range.clone(),
+        },
+        TempPartition {
+            inner: second,
+            store,
+            runtime,
+            range,
+        },
+        clock,
+    )
+}
+
 /// A partition wrapped in the Lamport assignment its owner would do.
 ///
 /// Versions are Lamports now, so a test that does not care about specific
