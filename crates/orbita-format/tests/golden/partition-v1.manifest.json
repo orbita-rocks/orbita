@@ -11,7 +11,7 @@
   "segments": [
     {
       "name": "segments/0000000000000006-0000000000000000.oseg",
-      "bytes": 384,
+      "bytes": 416,
       "record_count": 4,
       "min_key": "YWxwaGE=",
       "max_key": "ZGVsdGE=",

@@ -70,15 +70,16 @@
 //! because the cluster spends the whole run recovering and never reaches the
 //! states worth checking.
 //!
-//! # The limit, stated honestly
+//! # What is covered, stated honestly
 //!
-//! RocksDB does its own file I/O beneath `orbita_runtime::Disk`, so this crate
-//! cannot inject faults inside it. Simulation covers the distributed protocol
-//! layer, meaning WAL replication, consensus, ownership, routing, and the read
-//! path, and treats a local RocksDB as a trusted component with faults
-//! injected at its API boundary instead. The claim this supports is "the
-//! distributed layer is verified under deterministic simulation," not "the
-//! whole system is."
+//! Every seam the system does I/O through is simulated: the clock, the
+//! network, the disk the log writes through, and, since the storage engine
+//! moved onto `orbita_objectstore::ObjectStore` per ADR 0006, the store its
+//! segments and manifests persist through. Simulated runs currently stand an
+//! in-memory store into that last seam without injecting faults through it;
+//! a fault-injecting `ObjectStore` is the natural next piece of this crate,
+//! and until it exists the claim to make is that faults are injected at every
+//! seam but that one.
 //!
 //! Work brief: `docs/plan/05-sim.md`.
 

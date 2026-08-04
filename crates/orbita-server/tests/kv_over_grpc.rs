@@ -629,3 +629,36 @@ async fn a_client_can_discover_the_sizes_this_cluster_accepts() {
 
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_single_node_reports_ready_once_it_is_serving() {
+    let dir = DataDir::new("readiness");
+    let (server, _client) = start(&dir).await;
+
+    // `Server::start` returns only after recovery and open, and a single node
+    // has no leader group to join, so a node that is serving at all has met
+    // every condition. The wire answer and the programmatic gate must agree,
+    // because the SIGTERM handoff consumes the gate and the probe consumes
+    // the wire.
+    assert!(server.readiness().is_ready());
+
+    let mut health = orbita_proto::v1::health_client::HealthClient::connect(format!(
+        "http://{}",
+        server.local_addr()
+    ))
+    .await
+    .expect("a health client connects");
+    let response = health
+        .check_readiness(orbita_proto::v1::CheckReadinessRequest {})
+        .await
+        .expect("readiness is answered")
+        .into_inner();
+    assert!(response.ready, "unmet: {:?}", response.conditions);
+    assert!(
+        response.conditions.iter().all(|condition| condition.met),
+        "a ready answer must not carry an unmet condition: {:?}",
+        response.conditions
+    );
+
+    server.shutdown().await.unwrap();
+}

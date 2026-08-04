@@ -151,6 +151,36 @@ fn the_checked_in_segment_decodes_to_the_records_it_was_built_from() {
 }
 
 #[test]
+fn the_reserved_transaction_fields_are_zero_in_the_checked_in_segment() {
+    // partition-v1 reserves a commit timestamp field and an intent flag for
+    // the transaction work. Both must be written as zero, and this checks the
+    // fixture's raw bytes rather than trusting the decoder, because the
+    // decoder rejecting non-zero is exactly what would hide a writer that got
+    // it wrong.
+    check(SEGMENT_FIXTURE, &segment().bytes);
+    let bytes = std::fs::read(fixture(SEGMENT_FIXTURE)).expect("the fixture");
+    let segment = Segment::decode(&bytes).expect("the fixture is valid");
+
+    for entry in segment.index.entries() {
+        // Each record's body starts past the 4-byte checksum and 4-byte
+        // length. Flags are body byte 0; the reserved commit timestamp is
+        // body bytes 9..17, after the 8-byte lamport.
+        let body = entry.offset as usize + 8;
+        let flags = bytes[body];
+        assert_eq!(
+            flags & orbita_format::record::flags::INTENT,
+            0,
+            "the reserved intent flag must be zero in partition-v1"
+        );
+        assert_eq!(
+            &bytes[body + 9..body + 17],
+            &[0u8; 8],
+            "the reserved commit timestamp must be zero in partition-v1"
+        );
+    }
+}
+
+#[test]
 fn the_checked_in_manifest_decodes_to_a_manifest_that_names_the_segment() {
     check(MANIFEST_FIXTURE, &manifest(&segment()).encode());
     let bytes = std::fs::read(fixture(MANIFEST_FIXTURE)).expect("the fixture");

@@ -172,27 +172,29 @@ podDisruptionBudget:
 #
 # A StatefulSet replaces pods one at a time and will not move to the next one
 # until the current one reports Ready, so readiness is the entire safety
-# mechanism of an upgrade. Readiness is supposed to mean that this node has
-# registered with the leader group, recovered its write-ahead log, opened every
-# partition the map says it holds, and caught up enough to serve them.
+# mechanism of an upgrade. Readiness means that this node has recovered its
+# write-ahead log, opened every partition the map says it holds, caught up
+# enough to serve them, and registered with the leader group where it has one.
 #
-# It does not mean that yet. The server exposes no such signal, so readiness
-# here runs `orbita cluster ping`, which answers as soon as the process is
-# serving on the client port. That is weaker than the rule above, and it is
-# written down rather than papered over: until the server reports registration
-# and catch-up, a rolling upgrade of this chart can advance to the next pod
-# before the previous one has caught up. Stage upgrades with the StatefulSet
-# partition field and watch the cluster rather than trusting the rollout, and
-# read docs/UPGRADES.md before doing it on anything that matters.
+# Readiness and startup run `orbita cluster ready`, which exits non-zero and
+# names the unmet conditions until the node's readiness gate reports all of
+# them met. One honest caveat: the CLI does not yet pass the leader group to
+# the server, so on a node this chart starts the registration condition is met
+# by construction rather than by an accepted registration. Recovery and
+# catch-up are asserted for real; the rejoin half arrives when the CLI wiring
+# lands. docs/UPGRADES.md lists this gap and describes how to stage an upgrade
+# when the blast radius warrants it.
 #
 # Liveness is the opposite and stays conservative, because failing it kills the
-# pod. It asks only whether the process responds, never anything about the
-# cluster or about reaching peers. A liveness probe that depended on peers
-# would turn a network partition into every pod being killed at once.
+# pod. It runs `orbita cluster ping`, which asks only whether the process
+# responds, never anything about the cluster or about reaching peers. A
+# liveness probe that depended on the leader group would turn a control plane
+# outage or a network partition into every pod being killed at once.
 #
 # Slow starts belong to the startup probe. Recovering a large write-ahead log
-# legitimately takes time, and that is not the same as being wedged, so the
-# startup budget is generous where the liveness threshold is not.
+# or waiting for the leader group legitimately takes time, and that is not the
+# same as being wedged, so the startup budget is generous where the liveness
+# threshold is not.
 probes:
   readiness:
     enabled: true
