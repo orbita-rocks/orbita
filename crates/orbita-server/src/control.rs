@@ -183,12 +183,16 @@ impl<R: Runtime> StatusReporter<R> {
         &self,
         map_version: MapVersion,
         partitions: Vec<PartitionProgress>,
+        ready: bool,
+        draining: bool,
     ) -> bool {
         let status = NodeStatus {
             role: NodeRole::Worker,
             address: self.address.clone(),
             map_version,
             speaks: binary_speaks(),
+            ready,
+            draining,
             partitions,
         };
         match self
@@ -222,5 +226,10 @@ impl<R: Runtime> StatusReporter<R> {
                 false
             }
         }
+    }
+
+    /// Requests one control-plane drain pass for this node.
+    pub async fn drain_node(&self) -> Result<()> {
+        self.client.drain_node(self.node).await
     }
 }

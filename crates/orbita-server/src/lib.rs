@@ -157,6 +157,7 @@ impl Server {
         };
 
         let readiness = Arc::new(ReadinessGate::new());
+        readiness.mark(ReadinessCondition::AcceptingOwnership);
         // A node with no leader group answers to nobody, so the join condition
         // is met by construction rather than left to hang readiness forever.
         // A joined node's condition is marked by the control loop below, on
@@ -296,8 +297,8 @@ impl Server {
     }
 
     /// Serves until something else stops the process.
-    pub async fn wait(self) -> Result<()> {
-        self.serving
+    pub async fn wait(&mut self) -> Result<()> {
+        (&mut self.serving)
             .await
             .map_err(|e| Error::Internal(format!("the client listener panicked: {e}")))
     }
@@ -345,7 +346,10 @@ impl Server {
             // progress. A later report failing does not clear the condition,
             // because a control plane outage must not unready every worker at
             // once; see `ReadinessCondition::ControlPlaneJoined`.
-            if reporter.report(version, progress).await {
+            if reporter
+                .report(version, progress, readiness.is_ready(), false)
+                .await
+            {
                 readiness.mark(ReadinessCondition::ControlPlaneJoined);
             }
             directory.refresh().await;
@@ -385,5 +389,85 @@ impl Server {
     #[must_use]
     pub fn readiness(&self) -> Arc<ReadinessGate> {
         Arc::clone(&self.readiness)
+    }
+
+    /// Stops write admission, reports draining, and waits until the control
+    /// plane has committed every ownership handoff before stopping listeners.
+    ///
+    /// The timeout is deliberately external policy. Kubernetes gives the pod
+    /// a grace period, while the process uses a slightly smaller drain budget
+    /// so a failure is logged before the orchestrator sends SIGKILL.
+    pub async fn drain(self, timeout: Duration) -> Result<()> {
+        if self.reporter.is_none() {
+            return self.shutdown().await;
+        }
+
+        self.readiness.clear(ReadinessCondition::AcceptingOwnership);
+        self.heartbeat.abort();
+        if let Some(reporting) = &self.reporting {
+            reporting.abort();
+        }
+        let reporter = self.reporter.clone().expect("checked above");
+        let node = Arc::clone(&self.node);
+        let interval = node.lease_interval();
+        let last_failure = Arc::new(std::sync::Mutex::new(Some(
+            "waiting for in-flight writes to finish".to_string(),
+        )));
+        let failure = Arc::clone(&last_failure);
+        let drain = async move {
+            let _writes = node.begin_draining().await;
+            *failure.lock().expect("drain failure lock poisoned") =
+                Some("waiting for the control plane to accept draining state".into());
+            loop {
+                let reported = reporter
+                    .report(node.map().version(), node.progress().await, false, true)
+                    .await;
+                if reported {
+                    break;
+                }
+                tokio::time::sleep(interval).await;
+            }
+
+            // No lease can outlive this point because renewal stopped before
+            // write admission closed. Reads remain available from the owner.
+            tokio::time::sleep(node.lease_drain()).await;
+            loop {
+                match reporter.drain_node().await {
+                    Ok(()) => {
+                        node.refresh_map().await?;
+                        if node.owned_partition_count() == 0 {
+                            return Ok::<(), Error>(());
+                        }
+                    }
+                    Err(error) => {
+                        *failure.lock().expect("drain failure lock poisoned") =
+                            Some(error.to_string());
+                        tracing::warn!(%error, "partition handoff is not complete; retrying");
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        };
+
+        tokio::time::timeout(timeout, drain).await.map_err(|_| {
+            let detail = last_failure
+                .lock()
+                .expect("drain failure lock poisoned")
+                .clone()
+                .unwrap_or_else(|| "the control plane did not accept a drain pass".into());
+            Error::Unavailable(format!(
+                "node drain timed out after {} seconds; remaining ownership was not handed off: {detail}",
+                timeout.as_secs(),
+            ))
+        })??;
+
+        let _ = self.shutdown.send(());
+        if let Some(reporting) = &self.reporting {
+            reporting.abort();
+        }
+        self.peers.shutdown().await;
+        self.serving
+            .await
+            .map_err(|e| Error::Internal(format!("the client listener panicked: {e}")))
     }
 }

@@ -11,8 +11,9 @@ use crate::controller::Controller;
 use crate::membership::NodeStatus;
 use crate::version::ClusterVersion;
 use crate::wire::{
-    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest, METHOD_DRAIN_NODE,
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    METHOD_REPORT_STATUS_V3,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
@@ -112,8 +113,21 @@ impl<R: Runtime> ControlClient<R> {
         self.send_status(node, status).await
     }
 
-    /// Sends a report on the version-aware method, falling back to the
-    /// v0.0.1 method when the leader does not serve it.
+    /// Asks the leader to transfer every partition this node still owns. The
+    /// node must first have reported `draining`, and retries until this returns
+    /// successfully with no ownership left.
+    pub async fn drain_node(&self, node: NodeId) -> Result<()> {
+        match self
+            .call(METHOD_DRAIN_NODE, DrainNodeRequest { node }.encode())
+            .await?
+        {
+            ControlResponse::Accepted { .. } => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Sends the newest report shape, falling back one protocol generation at
+    /// a time when a leader does not serve it.
     ///
     /// The fallback is what keeps heartbeats landing mid-rollout: without it,
     /// an upgraded worker reporting to a not-yet-upgraded leader would be
@@ -130,7 +144,7 @@ impl<R: Runtime> ControlClient<R> {
             status: status.clone(),
         }
         .encode();
-        match self.call(METHOD_REPORT_STATUS_V2, payload).await {
+        match self.call(METHOD_REPORT_STATUS_V3, payload).await {
             Ok(ControlResponse::Accepted {
                 map_version,
                 cluster_version,
@@ -141,13 +155,28 @@ impl<R: Runtime> ControlClient<R> {
             // string match is on our own private protocol's fixed refusal, so
             // it cannot drift without this crate changing both sides.
             Err(Error::Internal(message)) if message.contains("unknown control method") => {
-                let payload = ReportStatusRequest { node, status }.encode_legacy();
-                match self.call(METHOD_REPORT_STATUS, payload).await? {
-                    ControlResponse::Accepted {
+                let payload = ReportStatusRequest {
+                    node,
+                    status: status.clone(),
+                }
+                .encode_v2();
+                match self.call(METHOD_REPORT_STATUS_V2, payload).await {
+                    Ok(ControlResponse::Accepted {
                         map_version,
                         cluster_version,
-                    } => Ok((map_version, cluster_version)),
-                    other => Err(unexpected(&other)),
+                    }) => Ok((map_version, cluster_version)),
+                    Err(Error::Internal(message)) if message.contains("unknown control method") => {
+                        let payload = ReportStatusRequest { node, status }.encode_legacy();
+                        match self.call(METHOD_REPORT_STATUS, payload).await? {
+                            ControlResponse::Accepted {
+                                map_version,
+                                cluster_version,
+                            } => Ok((map_version, cluster_version)),
+                            other => Err(unexpected(&other)),
+                        }
+                    }
+                    Ok(other) => Err(unexpected(&other)),
+                    Err(error) => Err(error),
                 }
             }
             Err(e) => Err(e),
@@ -301,7 +330,7 @@ fn unexpected(response: &ControlResponse) -> Error {
 mod tests {
     use super::*;
     use crate::membership::{NodeRole, NodeStatus};
-    use crate::wire::METHOD_REPORT_STATUS_V2;
+    use crate::wire::METHOD_REPORT_STATUS_V3;
 
     use orbita_runtime::{PeerCall, PeerHandler, ServiceId, TransportResult};
     use orbita_sim::Simulation;
@@ -360,7 +389,7 @@ mod tests {
 
     #[test]
     fn only_a_missing_method_triggers_the_fallback() {
-        // A leader that serves the v2 method but refuses the report must not
+        // A leader that serves the newest method but refuses the report must not
         // be retried on the legacy method: the refusal is an answer, and
         // retrying it in an older shape could turn one rejection into two
         // registrations.
@@ -372,7 +401,7 @@ mod tests {
                 call: PeerCall,
             ) -> TransportResult<bytes::Bytes> {
                 let response = match call.method {
-                    METHOD_REPORT_STATUS_V2 => ControlResponse::Error("no".into()),
+                    METHOD_REPORT_STATUS_V3 => ControlResponse::Error("no".into()),
                     other => panic!("the legacy method must not be tried, got {other}"),
                 };
                 Ok(response.encode())

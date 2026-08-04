@@ -144,7 +144,7 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
         config.node.role == Role::Worker && !options.dev && !config.cluster.leader_peers.is_empty();
     let mut backoff = JoinBackoff::new(&config.cluster);
 
-    let server = loop {
+    let mut server = loop {
         match Server::start(server_config(config, options, listen, peer_listen)?).await {
             Ok(server) => break server,
             Err(error) if joining => {
@@ -177,15 +177,39 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
         result = server.wait() => {
             result.map_err(|e| anyhow::anyhow!("{e}")).context("while serving")?;
         }
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("waiting for a shutdown signal")?;
+        signal = shutdown_signal() => {
+            signal?;
             eprintln!("orbita: draining");
-            // `wait` consumed the server in the other branch, so this branch
-            // owns it here.
+            server
+                .drain(Duration::from_millis(config.cluster.drain_timeout_millis))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .context("draining partitions before shutdown")?;
+            eprintln!("orbita: drain complete");
             return Ok(());
         }
     }
 
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("installing the SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("waiting for Ctrl-C")?;
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
     Ok(())
 }
 

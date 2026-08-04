@@ -7,8 +7,9 @@
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::wire::{
-    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest, METHOD_DRAIN_NODE,
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    METHOD_REPORT_STATUS_V3,
 };
 
 use bytes::Bytes;
@@ -58,7 +59,7 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
             },
-            METHOD_REPORT_STATUS_V2 => match ReportStatusRequest::decode(&call.payload) {
+            METHOD_REPORT_STATUS_V2 => match ReportStatusRequest::decode_v2(&call.payload) {
                 Ok(request) => match self
                     .controller
                     .record_status(request.node, request.status)
@@ -71,6 +72,34 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
+            },
+            METHOD_REPORT_STATUS_V3 => match ReportStatusRequest::decode(&call.payload) {
+                Ok(request) => match self
+                    .controller
+                    .record_status(request.node, request.status)
+                    .await
+                {
+                    Ok(map_version) => ControlResponse::Accepted {
+                        map_version,
+                        cluster_version: Some(self.controller.cluster_version().await),
+                    },
+                    Err(e) => ControlResponse::Error(e.to_string()),
+                },
+                Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
+            },
+            METHOD_DRAIN_NODE => match DrainNodeRequest::decode(&call.payload) {
+                Ok(request) => match self.controller.drain_node(request.node).await {
+                    Ok(true) => ControlResponse::Accepted {
+                        map_version: self.controller.map_version().await,
+                        cluster_version: Some(self.controller.cluster_version().await),
+                    },
+                    Ok(false) => ControlResponse::Error(
+                        "ownership transfers committed; waiting for receiving owners to report the new map ready"
+                            .into(),
+                    ),
+                    Err(e) => ControlResponse::Error(e.to_string()),
+                },
+                Err(e) => ControlResponse::Error(format!("undecodable drain request: {e}")),
             },
             METHOD_FETCH_NODES => ControlResponse::Nodes(self.controller.node_addresses().await),
             other => ControlResponse::Error(format!("unknown control method {other}")),

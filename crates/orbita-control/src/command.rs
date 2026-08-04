@@ -48,6 +48,10 @@ const TAG_SET_CLUSTER_VERSION: u8 = 13;
 // `RegisterNode` with the speakable version range appended. New entries are
 // written with this tag; the old tag stays readable for the release window.
 const TAG_REGISTER_NODE_V2: u8 = 14;
+// Registration with readiness and draining state. The older tags stay decode
+// only so an upgraded control member can replay either predecessor.
+const TAG_REGISTER_NODE_V3: u8 = 15;
+const TAG_TRANSFER_OWNERSHIP: u8 = 16;
 
 /// One decision, committed once and applied everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +68,8 @@ pub enum ControlCommand {
         /// node against a target version without asking anybody at that
         /// moment.
         speaks: VersionRange,
+        ready: bool,
+        draining: bool,
     },
 
     /// Records the leader group's conclusion about a node.
@@ -133,12 +139,21 @@ pub enum ControlCommand {
     /// Gives an ownerless partition an owner.
     ///
     /// The state machine refuses this for a partition that still has one,
-    /// which is what forces the fence to commit first. The ordering is not a
-    /// convention the caller is trusted to follow; it is the only sequence the
-    /// state machine accepts.
+    /// which is what forces the fence to commit first during failover. The
+    /// planned handoff has its own command after the old owner quiesces.
     AssignOwner {
         partition: PartitionId,
         owner: NodeId,
+        replicas: Vec<NodeId>,
+        expect_epoch: Epoch,
+    },
+
+    /// Moves ownership in one committed map change and bumps the epoch.
+    /// Reserved for a planned handoff after the old owner has quiesced writes.
+    TransferOwnership {
+        partition: PartitionId,
+        from: NodeId,
+        to: NodeId,
         replicas: Vec<NodeId>,
         expect_epoch: Epoch,
     },
@@ -186,12 +201,15 @@ impl ControlCommand {
                 role,
                 address,
                 speaks,
+                ready,
+                draining,
             } => {
-                w.u8(TAG_REGISTER_NODE_V2)
+                w.u8(TAG_REGISTER_NODE_V3)
                     .u64(node.get())
                     .u8(role_tag(*role))
                     .str(address);
                 speaks.encode(&mut w);
+                w.u8(u8::from(*ready)).u8(u8::from(*draining));
             }
             ControlCommand::SetHealth { node, health } => {
                 w.u8(TAG_SET_HEALTH).u64(node.get()).u8(health_tag(*health));
@@ -253,6 +271,22 @@ impl ControlCommand {
                     })
                     .u64(expect_epoch.get());
             }
+            ControlCommand::TransferOwnership {
+                partition,
+                from,
+                to,
+                replicas,
+                expect_epoch,
+            } => {
+                w.u8(TAG_TRANSFER_OWNERSHIP)
+                    .u64(partition.get())
+                    .u64(from.get())
+                    .u64(to.get())
+                    .seq(replicas, |w, n| {
+                        w.u64(n.get());
+                    })
+                    .u64(expect_epoch.get());
+            }
             ControlCommand::SetReplicas {
                 partition,
                 replicas,
@@ -300,6 +334,8 @@ impl ControlCommand {
                 role: role_from_tag(r.u8()?)?,
                 address: r.string()?,
                 speaks: VersionRange::exactly(ClusterVersion::ZERO),
+                ready: false,
+                draining: false,
             },
             TAG_SET_HEALTH => ControlCommand::SetHealth {
                 node: NodeId(r.u64()?),
@@ -367,6 +403,23 @@ impl ControlCommand {
                 role: role_from_tag(r.u8()?)?,
                 address: r.string()?,
                 speaks: VersionRange::decode(&mut r)?,
+                ready: false,
+                draining: false,
+            },
+            TAG_REGISTER_NODE_V3 => ControlCommand::RegisterNode {
+                node: NodeId(r.u64()?),
+                role: role_from_tag(r.u8()?)?,
+                address: r.string()?,
+                speaks: VersionRange::decode(&mut r)?,
+                ready: r.u8()? != 0,
+                draining: r.u8()? != 0,
+            },
+            TAG_TRANSFER_OWNERSHIP => ControlCommand::TransferOwnership {
+                partition: PartitionId(r.u64()?),
+                from: NodeId(r.u64()?),
+                to: NodeId(r.u64()?),
+                replicas: r.seq(|r| Ok(NodeId(r.u64()?)))?,
+                expect_epoch: Epoch(r.u64()?),
             },
             tag => {
                 return Err(CodecError::UnknownTag {
@@ -430,6 +483,8 @@ mod tests {
                 role: NodeRole::Worker,
                 address: "10.0.0.1:7000".into(),
                 speaks: VersionRange::new(ClusterVersion::new(0, 1), ClusterVersion::new(0, 2)),
+                ready: true,
+                draining: false,
             },
             ControlCommand::SetHealth {
                 node: NodeId(1),
@@ -473,6 +528,13 @@ mod tests {
                 partition: PartitionId(1),
                 owner: NodeId(2),
                 replicas: vec![NodeId(3), NodeId(4)],
+                expect_epoch: Epoch(4),
+            },
+            ControlCommand::TransferOwnership {
+                partition: PartitionId(1),
+                from: NodeId(2),
+                to: NodeId(3),
+                replicas: vec![NodeId(4)],
                 expect_epoch: Epoch(4),
             },
             ControlCommand::SetReplicas {
@@ -526,6 +588,8 @@ mod tests {
                 role: NodeRole::Worker,
                 address: "10.0.0.7:7000".into(),
                 speaks: VersionRange::exactly(ClusterVersion::ZERO),
+                ready: false,
+                draining: false,
             })
         );
     }

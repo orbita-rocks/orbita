@@ -26,6 +26,7 @@ data:
     join_backoff_initial = {{ .Values.cluster.joinBackoffInitial | quote }}
     join_backoff_max = {{ .Values.cluster.joinBackoffMax | quote }}
     join_timeout = {{ .Values.cluster.joinTimeout | quote }}
+    drain_timeout = {{ .Values.cluster.drainTimeout | quote }}
 
     [object_store]
     {{- if .Values.objectStore.endpoint }}

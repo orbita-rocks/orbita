@@ -19,9 +19,6 @@ finished.
   still joins, and no behaviour actually changes with the version because no
   format has two versions to choose between yet. Mixed-version operation is
   therefore still not something you should rely on today.
-- A node does not hand its partitions off on SIGTERM. The termination grace
-  periods in the chart are sized for a handoff that the server does not perform
-  yet, so today a restart is a failover.
 - The `orbita` binary does not yet hand the leader group configuration to the
   server. A node started by the CLI runs without a control client, and the
   `control-plane-joined` readiness condition is met by construction on such a
@@ -35,10 +32,10 @@ holds, and it turns unready again if a map change hands it a partition it
 cannot open. What a deployed cluster does not get yet is the rejoin half,
 per the gap above.
 
-The practical consequence of the gaps that remain: stage a rollout with the
-`partition` field and check the cluster between steps when the blast radius
-warrants it, because each pod replacement is still a failover and the rollout
-does not wait for a rejoin it cannot see.
+The practical consequence of the registration gap that remains is to stage a
+rollout with the `partition` field and check the cluster between steps when the
+blast radius warrants it. A server joined to the control plane drains on
+SIGTERM; the CLI wiring gap above means the chart does not reach that path yet.
 
 ## What a version means
 

@@ -41,6 +41,8 @@ struct Cluster {
     controller: Ctl,
     log: Arc<Log>,
     progress: Progress,
+    readiness: Arc<Mutex<HashMap<NodeId, bool>>>,
+    draining: Arc<Mutex<HashMap<NodeId, bool>>>,
 }
 
 impl Cluster {
@@ -83,6 +85,12 @@ impl Cluster {
             controller,
             log,
             progress: Arc::new(Mutex::new(HashMap::new())),
+            readiness: Arc::new(Mutex::new(
+                WORKERS.into_iter().map(|node| (node, true)).collect(),
+            )),
+            draining: Arc::new(Mutex::new(
+                WORKERS.into_iter().map(|node| (node, false)).collect(),
+            )),
         };
         cluster.spawn_sweep(&leader);
         for worker in WORKERS {
@@ -112,6 +120,8 @@ impl Cluster {
         let clock = runtime.clock().clone();
         let interval = controller.config().heartbeat_interval;
         let progress = Arc::clone(&self.progress);
+        let readiness = Arc::clone(&self.readiness);
+        let draining = Arc::clone(&self.draining);
 
         runtime.spawn(async move {
             loop {
@@ -137,6 +147,16 @@ impl Cluster {
                     address: format!("10.0.0.{node}:7000"),
                     map_version: map.version(),
                     speaks: orbita_control::binary_speaks(),
+                    ready: *readiness
+                        .lock()
+                        .expect("readiness lock poisoned")
+                        .get(&node)
+                        .unwrap_or(&false),
+                    draining: *draining
+                        .lock()
+                        .expect("draining lock poisoned")
+                        .get(&node)
+                        .unwrap_or(&false),
                     partitions,
                 };
                 let _ = controller.record_status(node, status).await;
@@ -150,6 +170,20 @@ impl Cluster {
             .lock()
             .expect("progress lock poisoned")
             .insert(node, lamport);
+    }
+
+    fn set_ready(&self, node: NodeId, ready: bool) {
+        self.readiness
+            .lock()
+            .expect("readiness lock poisoned")
+            .insert(node, ready);
+    }
+
+    fn set_draining(&self, node: NodeId, draining: bool) {
+        self.draining
+            .lock()
+            .expect("draining lock poisoned")
+            .insert(node, draining);
     }
 
     fn map(&self) -> PartitionMap {
@@ -205,6 +239,8 @@ impl Cluster {
                             address: format!("10.0.0.{node}:7000"),
                             map_version: MapVersion::default(),
                             speaks,
+                            ready: true,
+                            draining: false,
                             partitions: vec![],
                         },
                     )
@@ -506,6 +542,85 @@ fn reads_are_never_interrupted_by_a_failover_because_coverage_never_breaks() {
 
             coverage_holds_through_every_entry(&cluster.entries())
                 .map_err(|reason| cluster.sim.failure(reason))
+        },
+    );
+}
+
+#[test]
+fn a_planned_drain_moves_ownership_in_one_epoch_bumping_commit() {
+    check_seeds(
+        "a_planned_drain_moves_ownership_in_one_epoch_bumping_commit",
+        16,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let before = cluster.map().partition(partition).unwrap().clone();
+            let owner = before.owner.unwrap();
+            for node in WORKERS {
+                cluster.set_progress(node, 20);
+            }
+            cluster.set_draining(owner, true);
+            cluster.sim.run_for(Duration::from_secs(1));
+
+            let controller = cluster.controller.clone();
+            let drained = cluster
+                .sim
+                .block_on(async move { controller.drain_node(owner).await });
+            if drained != Ok(false) {
+                return Err(cluster
+                    .sim
+                    .failure(format!("the drain did not transfer ownership: {drained:?}")));
+            }
+            let after = cluster.map().partition(partition).unwrap().clone();
+            if after.owner == Some(owner) || after.epoch != before.epoch.next() {
+                return Err(cluster.sim.failure(format!(
+                    "handoff ended at owner {:?}, epoch {}, from owner {owner}, epoch {}",
+                    after.owner, after.epoch, before.epoch
+                )));
+            }
+            let last = cluster.entries().into_iter().last();
+            if !matches!(last, Some(ControlCommand::TransferOwnership { from, .. }) if from == owner)
+            {
+                return Err(cluster
+                    .sim
+                    .failure("the handoff was not one atomic transfer command"));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_not_ready_replica_is_never_a_planned_handoff_target() {
+    check_seeds(
+        "a_not_ready_replica_is_never_a_planned_handoff_target",
+        16,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let before = cluster.map().partition(partition).unwrap().clone();
+            let owner = before.owner.unwrap();
+            for replica in &before.replicas {
+                cluster.set_ready(*replica, false);
+            }
+            cluster.set_draining(owner, true);
+            cluster.sim.run_for(Duration::from_secs(1));
+
+            let controller = cluster.controller.clone();
+            let result = cluster
+                .sim
+                .block_on(async move { controller.drain_node(owner).await });
+            if !matches!(result, Err(orbita_core::Error::Unavailable(_))) {
+                return Err(cluster
+                    .sim
+                    .failure(format!("an unready receiver was not refused: {result:?}")));
+            }
+            if cluster.owner_of(partition) != Some(owner) {
+                return Err(cluster
+                    .sim
+                    .failure("ownership changed despite there being no ready receiver"));
+            }
+            Ok(())
         },
     );
 }
@@ -1029,6 +1144,8 @@ fn a_worker_reaches_the_leader_group_over_the_transport() {
                         address: "10.0.0.2:7000".into(),
                         map_version: MapVersion::default(),
                         speaks: orbita_control::binary_speaks(),
+                        ready: true,
+                        draining: false,
                         partitions: vec![],
                     },
                 )

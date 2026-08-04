@@ -30,6 +30,11 @@ pub const METHOD_FETCH_NODES: u16 = 3;
 /// back to [`METHOD_REPORT_STATUS`], which is how a new worker heartbeats an
 /// old leader mid-rollout.
 pub const METHOD_REPORT_STATUS_V2: u16 = 4;
+/// Status reporting with readiness and draining state. A new worker falls back
+/// through v2 to v0.0.1 so rolling upgrades keep heartbeating.
+pub const METHOD_REPORT_STATUS_V3: u16 = 5;
+/// A worker asks the control leader to hand off every partition it owns.
+pub const METHOD_DRAIN_NODE: u16 = 6;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -82,6 +87,21 @@ impl ReportStatusRequest {
         Ok(Self { node, status })
     }
 
+    pub(crate) fn encode_v2(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v2(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v2(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v2(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
     /// The v0.0.1 payload shape, for [`super::wire::METHOD_REPORT_STATUS`].
     pub(crate) fn encode_legacy(&self) -> Bytes {
         let mut w = Writer::new();
@@ -96,6 +116,26 @@ impl ReportStatusRequest {
         let status = NodeStatus::decode_legacy(&mut r)?;
         r.done()?;
         Ok(Self { node, status })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrainNodeRequest {
+    pub node: NodeId,
+}
+
+impl DrainNodeRequest {
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new().u64(self.node.get()).finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
     }
 }
 
@@ -387,6 +427,8 @@ mod tests {
                 address: "10.0.0.7:7000".into(),
                 map_version: MapVersion(3),
                 speaks: crate::version::binary_speaks(),
+                ready: true,
+                draining: false,
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),
@@ -413,6 +455,8 @@ mod tests {
                 address: "10.0.0.7:7000".into(),
                 map_version: MapVersion(3),
                 speaks: crate::version::VersionRange::exactly(crate::version::ClusterVersion::ZERO),
+                ready: false,
+                draining: false,
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),

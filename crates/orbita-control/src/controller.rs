@@ -378,7 +378,9 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     // finalize-upgrade decides from the stored range.
                     record.address != status.address
                         || record.role != status.role
-                        || record.speaks != status.speaks,
+                        || record.speaks != status.speaks
+                        || record.ready != status.ready
+                        || record.draining != status.draining,
                     record.health != NodeHealth::Healthy,
                 ),
             }
@@ -390,6 +392,8 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 role: status.role,
                 address: status.address.clone(),
                 speaks: status.speaks,
+                ready: status.ready,
+                draining: status.draining,
             })
             .await?;
         }
@@ -436,6 +440,8 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 role: NodeRole::Leader,
                 address: address.clone(),
                 speaks: binary_speaks(),
+                ready: true,
+                draining: false,
             })
             .await?;
         }
@@ -445,6 +451,8 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 role: NodeRole::Worker,
                 address: address.clone(),
                 speaks: binary_speaks(),
+                ready: false,
+                draining: false,
             })
             .await?;
         }
@@ -652,7 +660,6 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         .await?;
 
         self.runtime.clock().sleep(self.config.lease_drain()).await;
-
         let fenced_epoch = self.epoch_of(partition).await?;
         let mut replicas: Vec<NodeId> =
             info.replicas.iter().copied().filter(|r| *r != to).collect();
@@ -668,6 +675,87 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             expect_epoch: fenced_epoch,
         })
         .await
+    }
+
+    /// Transfers every partition owned by a draining worker to a ready,
+    /// caught-up replica. It never expands a replica set or rebalances ranges.
+    pub async fn drain_node(&self, node: NodeId) -> Result<bool> {
+        let commands = {
+            let inner = self.inner.lock().await;
+            let record = inner
+                .state
+                .node(node)
+                .ok_or_else(|| Error::InvalidArgument(format!("unknown node {node}")))?;
+            if !record.draining {
+                return Err(Error::InvalidArgument(format!(
+                    "node {node} has not entered draining state"
+                )));
+            }
+
+            let mut commands = Vec::new();
+            for info in inner
+                .state
+                .map()
+                .partitions()
+                .filter(|partition| partition.owner == Some(node))
+            {
+                let owner_progress = inner
+                    .observations
+                    .get(&node)
+                    .and_then(|observation| observation.status.progress(info.id))
+                    .map_or(Lamport::ZERO, |progress| progress.durable_lamport);
+                let target = info.replicas.iter().copied().find(|candidate| {
+                    inner.state.node(*candidate).is_some_and(|record| {
+                        record.health == NodeHealth::Healthy && record.ready && !record.draining
+                    }) && inner
+                        .observations
+                        .get(candidate)
+                        .and_then(|observation| observation.status.progress(info.id))
+                        .is_some_and(|progress| progress.durable_lamport >= owner_progress)
+                });
+                let Some(target) = target else {
+                    return Err(Error::Unavailable(format!(
+                        "partition {} has no eligible ready replica caught up through {owner_progress}",
+                        info.id
+                    )));
+                };
+                commands.push(ControlCommand::TransferOwnership {
+                    partition: info.id,
+                    from: node,
+                    to: target,
+                    replicas: info
+                        .replicas
+                        .iter()
+                        .copied()
+                        .filter(|replica| *replica != target)
+                        .collect(),
+                    expect_epoch: info.epoch,
+                });
+            }
+            commands
+        };
+
+        if commands.is_empty() {
+            let inner = self.inner.lock().await;
+            let map_version = inner.state.map_version();
+            let receivers_ready = inner.state.map().partitions().all(|partition| {
+                partition.owner.is_some_and(|owner| {
+                    inner.observations.get(&owner).is_some_and(|observation| {
+                        observation.status.ready && observation.status.map_version >= map_version
+                    })
+                })
+            });
+            if !receivers_ready {
+                return Err(Error::Unavailable(format!(
+                    "handoff is committed at map version {map_version}, but a receiving owner has not reported that version ready"
+                )));
+            }
+            return Ok(true);
+        }
+        for command in commands {
+            self.submit(command).await?;
+        }
+        Ok(false)
     }
 
     async fn epoch_of(&self, partition: PartitionId) -> Result<Epoch> {

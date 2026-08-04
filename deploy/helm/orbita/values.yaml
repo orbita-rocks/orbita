@@ -52,7 +52,8 @@ worker:
   # than going through failure detection and promotion, because a rolling
   # restart of three workers is an ordinary weekly event and should not cost
   # three failover windows. Three hundred seconds is room for a handoff of a
-  # large partition set. The server does not do the handoff yet.
+  # large partition set. The process uses 290 seconds and leaves ten seconds
+  # for a clear timeout exit before Kubernetes sends SIGKILL.
   terminationGracePeriodSeconds: 300
   persistence:
     enabled: true
@@ -111,6 +112,9 @@ cluster:
   joinBackoffInitial: 250ms
   joinBackoffMax: 10s
   joinTimeout: 5m
+  # Ten seconds shorter than the worker pod's grace period, so a failed drain
+  # is logged and exits non-zero before Kubernetes has to send SIGKILL.
+  drainTimeout: 290s
 
 objectStore:
   endpoint: ""
