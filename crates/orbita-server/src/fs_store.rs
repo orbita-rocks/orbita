@@ -14,6 +14,15 @@
 //! which a real bucket's conditional writes would refuse; a multi-node cluster
 //! is expected to bring a real object store rather than a shared filesystem.
 //!
+//! # Durability ordering
+//!
+//! Every write syncs its bytes before the rename and the directory after it,
+//! so a power loss can never persist a manifest that names segment bytes the
+//! disk lost. That ordering is the durability contract a real bucket gives a
+//! put, and the storage engine's recovery story depends on it: the manifest
+//! is authoritative below its horizon, so nothing can replay around a
+//! segment that is not there.
+//!
 //! Entity tags are derived from content (checksum plus length) rather than
 //! stored, so they survive a restart without a sidecar file. A rewrite of
 //! identical bytes therefore reuses its tag, which is harmless where tags are
@@ -28,7 +37,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use orbita_objectstore::{ETag, ObjectError, ObjectMeta, ObjectResult, ObjectStore, Precondition};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,10 +111,29 @@ impl FsStore {
             std::process::id(),
             self.next_temp.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&temp, data)
-            .map_err(|e| ObjectError::Other(format!("writing {key}: {e}")))?;
+        {
+            let mut file = std::fs::File::create(&temp)
+                .map_err(|e| ObjectError::Other(format!("writing {key}: {e}")))?;
+            file.write_all(data)
+                .map_err(|e| ObjectError::Other(format!("writing {key}: {e}")))?;
+            // The bytes must be on stable storage before the rename can be.
+            // A power loss that persisted the rename but not the data would
+            // leave a manifest naming a segment whose bytes are gone, and a
+            // recovery that fails permanently: the manifest is authoritative
+            // below its horizon, so log replay cannot repair it. A real
+            // bucket makes the same promise before acknowledging a put.
+            file.sync_all()
+                .map_err(|e| ObjectError::Other(format!("syncing {key}: {e}")))?;
+        }
         std::fs::rename(&temp, &path)
             .map_err(|e| ObjectError::Other(format!("publishing {key}: {e}")))?;
+        // The rename itself lives in the directory, and the manifest swap is
+        // only durable once the directory entry is. Syncing every write
+        // rather than only the manifest's is deliberate: objects are written
+        // rarely and read often, and one clear rule survives refactors.
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| ObjectError::Other(format!("syncing the directory of {key}: {e}")))?;
         Ok(etag_of(data))
     }
 
@@ -220,6 +248,10 @@ impl ObjectStore for FsStore {
     }
 
     async fn list(&self, prefix: &str) -> ObjectResult<Vec<ObjectMeta>> {
+        // Costs a full read of every listed object, because the tags are
+        // content-derived. Listings happen at partition open and nowhere
+        // hot; anything that wants to list on a serving path should change
+        // how tags are stored first.
         let mut keys = Vec::new();
         let root = self.root.clone();
         self.walk(&root, &mut keys)?;

@@ -38,7 +38,7 @@ use orbita_core::{
     Epoch, Error, KeyRange, Lamport, Record, Result, Version, WriteCondition, MAX_KEY_BYTES,
     MAX_LIST_LIMIT, MAX_VALUE_BYTES,
 };
-use orbita_format::segment::{Segment, SegmentBuilder, SegmentFooter, SegmentIndex, FOOTER_LEN};
+use orbita_format::segment::{Segment, SegmentBuilder};
 use orbita_format::{
     compact, CommitPlan, FormatError, PartitionPath, PartitionWriter, RecordValue, SegmentEntry,
     SegmentRecord, Snapshot,
@@ -432,6 +432,10 @@ impl<R: Runtime> Partition<R> {
         };
 
         let now = self.now_millis();
+        // The read lock is held across the store fetches below, so a slow
+        // store read stalls writers for the length of a page. Immaterial for
+        // the filesystem and in-memory stores that exist today; worth a
+        // bounded fetch or a lock drop per entry when a remote bucket lands.
         let state = self.state.read().await;
         let from = (Bound::Included(start.as_slice()), Bound::Unbounded);
         let mut table = state.memtable.range::<[u8], _>(from).peekable();
@@ -644,6 +648,10 @@ impl<R: Runtime> Partition<R> {
         let value = match record.value {
             RecordValue::Tombstone => Bytes::new(),
             RecordValue::Inline(value) => value,
+            // Read-side only for now: this engine writes every value inline
+            // (see `segment_record_of`), so this arm serves segments written
+            // by other implementations of the format. ADR 0007's write path,
+            // where large values spill to their own objects, is future work.
             RecordValue::External(external) => {
                 let (bytes, _) = self
                     .store
@@ -688,8 +696,22 @@ impl<R: Runtime> Partition<R> {
         state.memtable_bytes += added;
         state.committed = lamport;
 
+        // A failed flush must not fail the write that tripped it. By this
+        // point the write is applied here and durable in the log, and the
+        // caller has been promised exactly that; reporting an error would
+        // tell a client its durable write failed. The writes stay in the
+        // table and the next trigger retries, which does mean a store that
+        // stays down grows the table without bound. That is the honest
+        // trade: the alternative is refusing durable writes because space
+        // reclamation is behind, and refusal is the worse lie.
         if state.memtable_bytes >= FLUSH_TRIGGER_BYTES {
-            self.flush_locked(state).await?;
+            if let Err(error) = self.flush_locked(state).await {
+                tracing::warn!(
+                    %error,
+                    memtable_bytes = state.memtable_bytes,
+                    "flush failed; writes stay in the mutable table until the next trigger"
+                );
+            }
         }
         Ok(())
     }
@@ -733,7 +755,7 @@ impl<R: Runtime> Partition<R> {
         // Everything in the new segment wins over anything flushed before it,
         // because every record here carries a Lamport above the old horizon.
         let position = manifest.segments.len() - 1;
-        for entry in built_index(&built)?.entries() {
+        for entry in built.index.entries() {
             state.index.insert(
                 entry.key.clone(),
                 Loc {
@@ -748,8 +770,18 @@ impl<R: Runtime> Partition<R> {
         state.memtable_bytes = 0;
         state.flushed = committed;
 
+        // The flush's own promise, meaning the horizon advance, has already
+        // held by here; compaction is space reclamation on top of it. A
+        // failed compaction therefore does not fail the flush: the segments
+        // stay as they are and the next flush crosses the threshold again.
         if state.segments.len() >= COMPACT_TRIGGER_SEGMENTS {
-            self.compact_locked(state).await?;
+            if let Err(error) = self.compact_locked(state).await {
+                tracing::warn!(
+                    %error,
+                    segments = state.segments.len(),
+                    "compaction failed; the segments stand until the next trigger"
+                );
+            }
         }
         Ok(())
     }
@@ -759,6 +791,14 @@ impl<R: Runtime> Partition<R> {
             return Ok(());
         }
         let now = self.now_millis();
+
+        // This materializes the whole partition in memory and runs under the
+        // write lock, possibly from inside the client write that crossed the
+        // flush trigger. With the current constants that is a bounded but
+        // real stall, and it grows with partition size until the split
+        // threshold caps it. The crate's no-background-tasks posture is
+        // deliberate, so a streaming merge, or handing the schedule to the
+        // host, is the known follow-up rather than an accident.
 
         let mut inputs = Vec::with_capacity(state.segments.len());
         for entry in &state.segments {
@@ -770,13 +810,11 @@ impl<R: Runtime> Partition<R> {
             let segment = Segment::decode(&bytes).map_err(format_error)?;
             inputs.push(segment.records().to_vec());
         }
-        // Tombstone lifetime here is time-based rather than coverage-based:
-        // even when no retained segment could resurrect an older value, a
-        // tombstone has to keep answering a retrying deleter until its
-        // retention passes. The sentinel makes the merge keep every unexpired
-        // tombstone; the expiry rule reclaims them on schedule.
-        let merged =
-            compact::merge(&inputs, now, &[keep_unexpired_tombstones()]).map_err(format_error)?;
+        // A whole-partition merge, whose tombstone rule is time-based: an
+        // unexpired tombstone still answers a retrying deleter, so it
+        // survives until its retention passes and the expiry rule reclaims
+        // it on schedule.
+        let merged = compact::merge_all(&inputs, now).map_err(format_error)?;
 
         let replaced: Vec<String> = state.segments.iter().map(|e| e.name.clone()).collect();
         let (segments, index) = if merged.is_empty() {
@@ -798,7 +836,7 @@ impl<R: Runtime> Partition<R> {
                 .map_err(format_error)?;
 
             let mut index = BTreeMap::new();
-            for entry in built_index(&built)?.entries() {
+            for entry in built.index.entries() {
                 index.insert(
                     entry.key.clone(),
                     Loc {
@@ -900,35 +938,6 @@ fn segment_record_of(key: &Bytes, entry: &Stored) -> SegmentRecord {
         } else {
             RecordValue::Inline(entry.value.clone())
         },
-    }
-}
-
-/// Decodes a just-built segment's key index without a store round trip, which
-/// is what lets a flush update the in-memory index incrementally.
-fn built_index(built: &orbita_format::segment::BuiltSegment) -> Result<SegmentIndex> {
-    let bytes = &built.bytes;
-    let tail = &bytes[bytes.len() - FOOTER_LEN as usize..];
-    let footer = SegmentFooter::decode(tail).map_err(format_error)?;
-    let range = footer
-        .index_range(bytes.len() as u64)
-        .map_err(format_error)?;
-    SegmentIndex::decode(&bytes[range.start as usize..range.end as usize], &footer)
-        .map_err(format_error)
-}
-
-/// A retained-segment sentinel that covers every legal key from Lamport zero,
-/// so [`compact::merge`] keeps every unexpired tombstone. See the call site
-/// for why the engine wants time-based tombstone lifetime.
-fn keep_unexpired_tombstones() -> SegmentEntry {
-    SegmentEntry {
-        name: String::new(),
-        bytes: 0,
-        record_count: 0,
-        min_key: Bytes::new(),
-        // One byte longer than any legal key, so `may_hold` covers them all.
-        max_key: Bytes::from(vec![0xff; MAX_KEY_BYTES + 1]),
-        min_lamport: Lamport::ZERO,
-        max_lamport: Lamport::ZERO,
     }
 }
 
