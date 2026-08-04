@@ -23,6 +23,14 @@ env:
   # builds something you can break on.
   CARGO_PROFILE_DEV_DEBUG: 0
 
+  # The moon version, in one place. Keep it in step with .prototools, which is
+  # what a laptop reads; moonrepo/setup-toolchain does not read that file.
+  #
+  # Deliberately not called MOON_VERSION. Everything in this stanza is exported
+  # into every step, and moon reads MOON_VERSION itself to report its own
+  # version, so that name would make `moon --version` say whatever we put here.
+  MOONREPO_CLI_VERSION: '2.4.6'
+
 jobs:
   check:
     name: fmt, clippy, test
@@ -50,9 +58,9 @@ jobs:
           # rust-toolchain.toml as a version file, so it takes the Rust install
           # away from rustup and leaves a toolchain with no cargo in it.
           auto-install: false
-          # The action installs `latest` unless told otherwise; it does not read
-          # .prototools. Bump this and .prototools together.
-          moon-version: '2.4.6'
+          # The action installs `latest` unless told otherwise, and it does
+          # not read .prototools, so the version has to be passed in.
+          moon-version: ${{ env.MOONREPO_CLI_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -83,9 +91,9 @@ jobs:
           # rust-toolchain.toml as a version file, so it takes the Rust install
           # away from rustup and leaves a toolchain with no cargo in it.
           auto-install: false
-          # The action installs `latest` unless told otherwise; it does not read
-          # .prototools. Bump this and .prototools together.
-          moon-version: '2.4.6'
+          # The action installs `latest` unless told otherwise, and it does
+          # not read .prototools, so the version has to be passed in.
+          moon-version: ${{ env.MOONREPO_CLI_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -119,9 +127,9 @@ jobs:
           # rust-toolchain.toml as a version file, so it takes the Rust install
           # away from rustup and leaves a toolchain with no cargo in it.
           auto-install: false
-          # The action installs `latest` unless told otherwise; it does not read
-          # .prototools. Bump this and .prototools together.
-          moon-version: '2.4.6'
+          # The action installs `latest` unless told otherwise, and it does
+          # not read .prototools, so the version has to be passed in.
+          moon-version: ${{ env.MOONREPO_CLI_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
 

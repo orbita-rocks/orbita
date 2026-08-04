@@ -1,5 +1,5 @@
 # Pins the version of moon, so `proto install moon` in a fresh checkout gets
-# the one CI runs. Keep it in step with `moon-version` in
+# the one CI runs. Keep it in step with MOONREPO_CLI_VERSION in
 # .github/workflows/ci.yml: moonrepo/setup-toolchain does not read this file,
 # it installs whatever you pass it, so the two are written down separately.
 # They fail loudly rather than quietly when they disagree, because a moon that
