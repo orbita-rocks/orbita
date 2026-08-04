@@ -29,7 +29,8 @@
 //! part that would gain fidelity is the part already covered by packaging.
 
 use orbita_control::{
-    BootstrapSpec, ControlConfig, ControlService, Controller, KeyspaceConfig, SingleNodeLog,
+    binary_speaks, BootstrapSpec, ClusterVersion, ControlCommand, ControlConfig, ControlService,
+    Controller, KeyspaceConfig, SingleNodeLog,
 };
 use orbita_core::{NodeId, PartitionMap};
 use orbita_proto::v1::kv_client::KvClient;
@@ -307,6 +308,14 @@ async fn a_cluster_survives_losing_the_owner_without_losing_an_acknowledged_writ
             .into_inner();
         assert!(found.found, "{key} was missing from the replica");
         assert_eq!(String::from_utf8_lossy(&found.value), *value);
+    }
+    let deadline = Instant::now() + BUDGET * 3;
+    while workers[replica_index].server().replica_reads() == 0 && Instant::now() < deadline {
+        let _ = workers[replica_index]
+            .client
+            .get(get(&acknowledged[0].0))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
         workers[replica_index].server().replica_reads() > 0,
@@ -602,9 +611,75 @@ async fn a_drain_timeout_is_reported_as_failure() {
     let group = start_leader_group(control).await;
     let mut worker = start_worker(WORKERS[0], &group.address, lease).await;
 
+    let deadline = Instant::now() + BUDGET * 3;
+    while !worker.server().readiness().is_ready() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        worker.server().readiness().is_ready(),
+        "worker never became ready"
+    );
+
     let error = worker
         .drain(Duration::from_millis(10))
         .await
         .expect_err("a ten millisecond budget cannot drain a live lease");
     assert!(error.to_string().contains("drain timed out"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incompatible_rejoin_stays_running_and_reports_version_readiness() {
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+    let previous = binary_speaks().max;
+    let active = ClusterVersion::new(previous.major, previous.minor + 1);
+    group
+        .controller
+        .submit(ControlCommand::SetClusterVersion {
+            version: active,
+            expect: previous,
+        })
+        .await
+        .expect("the test advances beyond this binary's range");
+
+    let mut worker = start_worker(WORKERS[0], &group.address, lease).await;
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            if worker.server().active_cluster_version() == Some(active) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the worker receives the structured refusal");
+
+    let readiness = worker.server().readiness().state();
+    assert!(
+        !readiness.is_ready(),
+        "an incompatible node must not be Ready"
+    );
+    assert!(!readiness.is_met(orbita_server::ReadinessCondition::ClusterVersionCompatible));
+    assert!(!readiness.is_met(orbita_server::ReadinessCondition::ControlPlaneJoined));
+
+    // The health endpoint is still reachable, which is what keeps diagnostics
+    // available while Kubernetes holds the rollout at this pod.
+    let mut health = orbita_proto::v1::health_client::HealthClient::connect(format!(
+        "http://{}",
+        worker.server().local_addr()
+    ))
+    .await
+    .expect("the incompatible worker stays alive");
+    let response = health
+        .check_readiness(orbita_proto::v1::CheckReadinessRequest {})
+        .await
+        .expect("the running worker answers readiness")
+        .into_inner();
+    assert!(response
+        .conditions
+        .iter()
+        .any(|condition| condition.name == "cluster-version-compatible" && !condition.met));
+
+    worker.kill().await;
 }

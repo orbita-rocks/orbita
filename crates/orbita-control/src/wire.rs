@@ -10,7 +10,7 @@
 
 use crate::codec::{CodecError, CodecResult, Reader, Writer};
 use crate::membership::NodeStatus;
-use crate::version::ClusterVersion;
+use crate::version::{ClusterVersion, CompatibilityRefusal, VersionRange};
 
 use bytes::Bytes;
 use orbita_core::{
@@ -30,19 +30,23 @@ pub const METHOD_FETCH_NODES: u16 = 3;
 /// back to [`METHOD_REPORT_STATUS`], which is how a new worker heartbeats an
 /// old leader mid-rollout.
 pub const METHOD_REPORT_STATUS_V2: u16 = 4;
-/// Status reporting with readiness and draining state. A new worker falls back
-/// through v2 to v0.0.1 so rolling upgrades keep heartbeating.
-pub const METHOD_REPORT_STATUS_V3: u16 = 5;
+/// Reads the leader's committed control-command index. A restarting voter uses
+/// this as catch-up authority before it reports Ready.
+pub const METHOD_FETCH_COMMIT_INDEX: u16 = 5;
+/// Status reporting with readiness and draining state.
+pub const METHOD_REPORT_STATUS_V3: u16 = 6;
 /// A worker asks the control leader to hand off every partition it owns.
-pub const METHOD_DRAIN_NODE: u16 = 6;
+pub const METHOD_DRAIN_NODE: u16 = 7;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
 const STATUS_NOT_LEADER: u8 = 2;
 const STATUS_ERROR: u8 = 3;
 const STATUS_NODES: u8 = 4;
-// Tag 5 is reserved for the structured compatibility refusal.
-const STATUS_DRAIN_PROGRESS: u8 = 6;
+const STATUS_COMMIT_INDEX: u8 = 5;
+const STATUS_UNAVAILABLE: u8 = 6;
+const STATUS_INCOMPATIBLE: u8 = 7;
+const STATUS_DRAIN_PROGRESS: u8 = 8;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -177,6 +181,12 @@ pub(crate) enum ControlResponse {
         complete: bool,
         map_version: MapVersion,
     },
+    /// The leader's committed control-command index.
+    CommitIndex(crate::LogIndex),
+    /// This member cannot establish leader authority right now. Unlike a
+    /// command refusal, callers may try another member or retry later.
+    Unavailable(String),
+    Incompatible(CompatibilityRefusal),
     Error(String),
 }
 
@@ -223,8 +233,19 @@ impl ControlResponse {
                     .u8(u8::from(*complete))
                     .u64(map_version.get());
             }
+            ControlResponse::Incompatible(refusal) => {
+                w.u8(STATUS_INCOMPATIBLE);
+                refusal.speaks.encode(&mut w);
+                refusal.active.encode(&mut w);
+            }
+            ControlResponse::CommitIndex(index) => {
+                w.u8(STATUS_COMMIT_INDEX).u64(*index);
+            }
             ControlResponse::Error(message) => {
                 w.u8(STATUS_ERROR).str(message);
+            }
+            ControlResponse::Unavailable(message) => {
+                w.u8(STATUS_UNAVAILABLE).str(message);
             }
         }
         w.finish()
@@ -259,7 +280,13 @@ impl ControlResponse {
                 complete: r.u8()? != 0,
                 map_version: MapVersion(r.u64()?),
             },
+            STATUS_INCOMPATIBLE => ControlResponse::Incompatible(CompatibilityRefusal {
+                speaks: VersionRange::decode(&mut r)?,
+                active: ClusterVersion::decode(&mut r)?,
+            }),
+            STATUS_COMMIT_INDEX => ControlResponse::CommitIndex(r.u64()?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
+            STATUS_UNAVAILABLE => ControlResponse::Unavailable(r.string()?),
             tag => {
                 return Err(CodecError::UnknownTag {
                     what: "control response",
@@ -433,7 +460,13 @@ mod tests {
                 complete: false,
                 map_version: MapVersion(10),
             },
+            ControlResponse::Incompatible(CompatibilityRefusal {
+                speaks: VersionRange::new(ClusterVersion::new(0, 3), ClusterVersion::new(0, 4)),
+                active: ClusterVersion::new(0, 2),
+            }),
+            ControlResponse::Unavailable("catching up".into()),
             ControlResponse::Error("no".into()),
+            ControlResponse::CommitIndex(42),
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),

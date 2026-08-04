@@ -159,6 +159,7 @@ mod tests {
         assert_eq!(
             unmet,
             [
+                "cluster-version-compatible",
                 "control-plane-joined",
                 "partitions-caught-up",
                 "accepting-ownership"

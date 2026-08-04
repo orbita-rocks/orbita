@@ -9,6 +9,7 @@ use crate::map_source::{single_node_map, BoxedMapSource, StaticMapSource};
 use crate::transport::DEFAULT_PEER_CALL_TIMEOUT;
 
 use orbita_core::{KeyspaceName, NodeId};
+use orbita_objectstore::s3::{Credentials, S3Config};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,6 +24,33 @@ pub const DEFAULT_KEYSPACE: &str = "default";
 /// This matches the control plane's own heartbeat interval, which is chosen so
 /// that twelve reports have to go missing before a node is declared dead.
 pub const DEFAULT_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long acknowledged writes normally wait for cluster-wide durability.
+pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// One S3-compatible bucket and the credentials used to reach it.
+#[derive(Debug, Clone)]
+pub struct S3StorageConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    /// Static credentials keep MinIO and R2 simple. `None` selects AWS's
+    /// refreshable provider chain, including role assumption and EC2 metadata.
+    pub credentials: Option<Credentials>,
+    pub force_path_style: bool,
+}
+
+impl From<S3Config> for S3StorageConfig {
+    fn from(config: S3Config) -> Self {
+        Self {
+            endpoint: config.endpoint,
+            bucket: config.bucket,
+            region: config.region,
+            credentials: Some(config.credentials),
+            force_path_style: config.force_path_style,
+        }
+    }
+}
 
 /// One worker's configuration.
 #[derive(Debug, Clone)]
@@ -42,6 +70,11 @@ pub struct ServerConfig {
     /// reachable from the internet is a hole.
     pub peer_listen_addr: SocketAddr,
 
+    /// The stable address this node publishes to peers. This differs from the
+    /// bind address in containers, where the listener uses a wildcard and the
+    /// advertised address is the StatefulSet DNS name.
+    pub peer_advertise_addr: Option<String>,
+
     /// Where this node reaches every other node it might talk to.
     ///
     /// Configuration rather than discovery: finding a peer's address requires
@@ -60,6 +93,10 @@ pub struct ServerConfig {
     /// leader group and starts the heartbeat that failover depends on.
     pub leader_group: Vec<NodeId>,
 
+    /// Whether this node is one of the fixed voters and therefore hosts the
+    /// replicated control plane rather than only consuming it.
+    pub leader_member: bool,
+
     /// How often this node refetches the map and reports its own progress.
     ///
     /// One timer for both because they answer each other: the report says how
@@ -71,6 +108,13 @@ pub struct ServerConfig {
     /// The root of everything this node writes: the write-ahead log under
     /// `wal/` and the storage engine under `storage/`.
     pub data_dir: PathBuf,
+
+    /// A shared S3-compatible store. `None` keeps the single-node filesystem
+    /// adapter used by `orbita dev`; a multi-node deployment supplies this.
+    pub object_store: Option<S3StorageConfig>,
+
+    /// How often owners publish their applied writes to object storage.
+    pub flush_interval: Duration,
 
     /// Where the partition map comes from. A single node uses a static map; a
     /// real cluster will use an adapter over the control plane.
@@ -95,11 +139,15 @@ impl Default for ServerConfig {
             node_id,
             listen_addr: "127.0.0.1:7379".parse().expect("a literal address parses"),
             peer_listen_addr: "127.0.0.1:7380".parse().expect("a literal address parses"),
+            peer_advertise_addr: None,
             peers: Vec::new(),
             peer_call_timeout: DEFAULT_PEER_CALL_TIMEOUT,
             leader_group: Vec::new(),
+            leader_member: false,
             control_poll_interval: DEFAULT_CONTROL_POLL_INTERVAL,
             data_dir: PathBuf::from("data"),
+            object_store: None,
+            flush_interval: DEFAULT_FLUSH_INTERVAL,
             map_source: BoxedMapSource::new(StaticMapSource::new(single_node_map(
                 node_id,
                 &[KeyspaceName::new(DEFAULT_KEYSPACE).expect("a literal name is valid")],
@@ -153,6 +201,12 @@ impl ServerConfig {
         self
     }
 
+    #[must_use]
+    pub fn with_peer_advertise_addr(mut self, addr: impl Into<String>) -> Self {
+        self.peer_advertise_addr = Some(addr.into());
+        self
+    }
+
     /// Where this node reaches its peers, as pairs of node id and address.
     #[must_use]
     pub fn with_peers(mut self, peers: Vec<(NodeId, String)>) -> Self {
@@ -176,9 +230,29 @@ impl ServerConfig {
         self
     }
 
+    /// Hosts the fixed leader group on this node.
+    #[must_use]
+    pub fn with_leader_member(mut self, leader_member: bool) -> Self {
+        self.leader_member = leader_member;
+        self
+    }
+
     #[must_use]
     pub fn with_control_poll_interval(mut self, interval: Duration) -> Self {
         self.control_poll_interval = interval;
+        self
+    }
+
+    /// Uses an S3-compatible bucket instead of the single-node filesystem.
+    #[must_use]
+    pub fn with_object_store(mut self, config: impl Into<S3StorageConfig>) -> Self {
+        self.object_store = Some(config.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_flush_interval(mut self, interval: Duration) -> Self {
+        self.flush_interval = interval;
         self
     }
 

@@ -18,14 +18,18 @@ use tokio::sync::watch;
 /// One thing that must have happened before this node may call itself ready.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadinessCondition {
+    /// This binary can speak the active cluster version. Kept separate from
+    /// registration so a stopped rollout names version skew directly.
+    ClusterVersionCompatible,
     /// The node has registered with the leader group at least once, so the
     /// control plane knows it exists and it holds a map the group published.
     ///
     /// Met immediately on a node configured without a leader group, because a
     /// single-node cluster answers to nobody and would otherwise never be
-    /// ready. It is not cleared when a later heartbeat fails: a control plane
-    /// outage must not become a data plane outage, and a node that has joined
-    /// keeps serving on its last good map.
+    /// ready. It is not cleared when a later heartbeat is unreachable: a
+    /// control plane outage must not become a data plane outage, and a node
+    /// that has joined keeps serving on its last good map. An authoritative
+    /// compatibility refusal does clear it because that node has not rejoined.
     ControlPlaneJoined,
     /// Every write-ahead log this node holds has been replayed to its trusted
     /// end. Opening a partition is what recovers its log, so this is met when
@@ -43,7 +47,8 @@ pub enum ReadinessCondition {
 
 impl ReadinessCondition {
     /// Every condition, in the order reports list them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::ClusterVersionCompatible,
         Self::ControlPlaneJoined,
         Self::WalRecovered,
         Self::PartitionsCaughtUp,
@@ -55,6 +60,7 @@ impl ReadinessCondition {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            Self::ClusterVersionCompatible => "cluster-version-compatible",
             Self::ControlPlaneJoined => "control-plane-joined",
             Self::WalRecovered => "wal-recovered",
             Self::PartitionsCaughtUp => "partitions-caught-up",
@@ -75,6 +81,7 @@ impl std::fmt::Display for ReadinessCondition {
 /// moment rather than about state that moves under it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadinessState {
+    compatible: bool,
     joined: bool,
     recovered: bool,
     caught_up: bool,
@@ -85,13 +92,18 @@ impl ReadinessState {
     /// Whether every condition holds.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.joined && self.recovered && self.caught_up && self.accepting_ownership
+        self.compatible
+            && self.joined
+            && self.recovered
+            && self.caught_up
+            && self.accepting_ownership
     }
 
     /// Whether one condition holds.
     #[must_use]
     pub fn is_met(&self, condition: ReadinessCondition) -> bool {
         match condition {
+            ReadinessCondition::ClusterVersionCompatible => self.compatible,
             ReadinessCondition::ControlPlaneJoined => self.joined,
             ReadinessCondition::WalRecovered => self.recovered,
             ReadinessCondition::PartitionsCaughtUp => self.caught_up,
@@ -110,6 +122,7 @@ impl ReadinessState {
 
     fn set(&mut self, condition: ReadinessCondition, met: bool) {
         match condition {
+            ReadinessCondition::ClusterVersionCompatible => self.compatible = met,
             ReadinessCondition::ControlPlaneJoined => self.joined = met,
             ReadinessCondition::WalRecovered => self.recovered = met,
             ReadinessCondition::PartitionsCaughtUp => self.caught_up = met,

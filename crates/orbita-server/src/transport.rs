@@ -160,7 +160,9 @@ impl PeerTransport {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown, stop) = oneshot::channel();
+        let (connections, _) = tokio::sync::watch::channel(false);
         let transport = self.clone();
+        let connection_shutdown = connections.clone();
 
         let task = tokio::spawn(async move {
             let mut stop = stop;
@@ -170,7 +172,8 @@ impl PeerTransport {
                     accepted = listener.accept() => match accepted {
                         Ok((stream, from)) => {
                             let transport = transport.clone();
-                            tokio::spawn(async move { serve(transport, stream, from).await });
+                            let stop = connection_shutdown.subscribe();
+                            tokio::spawn(async move { serve(transport, stream, from, stop).await });
                         }
                         // An accept failure is usually a file descriptor
                         // limit, which is transient and node-wide rather than
@@ -187,6 +190,7 @@ impl PeerTransport {
         Ok(PeerListener {
             local_addr,
             shutdown,
+            connections,
             task,
         })
     }
@@ -347,6 +351,7 @@ impl Transport for PeerTransport {
 pub struct PeerListener {
     local_addr: SocketAddr,
     shutdown: oneshot::Sender<()>,
+    connections: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -358,6 +363,7 @@ impl PeerListener {
     }
 
     pub async fn shutdown(self) {
+        let _ = self.connections.send(true);
         let _ = self.shutdown.send(());
         let _ = self.task.await;
     }
@@ -502,7 +508,12 @@ fn status_of(to: NodeId, service: ServiceId, response: Response) -> TransportRes
 /// single writer, so a slow handler holds up neither the reader nor the
 /// replies to calls that finished behind it. The request id is what makes that
 /// safe: the caller matches replies by id and never by order.
-async fn serve(transport: PeerTransport, stream: TcpStream, from: SocketAddr) {
+async fn serve(
+    transport: PeerTransport,
+    stream: TcpStream,
+    from: SocketAddr,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%from, %error, "could not disable Nagle on an inbound connection");
     }
@@ -519,7 +530,11 @@ async fn serve(transport: PeerTransport, stream: TcpStream, from: SocketAddr) {
     });
 
     loop {
-        let body = match read_frame(&mut reader).await {
+        let frame = tokio::select! {
+            _ = stop.changed() => break,
+            frame = read_frame(&mut reader) => frame,
+        };
+        let body = match frame {
             Ok(Some(body)) => body,
             Ok(None) => break,
             Err(error) => {

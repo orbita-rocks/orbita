@@ -62,14 +62,14 @@ data:
 
     [cluster]
     name = "orbita"
-    # The leader group, as peer addresses on the peer port, identical on every
-    # node. Ignored once a node has a Raft log, so it is safe to leave here
-    # forever. These are peer addresses: a list on the client port would look
-    # almost right and never form a quorum.
+    # The fixed leader ids and peer addresses, identical on every node. The ids
+    # are persisted with the Raft log and checked on restart. These are peer
+    # addresses: a list on the client port would look almost right and never
+    # form a quorum.
     leader_peers = [
-      "orbita-leader-0.orbita-leader.orbita.svc.cluster.local:7101",
-      "orbita-leader-1.orbita-leader.orbita.svc.cluster.local:7101",
-      "orbita-leader-2.orbita-leader.orbita.svc.cluster.local:7101",
+      "1=orbita-leader-0.orbita-leader.orbita.svc.cluster.local:7101",
+      "2=orbita-leader-1.orbita-leader.orbita.svc.cluster.local:7101",
+      "3=orbita-leader-2.orbita-leader.orbita.svc.cluster.local:7101",
     ]
     allow_version_skew = false
     # A worker that starts before the leader group retries rather than failing,
@@ -171,7 +171,8 @@ metadata:
 spec:
   serviceName: orbita-leader
   replicas: 3
-  podManagementPolicy: OrderedReady
+  # A fixed-voter group needs a quorum before any member can become Ready.
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app.kubernetes.io/name: orbita
@@ -237,11 +238,9 @@ spec:
           # Readiness is what gates the next pod in a rolling update, so it is
           # the safety mechanism of an upgrade rather than a formality.
           # `cluster ready` exits non-zero and names the unmet conditions
-          # until the node has recovered its log, opened its partitions, and
-          # caught up. The registration condition is met by construction for
-          # now: the CLI does not yet pass the leader group to the server, so
-          # rejoin is not asserted on a deployed node. docs/UPGRADES.md lists
-          # that gap.
+          # until the node has recovered its log, opened its partitions, caught
+          # up, and joined the control plane. A leader satisfies the last part
+          # only after its durable Raft state joins an elected quorum.
           #
           # Liveness stays conservative, because failing it kills the pod. It
           # runs `cluster ping`, which never asks anything about the cluster
@@ -383,11 +382,8 @@ spec:
           # Readiness is what gates the next pod in a rolling update, so it is
           # the safety mechanism of an upgrade rather than a formality.
           # `cluster ready` exits non-zero and names the unmet conditions
-          # until the node has recovered its log, opened its partitions, and
-          # caught up. The registration condition is met by construction for
-          # now: the CLI does not yet pass the leader group to the server, so
-          # rejoin is not asserted on a deployed node. docs/UPGRADES.md lists
-          # that gap.
+          # until the node has recovered its log, opened its partitions, caught
+          # up, and had its registration accepted by the leader group.
           #
           # Liveness stays conservative, because failing it kills the pod. It
           # runs `cluster ping`, which never asks anything about the cluster

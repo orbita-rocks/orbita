@@ -6,10 +6,11 @@
 
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
+use crate::controller::RegistrationOutcome;
 use crate::wire::{
     ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest, METHOD_DRAIN_NODE,
-    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
-    METHOD_REPORT_STATUS_V3,
+    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
 };
 
 use bytes::Bytes;
@@ -51,10 +52,15 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     .record_status(request.node, request.status)
                     .await
                 {
-                    Ok(map_version) => ControlResponse::Accepted {
+                    Ok(RegistrationOutcome::Accepted(map_version)) => ControlResponse::Accepted {
                         map_version,
                         cluster_version: None,
                     },
+                    Ok(RegistrationOutcome::Incompatible(refusal)) => {
+                        // A v0.0.1 worker can decode the ordinary error shape,
+                        // but not the structured v2 refusal.
+                        ControlResponse::Error(refusal.to_string())
+                    }
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
@@ -65,10 +71,13 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     .record_status(request.node, request.status)
                     .await
                 {
-                    Ok(map_version) => ControlResponse::Accepted {
+                    Ok(RegistrationOutcome::Accepted(map_version)) => ControlResponse::Accepted {
                         map_version,
                         cluster_version: Some(self.controller.cluster_version().await),
                     },
+                    Ok(RegistrationOutcome::Incompatible(refusal)) => {
+                        ControlResponse::Incompatible(refusal)
+                    }
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
@@ -79,10 +88,13 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     .record_status(request.node, request.status)
                     .await
                 {
-                    Ok(map_version) => ControlResponse::Accepted {
+                    Ok(RegistrationOutcome::Accepted(map_version)) => ControlResponse::Accepted {
                         map_version,
                         cluster_version: Some(self.controller.cluster_version().await),
                     },
+                    Ok(RegistrationOutcome::Incompatible(refusal)) => {
+                        ControlResponse::Incompatible(refusal)
+                    }
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
@@ -98,6 +110,9 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 Err(e) => ControlResponse::Error(format!("undecodable drain request: {e}")),
             },
             METHOD_FETCH_NODES => ControlResponse::Nodes(self.controller.node_addresses().await),
+            METHOD_FETCH_COMMIT_INDEX => {
+                ControlResponse::CommitIndex(self.controller.commit_index().await)
+            }
             other => ControlResponse::Error(format!("unknown control method {other}")),
         }
     }
@@ -105,13 +120,19 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
 
 impl<R: Runtime, L: ConsensusLog> PeerHandler for ControlService<R, L> {
     async fn handle(&self, _from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
-        // A node that is not the leader answers with the redirect rather than
-        // with its own stale copy of the map. Serving a follower's map would
-        // be the control plane handing out routing it is not sure about, which
-        // is the one thing it exists not to do.
-        if !self.controller.log_is_leader().await {
-            let leader = self.controller.log_leader().await;
-            return Ok(ControlResponse::NotLeader { leader }.encode());
+        // Raft role alone is not authority: a new leader first applies the
+        // committed prefix it inherited, and ReadIndex proves it still has a
+        // quorum after doing so. A deposed minority therefore cannot serve its
+        // stale map, and a new majority cannot serve before its fence is
+        // visible locally.
+        if let Err(error) = self.controller.ensure_leader_ready().await {
+            let response = match error {
+                orbita_core::Error::NotLeader { leader } => ControlResponse::NotLeader { leader },
+                other => ControlResponse::Unavailable(format!(
+                    "control leader is not ready to serve: {other}"
+                )),
+            };
+            return Ok(response.encode());
         }
         // Errors travel as a response rather than as a transport failure,
         // because "the leader considered this and said no" and "the leader was

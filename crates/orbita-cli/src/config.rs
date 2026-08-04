@@ -62,7 +62,7 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
     ("ORBITA_CLUSTER_NAME", "cluster.name"),
     (
         "ORBITA_LEADER_PEERS",
-        "cluster.leader_peers, comma separated peer addresses",
+        "cluster.leader_peers, comma separated NODE_ID=ADDR entries",
     ),
     ("ORBITA_ALLOW_VERSION_SKEW", "cluster.allow_version_skew"),
     (
@@ -192,11 +192,12 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClusterConfig {
     pub name: String,
-    /// The leader group, as peer addresses.
+    /// The leader group, as `NODE_ID=ADDR` entries.
     ///
     /// On a leader this is the initial Raft membership, identical on every
-    /// leader node, and it is ignored once the data directory holds a Raft
-    /// log, so it is safe to leave in a template forever. On a worker it is
+    /// leader node. The voter IDs are checked against the durable Raft
+    /// identity on restart, so a changed template cannot redefine a cluster.
+    /// On a worker it is
     /// the list of leaders to contact in order to register and be told the
     /// partition map. One list rather than two, because they are the same
     /// addresses and an operator keeping two lists in sync will not.
@@ -894,10 +895,16 @@ mod tests {
 
     #[test]
     fn leader_peers_come_from_the_environment_as_a_comma_separated_list() {
-        let environment =
-            Layer::from_env(&env(&[("ORBITA_LEADER_PEERS", "a:7100, b:7100 ,c:7100")])).unwrap();
+        let environment = Layer::from_env(&env(&[(
+            "ORBITA_LEADER_PEERS",
+            "1=a:7101, 2=b:7101 ,3=c:7101",
+        )]))
+        .unwrap();
         let config = Layer::default().merge(environment).resolve().unwrap();
-        assert_eq!(config.cluster.leader_peers, ["a:7100", "b:7100", "c:7100"]);
+        assert_eq!(
+            config.cluster.leader_peers,
+            ["1=a:7101", "2=b:7101", "3=c:7101"]
+        );
     }
 
     #[test]

@@ -79,6 +79,7 @@ use tokio::sync::{mpsc, oneshot};
 const METHOD_MESSAGE: u16 = 1;
 
 const LOG_PATH: &str = "control/raft";
+const VOTERS_PATH: &str = "control/raft-voters";
 
 /// How often the driver ticks the state machine. Election and heartbeat
 /// timeouts below are measured in these.
@@ -127,6 +128,10 @@ enum Event {
         command: ControlCommand,
         reply: oneshot::Sender<Result<LogIndex>>,
     },
+    /// Settled after the driver processes `Ready`, never directly from the
+    /// mailbox, so leadership cannot become authoritative before committed
+    /// entries become visible to the controller.
+    LeaderBarrier(oneshot::Sender<Result<LogIndex>>),
     /// Stops the driver, which is how a test restarts a node without tearing
     /// down the world around it. Production nodes run until the process dies.
     Shutdown,
@@ -141,11 +146,25 @@ impl RaftLog {
     /// single-node log does, because dying mid-append is an ordinary end.
     pub async fn open<R: Runtime>(runtime: &R, voters: &[NodeId]) -> Result<Arc<Self>> {
         let local = runtime.transport().local_node();
+        if voters.is_empty() {
+            return Err(Error::InvalidArgument(
+                "the raft voter set cannot be empty".into(),
+            ));
+        }
+        let mut durable_voters = voters.to_vec();
+        durable_voters.sort_unstable();
+        if durable_voters.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::InvalidArgument(format!(
+                "the raft voter set contains a duplicate: {voters:?}"
+            )));
+        }
         if !voters.contains(&local) {
             return Err(Error::Internal(format!(
                 "node {local} is not in the raft voter set"
             )));
         }
+
+        assert_durable_voters(runtime, &durable_voters).await?;
 
         let file = runtime
             .disk()
@@ -175,7 +194,7 @@ impl RaftLog {
             file.sync().await.map_err(disk_error)?;
         }
 
-        let voter_ids: Vec<u64> = voters.iter().map(|v| v.get()).collect();
+        let voter_ids: Vec<u64> = durable_voters.iter().map(|v| v.get()).collect();
         let storage = MemStorage::new_with_conf_state((voter_ids, Vec::new()));
         if let Some(hs) = &hard_state {
             storage.wl().set_hardstate(hs.clone());
@@ -211,7 +230,9 @@ impl RaftLog {
             shared: Arc::clone(&shared),
             rx,
             pending: HashMap::new(),
+            barriers: HashMap::new(),
             next_proposal: 0,
+            next_barrier: 0,
             was_leader: false,
             timeout_key: None,
             timeout_ticks: ELECTION_TICK,
@@ -225,6 +246,56 @@ impl RaftLog {
     pub fn shutdown(&self) {
         let _ = self.tx.send(Event::Shutdown);
     }
+}
+
+async fn assert_durable_voters<R: Runtime>(runtime: &R, voters: &[NodeId]) -> Result<()> {
+    let file = runtime
+        .disk()
+        .open(VOTERS_PATH, OpenOptions::create())
+        .await
+        .map_err(disk_error)?;
+    let configured = encode_voters(voters);
+    let size = file.size().await.map_err(disk_error)?;
+    if size == 0 {
+        file.append(configured).await.map_err(disk_error)?;
+        file.sync().await.map_err(disk_error)?;
+        return Ok(());
+    }
+    let durable = file.read_at(0, size as usize).await.map_err(disk_error)?;
+    if durable != configured {
+        let held = decode_voters(&durable).unwrap_or_default();
+        return Err(Error::InvalidArgument(format!(
+            "configured raft voters {voters:?} do not match durable voters {held:?}; restore the \
+             original fixed peer set or use a new empty data directory for a new cluster"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_voters(voters: &[NodeId]) -> Bytes {
+    let mut bytes = BytesMut::with_capacity(4 + voters.len() * 8);
+    bytes.put_u32_le(voters.len() as u32);
+    for voter in voters {
+        bytes.put_u64_le(voter.get());
+    }
+    bytes.freeze()
+}
+
+fn decode_voters(bytes: &[u8]) -> Option<Vec<NodeId>> {
+    let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    if bytes.len() != 4 + count * 8 {
+        return None;
+    }
+    Some(
+        bytes[4..]
+            .chunks_exact(8)
+            .map(|chunk| {
+                NodeId(u64::from_le_bytes(
+                    chunk.try_into().expect("eight-byte chunk"),
+                ))
+            })
+            .collect(),
+    )
 }
 
 impl ConsensusLog for RaftLog {
@@ -254,6 +325,14 @@ impl ConsensusLog for RaftLog {
                 command: command.clone(),
             })
             .collect())
+    }
+
+    async fn leader_barrier(&self) -> Result<LogIndex> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Event::LeaderBarrier(reply))
+            .map_err(|_| driver_gone())?;
+        response.await.map_err(|_| driver_gone())?
     }
 
     async fn is_leader(&self) -> bool {
@@ -329,7 +408,10 @@ struct Driver<R: Runtime> {
     /// Proposals waiting to commit, keyed by the id carried in the entry's
     /// context.
     pending: HashMap<u64, oneshot::Sender<Result<LogIndex>>>,
+    /// Quorum-backed read-index checks waiting for their `ReadState`.
+    barriers: HashMap<u64, oneshot::Sender<Result<LogIndex>>>,
     next_proposal: u64,
+    next_barrier: u64,
     was_leader: bool,
     /// The `(term, role)` the current election jitter was drawn for.
     timeout_key: Option<(u64, StateRole)>,
@@ -367,6 +449,9 @@ impl<R: Runtime> Driver<R> {
                 for (_, reply) in self.pending.drain() {
                     let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
                 }
+                for (_, reply) in self.barriers.drain() {
+                    let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
+                }
                 return;
             }
             self.publish_soft_state();
@@ -397,10 +482,24 @@ impl<R: Runtime> Driver<R> {
                 }
             }
             Event::Propose { command, reply } => self.handle_propose(command, reply),
+            Event::LeaderBarrier(reply) => self.handle_leader_barrier(reply),
             // Shutdown is consumed by the select in `run`; nothing routes it
             // here.
             Event::Shutdown => {}
         }
+    }
+
+    fn handle_leader_barrier(&mut self, reply: oneshot::Sender<Result<LogIndex>>) {
+        if self.node.raft.state != StateRole::Leader {
+            let _ = reply.send(Err(Error::NotLeader {
+                leader: self.current_leader(),
+            }));
+            return;
+        }
+        let id = self.next_barrier;
+        self.next_barrier += 1;
+        self.barriers.insert(id, reply);
+        self.node.read_index(id.to_le_bytes().to_vec());
     }
 
     fn handle_propose(
@@ -443,6 +542,7 @@ impl<R: Runtime> Driver<R> {
             return Ok(());
         }
         let mut ready = self.node.ready();
+        let read_states = ready.take_read_states();
 
         self.send_messages(ready.take_messages());
 
@@ -492,7 +592,35 @@ impl<R: Runtime> Driver<R> {
         self.send_messages(light.take_messages());
         self.apply(light.take_committed_entries())?;
         self.node.advance_apply();
+        self.settle_read_states(read_states);
         Ok(())
+    }
+
+    fn settle_read_states(&mut self, read_states: Vec<raft::ReadState>) {
+        if read_states.is_empty() {
+            return;
+        }
+        let result = if self.node.raft.state == StateRole::Leader {
+            let committed = self
+                .shared
+                .lock()
+                .expect("raft shared state poisoned")
+                .committed
+                .len() as LogIndex;
+            Ok(committed)
+        } else {
+            Err(Error::NotLeader {
+                leader: self.current_leader(),
+            })
+        };
+        for state in read_states {
+            let Ok(id) = <[u8; 8]>::try_from(state.request_ctx.as_slice()) else {
+                continue;
+            };
+            if let Some(reply) = self.barriers.remove(&u64::from_le_bytes(id)) {
+                let _ = reply.send(result.clone());
+            }
+        }
     }
 
     /// Appends and fsyncs, rolling back to the last durable record on
@@ -566,6 +694,9 @@ impl<R: Runtime> Driver<R> {
             // NotLeader tells the caller to retry there, and the state
             // machine above the trait is what makes a duplicate harmless.
             for (_, reply) in self.pending.drain() {
+                let _ = reply.send(Err(Error::NotLeader { leader }));
+            }
+            for (_, reply) in self.barriers.drain() {
                 let _ = reply.send(Err(Error::NotLeader { leader }));
             }
         }
@@ -685,6 +816,7 @@ fn raft_error(e: raft::Error) -> Error {
 mod tests {
     use super::*;
     use crate::membership::NodeRole;
+    use orbita_sim::Simulation;
 
     fn register(id: u64) -> ControlCommand {
         ControlCommand::RegisterNode {
@@ -776,5 +908,32 @@ mod tests {
         let (entries, _, good) = decode_records(&raw);
         assert_eq!(entries.len(), 1);
         assert!(good < raw.len());
+    }
+
+    #[test]
+    fn a_restart_rejects_a_voter_set_that_differs_from_durable_identity() {
+        let sim = Simulation::new(9);
+        let runtime = sim.add_node(NodeId(1));
+        let opening = runtime.clone();
+        let log = sim.block_on(async move { RaftLog::open(&opening, &[NodeId(1)]).await.unwrap() });
+        log.shutdown();
+
+        let reopening = sim.runtime(NodeId(1));
+        let error = sim
+            .block_on(async move { RaftLog::open(&reopening, &[NodeId(1), NodeId(2)]).await })
+            .err()
+            .expect("the changed voter set is rejected");
+        assert!(error.to_string().contains("durable voters"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_voters_are_rejected_before_raft_starts() {
+        let sim = Simulation::new(10);
+        let runtime = sim.add_node(NodeId(1));
+        let error = sim
+            .block_on(async move { RaftLog::open(&runtime, &[NodeId(1), NodeId(1)]).await })
+            .err()
+            .expect("the duplicate is rejected");
+        assert!(error.to_string().contains("duplicate"), "{error}");
     }
 }

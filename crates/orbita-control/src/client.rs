@@ -9,17 +9,27 @@
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::membership::NodeStatus;
-use crate::version::ClusterVersion;
+use crate::version::{ClusterVersion, CompatibilityRefusal};
 use crate::wire::{
     ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest, METHOD_DRAIN_NODE,
-    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
-    METHOD_REPORT_STATUS_V3,
+    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
 use orbita_runtime::{PeerCall, Runtime, ServiceId, Transport, TransportError};
 
 use std::sync::Mutex;
+
+/// The leader group's answer to a version-aware status report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusReportResponse {
+    Accepted {
+        map_version: MapVersion,
+        cluster_version: Option<ClusterVersion>,
+    },
+    Incompatible(CompatibilityRefusal),
+}
 
 /// A client for the leader group.
 ///
@@ -90,6 +100,21 @@ impl<R: Runtime> ControlClient<R> {
         }
     }
 
+    /// The current leader's committed control-command index.
+    ///
+    /// A voter compares this authority with its own log and applied state
+    /// before becoming Ready. Merely observing a leader does not prove the
+    /// voter has the decisions that leader may need for the next quorum.
+    pub async fn fetch_commit_index(&self) -> Result<crate::LogIndex> {
+        match self
+            .call(METHOD_FETCH_COMMIT_INDEX, bytes::Bytes::new())
+            .await?
+        {
+            ControlResponse::CommitIndex(index) => Ok(index),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Reports this node's own view of itself: its role, its address, and how
     /// far it has got on every partition it holds.
     ///
@@ -97,7 +122,12 @@ impl<R: Runtime> ControlClient<R> {
     /// node out of the failure detector, and the progress it carries is what
     /// the leader group uses to choose a replacement owner if it stops.
     pub async fn report_status(&self, node: NodeId, status: NodeStatus) -> Result<()> {
-        self.send_status(node, status).await.map(|_| ())
+        match self.send_status(node, status, false).await? {
+            StatusReportResponse::Accepted { .. } => Ok(()),
+            StatusReportResponse::Incompatible(refusal) => {
+                Err(Error::InvalidArgument(refusal.to_string()))
+            }
+        }
     }
 
     /// The same as [`ControlClient::report_status`], but hands back what the
@@ -109,8 +139,17 @@ impl<R: Runtime> ControlClient<R> {
         &self,
         node: NodeId,
         status: NodeStatus,
-    ) -> Result<(MapVersion, Option<ClusterVersion>)> {
-        self.send_status(node, status).await
+    ) -> Result<StatusReportResponse> {
+        self.send_status(node, status, false).await
+    }
+
+    /// Reports lifecycle state after the active protocol enables its wire shape.
+    pub async fn report_status_with_lifecycle(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+    ) -> Result<StatusReportResponse> {
+        self.send_status(node, status, true).await
     }
 
     /// Asks the leader to transfer every partition this node still owns.
@@ -137,7 +176,11 @@ impl<R: Runtime> ControlClient<R> {
         &self,
         node: NodeId,
         status: NodeStatus,
-    ) -> Result<(MapVersion, Option<ClusterVersion>)> {
+        lifecycle: bool,
+    ) -> Result<StatusReportResponse> {
+        if !lifecycle {
+            return self.send_status_v2(node, status).await;
+        }
         let payload = ReportStatusRequest {
             node,
             status: status.clone(),
@@ -147,38 +190,61 @@ impl<R: Runtime> ControlClient<R> {
             Ok(ControlResponse::Accepted {
                 map_version,
                 cluster_version,
-            }) => Ok((map_version, cluster_version)),
+            }) => Ok(StatusReportResponse::Accepted {
+                map_version,
+                cluster_version,
+            }),
+            Ok(ControlResponse::Incompatible(refusal)) => {
+                Ok(StatusReportResponse::Incompatible(refusal))
+            }
             Ok(other) => Err(unexpected(&other)),
             // "The leader considered this and said no" here means it does not
             // serve the method at all, which only a v0.0.1 leader says. The
             // string match is on our own private protocol's fixed refusal, so
             // it cannot drift without this crate changing both sides.
             Err(Error::Internal(message)) if message.contains("unknown control method") => {
-                let payload = ReportStatusRequest {
-                    node,
-                    status: status.clone(),
-                }
-                .encode_v2();
-                match self.call(METHOD_REPORT_STATUS_V2, payload).await {
-                    Ok(ControlResponse::Accepted {
-                        map_version,
-                        cluster_version,
-                    }) => Ok((map_version, cluster_version)),
-                    Err(Error::Internal(message)) if message.contains("unknown control method") => {
-                        let payload = ReportStatusRequest { node, status }.encode_legacy();
-                        match self.call(METHOD_REPORT_STATUS, payload).await? {
-                            ControlResponse::Accepted {
-                                map_version,
-                                cluster_version,
-                            } => Ok((map_version, cluster_version)),
-                            other => Err(unexpected(&other)),
-                        }
-                    }
-                    Ok(other) => Err(unexpected(&other)),
-                    Err(error) => Err(error),
-                }
+                self.send_status_v2(node, status).await
             }
             Err(e) => Err(e),
+        }
+    }
+
+    async fn send_status_v2(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+    ) -> Result<StatusReportResponse> {
+        let payload = ReportStatusRequest {
+            node,
+            status: status.clone(),
+        }
+        .encode_v2();
+        match self.call(METHOD_REPORT_STATUS_V2, payload).await {
+            Ok(ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            }) => Ok(StatusReportResponse::Accepted {
+                map_version,
+                cluster_version,
+            }),
+            Ok(ControlResponse::Incompatible(refusal)) => {
+                Ok(StatusReportResponse::Incompatible(refusal))
+            }
+            Err(Error::Internal(message)) if message.contains("unknown control method") => {
+                let payload = ReportStatusRequest { node, status }.encode_legacy();
+                match self.call(METHOD_REPORT_STATUS, payload).await? {
+                    ControlResponse::Accepted {
+                        map_version,
+                        cluster_version,
+                    } => Ok(StatusReportResponse::Accepted {
+                        map_version,
+                        cluster_version,
+                    }),
+                    other => Err(unexpected(&other)),
+                }
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(error) => Err(error),
         }
     }
 
@@ -227,6 +293,9 @@ impl<R: Runtime> ControlClient<R> {
                     // The leader considered the request and refused it. Trying
                     // another member would get the same answer.
                     return Err(Error::Internal(message));
+                }
+                Ok(ControlResponse::Unavailable(message)) => {
+                    last = Some(Error::Unavailable(message));
                 }
                 Ok(response) => {
                     *self.preferred.lock().expect("control client lock poisoned") = Some(target);
@@ -285,21 +354,27 @@ impl<R: Runtime, L: ConsensusLog> LocalControlClient<R, L> {
     }
 
     pub async fn fetch_map(&self) -> Result<PartitionMap> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.partition_map().await)
     }
 
     pub async fn fetch_map_if_newer(&self, have: MapVersion) -> Result<Option<PartitionMap>> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.partition_map_if_newer(have).await)
     }
 
     pub async fn report_status(&self, node: NodeId, status: NodeStatus) -> Result<()> {
-        self.controller
-            .record_status(node, status)
-            .await
-            .map(|_| ())
+        self.controller.ensure_leader_ready().await?;
+        match self.controller.record_status(node, status).await? {
+            crate::controller::RegistrationOutcome::Accepted(_) => Ok(()),
+            crate::controller::RegistrationOutcome::Incompatible(refusal) => {
+                Err(Error::InvalidArgument(refusal.to_string()))
+            }
+        }
     }
 
     pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.node_addresses().await)
     }
 }
@@ -372,7 +447,7 @@ mod tests {
         let client = ControlClient::new(worker, vec![NodeId(1)]);
         let result = sim.block_on(async move {
             client
-                .report_status_for_version(
+                .report_status_with_lifecycle(
                     NodeId(2),
                     NodeStatus::joining(NodeRole::Worker, "10.0.0.2:7000"),
                 )
@@ -381,7 +456,10 @@ mod tests {
 
         assert_eq!(
             result,
-            Ok((MapVersion(9), None)),
+            Ok(StatusReportResponse::Accepted {
+                map_version: MapVersion(9),
+                cluster_version: None,
+            }),
             "the report must land through the legacy method, with no version learned"
         );
     }
@@ -415,7 +493,7 @@ mod tests {
         let client = ControlClient::new(worker, vec![NodeId(1)]);
         let result = sim.block_on(async move {
             client
-                .report_status_for_version(
+                .report_status_with_lifecycle(
                     NodeId(2),
                     NodeStatus::joining(NodeRole::Worker, "10.0.0.2:7000"),
                 )

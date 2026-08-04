@@ -17,7 +17,8 @@
 use crate::map_source::MapSource;
 
 use orbita_control::{
-    binary_speaks, ClusterVersion, ControlClient, NodeRole, NodeStatus, PartitionProgress,
+    binary_speaks, binary_version, ClusterVersion, CompatibilityRefusal, ControlClient, NodeRole,
+    NodeStatus, PartitionProgress, StatusReportResponse,
 };
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
 use orbita_runtime::Runtime;
@@ -135,6 +136,7 @@ impl<R: Runtime> PeerDirectorySync<R> {
 pub struct StatusReporter<R: Runtime> {
     client: ControlClient<R>,
     node: NodeId,
+    role: NodeRole,
     address: String,
     /// The active cluster version, as of the last heartbeat that landed.
     ///
@@ -149,6 +151,7 @@ impl<R: Runtime> Clone for StatusReporter<R> {
         Self {
             client: self.client.clone(),
             node: self.node,
+            role: self.role,
             address: self.address.clone(),
             active: Arc::clone(&self.active),
         }
@@ -158,9 +161,21 @@ impl<R: Runtime> Clone for StatusReporter<R> {
 impl<R: Runtime> StatusReporter<R> {
     #[must_use]
     pub fn new(client: ControlClient<R>, node: NodeId, address: impl Into<String>) -> Self {
+        Self::new_with_role(client, node, NodeRole::Worker, address)
+    }
+
+    /// Builds a reporter for a node whose cluster role is already known.
+    #[must_use]
+    pub fn new_with_role(
+        client: ControlClient<R>,
+        node: NodeId,
+        role: NodeRole,
+        address: impl Into<String>,
+    ) -> Self {
         Self {
             client,
             node,
+            role,
             address: address.into(),
             active: Arc::new(Mutex::new(None)),
         }
@@ -173,21 +188,27 @@ impl<R: Runtime> StatusReporter<R> {
         *self.active.lock().expect("active version poisoned")
     }
 
+    /// Whether this worker may use the finalized lifecycle protocol.
+    #[must_use]
+    pub fn can_handoff(&self) -> bool {
+        self.role == NodeRole::Worker && self.active_cluster_version() == Some(binary_version())
+    }
+
     /// Sends one report, carrying how far this node has got on every partition
     /// it holds, and reads the active cluster version back off the reply.
     ///
-    /// Answers whether the report landed. The first `true` is what marks this
-    /// node as joined for readiness, because a report the leader group
-    /// accepted is the moment the cluster knows this node exists.
+    /// A compatibility refusal is an accepted control-plane answer rather than
+    /// a transport failure, so the caller can keep the process running and
+    /// hold readiness closed with the exact versions that disagreed.
     pub async fn report(
         &self,
         map_version: MapVersion,
         partitions: Vec<PartitionProgress>,
         ready: bool,
         draining: bool,
-    ) -> bool {
+    ) -> Result<StatusReportResponse> {
         let status = NodeStatus {
-            role: NodeRole::Worker,
+            role: self.role,
             address: self.address.clone(),
             map_version,
             speaks: binary_speaks(),
@@ -195,35 +216,60 @@ impl<R: Runtime> StatusReporter<R> {
             draining,
             partitions,
         };
-        match self
-            .client
-            .report_status_for_version(self.node, status)
-            .await
-        {
+        let response = if self.can_handoff() {
+            self.client
+                .report_status_with_lifecycle(self.node, status)
+                .await?
+        } else {
+            self.client
+                .report_status_for_version(self.node, status)
+                .await?
+        };
+        match response {
             // No version in the reply means the leader predates them, which
             // mid-rollout is normal; this node keeps whatever it last knew.
-            Ok((_, None)) => true,
-            Ok((_, Some(cluster_version))) => {
-                *self.active.lock().expect("active version poisoned") = Some(cluster_version);
-                if !binary_speaks().contains(cluster_version) {
-                    // Per docs/UPGRADES.md a node outside the window keeps
-                    // running and says why, loudly, rather than exiting: a
-                    // process that exits takes its logs away in a restart
-                    // loop, and a stopped rollout needs those logs.
+            StatusReportResponse::Accepted {
+                map_version,
+                cluster_version: None,
+            } => {
+                if binary_speaks().contains(ClusterVersion::ZERO) {
+                    Ok(StatusReportResponse::Accepted {
+                        map_version,
+                        cluster_version: None,
+                    })
+                } else {
+                    let refusal = CompatibilityRefusal {
+                        speaks: binary_speaks(),
+                        active: ClusterVersion::ZERO,
+                    };
                     tracing::warn!(
-                        %cluster_version,
-                        speaks = %binary_speaks(),
-                        "this binary cannot speak the active cluster version; \
-                         it is outside the supported upgrade window"
+                        active_cluster_version = %refusal.active,
+                        speaks = %refusal.speaks,
+                        reason = %refusal,
+                        "the leader predates version reporting and this binary cannot speak its legacy cluster version"
                     );
+                    Ok(StatusReportResponse::Incompatible(refusal))
                 }
-                true
             }
-            // A heartbeat that does not land is what failover is built to
-            // survive, so it is worth saying and not worth stopping for.
-            Err(error) => {
-                tracing::debug!(%error, "reporting status to the leader group failed");
-                false
+            StatusReportResponse::Accepted {
+                map_version,
+                cluster_version: Some(cluster_version),
+            } => {
+                *self.active.lock().expect("active version poisoned") = Some(cluster_version);
+                Ok(StatusReportResponse::Accepted {
+                    map_version,
+                    cluster_version: Some(cluster_version),
+                })
+            }
+            StatusReportResponse::Incompatible(refusal) => {
+                *self.active.lock().expect("active version poisoned") = Some(refusal.active);
+                tracing::warn!(
+                    active_cluster_version = %refusal.active,
+                    speaks = %refusal.speaks,
+                    reason = %refusal,
+                    "the control plane refused this node because it is outside the supported upgrade window"
+                );
+                Ok(StatusReportResponse::Incompatible(refusal))
             }
         }
     }

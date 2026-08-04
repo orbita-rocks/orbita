@@ -30,6 +30,7 @@ base64 = "0.22"
 bytes.workspace = true
 clap = { version = "4.6.5", features = ["derive", "wrap_help"] }
 orbita-core.workspace = true
+orbita-objectstore = { workspace = true, features = ["s3"] }
 orbita-proto.workspace = true
 # The only thing that uses this is src/node.rs, which is the one place in the
 # crate that starts a server rather than dialing one. It goes through the

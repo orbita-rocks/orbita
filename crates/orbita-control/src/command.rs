@@ -204,12 +204,16 @@ impl ControlCommand {
                 ready,
                 draining,
             } => {
-                w.u8(TAG_REGISTER_NODE_V3)
-                    .u64(node.get())
-                    .u8(role_tag(*role))
-                    .str(address);
+                let tag = if *ready || *draining {
+                    TAG_REGISTER_NODE_V3
+                } else {
+                    TAG_REGISTER_NODE_V2
+                };
+                w.u8(tag).u64(node.get()).u8(role_tag(*role)).str(address);
                 speaks.encode(&mut w);
-                w.u8(u8::from(*ready)).u8(u8::from(*draining));
+                if tag == TAG_REGISTER_NODE_V3 {
+                    w.u8(u8::from(*ready)).u8(u8::from(*draining));
+                }
             }
             ControlCommand::SetHealth { node, health } => {
                 w.u8(TAG_SET_HEALTH).u64(node.get()).u8(health_tag(*health));
