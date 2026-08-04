@@ -4,8 +4,8 @@
 //! `ORBITA_SIM_SEED=7 cargo test -p orbita-control --test raft_failover a_promoted_owner_fences_partitioned_old_owner_writes_and_restores_liveness -- --exact --nocapture`.
 
 use orbita_control::{
-    BootstrapSpec, ClusterState, ConsensusLog, ControlCommand, ControlConfig, Controller,
-    KeyspaceConfig, RaftLog,
+    BootstrapSpec, ClusterState, ConsensusLog, ControlClient, ControlCommand, ControlConfig,
+    ControlService, Controller, KeyspaceConfig, RaftLog,
 };
 use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId};
 use orbita_runtime::{Runtime, ServiceId, Transport};
@@ -332,7 +332,25 @@ fn a_quorum_committed_epoch_survives_a_crash_before_controller_visibility() {
                 .filter(|node| *node != old_leader)
                 .collect();
             let leader = group.elect(&survivors)?;
-            group.recover(leader)?;
+            let leader_runtime = group.sim.runtime(leader);
+            leader_runtime.transport().register(
+                ServiceId::Control,
+                ControlService::new(group.controller(leader)),
+            );
+            let client = ControlClient::new(group.sim.runtime(WORKERS[2]), vec![leader]);
+            let map = group
+                .sim
+                .block_on(async move { client.fetch_map().await })
+                .map_err(|error| group.sim.failure(format!("fetch from new leader: {error}")))?;
+            let visible = map
+                .partition(group.partition)
+                .expect("partition remains present");
+            if visible.owner.is_some() || visible.epoch != Epoch(2) {
+                return Err(group.sim.failure(format!(
+                    "new leader served stale ownership before recovery: owner {:?}, epoch {}",
+                    visible.owner, visible.epoch
+                )));
+            }
             group.assert_invariants()?;
             if group.owner_epoch(leader) != (None, Epoch(2)) {
                 return Err(group
@@ -340,6 +358,60 @@ fn a_quorum_committed_epoch_survives_a_crash_before_controller_visibility() {
                     .failure("the committed epoch disappeared with its proposing leader"));
             }
             Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_new_leader_catches_up_before_attempting_a_stale_command() {
+    check_seeds(
+        "a_new_leader_catches_up_before_attempting_a_stale_command",
+        16,
+        |seed| {
+            let group = Group::start(seed);
+            let old_leader = group.leader(&CONTROL)?;
+            let log = Arc::clone(&group.logs[index_of(old_leader)]);
+            let partition = group.partition;
+            group
+                .sim
+                .block_on(async move { log.propose(fence(partition, Epoch(1))).await })
+                .map_err(|error| group.sim.failure(format!("epoch did not commit: {error}")))?;
+            group.sim.crash(old_leader);
+
+            let survivors: Vec<_> = CONTROL
+                .iter()
+                .copied()
+                .filter(|node| *node != old_leader)
+                .collect();
+            let leader = group.elect(&survivors)?;
+            let controller = group.controller(leader);
+            let attempted = group.sim.block_on(async move {
+                controller
+                    .submit(ControlCommand::AssignOwner {
+                        partition,
+                        owner: WORKERS[0],
+                        replicas: vec![WORKERS[1], WORKERS[2]],
+                        expect_epoch: Epoch(1),
+                    })
+                    .await
+            });
+            if !matches!(
+                attempted,
+                Err(Error::StaleEpoch {
+                    current: Epoch(2),
+                    ..
+                })
+            ) {
+                return Err(group.sim.failure(format!(
+                    "new leader attempted authority from stale state: {attempted:?}"
+                )));
+            }
+            if group.owner_epoch(leader) != (None, Epoch(2)) {
+                return Err(group
+                    .sim
+                    .failure("stale proposal changed ownership after leader catch-up"));
+            }
+            group.assert_invariants()
         },
     );
 }
@@ -379,6 +451,21 @@ fn a_majority_election_wins_an_inflight_epoch_race_and_fences_the_stale_leader()
                 .sim
                 .block_on(async move { controller.submit(fence(partition, Epoch(1))).await })
                 .map_err(|error| group.sim.failure(format!("majority fence failed: {error}")))?;
+
+            let old_runtime = group.sim.runtime(old_leader);
+            old_runtime.transport().register(
+                ServiceId::Control,
+                ControlService::new(group.controller(old_leader)),
+            );
+            let stale_client = ControlClient::new(group.sim.runtime(WORKERS[2]), vec![old_leader]);
+            let stale_fetch = group
+                .sim
+                .block_on(async move { stale_client.fetch_map().await });
+            if !matches!(stale_fetch, Err(Error::Unavailable(_))) {
+                return Err(group.sim.failure(format!(
+                    "the minority leader served a map without quorum authority: {stale_fetch:?}"
+                )));
+            }
             group.sim.heal_all();
             group.sim.run_for(REPLICATION_GRACE);
 

@@ -181,9 +181,13 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.runtime.transport().local_node()
     }
 
-    /// Whether this node may take decisions right now.
+    /// Whether this controller may expose leader authority right now.
+    ///
+    /// This is stricter than the Raft role: it becomes true only after the
+    /// inherited committed prefix is locally applied and quorum authority is
+    /// reconfirmed.
     pub async fn log_is_leader(&self) -> bool {
-        self.log.is_leader().await
+        self.ensure_leader_ready().await.is_ok()
     }
 
     /// Who to redirect to when this node may not.
@@ -193,11 +197,32 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 
     /// Replays the log into the state machine.
     ///
-    /// Called once on start. Everything else applies as it proposes, so this
-    /// is the only place a member catches up on decisions it did not make.
+    /// Called on start and by follower sweeps. Leader-facing operations use
+    /// [`Controller::ensure_leader_ready`] instead because recovery alone does
+    /// not prove the node still has quorum authority after applying.
     pub async fn recover(&self) -> Result<()> {
         let committed = self.log.commit_index().await;
-        self.apply_through(committed).await.map(|_| ())
+        self.apply_through(committed).await
+    }
+
+    /// Establishes that this controller is authoritative for a leader-facing
+    /// operation.
+    ///
+    /// The first barrier identifies the committed prefix inherited at
+    /// election. Applying it closes the stale-state window, and the second
+    /// barrier proves leadership survived that apply. If more commands became
+    /// committed in between, the loop catches those up before authority is
+    /// exposed.
+    pub async fn ensure_leader_ready(&self) -> Result<()> {
+        let mut target = self.log.leader_barrier().await?;
+        loop {
+            self.apply_through(target).await?;
+            let confirmed = self.log.leader_barrier().await?;
+            if confirmed == target {
+                return Ok(());
+            }
+            target = confirmed;
+        }
     }
 
     /// Proposes a command and returns what applying it decided.
@@ -206,8 +231,15 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// from the propose, because a rejection is a decision the whole cluster
     /// agreed on and not a failure to reach anybody.
     pub async fn submit(&self, command: ControlCommand) -> Result<()> {
+        self.ensure_leader_ready().await?;
         let index = self.log.propose(command).await?;
-        self.apply_through(index).await
+        self.apply_through(index).await?;
+        self.inner
+            .lock()
+            .await
+            .results
+            .remove(&index)
+            .unwrap_or(Ok(()))
     }
 
     async fn apply_through(&self, target: LogIndex) -> Result<()> {
@@ -220,13 +252,12 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 inner.results.insert(entry.index, outcome);
             }
         }
-        let result = inner.results.remove(&target).unwrap_or(Ok(()));
         // Results are only interesting to whoever proposed the entry. A
         // proposer whose future was dropped never collects, so old ones are
         // swept rather than kept forever.
         let floor = inner.applied.saturating_sub(1024);
         inner.results.retain(|index, _| *index > floor);
-        result
+        Ok(())
     }
 
     /// A copy of the routing table.

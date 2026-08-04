@@ -127,6 +127,10 @@ enum Event {
         command: ControlCommand,
         reply: oneshot::Sender<Result<LogIndex>>,
     },
+    /// Settled after the driver processes `Ready`, never directly from the
+    /// mailbox, so leadership cannot become authoritative before committed
+    /// entries become visible to the controller.
+    LeaderBarrier(oneshot::Sender<Result<LogIndex>>),
     /// Stops the driver, which is how a test restarts a node without tearing
     /// down the world around it. Production nodes run until the process dies.
     Shutdown,
@@ -211,7 +215,9 @@ impl RaftLog {
             shared: Arc::clone(&shared),
             rx,
             pending: HashMap::new(),
+            barriers: HashMap::new(),
             next_proposal: 0,
+            next_barrier: 0,
             was_leader: false,
             timeout_key: None,
             timeout_ticks: ELECTION_TICK,
@@ -254,6 +260,14 @@ impl ConsensusLog for RaftLog {
                 command: command.clone(),
             })
             .collect())
+    }
+
+    async fn leader_barrier(&self) -> Result<LogIndex> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Event::LeaderBarrier(reply))
+            .map_err(|_| driver_gone())?;
+        response.await.map_err(|_| driver_gone())?
     }
 
     async fn is_leader(&self) -> bool {
@@ -329,7 +343,10 @@ struct Driver<R: Runtime> {
     /// Proposals waiting to commit, keyed by the id carried in the entry's
     /// context.
     pending: HashMap<u64, oneshot::Sender<Result<LogIndex>>>,
+    /// Quorum-backed read-index checks waiting for their `ReadState`.
+    barriers: HashMap<u64, oneshot::Sender<Result<LogIndex>>>,
     next_proposal: u64,
+    next_barrier: u64,
     was_leader: bool,
     /// The `(term, role)` the current election jitter was drawn for.
     timeout_key: Option<(u64, StateRole)>,
@@ -367,6 +384,9 @@ impl<R: Runtime> Driver<R> {
                 for (_, reply) in self.pending.drain() {
                     let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
                 }
+                for (_, reply) in self.barriers.drain() {
+                    let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
+                }
                 return;
             }
             self.publish_soft_state();
@@ -397,10 +417,24 @@ impl<R: Runtime> Driver<R> {
                 }
             }
             Event::Propose { command, reply } => self.handle_propose(command, reply),
+            Event::LeaderBarrier(reply) => self.handle_leader_barrier(reply),
             // Shutdown is consumed by the select in `run`; nothing routes it
             // here.
             Event::Shutdown => {}
         }
+    }
+
+    fn handle_leader_barrier(&mut self, reply: oneshot::Sender<Result<LogIndex>>) {
+        if self.node.raft.state != StateRole::Leader {
+            let _ = reply.send(Err(Error::NotLeader {
+                leader: self.current_leader(),
+            }));
+            return;
+        }
+        let id = self.next_barrier;
+        self.next_barrier += 1;
+        self.barriers.insert(id, reply);
+        self.node.read_index(id.to_le_bytes().to_vec());
     }
 
     fn handle_propose(
@@ -443,6 +477,7 @@ impl<R: Runtime> Driver<R> {
             return Ok(());
         }
         let mut ready = self.node.ready();
+        let read_states = ready.take_read_states();
 
         self.send_messages(ready.take_messages());
 
@@ -492,7 +527,35 @@ impl<R: Runtime> Driver<R> {
         self.send_messages(light.take_messages());
         self.apply(light.take_committed_entries())?;
         self.node.advance_apply();
+        self.settle_read_states(read_states);
         Ok(())
+    }
+
+    fn settle_read_states(&mut self, read_states: Vec<raft::ReadState>) {
+        if read_states.is_empty() {
+            return;
+        }
+        let result = if self.node.raft.state == StateRole::Leader {
+            let committed = self
+                .shared
+                .lock()
+                .expect("raft shared state poisoned")
+                .committed
+                .len() as LogIndex;
+            Ok(committed)
+        } else {
+            Err(Error::NotLeader {
+                leader: self.current_leader(),
+            })
+        };
+        for state in read_states {
+            let Ok(id) = <[u8; 8]>::try_from(state.request_ctx.as_slice()) else {
+                continue;
+            };
+            if let Some(reply) = self.barriers.remove(&u64::from_le_bytes(id)) {
+                let _ = reply.send(result.clone());
+            }
+        }
     }
 
     /// Appends and fsyncs, rolling back to the last durable record on
@@ -566,6 +629,9 @@ impl<R: Runtime> Driver<R> {
             // NotLeader tells the caller to retry there, and the state
             // machine above the trait is what makes a duplicate harmless.
             for (_, reply) in self.pending.drain() {
+                let _ = reply.send(Err(Error::NotLeader { leader }));
+            }
+            for (_, reply) in self.barriers.drain() {
                 let _ = reply.send(Err(Error::NotLeader { leader }));
             }
         }

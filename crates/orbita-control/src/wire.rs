@@ -36,6 +36,7 @@ const STATUS_ACCEPTED: u8 = 1;
 const STATUS_NOT_LEADER: u8 = 2;
 const STATUS_ERROR: u8 = 3;
 const STATUS_NODES: u8 = 4;
+const STATUS_UNAVAILABLE: u8 = 5;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -129,6 +130,9 @@ pub(crate) enum ControlResponse {
     /// answer, and handing it back is what lets an operator configure the
     /// leader group and nothing else.
     Nodes(Vec<(NodeId, String)>),
+    /// This member cannot establish leader authority right now. Unlike a
+    /// command refusal, callers may try another member or retry later.
+    Unavailable(String),
     Error(String),
 }
 
@@ -170,6 +174,9 @@ impl ControlResponse {
             ControlResponse::Error(message) => {
                 w.u8(STATUS_ERROR).str(message);
             }
+            ControlResponse::Unavailable(message) => {
+                w.u8(STATUS_UNAVAILABLE).str(message);
+            }
         }
         w.finish()
     }
@@ -200,6 +207,7 @@ impl ControlResponse {
             },
             STATUS_NODES => ControlResponse::Nodes(r.seq(|r| Ok((NodeId(r.u64()?), r.string()?)))?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
+            STATUS_UNAVAILABLE => ControlResponse::Unavailable(r.string()?),
             tag => {
                 return Err(CodecError::UnknownTag {
                     what: "control response",
@@ -369,6 +377,7 @@ mod tests {
                 leader: Some(NodeId(2)),
             },
             ControlResponse::NotLeader { leader: None },
+            ControlResponse::Unavailable("catching up".into()),
             ControlResponse::Error("no".into()),
         ] {
             assert_eq!(

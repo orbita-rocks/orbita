@@ -69,6 +69,15 @@ pub trait ConsensusLog: Send + Sync + 'static {
     /// catches up on a timer.
     fn subscribe(&self, after: LogIndex) -> impl Future<Output = Result<Vec<LogEntry>>> + Send;
 
+    /// Confirms this node is still leader after processing its current
+    /// consensus work, and returns the command index visible at that point.
+    ///
+    /// Leader-facing reads apply through this index and confirm a second
+    /// barrier before answering. A plain `is_leader` check is insufficient:
+    /// election can become visible before the state machine has applied the
+    /// committed prefix inherited from the previous leader.
+    fn leader_barrier(&self) -> impl Future<Output = Result<LogIndex>> + Send;
+
     /// Whether this node may propose. Always true for a single-node log.
     fn is_leader(&self) -> impl Future<Output = bool> + Send;
 
@@ -201,6 +210,10 @@ impl<R: Runtime> ConsensusLog for SingleNodeLog<R> {
                 command: command.clone(),
             })
             .collect())
+    }
+
+    async fn leader_barrier(&self) -> Result<LogIndex> {
+        Ok(self.commit_index().await)
     }
 
     async fn is_leader(&self) -> bool {
