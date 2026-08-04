@@ -868,8 +868,78 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::map_source::StaticMapSource;
+    use async_trait::async_trait;
     use orbita_core::{Epoch, KeyRange, KeyspaceName, MapVersion};
+    use orbita_format::testing::MemoryStore;
+    use orbita_objectstore::{
+        ETag, ObjectError, ObjectMeta, ObjectResult, ObjectStore, Precondition,
+    };
     use orbita_sim::Simulation;
+    use std::ops::Range;
+
+    /// An in-memory store whose listings can be failed for one reconcile.
+    ///
+    /// Opening a partition lists its segment and value prefixes before it can
+    /// serve. Failing that operation exercises the real open error path while
+    /// keeping this simulation independent of a filesystem backend.
+    struct ListingFailureStore {
+        inner: MemoryStore,
+        fail_list: std::sync::atomic::AtomicBool,
+    }
+
+    impl ListingFailureStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_list: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn fail_list(&self, fail: bool) {
+            self.fail_list.store(fail, Ordering::Release);
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ListingFailureStore {
+        async fn put(&self, key: &str, data: Bytes) -> ObjectResult<ETag> {
+            self.inner.put(key, data).await
+        }
+
+        async fn put_if(
+            &self,
+            key: &str,
+            data: Bytes,
+            precondition: Precondition,
+        ) -> ObjectResult<ETag> {
+            self.inner.put_if(key, data, precondition).await
+        }
+
+        async fn get(&self, key: &str) -> ObjectResult<(Bytes, ETag)> {
+            self.inner.get(key).await
+        }
+
+        async fn get_range(&self, key: &str, range: Range<u64>) -> ObjectResult<Bytes> {
+            self.inner.get_range(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> ObjectResult<ObjectMeta> {
+            self.inner.head(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> ObjectResult<Vec<ObjectMeta>> {
+            if self.fail_list.load(Ordering::Acquire) {
+                return Err(ObjectError::Transient(
+                    "injected partition open failure".to_string(),
+                ));
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> ObjectResult<()> {
+            self.inner.delete(key).await
+        }
+    }
 
     fn keyspace_info() -> KeyspaceInfo {
         KeyspaceInfo {
@@ -924,18 +994,13 @@ mod tests {
     /// open succeeds.
     #[test]
     fn a_failed_reconcile_unreadies_the_node_until_a_retry_opens_the_partition() {
-        let root =
-            std::env::temp_dir().join(format!("orbita-readiness-reconcile-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-
         let sim = Simulation::new(7);
         let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(ListingFailureStore::new());
         let layout = DataLayout {
-            storage_root: root.join("n1"),
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
         };
-        std::fs::create_dir_all(&layout.storage_root).expect("a storage directory");
-        let blocked = layout.storage_root.join("p2");
 
         let source = StaticMapSource::new(one_partition_map());
         let gate = Arc::new(ReadinessGate::new());
@@ -961,10 +1026,7 @@ mod tests {
             "the initial open marks catch-up"
         );
 
-        // A plain file where the new partition's storage engine wants a
-        // directory, which stands in for the transient open failures the
-        // reconcile comment describes.
-        std::fs::write(&blocked, b"in the way").expect("the blocking file");
+        store.fail_list(true);
         source.set(two_partition_map());
         let refreshing = Arc::clone(&node);
         let outcome = sim.block_on(async move { refreshing.refresh_map().await });
@@ -974,7 +1036,7 @@ mod tests {
             "a node holding a partition it could not open is not ready"
         );
 
-        std::fs::remove_file(&blocked).expect("unblocking the partition");
+        store.fail_list(false);
         let refreshing = Arc::clone(&node);
         sim.block_on(async move { refreshing.refresh_map().await })
             .expect("the retry reconciles even though the map version is unchanged");
@@ -984,7 +1046,6 @@ mod tests {
         );
 
         drop(node);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
