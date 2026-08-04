@@ -19,16 +19,16 @@
 //! sequence of [`ControlCommand`]s to the cluster's metadata. [`Controller`]
 //! proposes commands, applies them, and runs the sweep that turns missed
 //! heartbeats into failovers. [`ConsensusLog`] is the seam consensus lives
-//! behind, [`SingleNodeLog`] is the implementation that ships today, and
+//! behind, [`SingleNodeLog`] and [`RaftLog`] are the implementations, and
 //! [`ControlClient`] is how everything outside this crate reaches it.
 //!
 //! # What is here and what is not
 //!
-//! Consensus is behind a trait with a single-node implementation underneath
-//! it. That is staging, and [`consensus`] documents it as such along with
-//! exactly how `openraft` slots in without changing anything above the trait.
-//! A single-node control plane is not a production configuration and this
-//! crate does not pretend it is.
+//! Consensus is behind a trait with two implementations underneath it:
+//! [`SingleNodeLog`], the durable log for a cluster of one that `orbita dev`
+//! runs, and [`RaftLog`], a Raft group driven by `raft-rs` with every piece
+//! of its IO routed through `orbita_runtime`. [`consensus`] documents the
+//! seam and the `raft` module documents how the pieces map onto it.
 //!
 //! Partition merge is not implemented. It is the highest-risk requirement in
 //! the project, `docs/plan/README.md` flags it as the first thing to cut, and
@@ -101,6 +101,7 @@ pub mod consensus;
 mod controller;
 mod membership;
 mod model;
+mod raft;
 mod service;
 mod state;
 mod version;
@@ -117,6 +118,7 @@ pub use controller::{
 };
 pub use membership::{NodeHealth, NodeRole, NodeStatus, PartitionProgress};
 pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
+pub use raft::RaftLog;
 pub use service::ControlService;
 pub use state::{ClusterState, NodeRecord, PartitionPhase};
 pub use version::{binary_speaks, binary_version, ClusterVersion, VersionRange};
