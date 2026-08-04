@@ -49,10 +49,9 @@
 //! its owner's log still holds cannot be caught up, and says so rather than
 //! pretending; the owner logs it and the partition runs on the copies it has.
 //!
-//! Also not built: checkpointing the log at the storage engine's flush
-//! horizon. Recovery replays the whole log and relies on the engine ignoring
-//! everything at or below the horizon, which is correct and unbounded; wiring
-//! `Wal::checkpoint` to the flush is deliberate follow-up work.
+//! Owners periodically publish applied writes as partition-v1 segments. A WAL
+//! checkpoint follows only after the manifest compare-and-swap succeeds, so a
+//! failed or deposed writer always retains the log range recovery still needs.
 
 #![forbid(unsafe_code)]
 
@@ -78,7 +77,9 @@ mod status;
 mod transport;
 mod validate;
 
-pub use config::{ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL, DEFAULT_KEYSPACE};
+pub use config::{
+    ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL, DEFAULT_FLUSH_INTERVAL, DEFAULT_KEYSPACE,
+};
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 pub use map_source::{single_node_map, BoxedMapSource, MapSource, StaticMapSource};
@@ -92,6 +93,8 @@ use crate::service::{HealthService, KvService};
 
 use orbita_control::ControlClient;
 use orbita_core::{Error, Result};
+use orbita_objectstore::s3::S3Store;
+use orbita_objectstore::ObjectStore;
 use orbita_proto::v1::health_server::HealthServer;
 use orbita_proto::v1::kv_server::KvServer;
 use orbita_runtime::Runtime;
@@ -113,6 +116,7 @@ pub struct Server {
     transport: PeerTransport,
     peers: PeerListener,
     heartbeat: tokio::task::JoinHandle<()>,
+    flusher: tokio::task::JoinHandle<()>,
     /// Present only for a node joined to a leader group.
     reporting: Option<tokio::task::JoinHandle<()>>,
     /// The reporting loop's handle, kept so the server can answer which
@@ -129,21 +133,26 @@ impl Server {
     /// node holds is open and recovered, so a caller that gets a `Server` back
     /// can send it a request immediately.
     pub async fn start(config: ServerConfig) -> Result<Self> {
-        let storage_root = config.data_dir.join("storage");
-        std::fs::create_dir_all(&storage_root)
-            .map_err(|e| Error::Internal(format!("creating {}: {e}", storage_root.display())))?;
-
         let runtime = ServerRuntime::new(config.node_id, &config.data_dir, config.rng_seed)
             .with_peer_call_timeout(config.node_id, config.peer_call_timeout);
         for (node, address) in &config.peers {
             runtime.transport().set_peer(*node, address.clone());
         }
-        // The node's own filesystem stands in for a bucket, which is what
-        // keeps a single node runnable from a data directory alone. Pointing
-        // this at a real object store is configuration work that arrives with
-        // multi-node deployment.
+        let store: Arc<dyn ObjectStore> = match config.object_store {
+            Some(object_store) => Arc::new(
+                S3Store::connect(object_store)
+                    .map_err(|e| Error::Internal(format!("configuring object storage: {e}")))?,
+            ),
+            None => {
+                let storage_root = config.data_dir.join("storage");
+                std::fs::create_dir_all(&storage_root).map_err(|e| {
+                    Error::Internal(format!("creating {}: {e}", storage_root.display()))
+                })?;
+                Arc::new(fs_store::FsStore::new(storage_root))
+            }
+        };
         let layout = DataLayout {
-            store: Arc::new(fs_store::FsStore::new(storage_root)),
+            store,
             wal_root: "wal".to_string(),
         };
 
@@ -196,6 +205,10 @@ impl Server {
         let heartbeat = tokio::spawn(Self::renew_leases_loop(
             Arc::downgrade(&node),
             node.lease_interval(),
+        ));
+        let flusher = tokio::spawn(Self::flush_loop(
+            Arc::downgrade(&node),
+            config.flush_interval,
         ));
 
         let mut reporter = None;
@@ -251,6 +264,7 @@ impl Server {
             transport: runtime.transport().clone(),
             peers,
             heartbeat,
+            flusher,
             reporting,
             reporter,
             shutdown,
@@ -286,6 +300,7 @@ impl Server {
     pub async fn shutdown(self) -> Result<()> {
         let _ = self.shutdown.send(());
         self.heartbeat.abort();
+        self.flusher.abort();
         if let Some(reporting) = &self.reporting {
             reporting.abort();
         }
@@ -314,6 +329,17 @@ impl Server {
             live.renew_leases().await;
             drop(live);
             tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// Publishes every owned partition on the configured cadence.
+    async fn flush_loop(node: std::sync::Weak<Node<ServerRuntime>>, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(live) = node.upgrade() else {
+                return;
+            };
+            live.flush_owned().await;
         }
     }
 

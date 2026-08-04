@@ -725,6 +725,7 @@ dependencies = [
  "bytes",
  "clap",
  "orbita-core",
+ "orbita-objectstore",
  "orbita-proto",
  "orbita-server",
  "serde",

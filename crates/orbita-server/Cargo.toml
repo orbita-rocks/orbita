@@ -22,7 +22,7 @@ publish = false
 orbita-core.workspace = true
 orbita-control.workspace = true
 orbita-format.workspace = true
-orbita-objectstore.workspace = true
+orbita-objectstore = { workspace = true, features = ["hyper-client"] }
 orbita-runtime.workspace = true
 orbita-proto.workspace = true
 orbita-storage.workspace = true

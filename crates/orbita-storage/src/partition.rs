@@ -351,7 +351,7 @@ impl<R: Runtime> Partition<R> {
             deleted: false,
             value,
         };
-        self.commit(&mut state, lamport, key, entry).await?;
+        self.commit(&mut state, lamport, key, entry, true).await?;
         Ok(WriteOutcome::Applied {
             version: version_at(lamport),
         })
@@ -397,7 +397,7 @@ impl<R: Runtime> Partition<R> {
             deleted: true,
             value: Bytes::new(),
         };
-        self.commit(&mut state, lamport, key, entry).await?;
+        self.commit(&mut state, lamport, key, entry, true).await?;
         Ok(WriteOutcome::Applied {
             version: version_at(lamport),
         })
@@ -547,7 +547,9 @@ impl<R: Runtime> Partition<R> {
                 value: Bytes::new(),
             },
         };
-        self.commit(&mut state, mutation.lamport, &mutation.key, entry)
+        // Replicas must not publish this partition's manifest. The host calls
+        // `flush_if_needed` only for the current owner after this apply lands.
+        self.commit(&mut state, mutation.lamport, &mutation.key, entry, false)
             .await
     }
 
@@ -559,6 +561,15 @@ impl<R: Runtime> Partition<R> {
     /// advance the same sequence.
     pub async fn committed_lamport(&self) -> Result<Lamport> {
         Ok(self.state.read().await.committed)
+    }
+
+    /// The highest Lamport made durable by a published manifest.
+    ///
+    /// A WAL may checkpoint through this boundary, and never through
+    /// [`Partition::committed_lamport`], because acknowledged writes above it
+    /// still exist only in the replicated log.
+    pub async fn flushed_lamport(&self) -> Result<Lamport> {
+        Ok(self.state.read().await.flushed)
     }
 
     /// The partition's size, which is what the leader splits on.
@@ -577,6 +588,18 @@ impl<R: Runtime> Partition<R> {
     /// names; the size trigger calls the same path from inside a write.
     pub async fn flush(&self) -> Result<()> {
         let mut state = self.state.write().await;
+        self.flush_locked(&mut state).await
+    }
+
+    /// Flushes only when the mutable table has crossed the size trigger.
+    ///
+    /// Ownership is deliberately the caller's decision. Replicas apply the
+    /// same mutations but only the current owner may publish a manifest.
+    pub async fn flush_if_needed(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        if state.memtable_bytes < FLUSH_TRIGGER_BYTES {
+            return Ok(());
+        }
         self.flush_locked(&mut state).await
     }
 
@@ -685,6 +708,7 @@ impl<R: Runtime> Partition<R> {
         lamport: Lamport,
         key: &[u8],
         entry: Stored,
+        flush_on_trigger: bool,
     ) -> Result<()> {
         let key = Bytes::copy_from_slice(key);
         let added = entry_cost(&key, &entry);
@@ -704,7 +728,7 @@ impl<R: Runtime> Partition<R> {
         // stays down grows the table without bound. That is the honest
         // trade: the alternative is refusing durable writes because space
         // reclamation is behind, and refusal is the worse lie.
-        if state.memtable_bytes >= FLUSH_TRIGGER_BYTES {
+        if flush_on_trigger && state.memtable_bytes >= FLUSH_TRIGGER_BYTES {
             if let Err(error) = self.flush_locked(state).await {
                 tracing::warn!(
                     %error,
