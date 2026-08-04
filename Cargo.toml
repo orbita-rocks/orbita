@@ -4,6 +4,7 @@ members = [
     "crates/orbita-core",
     "crates/orbita-runtime",
     "crates/orbita-objectstore",
+    "crates/orbita-format",
     "crates/orbita-proto",
     "crates/orbita-storage",
     "crates/orbita-wal",
@@ -25,6 +26,7 @@ authors = ["The Orbita Authors"]
 orbita-core = { path = "crates/orbita-core" }
 orbita-runtime = { path = "crates/orbita-runtime" }
 orbita-objectstore = { path = "crates/orbita-objectstore" }
+orbita-format = { path = "crates/orbita-format" }
 orbita-proto = { path = "crates/orbita-proto" }
 orbita-storage = { path = "crates/orbita-storage" }
 orbita-wal = { path = "crates/orbita-wal" }
@@ -33,7 +35,14 @@ orbita-server = { path = "crates/orbita-server" }
 orbita-sim = { path = "crates/orbita-sim" }
 
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1"
+# CRC32C, the Castagnoli polynomial the format specifies. This crate uses the
+# hardware instruction where there is one and falls back to a table otherwise,
+# which is the whole reason the format picked that polynomial.
+crc32c = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

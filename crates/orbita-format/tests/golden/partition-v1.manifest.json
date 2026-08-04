@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "keyspace_id": 1,
+  "partition_id": 7,
+  "epoch": 6,
+  "committed_lamport": 9,
+  "range": {
+    "start": "",
+    "end": "bQ=="
+  },
+  "segments": [
+    {
+      "name": "segments/0000000000000006-0000000000000000.oseg",
+      "bytes": 384,
+      "record_count": 4,
+      "min_key": "YWxwaGE=",
+      "max_key": "ZGVsdGE=",
+      "min_lamport": 1,
+      "max_lamport": 4
+    }
+  ]
+}
