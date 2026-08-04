@@ -19,7 +19,7 @@
 //! That is why `invalidating` does its work inline and `durable` queues it. The
 //! observer runs between an inbound batch and its acknowledgement, so anything
 //! slow in it becomes write latency for the whole partition, and applying to
-//! RocksDB is slow.
+//! the storage engine is slow.
 
 use crate::host::PartitionHost;
 

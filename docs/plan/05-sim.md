@@ -36,39 +36,23 @@ after the fact tends to be a simulator the system cannot actually run under.
 
 ## Out of scope
 
-- Simulating RocksDB's internal I/O. See the honest limit below.
 - Performance measurement. Virtual time says nothing about real latency.
 
-## The limit, being removed
+## Storage under simulation
 
-[ADR 0006](../adr/0006-partitions-are-an-index-over-immutable-objects.md)
-replaces RocksDB with a format this project owns, and everything that format
-persists goes through `Disk` or `ObjectStore`. When that lands, the limit below
-stops being true and this section should be deleted rather than reworded, and
-the public correctness report can claim the system is verified under simulation
-rather than the distributed layer.
+The section that used to sit here described a limit: RocksDB did its own file
+I/O beneath `orbita_runtime::Disk`, so storage was a trusted component with
+faults injected at its API boundary. Per
+[ADR 0006](../adr/0006-partitions-are-an-index-over-immutable-objects.md) the
+storage engine now persists exclusively through
+`orbita_objectstore::ObjectStore`, and per this brief's own instruction the
+limit was deleted rather than reworded.
 
-Until then the paragraphs below still describe what is actually true.
-
-## The limit, stated honestly
-
-RocksDB does its own file I/O beneath `orbita_runtime::Disk`, so the simulator
-cannot inject faults inside it without a custom RocksDB `Env`, which is a large
-piece of work in its own right. The consequence: simulation covers the
-distributed protocol layer, meaning WAL replication, consensus, ownership,
-routing, and the read path, and treats a local RocksDB as a trusted component,
-with faults injected at its API boundary instead.
-
-That is a real gap and it must be stated plainly in the public correctness
-report rather than glossed. It is defensible, since RocksDB is far more
-battle-tested than anything in this repository, and the failures that a
-distributed store gets wrong are overwhelmingly in the protocol layer. But the
-claim we can support is "the distributed layer is verified under deterministic
-simulation," not "the whole system is." Overclaiming here would undermine the
-one thing the project is selling.
-
-If someone later wants to close the gap, a RocksDB `Env` bridged to
-`orbita_runtime::Disk` is the way, and it is a good standalone project.
+What remains before the public correctness report can claim the whole system
+is verified under simulation: the simulated runs currently stand an in-memory
+store into that seam without injecting faults through it. A fault-injecting
+`ObjectStore` is small next to what the seam replaced and is the natural next
+piece of this crate.
 
 ## Decisions to make and write down
 

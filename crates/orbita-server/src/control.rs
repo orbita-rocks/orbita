@@ -148,17 +148,29 @@ impl<R: Runtime> StatusReporter<R> {
 
     /// Sends one report, carrying how far this node has got on every partition
     /// it holds.
-    pub async fn report(&self, map_version: MapVersion, partitions: Vec<PartitionProgress>) {
+    ///
+    /// Answers whether the report landed. The first `true` is what marks this
+    /// node as joined for readiness, because a report the leader group
+    /// accepted is the moment the cluster knows this node exists.
+    pub async fn report(
+        &self,
+        map_version: MapVersion,
+        partitions: Vec<PartitionProgress>,
+    ) -> bool {
         let status = NodeStatus {
             role: NodeRole::Worker,
             address: self.address.clone(),
             map_version,
             partitions,
         };
-        if let Err(error) = self.client.report_status(self.node, status).await {
-            // A heartbeat that does not land is what failover is built to
-            // survive, so it is worth saying and not worth stopping for.
-            tracing::debug!(%error, "reporting status to the leader group failed");
+        match self.client.report_status(self.node, status).await {
+            Ok(()) => true,
+            Err(error) => {
+                // A heartbeat that does not land is what failover is built to
+                // survive, so it is worth saying and not worth stopping for.
+                tracing::debug!(%error, "reporting status to the leader group failed");
+                false
+            }
         }
     }
 }

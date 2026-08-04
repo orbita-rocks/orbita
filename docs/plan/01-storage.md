@@ -1,9 +1,16 @@
 # 01: Storage engine (`orbita-storage`)
 
-Owns one partition's RocksDB instance and everything that happens inside it.
-This is single-node code with no notion of replication, ownership, or the
-cluster, which makes it the best place to start: it is fully testable on its
-own and every other crate depends on its semantics being right.
+Owns one partition and everything that happens inside it. This is single-node
+code with no notion of replication, ownership, or the cluster, which makes it
+the best place to start: it is fully testable on its own and every other crate
+depends on its semantics being right.
+
+> **Partly superseded.** This brief describes the engine as it was first
+> built, on RocksDB. [ADR 0006](../adr/0006-partitions-are-an-index-over-immutable-objects.md)
+> replaced that with the partition format in brief 07, and the crate now runs
+> on `orbita-format` over `orbita_objectstore::ObjectStore`. The semantics
+> below — conditional writes, TTL, tombstones, cursors, idempotent `apply`,
+> and the model test — carried over unchanged; the RocksDB mechanics did not.
 
 ## Scope
 

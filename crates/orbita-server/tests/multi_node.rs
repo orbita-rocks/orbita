@@ -452,3 +452,43 @@ async fn a_cluster_survives_losing_the_owner_without_losing_an_acknowledged_writ
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_worker_reports_ready_once_the_leader_group_has_heard_from_it() {
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+
+    let mut worker = start_worker(WORKERS[0], &group.address, lease).await;
+
+    // Recovery and partition open complete inside `Server::start`, but the
+    // join lands only when the control loop's first heartbeat is accepted, so
+    // readiness is awaited rather than asserted. The subscription is the same
+    // handle the SIGTERM handoff will consume, which is why this waits on the
+    // gate instead of polling the RPC.
+    let gate = worker.server().readiness();
+    let mut watched = gate.subscribe();
+    tokio::time::timeout(
+        BUDGET * 4,
+        watched.wait_for(orbita_server::ReadinessState::is_ready),
+    )
+    .await
+    .expect("the worker becomes ready within the budget")
+    .expect("the gate outlives the wait");
+
+    // The wire agrees with the gate.
+    let mut health = orbita_proto::v1::health_client::HealthClient::connect(format!(
+        "http://{}",
+        worker.server().local_addr()
+    ))
+    .await
+    .expect("a health client connects");
+    let response = health
+        .check_readiness(orbita_proto::v1::CheckReadinessRequest {})
+        .await
+        .expect("readiness is answered")
+        .into_inner();
+    assert!(response.ready, "unmet: {:?}", response.conditions);
+
+    worker.kill().await;
+}

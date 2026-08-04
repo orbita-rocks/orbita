@@ -33,12 +33,16 @@ implement against is a single-implementation format with extra steps.
 
 ## What is left
 
-`orbita-storage` still runs on RocksDB. Moving it onto this crate is the next
-step and a larger one, because it is where the parts this brief excludes live:
-a memtable, a flush policy, an index that spans both, recovery from the log
-above `committed_lamport`, and a compaction schedule. Doing it in the same
-change as the format would have meant reviewing the bytes and the engine
-together, and the bytes are the part another implementation has to agree with.
+The step this section used to name is done: `orbita-storage` runs on this
+crate rather than RocksDB, and owns the parts this brief excludes: the
+memtable, the flush policy, the index spanning both, recovery from the log
+above `committed_lamport`, and the compaction schedule. Doing that in a
+separate change from the format was the point: the bytes were reviewed alone,
+because the bytes are the part another implementation has to agree with.
+
+Still open here: the sweep's grace period, which waits on object creation
+times `orbita_objectstore::ObjectMeta` does not carry, and a store-level
+fault-injection seam for the simulator (see brief 05).
 
 ## Done when
 

@@ -28,6 +28,7 @@ use crate::host::{HostSpec, LeasePolicy, PartitionHost, PartitionPaths, Read, Wr
 use crate::lease::DEFAULT_LEASE_MARGIN;
 use crate::map_source::{BoxedMapSource, MapSource};
 use crate::proxy;
+use crate::readiness::{ReadinessCondition, ReadinessGate};
 use crate::replication::{Applies, ReplicaBridge};
 use crate::validate;
 
@@ -37,6 +38,8 @@ use orbita_core::{
     Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
     MESSAGE_OVERHEAD_BYTES,
 };
+use orbita_format::PartitionPath;
+use orbita_objectstore::ObjectStore;
 use orbita_proto::v1::{
     DeleteRequest, DeleteResponse, GetLimitsResponse, GetRequest, GetResponse, ListEntry,
     ListRequest, ListResponse, SetRequest, SetResponse,
@@ -51,26 +54,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
-/// Where a node's files go.
+/// Where a node's data goes.
 ///
-/// The two roots are different layers rather than a style choice: the log goes
-/// through `orbita_runtime::Disk`, which is rooted at the data directory and
-/// takes relative paths, and RocksDB does its own I/O below that seam and
-/// takes real ones.
-#[derive(Debug, Clone)]
+/// The two locations are different layers rather than a style choice: the log
+/// goes through `orbita_runtime::Disk`, which is rooted at the data directory
+/// and takes relative paths, and the storage engine goes through this one
+/// shared `ObjectStore`, addressed by the partition layout `orbita-format`
+/// defines.
+#[derive(Clone)]
 pub(crate) struct DataLayout {
-    pub storage_root: std::path::PathBuf,
+    pub store: Arc<dyn ObjectStore>,
     pub wal_root: String,
 }
 
 impl DataLayout {
-    fn paths(&self, partition: PartitionId) -> PartitionPaths {
+    fn paths(&self, keyspace: KeyspaceId, partition: PartitionId) -> PartitionPaths {
         PartitionPaths {
-            storage_path: self
-                .storage_root
-                .join(format!("p{}", partition.get()))
-                .to_string_lossy()
-                .into_owned(),
+            store: Arc::clone(&self.store),
+            path: PartitionPath::new("", keyspace, partition),
             wal_dir: format!("{}/p{}", self.wal_root, partition.get()),
         }
     }
@@ -100,6 +101,9 @@ pub(crate) struct Node<R: Runtime> {
     /// Whether the last attempt to match the open partitions to the map
     /// failed, which is what makes the next refresh try again.
     unreconciled: std::sync::atomic::AtomicBool,
+    /// The startup conditions this node reports. The node marks recovery and
+    /// catch-up; the control loop above it marks the join.
+    readiness: Arc<ReadinessGate>,
 }
 
 /// Where a request has to go.
@@ -138,6 +142,7 @@ impl<R: Runtime> Node<R> {
         layout: DataLayout,
         source: BoxedMapSource,
         lease_duration: Duration,
+        readiness: Arc<ReadinessGate>,
     ) -> Result<Arc<Self>> {
         let map = source.fetch().await?;
         let (bridge, applies) = ReplicaBridge::start(&runtime);
@@ -162,8 +167,15 @@ impl<R: Runtime> Node<R> {
             },
             replica_reads: AtomicU64::new(0),
             unreconciled: std::sync::atomic::AtomicBool::new(false),
+            readiness,
         });
         node.reconcile().await?;
+        // Opening a partition replays its write-ahead log to the trusted end,
+        // so the initial reconcile succeeding means every log this node holds
+        // is recovered. Marked here rather than inside `reconcile` because a
+        // later reconcile reopens single partitions, which is catch-up moving
+        // and not recovery happening again. `reconcile` marks catch-up itself.
+        node.readiness.mark(ReadinessCondition::WalRecovered);
 
         runtime
             .transport()
@@ -204,20 +216,47 @@ impl<R: Runtime> Node<R> {
                 return Ok(());
             }
         }
-        let outcome = self.reconcile().await;
-        self.unreconciled.store(outcome.is_err(), Ordering::Release);
-        if let Err(error) = &outcome {
-            tracing::warn!(%error, "could not open every partition this node was given");
-        }
-        outcome
+        self.reconcile().await
     }
 
-    /// Brings the set of open partitions in line with the map.
+    /// Brings the set of open partitions in line with the map, and records how
+    /// it went.
+    ///
+    /// The retry flag and the readiness condition are updated while the
+    /// `hosts` write lock is still held. `refresh_map` runs concurrently, from
+    /// the control loop, from misroute repair, and from the admin surface, and
+    /// the lock is the only thing serializing the reconciles underneath them.
+    /// Recording after the lock dropped would let a stale failure overwrite a
+    /// fresher success: the node would sit unready with the retry flag saying
+    /// there is nothing to retry, and nothing would ever re-mark it until the
+    /// map version moved.
     async fn reconcile(&self) -> Result<()> {
         let map = self.map();
         let wanted: Vec<PartitionInfo> = map.held_by(self.node_id).cloned().collect();
 
         let mut hosts = self.hosts.write().await;
+        let outcome = self.reconcile_locked(&mut hosts, wanted).await;
+        self.unreconciled.store(outcome.is_err(), Ordering::Release);
+        // Readiness follows the reconcile outcome both ways. A node holding a
+        // partition it could not open is not ready, however long it has been
+        // running, and a node that has since opened it is ready again.
+        match &outcome {
+            Ok(()) => self.readiness.mark(ReadinessCondition::PartitionsCaughtUp),
+            Err(error) => {
+                self.readiness.clear(ReadinessCondition::PartitionsCaughtUp);
+                tracing::warn!(%error, "could not open every partition this node was given");
+            }
+        }
+        outcome
+    }
+
+    /// The body of a reconcile, run under the `hosts` write lock the caller
+    /// holds so the outcome it returns is the outcome that gets recorded.
+    async fn reconcile_locked(
+        &self,
+        hosts: &mut HashMap<PartitionId, Arc<PartitionHost<R>>>,
+        wanted: Vec<PartitionInfo>,
+    ) -> Result<()> {
         hosts.retain(|id, _| {
             let keep = wanted.iter().any(|p| p.id == *id);
             if !keep {
@@ -244,15 +283,17 @@ impl<R: Runtime> Node<R> {
             if unchanged {
                 continue;
             }
-            // The old incarnation is closed before the new one opens, because
-            // both want the same storage engine directory and RocksDB holds a
-            // lock on it. Opening first and replacing after would fail every
-            // promotion, which is the one time this path matters.
+            // The old incarnation is closed before the new one opens, so that
+            // two incarnations never hold the same partition at once: the old
+            // one's applier retires with it, and the new one's recovery sees
+            // a store nothing else is writing. Opening first and replacing
+            // after would break every promotion, which is the one time this
+            // path matters.
             hosts.remove(&info.id);
             self.wal_service.unregister(info.id);
             self.bridge.unregister(info.id);
 
-            let paths = self.layout.paths(info.id);
+            let paths = self.layout.paths(info.keyspace, info.id);
             let spec = HostSpec {
                 id: info.id,
                 epoch: info.epoch,
@@ -826,6 +867,186 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map_source::StaticMapSource;
+    use async_trait::async_trait;
+    use orbita_core::{Epoch, KeyRange, KeyspaceName, MapVersion};
+    use orbita_format::testing::MemoryStore;
+    use orbita_objectstore::{
+        ETag, ObjectError, ObjectMeta, ObjectResult, ObjectStore, Precondition,
+    };
+    use orbita_sim::Simulation;
+    use std::ops::Range;
+
+    /// An in-memory store whose listings can be failed for one reconcile.
+    ///
+    /// Opening a partition lists its segment and value prefixes before it can
+    /// serve. Failing that operation exercises the real open error path while
+    /// keeping this simulation independent of a filesystem backend.
+    struct ListingFailureStore {
+        inner: MemoryStore,
+        fail_list: std::sync::atomic::AtomicBool,
+    }
+
+    impl ListingFailureStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_list: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn fail_list(&self, fail: bool) {
+            self.fail_list.store(fail, Ordering::Release);
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ListingFailureStore {
+        async fn put(&self, key: &str, data: Bytes) -> ObjectResult<ETag> {
+            self.inner.put(key, data).await
+        }
+
+        async fn put_if(
+            &self,
+            key: &str,
+            data: Bytes,
+            precondition: Precondition,
+        ) -> ObjectResult<ETag> {
+            self.inner.put_if(key, data, precondition).await
+        }
+
+        async fn get(&self, key: &str) -> ObjectResult<(Bytes, ETag)> {
+            self.inner.get(key).await
+        }
+
+        async fn get_range(&self, key: &str, range: Range<u64>) -> ObjectResult<Bytes> {
+            self.inner.get_range(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> ObjectResult<ObjectMeta> {
+            self.inner.head(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> ObjectResult<Vec<ObjectMeta>> {
+            if self.fail_list.load(Ordering::Acquire) {
+                return Err(ObjectError::Transient(
+                    "injected partition open failure".to_string(),
+                ));
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> ObjectResult<()> {
+            self.inner.delete(key).await
+        }
+    }
+
+    fn keyspace_info() -> KeyspaceInfo {
+        KeyspaceInfo {
+            id: KeyspaceId(1),
+            name: KeyspaceName::new("default").unwrap(),
+            default_ttl_millis: None,
+            max_value_bytes: None,
+            max_storage_bytes: None,
+            max_reads_per_second: None,
+            max_writes_per_second: None,
+        }
+    }
+
+    fn partition(id: u64, range: KeyRange) -> PartitionInfo {
+        PartitionInfo {
+            id: PartitionId(id),
+            keyspace: KeyspaceId(1),
+            range,
+            owner: Some(NodeId(1)),
+            epoch: Epoch(1),
+            replicas: Vec::new(),
+        }
+    }
+
+    /// One unbounded partition, which is what the node opens at start.
+    fn one_partition_map() -> PartitionMap {
+        let mut map = PartitionMap::new(MapVersion(1));
+        map.insert_keyspace(keyspace_info());
+        map.insert_partition(partition(1, KeyRange::unbounded()));
+        map
+    }
+
+    /// The same keyspace split in two, handing this node a second partition.
+    fn two_partition_map() -> PartitionMap {
+        let mut map = PartitionMap::new(MapVersion(2));
+        map.insert_keyspace(keyspace_info());
+        map.insert_partition(partition(
+            1,
+            KeyRange::new(Bytes::new(), Some(Bytes::from_static(b"m"))).unwrap(),
+        ));
+        map.insert_partition(partition(
+            2,
+            KeyRange::new(Bytes::from_static(b"m"), None).unwrap(),
+        ));
+        assert_eq!(map.check_coverage(), Ok(()));
+        map
+    }
+
+    /// The transition the readiness gate adds beyond startup: a reconcile that
+    /// cannot open a partition unreadies the node, and the retry on the next
+    /// refresh, with the map version unchanged, readies it again once the
+    /// open succeeds.
+    #[test]
+    fn a_failed_reconcile_unreadies_the_node_until_a_retry_opens_the_partition() {
+        let sim = Simulation::new(7);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(ListingFailureStore::new());
+        let layout = DataLayout {
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            wal_root: "wal".to_string(),
+        };
+
+        let source = StaticMapSource::new(one_partition_map());
+        let gate = Arc::new(ReadinessGate::new());
+        let node = {
+            let layout = layout.clone();
+            let source = BoxedMapSource::new(source.clone());
+            let gate = Arc::clone(&gate);
+            sim.block_on(async move {
+                Node::start(
+                    runtime,
+                    NodeId(1),
+                    layout,
+                    source,
+                    crate::DEFAULT_LEASE_DURATION,
+                    gate,
+                )
+                .await
+                .expect("the node starts")
+            })
+        };
+        assert!(
+            gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
+            "the initial open marks catch-up"
+        );
+
+        store.fail_list(true);
+        source.set(two_partition_map());
+        let refreshing = Arc::clone(&node);
+        let outcome = sim.block_on(async move { refreshing.refresh_map().await });
+        assert!(outcome.is_err(), "the blocked partition cannot open");
+        assert!(
+            !gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
+            "a node holding a partition it could not open is not ready"
+        );
+
+        store.fail_list(false);
+        let refreshing = Arc::clone(&node);
+        sim.block_on(async move { refreshing.refresh_map().await })
+            .expect("the retry reconciles even though the map version is unchanged");
+        assert!(
+            gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
+            "readiness returns once every partition is open again"
+        );
+
+        drop(node);
+    }
 
     #[test]
     fn a_cursor_carries_both_the_routing_key_and_the_engines_own() {
