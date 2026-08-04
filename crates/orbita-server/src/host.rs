@@ -38,6 +38,8 @@ use bytes::Bytes;
 use orbita_core::{
     Epoch, Error, KeyRange, Lamport, NodeId, PartitionId, Record, Result, Version, WriteCondition,
 };
+use orbita_format::PartitionPath;
+use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_storage::{Mutation, Partition, ScanPage, TOMBSTONE_RETENTION_MILLIS};
 use orbita_wal::{PartitionLog, Wal, WalConfig, WalEntry, WalOp};
@@ -51,10 +53,10 @@ use std::time::Duration;
 
 /// How long a scan waits for acknowledged writes to reach the storage engine.
 ///
-/// A page is read from RocksDB alone, so a write that has been acknowledged
-/// and not yet applied would be missing from it. Waiting is cheap because the
-/// queue drains in the time an apply takes, and a scan is already the
-/// expensive path.
+/// A page is read from the storage engine alone, so a write that has been
+/// acknowledged and not yet applied would be missing from it. Waiting is cheap
+/// because the queue drains in the time an apply takes, and a scan is already
+/// the expensive path.
 const SCAN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many keys a replica may hold unreadable before it is worth saying so.
@@ -138,15 +140,18 @@ pub(crate) struct WriteAck {
     pub existed: bool,
 }
 
-/// Where a partition's files live.
+/// Where a partition's data lives.
 ///
-/// The two paths are separate because they go through different layers. The
-/// log goes through `orbita_runtime::Disk`, so its path is relative to the
-/// node's data root and the simulator can fault-inject it. RocksDB does its
-/// own I/O underneath that seam, so its path is a real filesystem path.
-#[derive(Debug, Clone)]
+/// The two locations go through different layers on purpose. The log goes
+/// through `orbita_runtime::Disk`, so its path is relative to the node's data
+/// root and the simulator can fault-inject it. The storage engine persists
+/// through `ObjectStore`, which is a second seam the simulator can stand a
+/// store into, and in production is either a bucket or the node's own
+/// filesystem adapter.
+#[derive(Clone)]
 pub(crate) struct PartitionPaths {
-    pub storage_path: String,
+    pub store: Arc<dyn ObjectStore>,
+    pub path: PartitionPath,
     pub wal_dir: String,
 }
 
@@ -196,7 +201,16 @@ impl<R: Runtime> PartitionHost<R> {
         let HostSpec {
             id, epoch, range, ..
         } = spec.clone();
-        let storage = Arc::new(Partition::open(runtime.clone(), &paths.storage_path, range).await?);
+        let storage = Arc::new(
+            Partition::open(
+                runtime.clone(),
+                Arc::clone(&paths.store),
+                paths.path.clone(),
+                epoch,
+                range,
+            )
+            .await?,
+        );
         let config =
             WalConfig::new(id, paths.wal_dir.clone(), epoch).with_replicas(replicas.clone());
         let wal = Wal::open(runtime.clone(), config).await?;
@@ -241,7 +255,14 @@ impl<R: Runtime> PartitionHost<R> {
     ) -> Result<Arc<Self>> {
         let id = spec.id;
         let storage = Arc::new(
-            Partition::open(runtime.clone(), &paths.storage_path, spec.range.clone()).await?,
+            Partition::open(
+                runtime.clone(),
+                Arc::clone(&paths.store),
+                paths.path.clone(),
+                spec.epoch,
+                spec.range.clone(),
+            )
+            .await?,
         );
         let log = PartitionLog::open(
             runtime.clone(),
@@ -276,10 +297,10 @@ impl<R: Runtime> PartitionHost<R> {
         let pending = Arc::new(Mutex::new(PendingSet::default()));
         let drained = Arc::new(tokio::sync::Notify::new());
 
-        // The applier holds weak references so that dropping a host closes
-        // its RocksDB instance there and then. A background task keeping the
-        // engine alive would make a restart fail to acquire the lock on files
-        // the previous incarnation has already finished with.
+        // The applier holds weak references so that dropping a host retires
+        // its storage engine there and then. A background task keeping the
+        // engine alive would let a deposed incarnation keep applying after
+        // its replacement has opened the same partition.
         runtime.spawn(apply_loop(
             spec.id,
             Arc::downgrade(&storage),

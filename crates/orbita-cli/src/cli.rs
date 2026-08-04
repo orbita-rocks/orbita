@@ -282,7 +282,7 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ADDR")]
     pub peer_advertise: Option<String>,
 
-    /// Where the WAL, the local RocksDB, and the Raft log live.
+    /// Where the WAL, the local partition objects, and the Raft log live.
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 

@@ -6,3 +6,5 @@ $schema: 'https://moonrepo.dev/schemas/project.json'
 dependsOn:
   - 'orbita-core'
   - 'orbita-runtime'
+  - 'orbita-format'
+  - 'orbita-objectstore'

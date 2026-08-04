@@ -48,6 +48,11 @@
 //! What is not built is a snapshot. A replica that falls further behind than
 //! its owner's log still holds cannot be caught up, and says so rather than
 //! pretending; the owner logs it and the partition runs on the copies it has.
+//!
+//! Also not built: checkpointing the log at the storage engine's flush
+//! horizon. Recovery replays the whole log and relies on the engine ignoring
+//! everything at or below the horizon, which is correct and unbounded; wiring
+//! `Wal::checkpoint` to the flush is deliberate follow-up work.
 
 #![forbid(unsafe_code)]
 
@@ -56,6 +61,7 @@ mod control;
 #[cfg(test)]
 mod forwarding;
 mod frame;
+mod fs_store;
 mod host;
 mod lease;
 #[cfg(test)]
@@ -129,8 +135,12 @@ impl Server {
         for (node, address) in &config.peers {
             runtime.transport().set_peer(*node, address.clone());
         }
+        // The node's own filesystem stands in for a bucket, which is what
+        // keeps a single node runnable from a data directory alone. Pointing
+        // this at a real object store is configuration work that arrives with
+        // multi-node deployment.
         let layout = DataLayout {
-            storage_root,
+            store: Arc::new(fs_store::FsStore::new(storage_root)),
             wal_root: "wal".to_string(),
         };
 

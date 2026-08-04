@@ -38,6 +38,8 @@ use orbita_core::{
     Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
     MESSAGE_OVERHEAD_BYTES,
 };
+use orbita_format::PartitionPath;
+use orbita_objectstore::ObjectStore;
 use orbita_proto::v1::{
     DeleteRequest, DeleteResponse, GetLimitsResponse, GetRequest, GetResponse, ListEntry,
     ListRequest, ListResponse, SetRequest, SetResponse,
@@ -52,26 +54,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
-/// Where a node's files go.
+/// Where a node's data goes.
 ///
-/// The two roots are different layers rather than a style choice: the log goes
-/// through `orbita_runtime::Disk`, which is rooted at the data directory and
-/// takes relative paths, and RocksDB does its own I/O below that seam and
-/// takes real ones.
-#[derive(Debug, Clone)]
+/// The two locations are different layers rather than a style choice: the log
+/// goes through `orbita_runtime::Disk`, which is rooted at the data directory
+/// and takes relative paths, and the storage engine goes through this one
+/// shared `ObjectStore`, addressed by the partition layout `orbita-format`
+/// defines.
+#[derive(Clone)]
 pub(crate) struct DataLayout {
-    pub storage_root: std::path::PathBuf,
+    pub store: Arc<dyn ObjectStore>,
     pub wal_root: String,
 }
 
 impl DataLayout {
-    fn paths(&self, partition: PartitionId) -> PartitionPaths {
+    fn paths(&self, keyspace: KeyspaceId, partition: PartitionId) -> PartitionPaths {
         PartitionPaths {
-            storage_path: self
-                .storage_root
-                .join(format!("p{}", partition.get()))
-                .to_string_lossy()
-                .into_owned(),
+            store: Arc::clone(&self.store),
+            path: PartitionPath::new("", keyspace, partition),
             wal_dir: format!("{}/p{}", self.wal_root, partition.get()),
         }
     }
@@ -283,15 +283,17 @@ impl<R: Runtime> Node<R> {
             if unchanged {
                 continue;
             }
-            // The old incarnation is closed before the new one opens, because
-            // both want the same storage engine directory and RocksDB holds a
-            // lock on it. Opening first and replacing after would fail every
-            // promotion, which is the one time this path matters.
+            // The old incarnation is closed before the new one opens, so that
+            // two incarnations never hold the same partition at once: the old
+            // one's applier retires with it, and the new one's recovery sees
+            // a store nothing else is writing. Opening first and replacing
+            // after would break every promotion, which is the one time this
+            // path matters.
             hosts.remove(&info.id);
             self.wal_service.unregister(info.id);
             self.bridge.unregister(info.id);
 
-            let paths = self.layout.paths(info.id);
+            let paths = self.layout.paths(info.keyspace, info.id);
             let spec = HostSpec {
                 id: info.id,
                 epoch: info.epoch,

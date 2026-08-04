@@ -2,7 +2,7 @@
 //!
 //! [ADR 0003](../../../docs/adr/0003-conditions-evaluate-against-pending-writes.md)
 //! makes this the overlay a condition is evaluated against: a write exists in
-//! the log before it exists in RocksDB, and a second write to the same key
+//! the log before it exists in the storage engine, and a second write to the same key
 //! arriving in that window has to see the first one or two compare-and-swaps
 //! against the same version could both succeed.
 //!

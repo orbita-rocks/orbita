@@ -25,15 +25,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-  # A runner has about 14 GB of disk, and RocksDB compiles to a 1.4 GB static
-  # archive when it carries debug info. cargo builds it once per profile shape,
-  # so clippy, the test harness, and a plain build each get their own copy, and
-  # together they fill the disk and the job dies in the linker. Dropping the
-  # debug info takes each copy to under 200 MB. Nothing in CI runs a debugger,
-  # so this costs nothing here, and it is set only here so that a laptop still
-  # builds something you can break on.
-  CARGO_PROFILE_DEV_DEBUG: 0
-
   # The moon version, in one place. Keep it in step with .prototools, which is
   # what a laptop reads; moonrepo/setup-toolchain does not read that file.
   #

@@ -333,9 +333,13 @@ impl SegmentIndex {
 ///
 /// It carries what the manifest entry needs, so that publishing a segment
 /// never means computing those numbers a second time from a different source.
+/// The key index rides along for the same reason: a storage engine updating
+/// its in-memory index after a flush should not have to decode out of bytes
+/// what the builder had in hand a moment ago.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltSegment {
     pub bytes: Bytes,
+    pub index: SegmentIndex,
     pub record_count: u64,
     pub min_key: Bytes,
     pub max_key: Bytes,
@@ -451,6 +455,9 @@ impl SegmentBuilder {
 
         Ok(BuiltSegment {
             bytes: Bytes::from(self.body),
+            index: SegmentIndex {
+                entries: self.index,
+            },
             record_count: footer.record_count,
             min_key,
             max_key: self.max_key,
