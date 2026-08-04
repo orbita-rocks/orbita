@@ -47,3 +47,4 @@ slog = "2"
 
 [dev-dependencies]
 orbita-sim = { path = "../orbita-sim" }
+orbita-wal.workspace = true

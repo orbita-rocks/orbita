@@ -125,6 +125,8 @@ struct Inner {
     /// When this controller started observing. A node it has never heard from
     /// is timed from here rather than from the beginning of time.
     observing_since: u64,
+    /// Leadership changes invalidate every local failure-detection deadline.
+    was_leader: bool,
 }
 
 /// The leader group's decision loop and the API around it.
@@ -164,6 +166,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 observations: BTreeMap::new(),
                 fenced_since: BTreeMap::new(),
                 observing_since,
+                was_leader: false,
             })),
         }
     }
@@ -769,8 +772,29 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// simulation can drive it a step at a time and assert what changed
     /// between steps, which is how the failover ordering is actually verified.
     pub async fn tick(&self) -> Result<()> {
-        if !self.log.is_leader().await {
-            return Ok(());
+        // Followers must apply decisions while they are followers. Otherwise a
+        // newly elected leader starts its first sweep from the state it held
+        // when it last proposed a command, which can predate an ownership
+        // fence by an arbitrary amount.
+        self.recover().await?;
+        let is_leader = self.log.is_leader().await;
+        let now = self.runtime.clock().monotonic_nanos();
+        {
+            let mut inner = self.inner.lock().await;
+            if !is_leader {
+                inner.was_leader = false;
+                return Ok(());
+            }
+            if !inner.was_leader {
+                // Heartbeat times and lease-drain instants are observations
+                // made by one leader. Carrying them across an election can
+                // fence a healthy worker immediately or promote before the
+                // new leader has waited out the old owner's leases.
+                inner.observations.clear();
+                inner.fenced_since.clear();
+                inner.observing_since = now;
+                inner.was_leader = true;
+            }
         }
         self.refresh_health().await?;
         self.fence_dead_owners().await?;

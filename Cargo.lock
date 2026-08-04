@@ -833,6 +833,7 @@ dependencies = [
  "orbita-proto",
  "orbita-runtime",
  "orbita-sim",
+ "orbita-wal",
  "prost 0.11.9",
  "raft",
  "sha2",
