@@ -145,20 +145,35 @@ writing that plan is the first deliverable of the release. The shape of it:
   becomes a seeded regression test that runs forever.
 - Tests at scale: real clusters, sustained load, and the measured latency and
   throughput curves that replace the target rows in the requirements table.
-- The public correctness report assembled from all of the above, since the
-  evidence is the product and this release is where it becomes publishable.
+- Backup and point-in-time restore, plus an offline format reader. Both fall
+  out of ADR 0006 nearly for free: immutable segments and manifests mean PITR
+  is retaining old manifests and restore is pointing at one, and a tool that
+  dumps a bucket with no cluster running is what makes the open-format
+  promise checkable rather than aspirational. They live in this release
+  because restore tooling doubles as test infrastructure.
+- The operator kit: curated dashboards, alert rules with thresholds tied to
+  the SLOs the acceptance criteria define (WAL lag, failover duration, quota
+  saturation), and runbooks for the incidents every operator hits. It lands
+  here because the tests-at-scale work needs the same instrumentation to be
+  trustworthy.
+- Correctness evidence as a stream, not a one-shot report: nightly seeded
+  simulation runs published continuously, with the launch report assembled
+  from them. A report ages; a public record of interleavings explored and
+  violations found compounds, and it is the form of the claim a skeptical
+  infrastructure engineer can keep checking.
 - Whatever the measurements say to fix. This bullet is load-bearing; the
   honest outcome of a first serious testing pass is a list of regressions.
 
 Once this exists, planning 1.0 becomes a conversation about numbers rather
 than intentions, and this roadmap gets its next revision.
 
-## v0.3.0: watch and transactions
+## v0.3.0: watch, transactions, and the adoption path
 
-The theme is closing the two gaps the target persona actually hits, in the
-order they ask about them. Both are protocol additions, which is what a minor
-version is for under the compatibility scheme, and both are deliberately
-sequenced after v0.2.0 so they land on a harness that can check them.
+The theme is closing the gaps the target persona actually hits, in the order
+they ask about them. The first two are protocol additions, which is what a
+minor version is for under the compatibility scheme, and both are
+deliberately sequenced after v0.2.0 so they land on a harness that can check
+them.
 
 1. **Watch/subscribe streams.** The known gap for the coordination use case,
    and the first thing the target persona asks about.
@@ -169,10 +184,45 @@ sequenced after v0.2.0 so they land on a harness that can check them.
    official smart client and the client-authoring doc (`docs/CLIENTS.md`)
    land alongside, since interactive transactions are what justify a real
    client library.
+3. **Coordination recipes.** A small library of the wedge patterns, meaning
+   locks, leader election, fencing tokens, and epoch counters, run under the
+   deterministic simulator like everything else. The requirements say these
+   are built from CAS and linearizable reads, which today means every user
+   hand-rolls the same retry loops and some get lease renewal or fencing
+   subtly wrong and blame Orbita. A distributed lock with published
+   fault-injection results is a claim nobody else in this market makes, and
+   it is cheap because the harness exists. Recipes ship with watch because
+   watch is what makes them efficient.
+4. **The etcd migration path.** An importer from an etcd snapshot into a
+   keyspace, and a migration guide mapping etcd concepts to Orbita's,
+   meaning revisions to versions, leases to TTLs, and watches to watch. The
+   positioning makes "I have an etcd cluster today" the modal prospect, and
+   the docs currently have no answer to their first question.
 
 The ladder's stages are individually shippable, so if this release needs to
-split, it splits along them: watch plus the early stages first, the
-cross-partition work in a v0.4.0.
+split, it splits along them: watch, recipes, and the early stages first, the
+cross-partition work in a minor of its own, shifting the numbers below.
+
+## v0.4.0: security
+
+The theme is being trustworthy on a hostile network, which is a precondition
+for the production-adoption claim rather than a feature. The requirements
+cover credentials and quotas but were silent on transport security and
+granular authorization until this roadmap forced the question; the Security
+section of the requirements now specifies what this release delivers.
+
+- TLS on the client surface and mutual authentication between peers,
+  completing what ADR 0004's private framing starts, with certificate
+  rotation that does not require a restart.
+- Authorization finer than the keyspace: credentials grantable per key
+  prefix, since a coordination substrate shared by teams needs the same
+  range-scoped permissions etcd users already expect.
+- An audit log of administrative and credential operations, because the
+  target buyer's security review will ask for it by name.
+
+Multitenancy without transport security and granular authorization is a demo,
+not a product, and this release is scheduled before any 1.0 conversation for
+exactly that reason.
 
 ## Later
 
@@ -184,7 +234,16 @@ In priority order, from the requirements:
    of it.
 2. **Additional object storage backends** (GCS, Azure) through the trait,
    likely community-contributed.
-3. **A multi-region story**, which was fenced out of v1 to keep clock
+3. **A Kubernetes operator** for day-2 automation. The v0.1.0 upgrade work
+   makes rollouts safe and the v0.2.0 kit makes them observable; an operator
+   makes them boring, and it should wait until the procedures it automates
+   have stopped changing.
+4. **An etcd API shim, as a labeled experiment.** A kine-style facade that
+   lets existing etcd clients run against Orbita would be the single biggest
+   adoption lever if it works, and a tar pit of etcd semantics, meaning
+   compaction revisions and watch guarantees, if approached casually. It gets
+   a research spike with permission to fail, not a promise.
+5. **A multi-region story**, which was fenced out of v1 to keep clock
    uncertainty out of the design space.
 
 Multi-key transactions used to be on this list, and before that they were off

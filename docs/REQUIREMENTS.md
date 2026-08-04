@@ -144,6 +144,30 @@ partitioned key namespace with:
   store learns eventually; we build it in from the start.
 - **Config.** Per-keyspace defaults such as default TTL and max value size.
 
+### Security
+
+The first version of this document specified credentials and quotas and said
+nothing about transport security or granular authorization, which had the
+priorities inverted for a system asking to hold control-plane state. This
+section fixes the requirements; ROADMAP.md schedules them, currently at
+v0.4.0.
+
+- **Encryption in transit, everywhere.** TLS on the client surface, and
+  mutually authenticated connections between peers, completing what
+  [ADR 0004](adr/0004-peer-traffic-uses-private-framing.md) starts.
+  Certificate rotation must not require a restart, because coordination
+  infrastructure is exactly the thing you cannot bounce casually.
+- **Authorization finer than the keyspace.** Credentials grantable per key
+  prefix within a keyspace, read or write. A substrate shared by teams needs
+  the range-scoped permissions etcd users already expect, and arguably needs
+  them more, since multitenancy is the pitch.
+- **Audit logging.** Administrative and credential operations produce an
+  audit record. The target buyer's security review asks for this by name.
+
+Encryption at rest stays out of scope here: object storage backends provide
+it, and the deployment docs should say how to turn it on rather than Orbita
+reimplementing it.
+
 ## Architecture requirements
 
 This section fixes the architectural commitments the product depends on. The
@@ -399,6 +423,19 @@ them by exceeding one.
 - **Observability.** OpenTelemetry traces, logs, and metrics throughout,
   including per-keyspace and per-partition latency, WAL replication lag, split
   and merge activity, and quota consumption.
+- **Backup and point-in-time restore.** The storage design in
+  [ADR 0006](adr/0006-partitions-are-an-index-over-immutable-objects.md) makes
+  this cheap on purpose: immutable segments and manifests mean a backup is a
+  manifest retention policy and a restore is pointing at an old manifest. The
+  requirement is that an operator can restore a keyspace to a named point in
+  time, and that the retention window is theirs to configure. Backup is the
+  first checkbox on any production-adoption review, and a design that gets it
+  nearly free should say so out loud.
+- **An offline format reader.** A standalone tool that reads a partition from
+  a bucket with no cluster running. The format is specified so that data at
+  rest is reachable without Orbita, and this tool is what makes that promise
+  checkable rather than aspirational; it is also the recovery path of last
+  resort.
 
 ## Engineering posture
 
