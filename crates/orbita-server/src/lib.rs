@@ -163,6 +163,7 @@ impl Server {
         // its first report the leader group accepts.
         if control.is_none() {
             readiness.mark(ReadinessCondition::ControlPlaneJoined);
+            readiness.mark(ReadinessCondition::ClusterVersionCompatible);
         }
 
         let node = Node::start(
@@ -345,8 +346,20 @@ impl Server {
             // progress. A later report failing does not clear the condition,
             // because a control plane outage must not unready every worker at
             // once; see `ReadinessCondition::ControlPlaneJoined`.
-            if reporter.report(version, progress).await {
-                readiness.mark(ReadinessCondition::ControlPlaneJoined);
+            match reporter.report(version, progress).await {
+                Ok(orbita_control::StatusReportResponse::Accepted { .. }) => {
+                    readiness.mark(ReadinessCondition::ClusterVersionCompatible);
+                    readiness.mark(ReadinessCondition::ControlPlaneJoined);
+                }
+                Ok(orbita_control::StatusReportResponse::Incompatible(_)) => {
+                    readiness.clear(ReadinessCondition::ClusterVersionCompatible);
+                    readiness.clear(ReadinessCondition::ControlPlaneJoined);
+                }
+                // A heartbeat outage does not clear a completed join or make
+                // the data plane unavailable on its own.
+                Err(error) => {
+                    tracing::debug!(%error, "reporting status to the leader group failed");
+                }
             }
             directory.refresh().await;
             if let Err(error) = live.refresh_map().await {

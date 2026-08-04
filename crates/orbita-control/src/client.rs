@@ -9,7 +9,7 @@
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::membership::NodeStatus;
-use crate::version::ClusterVersion;
+use crate::version::{ClusterVersion, CompatibilityRefusal};
 use crate::wire::{
     ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
     METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
@@ -19,6 +19,16 @@ use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
 use orbita_runtime::{PeerCall, Runtime, ServiceId, Transport, TransportError};
 
 use std::sync::Mutex;
+
+/// The leader group's answer to a version-aware status report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusReportResponse {
+    Accepted {
+        map_version: MapVersion,
+        cluster_version: Option<ClusterVersion>,
+    },
+    Incompatible(CompatibilityRefusal),
+}
 
 /// A client for the leader group.
 ///
@@ -96,7 +106,12 @@ impl<R: Runtime> ControlClient<R> {
     /// node out of the failure detector, and the progress it carries is what
     /// the leader group uses to choose a replacement owner if it stops.
     pub async fn report_status(&self, node: NodeId, status: NodeStatus) -> Result<()> {
-        self.send_status(node, status).await.map(|_| ())
+        match self.send_status(node, status).await? {
+            StatusReportResponse::Accepted { .. } => Ok(()),
+            StatusReportResponse::Incompatible(refusal) => {
+                Err(Error::InvalidArgument(refusal.to_string()))
+            }
+        }
     }
 
     /// The same as [`ControlClient::report_status`], but hands back what the
@@ -108,7 +123,7 @@ impl<R: Runtime> ControlClient<R> {
         &self,
         node: NodeId,
         status: NodeStatus,
-    ) -> Result<(MapVersion, Option<ClusterVersion>)> {
+    ) -> Result<StatusReportResponse> {
         self.send_status(node, status).await
     }
 
@@ -120,11 +135,7 @@ impl<R: Runtime> ControlClient<R> {
     /// undecodable and drop out of the failure detector for the whole
     /// rollout. Delete alongside the legacy method when the window moves
     /// past 0.0.
-    async fn send_status(
-        &self,
-        node: NodeId,
-        status: NodeStatus,
-    ) -> Result<(MapVersion, Option<ClusterVersion>)> {
+    async fn send_status(&self, node: NodeId, status: NodeStatus) -> Result<StatusReportResponse> {
         let payload = ReportStatusRequest {
             node,
             status: status.clone(),
@@ -134,7 +145,13 @@ impl<R: Runtime> ControlClient<R> {
             Ok(ControlResponse::Accepted {
                 map_version,
                 cluster_version,
-            }) => Ok((map_version, cluster_version)),
+            }) => Ok(StatusReportResponse::Accepted {
+                map_version,
+                cluster_version,
+            }),
+            Ok(ControlResponse::Incompatible(refusal)) => {
+                Ok(StatusReportResponse::Incompatible(refusal))
+            }
             Ok(other) => Err(unexpected(&other)),
             // "The leader considered this and said no" here means it does not
             // serve the method at all, which only a v0.0.1 leader says. The
@@ -146,7 +163,10 @@ impl<R: Runtime> ControlClient<R> {
                     ControlResponse::Accepted {
                         map_version,
                         cluster_version,
-                    } => Ok((map_version, cluster_version)),
+                    } => Ok(StatusReportResponse::Accepted {
+                        map_version,
+                        cluster_version,
+                    }),
                     other => Err(unexpected(&other)),
                 }
             }
@@ -265,10 +285,12 @@ impl<R: Runtime, L: ConsensusLog> LocalControlClient<R, L> {
     }
 
     pub async fn report_status(&self, node: NodeId, status: NodeStatus) -> Result<()> {
-        self.controller
-            .record_status(node, status)
-            .await
-            .map(|_| ())
+        match self.controller.record_status(node, status).await? {
+            crate::controller::RegistrationOutcome::Accepted(_) => Ok(()),
+            crate::controller::RegistrationOutcome::Incompatible(refusal) => {
+                Err(Error::InvalidArgument(refusal.to_string()))
+            }
+        }
     }
 
     pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
@@ -353,7 +375,10 @@ mod tests {
 
         assert_eq!(
             result,
-            Ok((MapVersion(9), None)),
+            Ok(StatusReportResponse::Accepted {
+                map_version: MapVersion(9),
+                cluster_version: None,
+            }),
             "the report must land through the legacy method, with no version learned"
         );
     }

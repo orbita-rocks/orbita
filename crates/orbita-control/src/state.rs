@@ -19,7 +19,7 @@
 use crate::command::ControlCommand;
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Credential, Keyspace, KeyspaceConfig};
-use crate::version::{ClusterVersion, VersionRange};
+use crate::version::{ClusterVersion, CompatibilityRefusal, VersionRange};
 
 use orbita_core::{
     Epoch, Error, KeyRange, KeyspaceId, KeyspaceName, MapVersion, NodeId, PartitionId,
@@ -73,8 +73,9 @@ pub struct ClusterState {
     /// binary's own version in the same breath as the first keyspace. A state
     /// recovered from a 0.0 cluster legitimately holds
     /// `ClusterVersion::ZERO`, so ZERO cannot be read as "bootstrap never
-    /// ran"; `is_fresh` answers that question.
+    /// ran"; `version_initialized` and `is_fresh` answer that question.
     version: ClusterVersion,
+    version_initialized: bool,
 }
 
 impl ClusterState {
@@ -159,7 +160,11 @@ impl ClusterState {
         let mut candidates: Vec<(usize, NodeId)> = self
             .nodes
             .values()
-            .filter(|n| n.role == NodeRole::Worker && n.health == NodeHealth::Healthy)
+            .filter(|n| {
+                n.role == NodeRole::Worker
+                    && n.health == NodeHealth::Healthy
+                    && self.compatibility_refusal(n.speaks).is_none()
+            })
             .map(|n| (self.map.held_by(n.id).count(), n.id))
             .collect();
         candidates.sort_unstable();
@@ -229,6 +234,9 @@ impl ClusterState {
         address: &str,
         speaks: VersionRange,
     ) -> Result<()> {
+        if let Some(refusal) = self.compatibility_refusal(speaks) {
+            return Err(Error::InvalidArgument(refusal.to_string()));
+        }
         let entry = self.nodes.entry(node).or_insert_with(|| NodeRecord {
             id: node,
             role,
@@ -241,6 +249,33 @@ impl ClusterState {
         entry.role = role;
         entry.address = address.to_string();
         entry.speaks = speaks;
+        Ok(())
+    }
+
+    /// Why a node cannot join the active cluster, if it cannot.
+    ///
+    /// A genuinely fresh state has no active version yet. Once any cluster
+    /// state exists, including a recovered v0.0 cluster, version zero is a
+    /// real active version and only a binary that speaks it may register.
+    #[must_use]
+    pub fn compatibility_refusal(&self, speaks: VersionRange) -> Option<CompatibilityRefusal> {
+        let uninitialized = self.is_fresh() && !self.version_initialized;
+        (!uninitialized && !speaks.contains(self.version)).then_some(CompatibilityRefusal {
+            speaks,
+            active: self.version,
+        })
+    }
+
+    fn ensure_compatible_node(&self, node: NodeId) -> Result<()> {
+        let record = self
+            .nodes
+            .get(&node)
+            .ok_or_else(|| Error::InvalidArgument(format!("unknown node {node}")))?;
+        if let Some(refusal) = self.compatibility_refusal(record.speaks) {
+            return Err(Error::InvalidArgument(format!(
+                "node {node} cannot receive ownership: {refusal}"
+            )));
+        }
         Ok(())
     }
 
@@ -267,6 +302,7 @@ impl ClusterState {
             )));
         }
         self.version = version;
+        self.version_initialized = true;
         Ok(())
     }
 
@@ -308,6 +344,12 @@ impl ClusterState {
         let (id, created_at_millis, first_partition, owner) =
             (*id, *created_at_millis, *first_partition, *owner);
         let name = KeyspaceName::new(name).map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        if let Some(owner) = owner {
+            self.ensure_compatible_node(owner)?;
+        }
+        for replica in replicas {
+            self.ensure_compatible_node(*replica)?;
+        }
         if self.keyspaces.values().any(|k| k.name == name) {
             return Err(Error::KeyspaceAlreadyExists);
         }
@@ -496,6 +538,12 @@ impl ClusterState {
                 "the owner must not also be listed as a replica".into(),
             ));
         }
+        self.ensure_compatible_node(owner)?;
+        for replica in replicas {
+            if !info.replicas.contains(replica) {
+                self.ensure_compatible_node(*replica)?;
+            }
+        }
         info.owner = Some(owner);
         info.replicas = replicas.to_vec();
         self.replace_partition(info);
@@ -515,6 +563,11 @@ impl ClusterState {
             return Err(Error::InvalidArgument(
                 "the owner must not also be listed as a replica".into(),
             ));
+        }
+        for replica in replicas {
+            if !info.replicas.contains(replica) {
+                self.ensure_compatible_node(*replica)?;
+            }
         }
         info.replicas = replicas.to_vec();
         self.replace_partition(info);
@@ -603,6 +656,24 @@ mod tests {
             address: format!("10.0.0.{id}:7000"),
             speaks: crate::version::binary_speaks(),
         }
+    }
+
+    fn set_version(state: &mut ClusterState, version: ClusterVersion) {
+        state
+            .apply(&ControlCommand::SetClusterVersion {
+                version,
+                expect: ClusterVersion::ZERO,
+            })
+            .unwrap();
+    }
+
+    fn register_with(state: &mut ClusterState, id: u64, speaks: VersionRange) -> Result<()> {
+        state.apply(&ControlCommand::RegisterNode {
+            node: NodeId(id),
+            role: NodeRole::Worker,
+            address: format!("10.0.0.{id}:7000"),
+            speaks,
+        })
     }
 
     /// A cluster with three workers and one keyspace covered by one partition.
@@ -1003,18 +1074,167 @@ mod tests {
     fn re_registering_updates_the_versions_a_node_can_speak() {
         // This is what a rolling update looks like to the state machine: the
         // same node comes back asserting a newer window.
+        let active = ClusterVersion::new(0, 9);
         let mut state = ClusterState::new();
-        state.apply(&worker(1)).unwrap();
-        let upgraded = VersionRange::new(ClusterVersion::new(0, 9), ClusterVersion::new(0, 10));
+        set_version(&mut state, active);
+        register_with(
+            &mut state,
+            1,
+            VersionRange::new(ClusterVersion::new(0, 8), active),
+        )
+        .unwrap();
+        let upgraded = VersionRange::new(active, ClusterVersion::new(0, 10));
+        register_with(&mut state, 1, upgraded).unwrap();
+        assert_eq!(state.node(NodeId(1)).unwrap().speaks, upgraded);
+    }
+
+    #[test]
+    fn an_exact_active_version_is_admitted() {
+        let active = ClusterVersion::new(0, 4);
+        let mut state = ClusterState::new();
+        set_version(&mut state, active);
+
+        assert_eq!(
+            register_with(&mut state, 1, VersionRange::exactly(active)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_n_minus_one_binary_whose_range_reaches_active_is_admitted() {
+        let active = ClusterVersion::new(0, 4);
+        let mut state = ClusterState::new();
+        set_version(&mut state, active);
+
+        assert_eq!(
+            register_with(
+                &mut state,
+                1,
+                VersionRange::new(ClusterVersion::new(0, 3), active),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_too_old_node_is_refused_without_becoming_a_member() {
+        let mut state = ClusterState::new();
+        set_version(&mut state, ClusterVersion::new(0, 4));
+
+        let result = register_with(
+            &mut state,
+            1,
+            VersionRange::new(ClusterVersion::new(0, 2), ClusterVersion::new(0, 3)),
+        );
+
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(reason)) if reason.contains("0.2..0.3") && reason.contains("0.4"))
+        );
+        assert!(state.node(NodeId(1)).is_none());
+    }
+
+    #[test]
+    fn a_too_new_node_with_no_overlap_is_refused() {
+        let mut state = ClusterState::new();
+        set_version(&mut state, ClusterVersion::new(0, 4));
+
+        let result = register_with(
+            &mut state,
+            1,
+            VersionRange::new(ClusterVersion::new(0, 5), ClusterVersion::new(0, 6)),
+        );
+
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(reason)) if reason.contains("0.5..0.6") && reason.contains("0.4"))
+        );
+    }
+
+    #[test]
+    fn an_uninitialized_cluster_can_admit_the_node_that_will_bootstrap_it() {
+        let mut state = ClusterState::new();
+        let speaks = VersionRange::exactly(ClusterVersion::new(9, 9));
+
+        assert_eq!(register_with(&mut state, 1, speaks), Ok(()));
+    }
+
+    #[test]
+    fn a_legacy_registration_speaks_exactly_zero() {
+        let mut state = ClusterState::new();
         state
-            .apply(&ControlCommand::RegisterNode {
-                node: NodeId(1),
-                role: NodeRole::Worker,
-                address: "10.0.0.1:7000".into(),
-                speaks: upgraded,
+            .apply(&ControlCommand::CreateKeyspace {
+                id: KeyspaceId(1),
+                name: "legacy".into(),
+                config: KeyspaceConfig::default(),
+                created_at_millis: 1,
+                first_partition: PartitionId(1),
+                owner: None,
+                replicas: vec![],
             })
             .unwrap();
-        assert_eq!(state.node(NodeId(1)).unwrap().speaks, upgraded);
+
+        assert_eq!(
+            register_with(&mut state, 1, VersionRange::exactly(ClusterVersion::ZERO),),
+            Ok(())
+        );
+        assert!(register_with(
+            &mut state,
+            2,
+            VersionRange::exactly(ClusterVersion::new(0, 1)),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_incompatible_registered_node_keeps_existing_ownership_but_gets_no_new_ownership() {
+        let old = ClusterVersion::new(0, 3);
+        let active = ClusterVersion::new(0, 4);
+        let mut state = ClusterState::new();
+        set_version(&mut state, old);
+        register_with(
+            &mut state,
+            1,
+            VersionRange::new(ClusterVersion::new(0, 2), old),
+        )
+        .unwrap();
+        state
+            .apply(&ControlCommand::CreateKeyspace {
+                id: KeyspaceId(1),
+                name: "default".into(),
+                config: KeyspaceConfig::default(),
+                created_at_millis: 1,
+                first_partition: PartitionId(1),
+                owner: Some(NodeId(1)),
+                replicas: vec![],
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::SetClusterVersion {
+                version: active,
+                expect: old,
+            })
+            .unwrap();
+
+        assert_eq!(
+            state.map().partition(PartitionId(1)).unwrap().owner,
+            Some(NodeId(1))
+        );
+        assert!(!state.placement_candidates().contains(&NodeId(1)));
+
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: PartitionId(1),
+                expect_epoch: Epoch(1),
+            })
+            .unwrap();
+        let result = state.apply(&ControlCommand::AssignOwner {
+            partition: PartitionId(1),
+            owner: NodeId(1),
+            replicas: vec![],
+            expect_epoch: Epoch(2),
+        });
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(reason)) if reason.contains("cannot receive ownership"))
+        );
     }
 
     #[test]

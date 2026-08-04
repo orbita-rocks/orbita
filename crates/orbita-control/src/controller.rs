@@ -22,7 +22,7 @@ use crate::consensus::{ConsensusLog, LogIndex};
 use crate::membership::{NodeHealth, NodeRole, NodeStatus};
 use crate::model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 use crate::state::{ClusterState, NodeRecord, PartitionPhase};
-use crate::version::{binary_speaks, ClusterVersion};
+use crate::version::{binary_speaks, ClusterVersion, CompatibilityRefusal};
 
 use bytes::Bytes;
 use orbita_core::{
@@ -109,6 +109,13 @@ pub struct ClusterView {
 pub struct FinalizedUpgrade {
     pub previous: ClusterVersion,
     pub active: ClusterVersion,
+}
+
+/// The replicated control plane's decision on one status report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    Accepted(MapVersion),
+    Incompatible(CompatibilityRefusal),
 }
 
 struct Inner {
@@ -358,10 +365,17 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     ///
     /// Returns the current map version so the reporting node learns in the
     /// same round trip whether the map it is routing on is stale.
-    pub async fn record_status(&self, node: NodeId, status: NodeStatus) -> Result<MapVersion> {
+    pub async fn record_status(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+    ) -> Result<RegistrationOutcome> {
         let now = self.runtime.clock().monotonic_nanos();
         let (needs_registration, needs_revival) = {
             let mut inner = self.inner.lock().await;
+            if let Some(refusal) = inner.state.compatibility_refusal(status.speaks) {
+                return Ok(RegistrationOutcome::Incompatible(refusal));
+            }
             let known = inner.state.node(node).cloned();
             inner.observations.insert(
                 node,
@@ -385,13 +399,25 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         };
 
         if needs_registration {
-            self.submit(ControlCommand::RegisterNode {
-                node,
-                role: status.role,
-                address: status.address.clone(),
-                speaks: status.speaks,
-            })
-            .await?;
+            if let Err(error) = self
+                .submit(ControlCommand::RegisterNode {
+                    node,
+                    role: status.role,
+                    address: status.address.clone(),
+                    speaks: status.speaks,
+                })
+                .await
+            {
+                // Finalization can race the proposal. The state machine is the
+                // authority, and this read turns its refusal back into the
+                // same structured answer as the fast path above.
+                let mut inner = self.inner.lock().await;
+                if let Some(refusal) = inner.state.compatibility_refusal(status.speaks) {
+                    inner.observations.remove(&node);
+                    return Ok(RegistrationOutcome::Incompatible(refusal));
+                }
+                return Err(error);
+            }
         }
         if needs_revival {
             // A node that came back has to be marked healthy through the log,
@@ -403,7 +429,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             .await?;
         }
 
-        Ok(self.map_version().await)
+        Ok(RegistrationOutcome::Accepted(self.map_version().await))
     }
 
     /// Creates the first keyspace of a fresh cluster, with its single

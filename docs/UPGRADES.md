@@ -10,15 +10,15 @@ command at the end. The reasoning is in
 Read this first. The chart is written for the process below; the server is not
 finished.
 
-- The cluster version and `orbita cluster finalize-upgrade` exist. The control
-  plane holds the version in its replicated state, every node reports the
-  range of versions its binary can speak on every heartbeat and reads the
-  active version back, and finalizing advances the version only after checking
-  every live node can speak the new one. What does not exist yet is the
-  enforcement around it: a node outside the window says so in its logs but
-  still joins, and no behaviour actually changes with the version because no
-  format has two versions to choose between yet. Mixed-version operation is
-  therefore still not something you should rely on today.
+- The cluster version, compatibility enforcement, and `orbita cluster
+  finalize-upgrade` exist. The control plane holds the version in its
+  replicated state and refuses a registration whose speakable range does not
+  include it. The refused node stays running, reports
+  `cluster-version-compatible` and `control-plane-joined` as unmet readiness
+  conditions, and logs both its range and the active version. No behaviour
+  actually changes with the version yet because no format has two versions to
+  choose between, so mixed-version operation is enforced but still has little
+  practical work to do today.
 - A node does not hand its partitions off on SIGTERM. The termination grace
   periods in the chart are sized for a handoff that the server does not perform
   yet, so today a restart is a failover.
@@ -134,12 +134,28 @@ everything 0.0 wrote, so the forward direction is safe; it is the return to
 0.0 that is not, and this is a one-time cost of the version machinery not
 existing yet when 0.0 shipped.
 
-A node that cannot speak the cluster's active version is meant to start,
-report itself not Ready, and say why in its logs. It is not meant to exit.
+A node that cannot speak the cluster's active version starts, reports itself
+not Ready, and says why in its logs. It does not exit.
 That is deliberate: a pod that is running and not Ready stops the rollout at
 exactly one pod and leaves its diagnostics reachable, where a pod that exits
-takes its logs away in a restart loop. Today the node starts and says why in
-its logs; readiness does not reflect it yet.
+takes its logs away in a restart loop. The refusal includes the node's
+speakable range and the active cluster version, so the stopped rollout
+identifies which side needs changing.
+
+The registration check is part of the replicated state machine, not a worker
+preflight. A refused worker is not added to membership and cannot receive
+ownership. If finalization makes a previously registered node incompatible,
+the node keeps serving partitions it already holds. This preserves the data
+plane during a control-plane transition. It is excluded from placement and
+cannot be promoted or added as a new replica until it reports a compatible
+range again.
+
+The v0.0.1 heartbeat remains a deliberate special case. Its registration has
+no version field, so the control plane treats it as speaking exactly version
+0.0. It is accepted only while 0.0 is active. A newer worker can still fall
+back to the legacy heartbeat when talking to a v0.0.1 leader, but it reports
+Ready only if its own range includes 0.0. This keeps the first rolling upgrade
+working without turning a missing field into an unlimited compatibility claim.
 
 ## Finalizing
 
@@ -237,8 +253,9 @@ stateful system is broken on Kubernetes.
 
 - Readiness gates the rollout and the client Service. It runs `orbita cluster
   ready`, which exits non-zero and names the unmet conditions until the node
-  has recovered its write-ahead log, opened and caught up its partitions, and
-  registered with the leader group where it has one. Until the CLI wires the
+  has recovered its write-ahead log, opened and caught up its partitions,
+  registered with the leader group where it has one, and confirmed that its
+  binary can speak the active cluster version. Until the CLI wires the
   leader group through (see the gaps at the top), that last condition is met
   by construction on a deployed node.
 - Liveness kills the pod when it fails, so it runs `orbita cluster ping` and

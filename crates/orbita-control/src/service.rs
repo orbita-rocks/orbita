@@ -6,6 +6,7 @@
 
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
+use crate::controller::RegistrationOutcome;
 use crate::wire::{
     ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
     METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
@@ -50,10 +51,15 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     .record_status(request.node, request.status)
                     .await
                 {
-                    Ok(map_version) => ControlResponse::Accepted {
+                    Ok(RegistrationOutcome::Accepted(map_version)) => ControlResponse::Accepted {
                         map_version,
                         cluster_version: None,
                     },
+                    Ok(RegistrationOutcome::Incompatible(refusal)) => {
+                        // A v0.0.1 worker can decode the ordinary error shape,
+                        // but not the structured v2 refusal.
+                        ControlResponse::Error(refusal.to_string())
+                    }
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
@@ -64,10 +70,13 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     .record_status(request.node, request.status)
                     .await
                 {
-                    Ok(map_version) => ControlResponse::Accepted {
+                    Ok(RegistrationOutcome::Accepted(map_version)) => ControlResponse::Accepted {
                         map_version,
                         cluster_version: Some(self.controller.cluster_version().await),
                     },
+                    Ok(RegistrationOutcome::Incompatible(refusal)) => {
+                        ControlResponse::Incompatible(refusal)
+                    }
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),

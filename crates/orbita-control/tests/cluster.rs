@@ -14,7 +14,7 @@
 use orbita_control::{
     binary_speaks, BootstrapSpec, ClusterState, ClusterVersion, ConsensusLog, ControlClient,
     ControlCommand, ControlConfig, ControlService, Controller, KeyspaceConfig, NodeRole,
-    NodeStatus, PartitionProgress, SingleNodeLog, VersionRange,
+    NodeStatus, PartitionProgress, RegistrationOutcome, SingleNodeLog, VersionRange,
 };
 use orbita_core::{Epoch, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
 use orbita_runtime::{Clock, Runtime, ServiceId, Transport};
@@ -867,6 +867,89 @@ fn a_dead_node_does_not_pin_the_cluster_to_the_old_version() {
         .block_on(async move { controller.finalize_upgrade().await })
         .expect("a dead node must not block the finalize");
     assert_eq!(finalized.active, upgraded_speaks().max);
+}
+
+#[test]
+fn incompatible_joins_are_rejected_under_deterministic_simulation() {
+    check_seeds(
+        "incompatible_joins_are_rejected_under_deterministic_simulation",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let active = binary_speaks().max;
+            let too_new = VersionRange::new(
+                ClusterVersion::new(active.major, active.minor + 1),
+                ClusterVersion::new(active.major, active.minor + 2),
+            );
+            let controller = cluster.controller.clone();
+            let outcome = cluster.sim.block_on(async move {
+                controller
+                    .record_status(
+                        NodeId(9),
+                        NodeStatus {
+                            role: NodeRole::Worker,
+                            address: "10.0.0.9:7000".into(),
+                            map_version: MapVersion::default(),
+                            speaks: too_new,
+                            partitions: vec![],
+                        },
+                    )
+                    .await
+            });
+            match outcome {
+                Ok(RegistrationOutcome::Incompatible(refusal))
+                    if refusal.speaks == too_new && refusal.active == active => {}
+                other => {
+                    return Err(cluster
+                        .sim
+                        .failure(format!("incompatible join was not refused: {other:?}")))
+                }
+            }
+            let controller = cluster.controller.clone();
+            let admitted = cluster
+                .sim
+                .block_on(async move { controller.snapshot().await.node(NodeId(9)).is_some() });
+            if admitted {
+                return Err(cluster.sim.failure("the refused node became a member"));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn rolling_upgrade_ranges_are_accepted_under_deterministic_simulation() {
+    check_seeds(
+        "rolling_upgrade_ranges_are_accepted_under_deterministic_simulation",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let active = binary_speaks().max;
+            let rolling =
+                VersionRange::new(active, ClusterVersion::new(active.major, active.minor + 1));
+            let controller = cluster.controller.clone();
+            let outcome = cluster.sim.block_on(async move {
+                controller
+                    .record_status(
+                        NodeId(9),
+                        NodeStatus {
+                            role: NodeRole::Worker,
+                            address: "10.0.0.9:7000".into(),
+                            map_version: MapVersion::default(),
+                            speaks: rolling,
+                            partitions: vec![],
+                        },
+                    )
+                    .await
+            });
+            if !matches!(outcome, Ok(RegistrationOutcome::Accepted(_))) {
+                return Err(cluster
+                    .sim
+                    .failure(format!("rolling upgrade join was refused: {outcome:?}")));
+            }
+            Ok(())
+        },
+    );
 }
 
 /// Kept separate from the scenarios so a failure points at the harness rather

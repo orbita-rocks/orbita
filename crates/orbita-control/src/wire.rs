@@ -10,7 +10,7 @@
 
 use crate::codec::{CodecError, CodecResult, Reader, Writer};
 use crate::membership::NodeStatus;
-use crate::version::ClusterVersion;
+use crate::version::{ClusterVersion, CompatibilityRefusal, VersionRange};
 
 use bytes::Bytes;
 use orbita_core::{
@@ -36,6 +36,7 @@ const STATUS_ACCEPTED: u8 = 1;
 const STATUS_NOT_LEADER: u8 = 2;
 const STATUS_ERROR: u8 = 3;
 const STATUS_NODES: u8 = 4;
+const STATUS_INCOMPATIBLE: u8 = 5;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -129,6 +130,7 @@ pub(crate) enum ControlResponse {
     /// answer, and handing it back is what lets an operator configure the
     /// leader group and nothing else.
     Nodes(Vec<(NodeId, String)>),
+    Incompatible(CompatibilityRefusal),
     Error(String),
 }
 
@@ -167,6 +169,11 @@ impl ControlResponse {
                     w.u64(node.get()).str(address);
                 });
             }
+            ControlResponse::Incompatible(refusal) => {
+                w.u8(STATUS_INCOMPATIBLE);
+                refusal.speaks.encode(&mut w);
+                refusal.active.encode(&mut w);
+            }
             ControlResponse::Error(message) => {
                 w.u8(STATUS_ERROR).str(message);
             }
@@ -199,6 +206,10 @@ impl ControlResponse {
                 leader: r.opt_u64()?.map(NodeId),
             },
             STATUS_NODES => ControlResponse::Nodes(r.seq(|r| Ok((NodeId(r.u64()?), r.string()?)))?),
+            STATUS_INCOMPATIBLE => ControlResponse::Incompatible(CompatibilityRefusal {
+                speaks: VersionRange::decode(&mut r)?,
+                active: ClusterVersion::decode(&mut r)?,
+            }),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
             tag => {
                 return Err(CodecError::UnknownTag {
@@ -369,6 +380,10 @@ mod tests {
                 leader: Some(NodeId(2)),
             },
             ControlResponse::NotLeader { leader: None },
+            ControlResponse::Incompatible(CompatibilityRefusal {
+                speaks: VersionRange::new(ClusterVersion::new(0, 3), ClusterVersion::new(0, 4)),
+                active: ClusterVersion::new(0, 2),
+            }),
             ControlResponse::Error("no".into()),
         ] {
             assert_eq!(

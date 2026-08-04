@@ -156,7 +156,14 @@ mod tests {
             .filter(|c| !c.met)
             .map(|c| c.name.as_str())
             .collect();
-        assert_eq!(unmet, ["control-plane-joined", "partitions-caught-up"]);
+        assert_eq!(
+            unmet,
+            [
+                "cluster-version-compatible",
+                "control-plane-joined",
+                "partitions-caught-up"
+            ]
+        );
     }
 
     #[tokio::test]
