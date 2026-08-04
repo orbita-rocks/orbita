@@ -78,6 +78,14 @@ reachable without Orbita, is unearned until this lands.
   reservation is the only part of that direction with a deadline.
 - musl static builds become worth revisiting once the C++ toolchain dependency
   goes with RocksDB.
+- Resource visibility in `orbita cluster describe`: memory held by the
+  partition indexes per node, per-partition size, WAL lag, and quota
+  saturation. This lives in the format theme because the format work creates
+  the need: retiring RocksDB makes the index memory-resident, meaning memory
+  becomes the resource that runs out first, and shipping that change with no
+  way to watch it is exactly the kind of caveat this release exists to avoid.
+  The thresholds that turn these numbers into scaling decisions come later;
+  the raw signals cannot.
 
 Folding this into the first release also dissolves a conflict the earlier
 draft of this roadmap had to flag: the format spec says its draft window closes
@@ -155,7 +163,13 @@ writing that plan is the first deliverable of the release. The shape of it:
   the SLOs the acceptance criteria define (WAL lag, failover duration, quota
   saturation), and runbooks for the incidents every operator hits. It lands
   here because the tests-at-scale work needs the same instrumentation to be
-  trustworthy.
+  trustworthy. The kit also owns the scaling signals: the thresholds that
+  tell an operator when to split a partition, add a worker, or grow the
+  leader group, surfaced through `cluster describe` on top of the raw
+  numbers v0.1.0 exposes. They land here rather than with the numbers
+  because a credible threshold comes from the measured envelope the
+  tests-at-scale work produces, and a threshold invented before the
+  measurements exist is a guess with a UI.
 - Correctness evidence as a stream, not a one-shot report: nightly seeded
   simulation runs published continuously, with the launch report assembled
   from them. A report ages; a public record of interleavings explored and
