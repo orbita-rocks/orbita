@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# Nothing here is published to crates.io yet. The product is the binary and
+# the image, and putting ten crates on the registry would be a semver promise
+# about `orbita-core`'s types that we are not ready to make.
+publish = false
+
 # The crate is called orbita-cli so it sorts next to its siblings, but the
 # thing a user installs is called `orbita`. One binary, not two, because the
 # role a node runs in is configuration rather than a different program.
@@ -27,8 +32,10 @@ clap = { version = "4.6.5", features = ["derive", "wrap_help"] }
 orbita-core.workspace = true
 orbita-proto.workspace = true
 # The only thing that uses this is src/node.rs, which is the one place in the
-# crate that starts a server rather than dialing one.
-orbita-server = { version = "0.0.0", path = "../orbita-server" }
+# crate that starts a server rather than dialing one. It goes through the
+# workspace like every other sibling, because a literal version here is a copy
+# of the workspace version that nothing keeps in sync.
+orbita-server.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 tokio.workspace = true

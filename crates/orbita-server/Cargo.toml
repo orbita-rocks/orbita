@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# Nothing here is published to crates.io yet. The product is the binary and
+# the image, and putting ten crates on the registry would be a semver promise
+# about `orbita-core`'s types that we are not ready to make.
+publish = false
+
 # The dependency on orbita-control is one adapter, in `control.rs`. This crate
 # still consumes the partition map through its own `MapSource` trait, so a test
 # or a single node supplies a static map and nothing else in here knows the

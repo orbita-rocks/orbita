@@ -1,0 +1,93 @@
+name: Post-release
+
+# Puts develop back in front of main after a release lands.
+#
+# Without this, the version bump exists only on main, and the next release pull
+# request shows it as a revert. Worse, develop stops being a strict descendant
+# of main, and every merge after that carries a conflict in the same three
+# files. The back-merge is small, mechanical, and easy to forget, which is why
+# it is automated and the interesting parts of the release are not.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  backmerge:
+    name: back-merge into develop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - id: check
+        name: Did a release just land?
+        run: |
+          main_version="$(perl -0ne 'print $1 if /\[workspace\.package\]\nversion = "([^"]+)"/' Cargo.toml)"
+          git show "origin/develop:Cargo.toml" > /tmp/develop-cargo.toml
+          dev_version="$(perl -0ne 'print $1 if /\[workspace\.package\]\nversion = "([^"]+)"/' /tmp/develop-cargo.toml)"
+
+          # A release is the only thing that moves main's version, so the test
+          # for "did a release land" is whether develop is already sitting on
+          # the -dev version that follows main's. Every other push to main
+          # finds it already there and does nothing.
+          major="$(echo "$main_version" | cut -d. -f1)"
+          minor="$(echo "$main_version" | cut -d. -f2)"
+          next="${major}.$((minor + 1)).0-dev"
+
+          if [ "$dev_version" = "$next" ]; then
+            echo "develop is already at $next, nothing to do"
+            echo "act=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "main is at $main_version, develop at $dev_version, moving develop to $next"
+            echo "act=true" >> "$GITHUB_OUTPUT"
+            echo "next=$next" >> "$GITHUB_OUTPUT"
+            echo "released=$main_version" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge main into develop and open the next cycle
+        if: steps.check.outputs.act == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          next="${{ steps.check.outputs.next }}"
+          branch="chore/back-merge-v${{ steps.check.outputs.released }}"
+
+          git config user.name "orbita-release"
+          git config user.email "release@orbita.rocks"
+          git switch -c "$branch" origin/develop
+
+          # The merge takes main's side on the version files, since main is the
+          # side that just changed them, and leaves everything else to a normal
+          # merge. A conflict anywhere else is real and worth a human.
+          git merge --no-ff origin/main -m "chore(release): back-merge v${{ steps.check.outputs.released }}" || {
+            git checkout --theirs Cargo.toml Cargo.lock CHANGELOG.md \
+              deploy/helm/orbita/Chart.yaml deploy/manifests/orbita.yaml 2>/dev/null || true
+            git add -A
+            git -c core.editor=true merge --continue
+          }
+
+          chmod +x scripts/*.sh
+          scripts/bump-version.sh "$next"
+          git add -A
+          git commit -m "chore(release): open $next"
+          git push origin "$branch"
+
+          gh pr create \
+            --base develop \
+            --head "$branch" \
+            --title "chore(release): back-merge v${{ steps.check.outputs.released }} and open $next" \
+            --body "This pull request brings the v${{ steps.check.outputs.released }} release commit back onto \`develop\` and moves the workspace version to \`$next\`.
+
+          It matters because develop has to stay a descendant of main. If it does not, the next release pull request shows the version bump as a revert and every merge after this one conflicts in the same handful of files.
+
+          Nothing here needs review beyond checking that the merge did what it says."

@@ -86,7 +86,7 @@ was not applied.";
 #[derive(Debug, Parser)]
 #[command(
     name = "orbita",
-    version,
+    version = crate::LONG_VERSION,
     about = ABOUT,
     long_about = LONG_ABOUT,
     disable_help_subcommand = true

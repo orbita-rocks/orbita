@@ -7,3 +7,27 @@ dependsOn:
   - 'orbita-core'
   - 'orbita-proto'
   - 'orbita-server'
+
+tasks:
+  # What a release builds. Separate from the inherited `build` task because a
+  # release is optimised and pinned to the lockfile, and neither of those is
+  # what you want on a laptop.
+  #
+  # The target comes from the caller, because the release matrix builds this
+  # same binary on four machines:
+  #
+  #   moon run orbita-cli:build-release -- --target aarch64-apple-darwin
+  #
+  # It is a task rather than a line of YAML in the release workflow for the
+  # same reason everything else here is: the way to find out what a release
+  # builds should not be reading a workflow file.
+  build-release:
+    command: 'cargo build -p orbita-cli --release --locked --bin orbita'
+    inputs:
+      - '@group(sources)'
+      - '@group(manifests)'
+    options:
+      # Same reason the inherited `build` is not cached: moon does not own
+      # target/, so a cache hit over a binary somebody deleted is a confusing
+      # way to fail. A release must never skip this.
+      cache: false

@@ -10,6 +10,17 @@ on:
   schedule:
     # Nightly, for the long simulation batch.
     - cron: "0 7 * * *"
+  # The release workflow calls this rather than restating it, so a tag is
+  # gated on exactly the checks a pull request is gated on and the two cannot
+  # drift apart. `long_sim` is the one knob it needs: a release is worth far
+  # more simulation than a pull request is.
+  workflow_call:
+    inputs:
+      long_sim:
+        description: "Run the nightly simulation batch instead of the short one."
+        type: boolean
+        required: false
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -137,12 +148,13 @@ jobs:
       # reproduces it exactly on any machine, with a paste-ready command.
       # Pull requests get a short batch to keep the feedback loop tight.
       - name: Run simulation seeds
-        if: github.event_name != 'schedule'
+        if: github.event_name != 'schedule' && !inputs.long_sim
         run: moon run orbita-sim:sim
 
-      # Nightly explores far more of the state space. The seed count lives in
-      # the task definition rather than here, so the long batch can be run by
-      # hand exactly as the nightly runs it.
+      # Nightly explores far more of the state space, and so does a release,
+      # which asks for this batch by name. The seed count lives in the task
+      # definition rather than here, so the long batch can be run by hand
+      # exactly as the nightly and the release run it.
       - name: Run the long simulation batch
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.long_sim
         run: moon run orbita-sim:sim-long
