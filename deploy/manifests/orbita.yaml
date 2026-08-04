@@ -191,7 +191,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: orbita
-          image: ghcr.io/orbita-rocks/orbita:latest
+          image: ghcr.io/orbita-rocks/orbita:0.1.0-dev
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -333,7 +333,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: orbita
-          image: ghcr.io/orbita-rocks/orbita:latest
+          image: ghcr.io/orbita-rocks/orbita:0.1.0-dev
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
