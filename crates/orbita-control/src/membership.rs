@@ -8,6 +8,7 @@
 //! would not be.
 
 use crate::codec::{CodecResult, Reader, Writer};
+use crate::version::VersionRange;
 
 use orbita_core::{Lamport, MapVersion, PartitionId};
 
@@ -78,6 +79,11 @@ pub struct NodeStatus {
     /// The map version this node is routing on, which tells the leader group
     /// whether its published map has actually landed.
     pub map_version: MapVersion,
+    /// The cluster versions this node's binary can speak. Reported on every
+    /// heartbeat rather than once, so that a rolling update in which the
+    /// binary changed under the same node id corrects the record without an
+    /// operator noticing anything.
+    pub speaks: VersionRange,
     pub partitions: Vec<PartitionProgress>,
 }
 
@@ -90,6 +96,7 @@ impl NodeStatus {
             role,
             address: address.into(),
             map_version: MapVersion::default(),
+            speaks: crate::version::binary_speaks(),
             partitions: Vec::new(),
         }
     }
@@ -108,8 +115,9 @@ impl NodeStatus {
             NodeRole::Worker => 1,
         })
         .str(&self.address)
-        .u64(self.map_version.get())
-        .seq(&self.partitions, |w, p| p.encode(w));
+        .u64(self.map_version.get());
+        self.speaks.encode(w);
+        w.seq(&self.partitions, |w, p| p.encode(w));
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> CodecResult<Self> {
@@ -127,6 +135,7 @@ impl NodeStatus {
             role,
             address: r.string()?,
             map_version: MapVersion(r.u64()?),
+            speaks: VersionRange::decode(r)?,
             partitions: r.seq(PartitionProgress::decode)?,
         })
     }
@@ -142,6 +151,10 @@ mod tests {
             role: NodeRole::Worker,
             address: "10.0.0.4:7000".into(),
             map_version: MapVersion(12),
+            speaks: crate::version::VersionRange::new(
+                crate::version::ClusterVersion::new(0, 1),
+                crate::version::ClusterVersion::new(0, 2),
+            ),
             partitions: vec![PartitionProgress {
                 partition: PartitionId(3),
                 durable_lamport: Lamport(90),

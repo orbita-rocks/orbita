@@ -10,6 +10,7 @@
 
 use crate::codec::{CodecError, CodecResult, Reader, Writer};
 use crate::membership::NodeStatus;
+use crate::version::ClusterVersion;
 
 use bytes::Bytes;
 use orbita_core::{
@@ -80,6 +81,10 @@ pub(crate) enum ControlResponse {
     Map(Option<PartitionMap>),
     Accepted {
         map_version: MapVersion,
+        /// The active cluster version, carried on every heartbeat reply so a
+        /// node learns which version to speak in the same round trip that
+        /// keeps it out of the failure detector.
+        cluster_version: ClusterVersion,
     },
     /// Carries the leader so the caller retries in one hop rather than
     /// sweeping the whole group.
@@ -113,8 +118,12 @@ impl ControlResponse {
                     }
                 }
             }
-            ControlResponse::Accepted { map_version } => {
+            ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            } => {
                 w.u8(STATUS_ACCEPTED).u64(map_version.get());
+                cluster_version.encode(&mut w);
             }
             ControlResponse::NotLeader { leader } => {
                 w.u8(STATUS_NOT_LEADER)
@@ -145,6 +154,7 @@ impl ControlResponse {
             }
             STATUS_ACCEPTED => ControlResponse::Accepted {
                 map_version: MapVersion(r.u64()?),
+                cluster_version: ClusterVersion::decode(&mut r)?,
             },
             STATUS_NOT_LEADER => ControlResponse::NotLeader {
                 leader: r.opt_u64()?.map(NodeId),
@@ -308,6 +318,7 @@ mod tests {
             ControlResponse::Map(None),
             ControlResponse::Accepted {
                 map_version: MapVersion(9),
+                cluster_version: ClusterVersion::new(0, 2),
             },
             ControlResponse::NotLeader {
                 leader: Some(NodeId(2)),
@@ -330,6 +341,7 @@ mod tests {
                 role: NodeRole::Worker,
                 address: "10.0.0.7:7000".into(),
                 map_version: MapVersion(3),
+                speaks: crate::version::binary_speaks(),
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),

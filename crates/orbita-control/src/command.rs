@@ -22,6 +22,7 @@
 use crate::codec::{CodecError, CodecResult, Reader, Writer};
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Credential, KeyspaceConfig};
+use crate::version::{ClusterVersion, VersionRange};
 
 use bytes::Bytes;
 use orbita_core::{Epoch, KeyspaceId, NodeId, PartitionId};
@@ -38,6 +39,7 @@ const TAG_FENCE_PARTITION: u8 = 9;
 const TAG_ASSIGN_OWNER: u8 = 10;
 const TAG_SET_REPLICAS: u8 = 11;
 const TAG_SPLIT_PARTITION: u8 = 12;
+const TAG_SET_CLUSTER_VERSION: u8 = 13;
 
 /// One decision, committed once and applied everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +51,11 @@ pub enum ControlCommand {
         node: NodeId,
         role: NodeRole,
         address: String,
+        /// The cluster versions this node's binary can speak, asserted by the
+        /// node itself. Recorded so that `finalize-upgrade` can check every
+        /// node against a target version without asking anybody at that
+        /// moment.
+        speaks: VersionRange,
     },
 
     /// Records the leader group's conclusion about a node.
@@ -148,6 +155,17 @@ pub enum ControlCommand {
         upper: PartitionId,
         expect_epoch: Epoch,
     },
+
+    /// Advances the cluster's active protocol version, which is what
+    /// `orbita cluster finalize-upgrade` commits.
+    ///
+    /// `expect` makes it safe to race, the same way `expect_epoch` does for a
+    /// fence: two operators finalizing at once produce one advance and one
+    /// clear refusal rather than a double bump.
+    SetClusterVersion {
+        version: ClusterVersion,
+        expect: ClusterVersion,
+    },
 }
 
 impl ControlCommand {
@@ -159,11 +177,13 @@ impl ControlCommand {
                 node,
                 role,
                 address,
+                speaks,
             } => {
                 w.u8(TAG_REGISTER_NODE)
                     .u64(node.get())
                     .u8(role_tag(*role))
                     .str(address);
+                speaks.encode(&mut w);
             }
             ControlCommand::SetHealth { node, health } => {
                 w.u8(TAG_SET_HEALTH).u64(node.get()).u8(health_tag(*health));
@@ -251,6 +271,11 @@ impl ControlCommand {
                     .u64(upper.get())
                     .u64(expect_epoch.get());
             }
+            ControlCommand::SetClusterVersion { version, expect } => {
+                w.u8(TAG_SET_CLUSTER_VERSION);
+                version.encode(&mut w);
+                expect.encode(&mut w);
+            }
         }
         w.finish()
     }
@@ -262,6 +287,7 @@ impl ControlCommand {
                 node: NodeId(r.u64()?),
                 role: role_from_tag(r.u8()?)?,
                 address: r.string()?,
+                speaks: VersionRange::decode(&mut r)?,
             },
             TAG_SET_HEALTH => ControlCommand::SetHealth {
                 node: NodeId(r.u64()?),
@@ -319,6 +345,10 @@ impl ControlCommand {
                 lower: PartitionId(r.u64()?),
                 upper: PartitionId(r.u64()?),
                 expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_SET_CLUSTER_VERSION => ControlCommand::SetClusterVersion {
+                version: ClusterVersion::decode(&mut r)?,
+                expect: ClusterVersion::decode(&mut r)?,
             },
             tag => {
                 return Err(CodecError::UnknownTag {
@@ -381,6 +411,7 @@ mod tests {
                 node: NodeId(1),
                 role: NodeRole::Worker,
                 address: "10.0.0.1:7000".into(),
+                speaks: VersionRange::new(ClusterVersion::new(0, 1), ClusterVersion::new(0, 2)),
             },
             ControlCommand::SetHealth {
                 node: NodeId(1),
@@ -437,6 +468,10 @@ mod tests {
                 lower: PartitionId(2),
                 upper: PartitionId(3),
                 expect_epoch: Epoch(4),
+            },
+            ControlCommand::SetClusterVersion {
+                version: ClusterVersion::new(0, 2),
+                expect: ClusterVersion::new(0, 1),
             },
         ]
     }

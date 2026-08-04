@@ -23,6 +23,19 @@ service Admin {
   rpc SplitPartition(SplitPartitionRequest) returns (SplitPartitionResponse);
   rpc MergePartitions(MergePartitionsRequest) returns (MergePartitionsResponse);
   rpc TransferOwnership(TransferOwnershipRequest) returns (TransferOwnershipResponse);
+
+  // Advances the active cluster version once every live node can speak the
+  // new one. This is the one-way door at the end of a rolling upgrade; see
+  // docs/UPGRADES.md.
+  rpc FinalizeUpgrade(FinalizeUpgradeRequest) returns (FinalizeUpgradeResponse);
+}
+
+// The protocol and format version a cluster has agreed to speak. Not a binary
+// version: before 1.0 the minor is the compatibility unit, so the patch
+// component of a binary version has no business here.
+message ClusterVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
 }
 
 message KeyspaceConfig {
@@ -126,6 +139,10 @@ message Node {
   NodeHealth health = 4;
   // True for the current Raft leader of the control plane.
   bool is_raft_leader = 5;
+  // The cluster versions this node's binary can speak, inclusive at both
+  // ends. This is what finalize-upgrade checks before it advances.
+  ClusterVersion speaks_min = 6;
+  ClusterVersion speaks_max = 7;
 }
 
 message Replica {
@@ -154,6 +171,8 @@ message Partition {
 message DescribeClusterResponse {
   repeated Node nodes = 1;
   repeated Partition partitions = 2;
+  // The active cluster version every node has agreed to speak.
+  ClusterVersion cluster_version = 3;
 }
 
 message SplitPartitionRequest {
@@ -186,4 +205,13 @@ message TransferOwnershipRequest {
 
 message TransferOwnershipResponse {
   Partition partition = 1;
+}
+
+message FinalizeUpgradeRequest {}
+
+// What the finalize committed. After this lands, rolling back is not
+// supported; the only path backwards is a restore.
+message FinalizeUpgradeResponse {
+  ClusterVersion previous = 1;
+  ClusterVersion active = 2;
 }

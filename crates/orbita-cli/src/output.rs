@@ -338,6 +338,9 @@ pub struct NodeView {
     pub role: String,
     pub health: String,
     pub raft_leader: bool,
+    /// The cluster versions this node's binary can speak, such as "0.1..0.2",
+    /// or "unknown" from a server that predates version reporting.
+    pub speaks: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -490,6 +493,8 @@ impl ClusterSummaryView {
 #[derive(Debug, Clone, Serialize)]
 pub struct ClusterView {
     pub summary: ClusterSummaryView,
+    /// The active cluster version, or absent from a server that predates it.
+    pub cluster_version: Option<String>,
     pub nodes: Vec<NodeView>,
     pub partitions: Vec<PartitionView>,
 }
@@ -534,9 +539,18 @@ impl ClusterView {
 
         Self {
             summary,
+            cluster_version: None,
             nodes,
             partitions,
         }
+    }
+
+    /// Attaches the active cluster version, kept separate from [`Self::new`]
+    /// so the callers that print partial views do not have to invent one.
+    #[must_use]
+    pub fn with_cluster_version(mut self, version: Option<String>) -> Self {
+        self.cluster_version = version;
+        self
     }
 }
 
@@ -557,6 +571,9 @@ impl Render for ClusterView {
                 |id| format!("node {id}")
             )
         );
+        if let Some(version) = &self.cluster_version {
+            let _ = writeln!(out, "  version      {version}");
+        }
         let _ = writeln!(
             out,
             "  partitions   {} total, {} with an unhealthy owner, {} with no replica",
@@ -581,11 +598,12 @@ impl Render for ClusterView {
                         n.role.clone(),
                         n.health.clone(),
                         if n.raft_leader { "yes" } else { "no" }.to_owned(),
+                        n.speaks.clone(),
                     ]
                 })
                 .collect();
             out.push_str(&indent(&table(
-                &["id", "address", "role", "health", "raft leader"],
+                &["id", "address", "role", "health", "raft leader", "speaks"],
                 &rows,
             )));
         }
@@ -635,6 +653,32 @@ pub struct PingView {
 impl Render for PingView {
     fn render_human(&self, out: &mut String) {
         let _ = write!(out, "{} is answering ({})", self.endpoint, self.detail);
+    }
+}
+
+/// A finalized upgrade: the version the cluster left and the one it is on.
+///
+/// The human rendering repeats the one-way-door warning, because the moment
+/// this prints is the moment the cheap rollback stopped existing and the
+/// operator deserves to be told at that moment, not only in the docs.
+#[derive(Debug, Clone, Serialize)]
+pub struct FinalizeUpgradeView {
+    pub previous: String,
+    pub active: String,
+}
+
+impl Render for FinalizeUpgradeView {
+    fn render_human(&self, out: &mut String) {
+        let _ = writeln!(
+            out,
+            "cluster version advanced from {} to {}",
+            self.previous, self.active
+        );
+        out.push_str(
+            "Nodes will now write new formats. Rolling back past this point is not\n\
+             supported; the only path backwards is restoring from a backup taken before\n\
+             the upgrade.",
+        );
     }
 }
 
@@ -1020,6 +1064,7 @@ mod tests {
             role: role.to_owned(),
             health: health.to_owned(),
             raft_leader,
+            speaks: "0.1..0.2".to_owned(),
         }
     }
 

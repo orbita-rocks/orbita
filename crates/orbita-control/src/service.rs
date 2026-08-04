@@ -47,7 +47,10 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     .record_status(request.node, request.status)
                     .await
                 {
-                    Ok(map_version) => ControlResponse::Accepted { map_version },
+                    Ok(map_version) => ControlResponse::Accepted {
+                        map_version,
+                        cluster_version: self.controller.cluster_version().await,
+                    },
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),

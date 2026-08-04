@@ -23,12 +23,13 @@ use orbita_cli::{admin, data};
 use orbita_proto::v1::admin_server::{Admin, AdminServer};
 use orbita_proto::v1::kv_server::{Kv, KvServer};
 use orbita_proto::v1::{
-    CreateCredentialRequest, CreateCredentialResponse, CreateKeyspaceRequest,
+    ClusterVersion, CreateCredentialRequest, CreateCredentialResponse, CreateKeyspaceRequest,
     DeleteKeyspaceRequest, DeleteKeyspaceResponse, DeleteRequest, DeleteResponse,
-    DescribeClusterRequest, DescribeClusterResponse, GetRequest, GetResponse, Keyspace,
-    KeyspaceConfig, ListKeyspacesRequest, ListKeyspacesResponse, ListRequest, ListResponse,
-    MergePartitionsRequest, MergePartitionsResponse, Node, NodeHealth, NodeRole, Partition,
-    Replica, RevokeCredentialRequest, RevokeCredentialResponse, SetRequest, SetResponse,
+    DescribeClusterRequest, DescribeClusterResponse, FinalizeUpgradeRequest,
+    FinalizeUpgradeResponse, GetRequest, GetResponse, Keyspace, KeyspaceConfig,
+    ListKeyspacesRequest, ListKeyspacesResponse, ListRequest, ListResponse, MergePartitionsRequest,
+    MergePartitionsResponse, Node, NodeHealth, NodeRole, Partition, Replica,
+    RevokeCredentialRequest, RevokeCredentialResponse, SetRequest, SetResponse,
     SplitPartitionRequest, SplitPartitionResponse, TransferOwnershipRequest,
     TransferOwnershipResponse, UpdateKeyspaceRequest,
 };
@@ -156,6 +157,8 @@ impl Admin for Fake {
                 role: NodeRole::Leader as i32,
                 health: NodeHealth::Healthy as i32,
                 is_raft_leader: true,
+                speaks_min: Some(ClusterVersion { major: 0, minor: 1 }),
+                speaks_max: Some(ClusterVersion { major: 0, minor: 2 }),
             }],
             partitions: vec![Partition {
                 id: 10,
@@ -171,6 +174,7 @@ impl Admin for Fake {
                 }],
                 size_bytes: 1_048_576,
             }],
+            cluster_version: Some(ClusterVersion { major: 0, minor: 2 }),
         }))
     }
 
@@ -193,6 +197,17 @@ impl Admin for Fake {
         _: Request<TransferOwnershipRequest>,
     ) -> Result<Response<TransferOwnershipResponse>, Status> {
         Err(Status::unimplemented("not needed by these tests"))
+    }
+
+    async fn finalize_upgrade(
+        &self,
+        request: Request<FinalizeUpgradeRequest>,
+    ) -> Result<Response<FinalizeUpgradeResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(FinalizeUpgradeResponse {
+            previous: Some(ClusterVersion { major: 0, minor: 1 }),
+            active: Some(ClusterVersion { major: 0, minor: 2 }),
+        }))
     }
 }
 
@@ -413,6 +428,46 @@ async fn the_describe_json_carries_the_summary_a_script_would_alert_on() {
     assert_eq!(json["summary"]["max_replica_lag"], 10);
     assert_eq!(json["summary"]["partitions_with_an_unhealthy_owner"], 1);
     assert_eq!(json["partitions"][0]["replicas"][0]["applied_lamport"], 490);
+}
+
+#[tokio::test]
+async fn describing_the_cluster_shows_the_active_version_and_what_each_node_speaks() {
+    let (config, _) = start(fake()).await;
+    let text = admin::cluster(
+        &config,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    assert!(text.contains("version      0.2"), "{text}");
+    assert!(text.contains("0.1..0.2"), "{text}");
+}
+
+#[tokio::test]
+async fn finalizing_an_upgrade_reports_the_advance_and_warns_that_rollback_is_gone() {
+    let (config, seen) = start(fake()).await;
+    let text = admin::cluster(&config, Format::Human, ClusterCommand::FinalizeUpgrade)
+        .await
+        .unwrap();
+    assert!(text.contains("from 0.1 to 0.2"), "{text}");
+    assert!(text.contains("not"), "{text}");
+    assert!(text.contains("supported"), "{text}");
+    assert_eq!(
+        seen.lock().unwrap().authorization.as_deref(),
+        Some("Bearer token-abc")
+    );
+}
+
+#[tokio::test]
+async fn the_finalize_json_carries_both_versions_for_a_script() {
+    let (config, _) = start(fake()).await;
+    let text = admin::cluster(&config, Format::Json, ClusterCommand::FinalizeUpgrade)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["previous"], "0.1");
+    assert_eq!(json["active"], "0.2");
 }
 
 #[tokio::test]

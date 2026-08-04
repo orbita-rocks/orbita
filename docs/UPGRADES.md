@@ -10,12 +10,15 @@ command at the end. The reasoning is in
 Read this first. The chart is written for the process below; the server is not
 finished.
 
-- There is no cluster version. Nodes do not read one, do not report which
-  versions they can speak, and do not gate their behaviour on it. Mixed-version
-  operation is therefore not something you should rely on today.
-- `orbita cluster finalize-upgrade` does not exist. It is described below
-  because that is where it goes, not because you can run it. There is nothing
-  for it to finalize until the control plane holds a cluster version.
+- The cluster version and `orbita cluster finalize-upgrade` exist. The control
+  plane holds the version in its replicated state, every node reports the
+  range of versions its binary can speak on every heartbeat and reads the
+  active version back, and finalizing advances the version only after checking
+  every live node can speak the new one. What does not exist yet is the
+  enforcement around it: a node outside the window says so in its logs but
+  still joins, and no behaviour actually changes with the version because no
+  format has two versions to choose between yet. Mixed-version operation is
+  therefore still not something you should rely on today.
 - Readiness does not mean what it should. It means the process is answering on
   the client port, not that the node has rejoined the leader group, recovered
   its write-ahead log, opened its partitions, and caught up. A rolling update
@@ -116,7 +119,8 @@ A node that cannot speak the cluster's active version is meant to start,
 report itself not Ready, and say why in its logs. It is not meant to exit.
 That is deliberate: a pod that is running and not Ready stops the rollout at
 exactly one pod and leaves its diagnostics reachable, where a pod that exits
-takes its logs away in a restart loop. Nothing implements that yet.
+takes its logs away in a restart loop. Today the node starts and says why in
+its logs; readiness does not reflect it yet.
 
 ## Finalizing
 
@@ -135,7 +139,10 @@ Finalization is not automatic on purpose. Doing it automatically would close
 the rollback window at the exact moment an operator is most likely to want it,
 which is a few minutes after a rollout finishes and something looks off.
 
-This command does not exist yet.
+The command checks before it commits: if any live node cannot speak the new
+version, nothing changes and the error names the nodes holding it back. A
+node the cluster has declared dead does not get a vote, because a lost node's
+last act should not be pinning the cluster to an old version.
 
 ### If you need to go back after finalizing
 

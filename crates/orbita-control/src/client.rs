@@ -9,6 +9,7 @@
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::membership::NodeStatus;
+use crate::version::ClusterVersion;
 use crate::wire::{
     ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
     METHOD_REPORT_STATUS,
@@ -102,17 +103,21 @@ impl<R: Runtime> ControlClient<R> {
         }
     }
 
-    /// The same as [`ControlClient::report_status`], but hands back the map
-    /// version the leader group is on so a caller can tell in one round trip
-    /// whether its routing is stale.
+    /// The same as [`ControlClient::report_status`], but hands back what the
+    /// leader group said yes with: the map version it is on, so a caller can
+    /// tell in one round trip whether its routing is stale, and the active
+    /// cluster version, which is how a node learns what to speak.
     pub async fn report_status_for_version(
         &self,
         node: NodeId,
         status: NodeStatus,
-    ) -> Result<MapVersion> {
+    ) -> Result<(MapVersion, ClusterVersion)> {
         let payload = ReportStatusRequest { node, status }.encode();
         match self.call(METHOD_REPORT_STATUS, payload).await? {
-            ControlResponse::Accepted { map_version } => Ok(map_version),
+            ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            } => Ok((map_version, cluster_version)),
             other => Err(unexpected(&other)),
         }
     }

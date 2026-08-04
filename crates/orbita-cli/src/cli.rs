@@ -497,6 +497,21 @@ request that timed out counts as down.
 Use `cluster describe` to find out whether the cluster is healthy. Use this to
 find out whether one node is.")]
     Ping,
+
+    /// Advance the cluster version after a rolling upgrade.
+    #[command(long_about = "\
+Advance the cluster's active version to the newest one every live node can
+speak. Run it once every node is upgraded and you are happy with the result.
+
+Until this runs, upgraded nodes keep speaking the old version and a rollback
+is the ordinary Kubernetes one, because nothing new has been written. After it
+runs, nodes start writing new formats and rolling back is not supported: the
+only path backwards is restoring from a backup taken before the upgrade. That
+is why finalization is a command and not automatic.
+
+If any live node cannot speak the new version, nothing is committed and the
+error names the nodes holding it back.")]
+    FinalizeUpgrade,
 }
 
 #[derive(Debug, Subcommand)]
