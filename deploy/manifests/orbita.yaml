@@ -232,39 +232,44 @@ spec:
             - name: peer
               containerPort: 7101
           # Readiness is what gates the next pod in a rolling update, so it is
-          # the safety mechanism of an upgrade rather than a formality. It is
-          # supposed to mean that this node has registered with the leader
-          # group, recovered its log, opened its partitions, and caught up.
-          # It does not mean that yet: the server reports nothing better than
-          # "the process is answering", which is what `cluster ping` checks.
-          # Stage upgrades with the StatefulSet partition field and watch the
-          # cluster rather than trusting the rollout. See docs/UPGRADES.md.
+          # the safety mechanism of an upgrade rather than a formality.
+          # `cluster ready` exits non-zero and names the unmet conditions
+          # until the node has recovered its log, opened its partitions, and
+          # caught up. The registration condition is met by construction for
+          # now: the CLI does not yet pass the leader group to the server, so
+          # rejoin is not asserted on a deployed node. docs/UPGRADES.md lists
+          # that gap.
           #
           # Liveness stays conservative, because failing it kills the pod. It
-          # never asks anything about the cluster or about reaching peers: a
-          # liveness probe that did would turn a network partition into every
-          # pod being killed at once. Slow starts belong to the startup probe,
-          # whose budget is long because recovering a large log legitimately
-          # takes time and a worker that starts before the leader group retries
-          # until it can join.
+          # runs `cluster ping`, which never asks anything about the cluster
+          # or about reaching peers: a liveness probe that did would turn a
+          # network partition into every pod being killed at once. Slow starts
+          # belong to the startup probe, whose budget is long because
+          # recovering a large log legitimately takes time and a worker that
+          # starts before the leader group retries until it can join.
           startupProbe:
             exec:
-              command: &leader-probe
+              command: &leader-ready-probe
+                - /usr/local/bin/orbita
+                - --endpoint
+                - http://127.0.0.1:7100
+                - cluster
+                - ready
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: *leader-ready-probe
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
                 - /usr/local/bin/orbita
                 - --endpoint
                 - http://127.0.0.1:7100
                 - cluster
                 - ping
-            periodSeconds: 5
-            failureThreshold: 60
-          readinessProbe:
-            exec:
-              command: *leader-probe
-            periodSeconds: 10
-            failureThreshold: 3
-          livenessProbe:
-            exec:
-              command: *leader-probe
             periodSeconds: 30
             failureThreshold: 4
           resources:
@@ -372,39 +377,44 @@ spec:
             - name: peer
               containerPort: 7101
           # Readiness is what gates the next pod in a rolling update, so it is
-          # the safety mechanism of an upgrade rather than a formality. It is
-          # supposed to mean that this node has registered with the leader
-          # group, recovered its log, opened its partitions, and caught up.
-          # It does not mean that yet: the server reports nothing better than
-          # "the process is answering", which is what `cluster ping` checks.
-          # Stage upgrades with the StatefulSet partition field and watch the
-          # cluster rather than trusting the rollout. See docs/UPGRADES.md.
+          # the safety mechanism of an upgrade rather than a formality.
+          # `cluster ready` exits non-zero and names the unmet conditions
+          # until the node has recovered its log, opened its partitions, and
+          # caught up. The registration condition is met by construction for
+          # now: the CLI does not yet pass the leader group to the server, so
+          # rejoin is not asserted on a deployed node. docs/UPGRADES.md lists
+          # that gap.
           #
           # Liveness stays conservative, because failing it kills the pod. It
-          # never asks anything about the cluster or about reaching peers: a
-          # liveness probe that did would turn a network partition into every
-          # pod being killed at once. Slow starts belong to the startup probe,
-          # whose budget is long because recovering a large log legitimately
-          # takes time and a worker that starts before the leader group retries
-          # until it can join.
+          # runs `cluster ping`, which never asks anything about the cluster
+          # or about reaching peers: a liveness probe that did would turn a
+          # network partition into every pod being killed at once. Slow starts
+          # belong to the startup probe, whose budget is long because
+          # recovering a large log legitimately takes time and a worker that
+          # starts before the leader group retries until it can join.
           startupProbe:
             exec:
-              command: &worker-probe
+              command: &worker-ready-probe
+                - /usr/local/bin/orbita
+                - --endpoint
+                - http://127.0.0.1:7100
+                - cluster
+                - ready
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: *worker-ready-probe
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
                 - /usr/local/bin/orbita
                 - --endpoint
                 - http://127.0.0.1:7100
                 - cluster
                 - ping
-            periodSeconds: 5
-            failureThreshold: 120
-          readinessProbe:
-            exec:
-              command: *worker-probe
-            periodSeconds: 10
-            failureThreshold: 3
-          livenessProbe:
-            exec:
-              command: *worker-probe
             periodSeconds: 30
             failureThreshold: 4
           resources:

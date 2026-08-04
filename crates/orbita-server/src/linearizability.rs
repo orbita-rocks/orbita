@@ -282,9 +282,16 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
     };
     let source = BoxedMapSource::new(StaticMapSource::new(owner_and_replica_map()));
     sim.block_on(async move {
-        Node::start(runtime, node, layout, source, lease)
-            .await
-            .expect("the node starts")
+        Node::start(
+            runtime,
+            node,
+            layout,
+            source,
+            lease,
+            Arc::new(crate::ReadinessGate::new()),
+        )
+        .await
+        .expect("the node starts")
     })
 }
 
