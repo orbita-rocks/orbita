@@ -261,11 +261,12 @@ implemented against is prose, not a contract.
 
 ## Transactions
 
-v1 ships without multi-key transactions, and the first version of this
-document treated them as permanently out of scope. That position is reversed:
-ACID transactions are a committed post-v1 direction. This section records the
-decisions so the v1 pieces are built with them in mind, not to schedule the
-work; sequencing lives in ROADMAP.md.
+The first version of this document treated multi-key transactions as
+permanently out of scope. That position is reversed: ACID transactions are a
+committed direction, currently scheduled at v0.3.0 in ROADMAP.md, after the
+first release and after the testing investment that makes checking them
+possible. This section records the decisions so everything built earlier has
+them in mind, not to schedule the work; sequencing lives in ROADMAP.md.
 
 The guarantee is strict serializability or nothing. I considered causal
 transactions over vector clocks, which avoid central timestamping and handle
@@ -447,16 +448,14 @@ cannot creep past it:
 - **Geo-replication.** Single-region clusters only. This keeps the
   clock-sync and uncertainty-interval design space out of v1 entirely.
 
-## Roadmap (post-v1, in rough priority order)
+## Roadmap
 
-1. Watch/subscribe streams.
-2. The transaction ladder from Transactions above: snapshot timestamps on
-   reads, single-partition batches, cross-partition snapshot isolation, then
-   strict serializability, with the official client library and `docs/CLIENTS.md`
-   landing alongside.
-3. Third-party Jepsen analysis.
-4. Additional object storage backends via the storage trait (GCS, Azure).
-5. Multi-region story.
+Sequencing lives in ROADMAP.md, which maps this work to releases. The
+priority order, for when the two disagree: watch/subscribe streams first,
+then the transaction ladder from Transactions above with the official client
+library and `docs/CLIENTS.md` alongside, then a third-party Jepsen analysis,
+then additional object storage backends via the storage trait (GCS, Azure),
+then a multi-region story.
 
 Earlier versions of this document kept multi-key transactions off this list
 and conceded them to FoundationDB flatly. That concession is withdrawn

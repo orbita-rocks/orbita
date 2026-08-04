@@ -124,30 +124,41 @@ The upgrade theme is the second candidate, since attended-only rollouts are a
 warning label rather than a wrong claim. The format and Raft themes are not
 cuttable; they are the difference between the pitch being true and not.
 
-## v0.2.0: the evidence
+## v0.2.0: testing and correctness
 
-The theme is measurement. The acceptance criteria in
-[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) all say measured, not estimated,
-and this release is where the measuring happens. It follows everything else
-because every earlier piece of work changes what would be measured.
+The theme is that the test system grows up before the feature surface grows
+again. v0.1.0 ships a system whose correctness argument rests on the
+deterministic simulator, and v0.3.0 pulls a transaction protocol and a
+streaming surface into that system. Between them is the release where the
+instruments get built, because verifying serializable histories and long-lived
+subscriptions demands more from the harness than verifying per-key
+linearizability does, and building the checker after the protocol is how the
+protocol ships unchecked.
 
-- A partition-count knob in the simulator, and the experiment that finds where
-  the leader group strains. The scale envelope calls this the number that turns
-  the scaling argument from a design claim into a published one.
-- The measured latency and throughput curves against worker count, replacing
-  the target rows in the requirements table.
-- The public correctness report: DST coverage, fault-injection results, and the
-  linearizability verification under partitions, crashes, restarts, and clock
-  skew.
+This section is deliberately vague. The work needs a plan of its own, and
+writing that plan is the first deliverable of the release. The shape of it:
+
+- Improved harnesses: more of the system drivable by the simulator, more
+  fault types, longer and larger schedules, and the knobs the scale envelope
+  says are missing, partition count first.
+- A regression discipline: every bug found, in the simulator or in the field,
+  becomes a seeded regression test that runs forever.
+- Tests at scale: real clusters, sustained load, and the measured latency and
+  throughput curves that replace the target rows in the requirements table.
+- The public correctness report assembled from all of the above, since the
+  evidence is the product and this release is where it becomes publishable.
 - Whatever the measurements say to fix. This bullet is load-bearing; the
-  honest outcome of a first benchmarking pass is a list of regressions.
+  honest outcome of a first serious testing pass is a list of regressions.
 
 Once this exists, planning 1.0 becomes a conversation about numbers rather
 than intentions, and this roadmap gets its next revision.
 
-## Later
+## v0.3.0: watch and transactions
 
-In priority order, from the requirements:
+The theme is closing the two gaps the target persona actually hits, in the
+order they ask about them. Both are protocol additions, which is what a minor
+version is for under the compatibility scheme, and both are deliberately
+sequenced after v0.2.0 so they land on a harness that can check them.
 
 1. **Watch/subscribe streams.** The known gap for the coordination use case,
    and the first thing the target persona asks about.
@@ -158,15 +169,27 @@ In priority order, from the requirements:
    official smart client and the client-authoring doc (`docs/CLIENTS.md`)
    land alongside, since interactive transactions are what justify a real
    client library.
-3. **A third-party Jepsen analysis**, once the system is stable enough that
-   the report would be about Orbita rather than about churn.
-4. **Additional object storage backends** (GCS, Azure) through the trait,
+
+The ladder's stages are individually shippable, so if this release needs to
+split, it splits along them: watch plus the early stages first, the
+cross-partition work in a v0.4.0.
+
+## Later
+
+In priority order, from the requirements:
+
+1. **A third-party Jepsen analysis**, once the system is stable enough that
+   the report would be about Orbita rather than about churn, and ideally
+   covering the transaction protocol from v0.3.0 rather than stopping short
+   of it.
+2. **Additional object storage backends** (GCS, Azure) through the trait,
    likely community-contributed.
-5. **A multi-region story**, which was fenced out of v1 to keep clock
+3. **A multi-region story**, which was fenced out of v1 to keep clock
    uncertainty out of the design space.
 
-Multi-key transactions used to be off this list on purpose, conceded to
-FoundationDB. The requirements now record why that reversed and what the
-guarantee has to be; the short version is that Orbita already owns most of
-what a verifiable transaction system needs, and evidence-backed transactions
-are rarer than transactions.
+Multi-key transactions used to be on this list, and before that they were off
+every list on purpose, conceded to FoundationDB. The requirements record why
+that reversed and what the guarantee has to be; the short version is that
+Orbita already owns most of what a verifiable transaction system needs, and
+evidence-backed transactions are rarer than transactions. Scheduling them at
+v0.3.0 is what v0.2.0's investment in the harness is for.
