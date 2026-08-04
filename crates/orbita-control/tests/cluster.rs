@@ -743,11 +743,9 @@ fn a_fresh_cluster_starts_at_the_bootstrapping_binarys_version() {
         .block_on(async move { controller.cluster_version().await });
     assert_eq!(version, binary_speaks().max);
 
-    // While the workspace version is 0.0.x the assertion above is vacuous,
-    // because the binary's version and ClusterVersion::ZERO coincide. The
-    // log entry is not: bootstrap must have committed the version rather
-    // than left the state machine on its default, or a member replaying the
-    // log could not agree on it.
+    // The log entry matters independently of the value: bootstrap must have
+    // committed the version rather than left the state machine on its
+    // default, or a member replaying the log could not agree on it.
     let set_at_bootstrap = cluster.entries().into_iter().any(|command| {
         command
             == ControlCommand::SetClusterVersion {

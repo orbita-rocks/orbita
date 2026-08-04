@@ -1,12 +1,16 @@
 //! Single-partition storage engine.
 //!
-//! This crate owns one partition's RocksDB instance and everything that
-//! happens inside it: encoding records, enforcing conditional writes,
-//! filtering expired keys, and serving prefix scans. It knows nothing about
-//! replication, ownership, or the cluster, which is what makes it the easiest
-//! part of Orbita to test and the right place to start.
+//! This crate owns one partition and everything that happens inside it:
+//! enforcing conditional writes, filtering expired keys, serving prefix
+//! scans, and moving data between the mutable table and the immutable
+//! segments `orbita-format` defines, per
+//! [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md).
+//! Every persisted byte goes through `orbita_objectstore::ObjectStore`, which
+//! is what lets the deterministic simulation stand in a faultable store and
+//! what makes a worker cheap to replace. The crate knows nothing about
+//! replication, ownership, or the cluster.
 //!
-//! Work brief: `docs/plan/01-storage.md`.
+//! Work briefs: `docs/plan/01-storage.md` and `docs/plan/07-format.md`.
 //!
 //! # A key's version is the Lamport it was written at
 //!
@@ -34,9 +38,9 @@
 //! [`Partition::put`] and [`Partition::delete`] take the Lamport to write at
 //! rather than allocating one. Under
 //! [ADR 0001](../../../docs/adr/0001-linearizable-reads-from-replicas.md) the
-//! owner assigns a Lamport, appends to its own log, and replicates before it
-//! ever touches RocksDB, so by the time storage is involved the number is
-//! already fixed and already on the wire. A partition that allocated its own
+//! owner assigns a Lamport, appends to its own log, and replicates before the
+//! storage engine ever sees the write, so by the time storage is involved the
+//! number is already fixed and already on the wire. A partition that allocated its own
 //! would produce a second number that has to agree with the first, and the two
 //! nodes replaying that write would have nothing to agree on.
 //!
@@ -55,16 +59,16 @@
 //! # Deletes are explicit tombstones
 //!
 //! Deleting a key writes a record marked deleted, carrying the version the
-//! delete produced, instead of issuing a RocksDB delete. Conditional writes
-//! need to tell "this key never existed" apart from "this key was deleted at
-//! version 112", because a client doing compare-and-swap on a lease has to
-//! know whether it lost a race or is looking at a fresh key. A RocksDB
-//! tombstone carries no version and cannot answer that.
+//! delete produced, instead of erasing the key. Conditional writes need to
+//! tell "this key never existed" apart from "this key was deleted at version
+//! 112", because a client doing compare-and-swap on a lease has to know
+//! whether it lost a race or is looking at a fresh key. An absence cannot
+//! answer that; a tombstone can.
 //!
 //! The cost is space, and the answer to that cost is the mechanism TTL already
 //! needs: a tombstone is stored with an absolute expiry a day out, and the
-//! compaction filter that reclaims expired records reclaims it too. A delete
-//! costs one record for a day and then nothing.
+//! compaction that reclaims expired records reclaims it too. A delete costs
+//! one record for a day and then nothing.
 //!
 //! # Cursors name a key, not a position
 //!
@@ -104,7 +108,6 @@
 #![forbid(unsafe_code)]
 
 mod cursor;
-mod encoding;
 mod mutation;
 mod partition;
 

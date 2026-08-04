@@ -175,7 +175,15 @@ impl<R: Runtime> StatusReporter<R> {
 
     /// Sends one report, carrying how far this node has got on every partition
     /// it holds, and reads the active cluster version back off the reply.
-    pub async fn report(&self, map_version: MapVersion, partitions: Vec<PartitionProgress>) {
+    ///
+    /// Answers whether the report landed. The first `true` is what marks this
+    /// node as joined for readiness, because a report the leader group
+    /// accepted is the moment the cluster knows this node exists.
+    pub async fn report(
+        &self,
+        map_version: MapVersion,
+        partitions: Vec<PartitionProgress>,
+    ) -> bool {
         let status = NodeStatus {
             role: NodeRole::Worker,
             address: self.address.clone(),
@@ -190,7 +198,7 @@ impl<R: Runtime> StatusReporter<R> {
         {
             // No version in the reply means the leader predates them, which
             // mid-rollout is normal; this node keeps whatever it last knew.
-            Ok((_, None)) => {}
+            Ok((_, None)) => true,
             Ok((_, Some(cluster_version))) => {
                 *self.active.lock().expect("active version poisoned") = Some(cluster_version);
                 if !binary_speaks().contains(cluster_version) {
@@ -205,11 +213,13 @@ impl<R: Runtime> StatusReporter<R> {
                          it is outside the supported upgrade window"
                     );
                 }
+                true
             }
             // A heartbeat that does not land is what failover is built to
             // survive, so it is worth saying and not worth stopping for.
             Err(error) => {
                 tracing::debug!(%error, "reporting status to the leader group failed");
+                false
             }
         }
     }

@@ -35,7 +35,7 @@ pub enum NodeHealth {
 /// How far one node has got on one partition.
 ///
 /// `durable_lamport` is the promotion input. It is what the node has on stable
-/// storage, not what it has applied to RocksDB, because the promise is that no
+/// storage, not what it has applied to its storage engine, because the promise is that no
 /// acknowledged write is lost and an acknowledgement is paid for by durability
 /// rather than by application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,6 +9,12 @@
 //!   record for its key, because dropping it early resurrects the value.
 //! - An expired record may be dropped at any time.
 //!
+//! There are two entry points because there are two tombstone rules. A
+//! partial merge ([`merge`]) drops tombstones by coverage, since resurrection
+//! is the only risk. A whole-partition merge ([`merge_all`]) keeps every
+//! unexpired tombstone, because an engine whose deletes carry a retention
+//! period still needs them answering retries until it passes.
+//!
 //! The result is published by the ordinary commit, which is what makes a
 //! compaction that dies half way through cost nothing but the objects it wrote.
 
@@ -44,6 +50,41 @@ pub fn merge(
     now_millis: u64,
     retained: &[SegmentEntry],
 ) -> Result<Vec<SegmentRecord>> {
+    Ok(winners(inputs)?
+        .into_iter()
+        .filter(|record| !record.is_expired_at(now_millis))
+        .filter(|record| {
+            !record.is_tombstone()
+                || retained
+                    .iter()
+                    .any(|entry| entry.may_hold(&record.key) && entry.min_lamport < record.lamport)
+        })
+        .cloned()
+        .collect())
+}
+
+/// Merges every segment of a partition, keeping every unexpired tombstone.
+///
+/// This is the whole-partition compaction a storage engine runs, and its
+/// tombstone rule is time-based where [`merge`]'s is coverage-based. Coverage
+/// answers "could dropping this resurrect an older value", which is the only
+/// question when some segments stay behind. When nothing stays behind that
+/// answer is always no, but a tombstone still has work to do: it answers a
+/// retrying deleter until its retention passes, and dropping it early makes a
+/// retried delete consume a fresh Lamport for a delete that already happened.
+/// So an unexpired tombstone survives here, and the expiry rule reclaims it
+/// on schedule.
+pub fn merge_all(inputs: &[Vec<SegmentRecord>], now_millis: u64) -> Result<Vec<SegmentRecord>> {
+    Ok(winners(inputs)?
+        .into_iter()
+        .filter(|record| !record.is_expired_at(now_millis))
+        .cloned()
+        .collect())
+}
+
+/// The record with the highest Lamport for each key, ascending by key, with
+/// the exhaustive duplicate-Lamport check both merges rely on.
+fn winners(inputs: &[Vec<SegmentRecord>]) -> Result<Vec<&SegmentRecord>> {
     let mut grouped: BTreeMap<&[u8], Vec<&SegmentRecord>> = BTreeMap::new();
     for records in inputs {
         for record in records {
@@ -62,18 +103,7 @@ pub fn merge(
         }
         winners.push(candidates.pop().expect("a group holds at least one record"));
     }
-
-    Ok(winners
-        .into_iter()
-        .filter(|record| !record.is_expired_at(now_millis))
-        .filter(|record| {
-            !record.is_tombstone()
-                || retained
-                    .iter()
-                    .any(|entry| entry.may_hold(&record.key) && entry.min_lamport < record.lamport)
-        })
-        .cloned()
-        .collect())
+    Ok(winners)
 }
 
 #[cfg(test)]
@@ -208,6 +238,43 @@ mod tests {
         .unwrap();
         assert_eq!(merged.len(), 1, "a write after a delete is not a delete");
         assert_eq!(merged[0].lamport, Lamport(9));
+    }
+
+    #[test]
+    fn a_whole_partition_merge_keeps_an_unexpired_tombstone() {
+        // The rule merge_all exists for. Nothing is retained, so coverage
+        // says the tombstone could go, but a retrying deleter still needs it
+        // until its retention passes.
+        let merged = merge_all(&[vec![tombstone("m", 7, u64::MAX)]], 0).unwrap();
+        assert_eq!(keys(&merged), vec![&b"m"[..]]);
+    }
+
+    #[test]
+    fn a_whole_partition_merge_reclaims_an_expired_tombstone() {
+        let merged = merge_all(&[vec![tombstone("m", 7, 100)]], 100).unwrap();
+        assert!(merged.is_empty(), "retention passed, so the work is done");
+    }
+
+    #[test]
+    fn a_whole_partition_merge_resolves_keys_and_drops_expired_records() {
+        let mut expiring = put("c", 4, "v");
+        expiring.expires_at_millis = Some(100);
+        let merged = merge_all(
+            &[
+                vec![put("a", 1, "old"), expiring],
+                vec![put("a", 9, "new"), put("b", 2, "keep")],
+            ],
+            100,
+        )
+        .unwrap();
+        assert_eq!(keys(&merged), vec![&b"a"[..], b"b"]);
+        assert_eq!(merged[0].lamport, Lamport(9));
+    }
+
+    #[test]
+    fn a_whole_partition_merge_catches_duplicate_lamports_too() {
+        let outcome = merge_all(&[vec![put("a", 5, "one")], vec![put("a", 5, "two")]], 0);
+        assert!(matches!(outcome, Err(FormatError::Corrupt(_))));
     }
 
     #[test]

@@ -87,14 +87,8 @@ orbita --endpoint http://127.0.0.1:7100 cluster describe
 Check that everything is up with `docker compose ps`. All seven services should
 say healthy within a minute.
 
-The first build compiles RocksDB from source and takes about ten minutes.
-Everything after that is cached. It builds four files at a time, because each
-parallel C++ job wants roughly a gigabyte and the default Docker Desktop
-allocation is smaller than most laptops have cores. On a bigger machine:
-
-```
-docker compose build --build-arg BUILD_JOBS=16
-```
+The first build compiles the workspace from source and takes a few minutes.
+Everything after that is cached.
 
 Tear it down with `docker compose down -v`. The `-v` removes the volumes, which
 is what you want unless you meant to keep the data.

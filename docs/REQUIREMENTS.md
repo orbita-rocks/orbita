@@ -1,8 +1,9 @@
 # Orbita
 
 > Orbita is a strongly consistent, multitenant distributed key-value store. It
-> uses RocksDB for storage, keeps compacted data on object storage, and is
-> built under deterministic simulation from day one.
+> stores partitions as immutable objects behind a memory-resident index, keeps
+> the objects on object storage, and is built under deterministic simulation
+> from day one.
 
 This document is the product requirements for Orbita v1. It fixes the scope,
 the guarantees, and the acceptance criteria. Sequencing and detailed design
@@ -439,7 +440,9 @@ them by exceeding one.
 
 ## Engineering posture
 
-- **Language.** Rust, using the mature `rocksdb` crate.
+- **Language.** Rust. Storage originally sat on the `rocksdb` crate; ADR 0006
+  replaced that with a partition format this project owns, so the engine has
+  no storage dependency to trust beyond the object store.
 - **Deterministic simulation testing from day one.** All network, disk, and
   clock access sits behind swappable interfaces so the whole system runs
   single-threaded in a seeded, fault-injecting simulation. This is expensive

@@ -1,24 +1,26 @@
-//! A runtime for the crate's own tests.
+//! A runtime and an object store for the crate's own tests.
 //!
 //! The storage engine reads the clock on every operation, so testing TTL means
-//! controlling time rather than sleeping through it. The simulator in
-//! `orbita-sim` will eventually provide this, but the storage engine is in the
-//! first wave alongside it and cannot wait for it. Everything here is a stub
-//! except the clock and the random number generator, because the storage
-//! engine touches nothing else: RocksDB does its own file I/O below the disk
-//! seam, and one partition never talks to a peer.
+//! controlling time rather than sleeping through it. Persistence goes through
+//! `orbita_objectstore::ObjectStore`, so the tests run against the in-memory
+//! store the format crate ships for exactly this purpose, and a "restart" is
+//! reopening the partition over the same store. Everything else here is a
+//! stub, because one partition touches no disk and never talks to a peer.
 
 use crate::partition::WriteOutcome;
 
 use bytes::Bytes;
-use orbita_core::{KeyRange, Lamport, NodeId, Version, WriteCondition};
+use orbita_core::{
+    Epoch, KeyRange, KeyspaceId, Lamport, NodeId, PartitionId, Version, WriteCondition,
+};
+use orbita_format::testing::MemoryStore;
+use orbita_format::PartitionPath;
 use orbita_runtime::{
     Clock, Disk, DiskError, File, OpenOptions, PeerCall, PeerHandler, Rng, Runtime, SeededRng,
     ServiceId, Transport, TransportError,
 };
 use std::future::Future;
 use std::ops::Deref;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,10 +168,13 @@ impl Runtime for TestRuntime {
     }
 }
 
-/// A partition in a directory that cleans itself up.
+/// A partition plus everything needed to reopen it over the same objects,
+/// which is what a restart is under this engine.
 pub(crate) struct TempPartition {
     inner: crate::Partition<TestRuntime>,
-    dir: PathBuf,
+    store: Arc<MemoryStore>,
+    runtime: TestRuntime,
+    range: KeyRange,
 }
 
 impl Deref for TempPartition {
@@ -180,9 +185,30 @@ impl Deref for TempPartition {
     }
 }
 
-impl Drop for TempPartition {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.dir).ok();
+/// Drops the partition and opens a fresh one over the same store, losing
+/// everything a real restart would lose.
+pub(crate) async fn reopened(partition: TempPartition) -> TempPartition {
+    let TempPartition {
+        inner,
+        store,
+        runtime,
+        range,
+    } = partition;
+    drop(inner);
+    let inner = crate::Partition::open(
+        runtime.clone(),
+        store.clone(),
+        partition_path(),
+        Epoch(1),
+        range.clone(),
+    )
+    .await
+    .expect("reopening over the same store");
+    TempPartition {
+        inner,
+        store,
+        runtime,
+        range,
     }
 }
 
@@ -310,22 +336,34 @@ fn owner_from(partition: TempPartition) -> Owner {
     }
 }
 
+fn partition_path() -> PartitionPath {
+    PartitionPath::new("", KeyspaceId(1), PartitionId(1))
+}
+
 async fn open_partition(range: KeyRange, clock: ManualClock) -> (TempPartition, ManualClock) {
-    let dir = temp_dir();
+    let store = Arc::new(MemoryStore::new());
     let runtime = TestRuntime {
         clock: clock.clone(),
         disk: NoDisk,
         transport: NoTransport,
         rng: SharedRng(Arc::new(SeededRng::new(0))),
     };
-    let inner = crate::Partition::open(runtime, dir.to_str().unwrap(), range)
-        .await
-        .expect("opening a partition in a fresh directory");
-    (TempPartition { inner, dir }, clock)
-}
-
-fn temp_dir() -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let id = NEXT.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("orbita-storage-test-{}-{id}", std::process::id()))
+    let inner = crate::Partition::open(
+        runtime.clone(),
+        store.clone(),
+        partition_path(),
+        Epoch(1),
+        range.clone(),
+    )
+    .await
+    .expect("opening a partition over a fresh store");
+    (
+        TempPartition {
+            inner,
+            store,
+            runtime,
+            range,
+        },
+        clock,
+    )
 }

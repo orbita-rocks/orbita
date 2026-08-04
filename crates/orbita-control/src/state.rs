@@ -70,10 +70,10 @@ pub struct ClusterState {
     next_keyspace_id: u64,
     next_partition_id: u64,
     /// The active cluster version. Bootstrap sets it to the bootstrapping
-    /// binary's own version in the same breath as the first keyspace. Note
-    /// that while the workspace version is 0.0.x, the honest value here is
-    /// `ClusterVersion::ZERO` itself, so ZERO cannot be read as "bootstrap
-    /// never ran"; `is_fresh` answers that question.
+    /// binary's own version in the same breath as the first keyspace. A state
+    /// recovered from a 0.0 cluster legitimately holds
+    /// `ClusterVersion::ZERO`, so ZERO cannot be read as "bootstrap never
+    /// ran"; `is_fresh` answers that question.
     version: ClusterVersion,
 }
 

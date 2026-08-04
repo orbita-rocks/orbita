@@ -28,9 +28,9 @@ pub struct ClusterVersion {
 
 impl ClusterVersion {
     /// Version 0.0, which is both the value of a state machine bootstrap has
-    /// not reached and, while the workspace version is 0.0.x, the legitimate
-    /// active version of a bootstrapped cluster. It is a floor for the
-    /// advance rule, not a "never set" sentinel.
+    /// not reached and the legitimate active version recovered from a 0.0
+    /// cluster's log. It is a floor for the advance rule, not a "never set"
+    /// sentinel.
     pub const ZERO: Self = Self { major: 0, minor: 0 };
 
     #[must_use]

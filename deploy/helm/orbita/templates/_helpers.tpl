@@ -61,23 +61,33 @@ port would look almost right and never form a quorum.
 {{- end -}}
 
 {{/*
-What a probe runs: the binary asking its own client port whether it is serving.
+What the probes run: the binary asking its own client port.
 
-It is `cluster ping` rather than `cluster describe` on purpose. A probe asks
-whether this node is up. Whether the cluster is well is a different question,
-and answering it in a liveness probe would kill healthy pods during an incident
-somebody else is already handling, which is the failure mode ADR 0005 calls out
-by name.
+Two questions, two commands, on purpose. `cluster ready` asks whether this
+node may take traffic: registered with the leader group, write-ahead log
+recovered, partitions open and caught up. That is what readiness and startup
+gate on, and it is what makes a rolling upgrade wait for a node instead of
+outrunning it (ADR 0005).
 
-One definition, used by all three probes, because the day liveness and
-readiness drift apart is the day one of them is wrong and nobody notices.
+`cluster ping` asks only whether the process answers, and that is all liveness
+may ever ask. Readiness depends on the leader group, and a liveness probe that
+did would kill healthy pods during an incident somebody else is already
+handling, which is the failure mode ADR 0005 calls out by name.
 */}}
-{{- define "orbita.probeCommand" -}}
+{{- define "orbita.livenessCommand" -}}
 - /usr/local/bin/orbita
 - --endpoint
 - http://127.0.0.1:{{ .Values.service.port }}
 - cluster
 - ping
+{{- end -}}
+
+{{- define "orbita.readinessCommand" -}}
+- /usr/local/bin/orbita
+- --endpoint
+- http://127.0.0.1:{{ .Values.service.port }}
+- cluster
+- ready
 {{- end -}}
 
 {{/*
@@ -87,10 +97,9 @@ them and forget the third.
 Takes a dict of "root" and "startupFailureThreshold", because the startup
 budget is the one thing that differs between a leader and a worker.
 
-Readiness is weaker than ADR 0005 requires. It should mean registered,
-recovered, and caught up, and today it means the process answers on the client
-port, because the server reports nothing better. That gap is written down in
-values.yaml under `probes` and in docs/UPGRADES.md rather than hidden here.
+Startup uses the readiness command with its own generous budget: recovering a
+large write-ahead log or waiting for the leader group legitimately takes time,
+and that is the startup probe's problem rather than the liveness probe's.
 */}}
 {{- define "orbita.probes" -}}
 {{- $root := .root -}}
@@ -99,7 +108,7 @@ values.yaml under `probes` and in docs/UPGRADES.md rather than hidden here.
 startupProbe:
   exec:
     command:
-      {{- include "orbita.probeCommand" $root | nindent 6 }}
+      {{- include "orbita.readinessCommand" $root | nindent 6 }}
   periodSeconds: {{ $probes.startup.periodSeconds }}
   failureThreshold: {{ .startupFailureThreshold }}
 {{- end }}
@@ -107,7 +116,7 @@ startupProbe:
 readinessProbe:
   exec:
     command:
-      {{- include "orbita.probeCommand" $root | nindent 6 }}
+      {{- include "orbita.readinessCommand" $root | nindent 6 }}
   periodSeconds: {{ $probes.readiness.periodSeconds }}
   failureThreshold: {{ $probes.readiness.failureThreshold }}
 {{- end }}
@@ -115,7 +124,7 @@ readinessProbe:
 livenessProbe:
   exec:
     command:
-      {{- include "orbita.probeCommand" $root | nindent 6 }}
+      {{- include "orbita.livenessCommand" $root | nindent 6 }}
   periodSeconds: {{ $probes.liveness.periodSeconds }}
   failureThreshold: {{ $probes.liveness.failureThreshold }}
 {{- end }}

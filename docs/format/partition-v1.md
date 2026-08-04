@@ -1,6 +1,7 @@
 # Orbita partition format, version 1
 
-Status: Draft. The bytes may still change until the first release.
+Status: Draft. The bytes may still change until v0.1.0 ships; earlier
+pre-releases do not close the window.
 
 This specifies everything Orbita writes to object storage for one partition. It
 is written to be implementable by someone who has never read the Orbita source,
@@ -227,10 +228,24 @@ Each record in the data section is:
 |---|---|
 | 1 | `flags` |
 | 8 | `lamport`, which is also the record's version |
+| 8 | `commit_timestamp`, reserved; must be written as zero |
 | 4 | `key_length` |
 | `key_length` | `key` |
 | 8 | `expires_at_millis`, present only if `flags` bit 1 is set |
 | varies | value, described below |
+
+`commit_timestamp` is reserved for the transaction work described in the
+Transactions section of [REQUIREMENTS.md](../REQUIREMENTS.md), which needs its
+bytes to exist before v0.1.0 freezes them. In partition-v1 a writer must write
+it as zero and a reader must reject a non-zero value rather than interpret it,
+the same rule the reserved flag bits follow. Readers must not assign it any
+meaning; a future version will.
+
+That rejection has a consequence the transaction work inherits: a v1 reader
+refuses a non-zero value as a malformed record, not as a version it does not
+implement. Whatever eventually writes this field for real must gate the change
+on every reader understanding it, by cluster version or capability, rather
+than relying on the format version to sort readers from writers.
 
 `expires_at_millis` is milliseconds since the Unix epoch, UTC. A record is
 expired when that value is less than or equal to the reader's current time on
@@ -243,7 +258,13 @@ the same scale.
 | 0 | tombstone; the key is deleted and there is no value |
 | 1 | the record carries `expires_at_millis` |
 | 2 | the value is stored in its own object |
-| 3-7 | reserved, must be zero |
+| 3 | intent; reserved for the transaction work, must be zero |
+| 4-7 | reserved, must be zero |
+
+Bit 3 is named rather than generic for the same reason `commit_timestamp`
+exists: the Transactions direction claims it before v0.1.0 freezes
+this version's bytes. In partition-v1 it must be zero like every other reserved
+bit, and a reader treats it exactly as it treats them.
 
 Legal combinations:
 

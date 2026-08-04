@@ -35,6 +35,20 @@ struct Location {
     lamport: Option<Lamport>,
 }
 
+/// Where a key's winning record sits, as a [`Snapshot`] resolved it.
+///
+/// This exists so a storage engine can seed its own in-memory index from a
+/// snapshot and then maintain it incrementally across flushes, rather than
+/// paying a full rebuild every time the manifest moves. The `segment` is a
+/// position in the snapshot's manifest, which is only meaningful against that
+/// same manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyLocation {
+    pub segment: usize,
+    pub offset: u64,
+    pub record_length: u32,
+}
+
 impl Location {
     fn range(&self) -> std::ops::Range<u64> {
         self.offset..self.offset + u64::from(self.record_length)
@@ -228,6 +242,22 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
     /// Every key in the index, ascending, without regard to visibility.
     pub fn keys(&self) -> impl Iterator<Item = &Bytes> {
         self.index.keys()
+    }
+
+    /// Every key and where its winning record lives, ascending.
+    ///
+    /// See [`KeyLocation`] for what the positions mean and why this is public.
+    pub fn locations(&self) -> impl Iterator<Item = (&Bytes, KeyLocation)> {
+        self.index.iter().map(|(key, located)| {
+            (
+                key,
+                KeyLocation {
+                    segment: located.segment,
+                    offset: located.offset,
+                    record_length: located.record_length,
+                },
+            )
+        })
     }
 
     /// The record for a key, or `None` if no segment holds one.

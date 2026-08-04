@@ -10,11 +10,12 @@
 
 use anyhow::{bail, Result};
 use orbita_proto::v1::admin_client::AdminClient;
+use orbita_proto::v1::health_client::HealthClient;
 use orbita_proto::v1::{
-    ClusterVersion, CreateCredentialRequest, CreateKeyspaceRequest, DeleteKeyspaceRequest,
-    DescribeClusterRequest, DescribeClusterResponse, FinalizeUpgradeRequest, Keyspace,
-    KeyspaceConfig, ListKeyspacesRequest, MergePartitionsRequest, Node, NodeHealth, NodeRole,
-    Partition, Permission, RevokeCredentialRequest, SplitPartitionRequest,
+    CheckReadinessRequest, ClusterVersion, CreateCredentialRequest, CreateKeyspaceRequest,
+    DeleteKeyspaceRequest, DescribeClusterRequest, DescribeClusterResponse, FinalizeUpgradeRequest,
+    Keyspace, KeyspaceConfig, ListKeyspacesRequest, MergePartitionsRequest, Node, NodeHealth,
+    NodeRole, Partition, Permission, RevokeCredentialRequest, SplitPartitionRequest,
     TransferOwnershipRequest, UpdateKeyspaceRequest,
 };
 use tonic::transport::Channel;
@@ -28,12 +29,17 @@ use crate::config::Config;
 use crate::output::{
     render, Ack, Blob, ClusterView, CredentialView, FinalizeUpgradeView, Format,
     KeyspaceConfigView, KeyspaceListView, KeyspaceView, NodeView, PartitionResultView,
-    PartitionView, PingView, ReplicaView, SplitView,
+    PartitionView, PingView, ReadyConditionView, ReadyView, ReplicaView, SplitView,
 };
 
 /// Opens an admin client against the configured endpoint.
 pub fn connect(config: &Config) -> Result<AdminClient<Channel>> {
     Ok(AdminClient::new(channel(config)?))
+}
+
+/// Opens a health client against the configured endpoint.
+fn connect_health(config: &Config) -> Result<HealthClient<Channel>> {
+    Ok(HealthClient::new(channel(config)?))
 }
 
 /// Runs a `keyspace` subcommand and returns what should be printed.
@@ -190,6 +196,47 @@ pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -
                 &FinalizeUpgradeView {
                     previous: version_text(response.previous.as_ref()),
                     active: version_text(response.active.as_ref()),
+                },
+            )
+        }
+        ClusterCommand::Ready => {
+            let mut health = connect_health(config)?;
+            let request = authed(config, CheckReadinessRequest {})?;
+            // Unlike `ping`, an error here is a failure. A readiness probe
+            // asks whether this node may take traffic, and a node that cannot
+            // answer that question may not. This includes `Unimplemented` from
+            // a build older than the readiness API, which is a node nobody
+            // should be routing to on the strength of this command's exit
+            // code.
+            let response = health.check_readiness(request).await?.into_inner();
+            if !response.ready {
+                let waiting: Vec<&str> = response
+                    .conditions
+                    .iter()
+                    .filter(|condition| !condition.met)
+                    .map(|condition| condition.name.as_str())
+                    .collect();
+                // A server that says "not ready" without naming a condition is
+                // violating the response contract, but the probe log should
+                // still read as a sentence rather than trail off.
+                if waiting.is_empty() {
+                    bail!("the node is not ready, and named no unmet condition");
+                }
+                bail!("the node is not ready, waiting on: {}", waiting.join(", "));
+            }
+            render(
+                format,
+                &ReadyView {
+                    endpoint: config.client.endpoint.clone(),
+                    ready: true,
+                    conditions: response
+                        .conditions
+                        .iter()
+                        .map(|condition| ReadyConditionView {
+                            name: condition.name.clone(),
+                            met: condition.met,
+                        })
+                        .collect(),
                 },
             )
         }
