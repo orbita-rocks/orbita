@@ -38,14 +38,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       # The compiler version comes from rust-toolchain.toml, so CI and a
-      # developer laptop cannot drift apart. moon's own version comes from
-      # .prototools for the same reason. Rust is installed first, because moon
-      # only runs cargo and does not install it.
+      # developer laptop cannot drift apart. Rust is installed first, because
+      # moon only runs cargo and does not install it.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - uses: ./.github/actions/setup-moon
+      - uses: moonrepo/setup-toolchain@v0
+        with:
+          # Keep auto-install off. It runs `proto install`, and proto reads
+          # rust-toolchain.toml as a version file, so it takes the Rust install
+          # away from rustup and leaves a toolchain with no cargo in it.
+          auto-install: false
+          # The action installs `latest` unless told otherwise; it does not read
+          # .prototools. Bump this and .prototools together.
+          moon-version: '2.4.6'
 
       - uses: Swatinem/rust-cache@v2
 
@@ -70,7 +77,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: ./.github/actions/setup-moon
+      - uses: moonrepo/setup-toolchain@v0
+        with:
+          # Keep auto-install off. It runs `proto install`, and proto reads
+          # rust-toolchain.toml as a version file, so it takes the Rust install
+          # away from rustup and leaves a toolchain with no cargo in it.
+          auto-install: false
+          # The action installs `latest` unless told otherwise; it does not read
+          # .prototools. Bump this and .prototools together.
+          moon-version: '2.4.6'
 
       - uses: Swatinem/rust-cache@v2
 
@@ -98,7 +113,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: ./.github/actions/setup-moon
+      - uses: moonrepo/setup-toolchain@v0
+        with:
+          # Keep auto-install off. It runs `proto install`, and proto reads
+          # rust-toolchain.toml as a version file, so it takes the Rust install
+          # away from rustup and leaves a toolchain with no cargo in it.
+          auto-install: false
+          # The action installs `latest` unless told otherwise; it does not read
+          # .prototools. Bump this and .prototools together.
+          moon-version: '2.4.6'
 
       - uses: Swatinem/rust-cache@v2
 
