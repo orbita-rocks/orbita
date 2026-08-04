@@ -227,10 +227,18 @@ Each record in the data section is:
 |---|---|
 | 1 | `flags` |
 | 8 | `lamport`, which is also the record's version |
+| 8 | `commit_timestamp`, reserved; must be written as zero |
 | 4 | `key_length` |
 | `key_length` | `key` |
 | 8 | `expires_at_millis`, present only if `flags` bit 1 is set |
 | varies | value, described below |
+
+`commit_timestamp` is reserved for the transaction work described in the
+Transactions section of [REQUIREMENTS.md](../REQUIREMENTS.md), which needs its
+bytes to exist before this format's first release freezes them. In partition-v1
+a writer must write it as zero and a reader must reject a non-zero value rather
+than interpret it, the same rule the reserved flag bits follow. Readers must
+not assign it any meaning; a future version will.
 
 `expires_at_millis` is milliseconds since the Unix epoch, UTC. A record is
 expired when that value is less than or equal to the reader's current time on
@@ -243,7 +251,13 @@ the same scale.
 | 0 | tombstone; the key is deleted and there is no value |
 | 1 | the record carries `expires_at_millis` |
 | 2 | the value is stored in its own object |
-| 3-7 | reserved, must be zero |
+| 3 | intent; reserved for the transaction work, must be zero |
+| 4-7 | reserved, must be zero |
+
+Bit 3 is named rather than generic for the same reason `commit_timestamp`
+exists: the Transactions direction claims it before the first release freezes
+this version's bytes. In partition-v1 it must be zero like every other reserved
+bit, and a reader treats it exactly as it treats them.
 
 Legal combinations:
 
