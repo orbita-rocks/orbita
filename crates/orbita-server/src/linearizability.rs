@@ -25,6 +25,8 @@ use orbita_core::{
     Epoch, KeyRange, KeyspaceId, KeyspaceInfo, KeyspaceName, MapVersion, NodeId, PartitionId,
     PartitionInfo, PartitionMap, Record, Version, WriteCondition,
 };
+use orbita_format::testing::MemoryStore;
+use orbita_format::PartitionPath;
 use orbita_proto::v1::{GetRequest, SetRequest};
 use orbita_runtime::{Clock, Runtime};
 use orbita_sim::lin::{check, Recorder, Register, RegisterOp, RegisterRet};
@@ -41,45 +43,21 @@ const SEARCH_BUDGET: u64 = 2_000_000;
 
 const KEY: &[u8] = b"register";
 
-/// A RocksDB directory unique to one simulation run.
+/// Where a simulated partition persists.
 ///
-/// The storage engine does its own I/O below the runtime seam, so it needs a
-/// real path even under simulation. That limit is stated in the simulator's
-/// own crate docs; what is simulated here is everything above it.
-struct StoragePath(std::path::PathBuf);
-
-impl StoragePath {
-    fn new(label: &str, seed: u64) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "orbita-lin-{}-{label}-{seed}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::remove_dir_all(&path).ok();
-        Self(path)
-    }
-
-    fn as_str(&self) -> String {
-        self.0.to_string_lossy().into_owned()
-    }
-}
-
-impl Drop for StoragePath {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).ok();
-    }
-}
-
-fn open(
-    sim: &Simulation,
-    runtime: SimRuntime,
-    storage: &StoragePath,
-) -> Arc<PartitionHost<SimRuntime>> {
-    let paths = PartitionPaths {
-        storage_path: storage.as_str(),
+/// An in-memory store per node, so a run touches no real filesystem and stays
+/// deterministic. Store-level fault injection is the simulator's to grow into
+/// now that the seam exists.
+fn partition_paths() -> PartitionPaths {
+    PartitionPaths {
+        store: Arc::new(MemoryStore::new()),
+        path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
         wal_dir: "wal/p1".to_string(),
-    };
+    }
+}
+
+fn open(sim: &Simulation, runtime: SimRuntime) -> Arc<PartitionHost<SimRuntime>> {
+    let paths = partition_paths();
     sim.block_on(async move {
         PartitionHost::open_owner(
             runtime,
@@ -117,10 +95,9 @@ fn a_read_never_misses_an_acknowledged_write() {
         "linearizability::a_read_never_misses_an_acknowledged_write",
         20,
         |seed| {
-            let storage = StoragePath::new("register", seed);
             let sim = Simulation::new(seed);
             let runtime = sim.add_node(NodeId(1));
-            let host = open(&sim, runtime.clone(), &storage);
+            let host = open(&sim, runtime.clone());
             let recorder: Recorder<RegisterOp, RegisterRet> = Recorder::new();
 
             for client in 0..4u64 {
@@ -193,10 +170,9 @@ fn at_most_one_compare_and_swap_against_a_version_ever_succeeds() {
         "linearizability::at_most_one_compare_and_swap_against_a_version_ever_succeeds",
         20,
         |seed| {
-            let storage = StoragePath::new("cas", seed);
             let sim = Simulation::new(seed);
             let runtime = sim.add_node(NodeId(1));
-            let host = open(&sim, runtime.clone(), &storage);
+            let host = open(&sim, runtime.clone());
 
             let initial = {
                 let host = Arc::clone(&host);
@@ -296,18 +272,14 @@ const KEYSPACE: &str = "default";
 /// keep the simulated world from ever going idle and the run from ever ending.
 const RENEWALS: u32 = 40;
 
-fn start_node(
-    sim: &Simulation,
-    storage: &StoragePath,
-    node: NodeId,
-    lease: Duration,
-) -> Arc<Node<SimRuntime>> {
+fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
+    // Each node gets its own store, the way each node owns its own bucket
+    // prefix or data directory in production.
     let layout = DataLayout {
-        storage_root: storage.0.join(format!("n{}", node.get())),
+        store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
     };
-    std::fs::create_dir_all(&layout.storage_root).expect("a storage directory");
     let source = BoxedMapSource::new(StaticMapSource::new(owner_and_replica_map()));
     sim.block_on(async move {
         Node::start(runtime, node, layout, source, lease)
@@ -322,15 +294,14 @@ fn a_replica_serving_reads_never_answers_with_a_value_a_write_has_replaced() {
         "linearizability::a_replica_serving_reads_never_answers_with_a_value_a_write_has_replaced",
         20,
         |seed| {
-            let storage = StoragePath::new("replica-reads", seed);
             let sim = Simulation::new(seed);
             // Shorter than the production default so that the owner's
             // heartbeat, which is what releases the last write of a burst,
             // lands inside a test that runs for a few hundred milliseconds of
             // virtual time.
             let lease = Duration::from_millis(150);
-            let owner = start_node(&sim, &storage, NodeId(1), lease);
-            let replica = start_node(&sim, &storage, NodeId(2), lease);
+            let owner = start_node(&sim, NodeId(1), lease);
+            let replica = start_node(&sim, NodeId(2), lease);
             let recorder: Recorder<RegisterOp, RegisterRet> = Recorder::new();
             let clock = sim.add_node(NodeId(1)).clock().clone();
 

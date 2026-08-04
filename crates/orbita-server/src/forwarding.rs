@@ -14,43 +14,14 @@ use orbita_core::{
     Epoch, Error, KeyRange, KeyspaceId, KeyspaceInfo, KeyspaceName, MapVersion, NodeId,
     PartitionId, PartitionInfo, PartitionMap,
 };
+use orbita_format::testing::MemoryStore;
 use orbita_proto::v1::{GetRequest, ListRequest, SetRequest};
 use orbita_sim::{SimRuntime, Simulation};
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const KEYSPACE: &str = "default";
 const BOUNDARY: &[u8] = b"m";
-
-/// Storage directories for one run, removed when the test ends.
-struct Roots(std::path::PathBuf);
-
-impl Roots {
-    fn new(label: &str) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "orbita-forwarding-{}-{label}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::remove_dir_all(&path).ok();
-        Self(path)
-    }
-
-    fn layout(&self, node: NodeId) -> DataLayout {
-        DataLayout {
-            storage_root: self.0.join(format!("n{}", node.get())),
-            wal_root: "wal".to_string(),
-        }
-    }
-}
-
-impl Drop for Roots {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).ok();
-    }
-}
 
 /// One keyspace split in two at `m`, with a different owner on each side.
 fn split_map() -> PartitionMap {
@@ -93,10 +64,14 @@ fn split_map() -> PartitionMap {
     map
 }
 
-fn start(sim: &Simulation, roots: &Roots, node: NodeId) -> Arc<Node<SimRuntime>> {
+fn start(sim: &Simulation, node: NodeId) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
-    let layout = roots.layout(node);
-    std::fs::create_dir_all(&layout.storage_root).expect("a storage directory");
+    // Each node persists into its own in-memory store, so a run touches no
+    // real filesystem and stays deterministic.
+    let layout = DataLayout {
+        store: Arc::new(MemoryStore::new()),
+        wal_root: "wal".to_string(),
+    };
     let source = BoxedMapSource::new(StaticMapSource::new(split_map()));
     sim.block_on(async move {
         Node::start(runtime, node, layout, source, crate::DEFAULT_LEASE_DURATION)
@@ -124,10 +99,9 @@ fn get(key: &str) -> GetRequest {
 
 #[test]
 fn a_request_for_a_key_this_node_does_not_own_is_served_by_the_one_that_does() {
-    let roots = Roots::new("forward");
     let sim = Simulation::new(1);
-    let first = start(&sim, &roots, NodeId(1));
-    let second = start(&sim, &roots, NodeId(2));
+    let first = start(&sim, NodeId(1));
+    let second = start(&sim, NodeId(2));
 
     // "zebra" is past the boundary, so node one owns none of it and has to
     // forward. The client is talking to node one throughout.
@@ -162,10 +136,9 @@ fn a_request_for_a_key_this_node_does_not_own_is_served_by_the_one_that_does() {
 
 #[test]
 fn each_node_serves_the_half_of_the_keyspace_it_owns() {
-    let roots = Roots::new("both-halves");
     let sim = Simulation::new(2);
-    let first = start(&sim, &roots, NodeId(1));
-    let _second = start(&sim, &roots, NodeId(2));
+    let first = start(&sim, NodeId(1));
+    let _second = start(&sim, NodeId(2));
 
     for key in ["apple", "zebra"] {
         let node = Arc::clone(&first);
@@ -210,9 +183,8 @@ fn each_node_serves_the_half_of_the_keyspace_it_owns() {
 fn a_forwarded_request_is_never_forwarded_again() {
     // A stale map anywhere in the cluster would otherwise turn one request
     // into a loop between two nodes that each think the other owns the key.
-    let roots = Roots::new("one-hop");
     let sim = Simulation::new(3);
-    let first = start(&sim, &roots, NodeId(1));
+    let first = start(&sim, NodeId(1));
 
     let node = Arc::clone(&first);
     let refused = sim

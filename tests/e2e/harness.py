@@ -28,7 +28,7 @@ GENERATED_DIR = Path(__file__).resolve().parent / ".generated"
 DEFAULT_KEYSPACE = "default"
 
 # How long we are willing to wait for a node to answer its first request. A
-# cold RocksDB open on a loaded CI runner is the slow case.
+# cold start on a loaded CI runner is the slow case.
 STARTUP_TIMEOUT_SECONDS = 60.0
 
 

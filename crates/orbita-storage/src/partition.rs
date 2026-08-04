@@ -1,30 +1,54 @@
-//! One partition's RocksDB instance.
+//! One partition: a mutable table of recent writes over immutable segments.
+//!
+//! Per [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md)
+//! a partition is a memory-resident index over immutable objects in object
+//! storage, plus a sorted table of writes that have been acknowledged but not
+//! yet flushed into a segment. A read consults the table first and the index
+//! second; a write goes into the table and becomes durable through the
+//! replicated log, not through anything this crate does.
+//!
+//! # Flushing and the two durability levels
+//!
+//! Flushing turns the mutable table into a segment and swaps the manifest, on
+//! a size trigger and on explicit request. The manifest's `committed_lamport`
+//! is the flush horizon: a restart rebuilds the index from the manifest and
+//! replays the log above that horizon, which [`Partition::apply`]'s
+//! idempotence makes safe to overdo. Time-based flushing is the caller's to
+//! schedule, because this crate has nowhere to run a timer: it takes a
+//! `Runtime` but deliberately owns no background tasks, so that everything it
+//! does happens inside a call a test can drive.
+//!
+//! # What compaction is for
+//!
+//! A lookup never consults more than one segment, so the only reason to merge
+//! is to reclaim space: expired records, aged tombstones, and shadowed
+//! versions. It runs when the segment count crosses a threshold and on
+//! explicit request, and it republishes through the same manifest swap as a
+//! flush, so a compaction that dies half way costs objects rather than data.
+//! The objects it replaces are deleted once the new manifest is committed;
+//! anything a crash strands is left for a sweep, which does not exist yet and
+//! is deliberate scope for later, as is a cache for values read back out of
+//! segments.
 
 use crate::cursor::Cursor;
-use crate::encoding::{expiry_of, Stored};
 use crate::mutation::{version_at, Mutation, MutationOp};
 
 use bytes::Bytes;
 use orbita_core::{
-    Error, KeyRange, Lamport, Record, Result, Version, WriteCondition, MAX_KEY_BYTES,
+    Epoch, Error, KeyRange, Lamport, Record, Result, Version, WriteCondition, MAX_KEY_BYTES,
     MAX_LIST_LIMIT, MAX_VALUE_BYTES,
 };
-use orbita_runtime::{Clock, Runtime};
-use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, DBWithThreadMode,
-    Direction, IteratorMode, MultiThreaded, Options, WriteBatch, WriteOptions,
+use orbita_format::segment::{Segment, SegmentBuilder, SegmentFooter, SegmentIndex, FOOTER_LEN};
+use orbita_format::{
+    compact, CommitPlan, FormatError, PartitionPath, PartitionWriter, RecordValue, SegmentEntry,
+    SegmentRecord, Snapshot,
 };
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use orbita_objectstore::{ObjectError, ObjectStore};
+use orbita_runtime::{Clock, Runtime};
+use std::collections::BTreeMap;
+use std::ops::Bound;
+use std::sync::Arc;
 use std::time::Duration;
-
-/// User data. Everything the API can read or write lives here.
-const CF_DATA: &str = "data";
-/// Bookkeeping the partition keeps about itself, which must not be swept by
-/// the TTL compaction filter and must not be visible to a scan.
-const CF_META: &str = "meta";
-
-const META_COMMITTED_LAMPORT: &[u8] = b"committed_lamport";
 
 /// How long a tombstone survives before compaction may reclaim it.
 ///
@@ -34,6 +58,26 @@ const META_COMMITTED_LAMPORT: &[u8] = b"committed_lamport";
 /// loop while still being short enough that a delete-heavy workload does not
 /// grow without bound.
 pub const TOMBSTONE_RETENTION_MILLIS: u64 = 24 * 60 * 60 * 1000;
+
+/// How large the mutable table may grow before a write triggers a flush.
+///
+/// The number bounds recovery work as much as memory: everything above the
+/// flush horizon has to be replayed from the log on a restart. Eight
+/// mebibytes keeps both small while staying far above any single record, so a
+/// flush amortises over many writes rather than chasing each one.
+const FLUSH_TRIGGER_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How many segments may accumulate before a flush triggers a compaction.
+///
+/// Reads never pay for segment count, so this is purely about space: every
+/// overwrite strands a shadowed record until a merge reclaims it. Sixteen
+/// flush-sized segments bound that waste at roughly the cost of one merge per
+/// sixteen flushes.
+const COMPACT_TRIGGER_SEGMENTS: usize = 16;
+
+/// The bookkeeping cost charged to the flush trigger per entry, on top of the
+/// key and value bytes. An estimate is all a trigger needs.
+const ENTRY_OVERHEAD_BYTES: u64 = 64;
 
 /// What a conditional write did.
 ///
@@ -103,77 +147,148 @@ pub struct ScanPage {
     pub cursor: Option<Bytes>,
 }
 
-type Db = DBWithThreadMode<MultiThreaded>;
+/// One entry as the partition holds it, in the mutable table or a segment.
+///
+/// This is distinct from [`Record`] because a tombstone is a stored entry with
+/// no visible record, and because the read path has to reason about entries
+/// that exist but are not visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stored {
+    pub version: Version,
+    pub expires_at_millis: Option<u64>,
+    /// True for a tombstone, meaning the key was deleted at `version`.
+    pub deleted: bool,
+    pub value: Bytes,
+}
+
+impl Stored {
+    /// Whether the entry is past its deadline, which for a live record means
+    /// it is invisible and for a tombstone means it is reclaimable.
+    pub fn is_expired_at(&self, now_millis: u64) -> bool {
+        self.expires_at_millis.is_some_and(|e| now_millis >= e)
+    }
+
+    /// The record a reader should see, or `None` if the key is absent as far
+    /// as the API is concerned.
+    pub fn visible_at(&self, now_millis: u64) -> Option<Record> {
+        if self.deleted || self.is_expired_at(now_millis) {
+            return None;
+        }
+        Some(Record {
+            value: self.value.clone(),
+            version: self.version,
+            expires_at_millis: self.expires_at_millis,
+        })
+    }
+}
+
+/// Where a flushed key's winning record sits.
+#[derive(Debug, Clone, Copy)]
+struct Loc {
+    /// A position in [`State::segments`], which moves wholesale on compaction
+    /// and only ever grows on flush, so a held position never dangles.
+    segment: usize,
+    offset: u64,
+    record_length: u32,
+}
+
+/// Everything that changes together under the partition's one lock.
+struct State {
+    /// Acknowledged writes not yet in a segment. Holds at most one entry per
+    /// key, because a later write at the same key shadows the earlier one
+    /// completely and the earlier one is already durable in the log.
+    memtable: BTreeMap<Bytes, Stored>,
+    /// The flush trigger's estimate of the table's cost.
+    memtable_bytes: u64,
+    /// The highest Lamport committed, across local writes and replayed
+    /// mutations alike. Volatile: it is rebuilt on restart from the manifest
+    /// horizon plus the log replay the host performs.
+    committed: Lamport,
+    /// The manifest's `committed_lamport`, meaning everything at or below it
+    /// is in the segments and nothing above it is.
+    flushed: Lamport,
+    /// The published segments, in manifest order.
+    segments: Vec<SegmentEntry>,
+    /// Every flushed key and where its winning record lives.
+    index: BTreeMap<Bytes, Loc>,
+}
 
 /// A single partition of one keyspace.
 ///
 /// The partition is told which key range it owns and rejects anything outside
 /// it. It does not know who owns it, which epoch is current, or that other
-/// partitions exist.
+/// partitions exist; the epoch it takes at open is stamped into object names
+/// and manifests so a deposed writer cannot collide with its replacement.
 pub struct Partition<R: Runtime> {
     runtime: R,
-    db: Arc<Db>,
+    store: Arc<dyn ObjectStore>,
+    path: PartitionPath,
     range: KeyRange,
-    /// Serializes the read-modify-write that every conditional write needs.
-    ///
-    /// RocksDB has no compare-and-swap, so evaluating a condition and
-    /// committing the result has to be atomic against other writers. One lock
-    /// for the whole partition rather than a lock per key is deliberate: a
-    /// partition already has exactly one writer in production, because the
-    /// owning worker serializes writes before they reach here, so striping
-    /// would buy contention we do not have in exchange for a class of bugs we
-    /// would rather not reason about. Reads never take it.
-    write_lock: Mutex<()>,
+    writer: PartitionWriter<dyn ObjectStore>,
+    /// One lock rather than a lock per key is deliberate: a partition already
+    /// has exactly one writer in production, because the owning worker
+    /// serializes writes before they reach here, so striping would buy
+    /// contention we do not have in exchange for a class of bugs we would
+    /// rather not reason about. Reads share it.
+    state: tokio::sync::RwLock<State>,
 }
 
 impl<R: Runtime> Partition<R> {
-    /// Opens or creates the partition's RocksDB instance at `path`.
+    /// Opens the partition, rebuilding its index from the manifest if one has
+    /// been published.
     ///
-    /// The runtime is taken now even where it is not needed yet, so that
-    /// adding background compaction or upload work later does not change every
-    /// caller's signature.
-    pub async fn open(runtime: R, path: &str, range: KeyRange) -> Result<Self> {
-        let clock = runtime.clock().clone();
+    /// The caller replays its log above [`Partition::committed_lamport`]
+    /// afterwards; nothing here reads a log. The runtime is taken even though
+    /// only its clock is used, so that adding background work later does not
+    /// change every caller's signature.
+    pub async fn open(
+        runtime: R,
+        store: Arc<dyn ObjectStore>,
+        path: PartitionPath,
+        epoch: Epoch,
+        range: KeyRange,
+    ) -> Result<Self> {
+        let writer = PartitionWriter::open(Arc::clone(&store), path.clone(), epoch)
+            .await
+            .map_err(format_error)?;
 
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-        // Compacted SSTs are uploaded to object storage later, so keep the
-        // files themselves free of anything that would need rewriting: plain
-        // block-based tables and a compression codec every reader has.
-        db_opts.set_compression_type(DBCompressionType::Lz4);
-
-        let mut block_opts = BlockBasedOptions::default();
-        // A shared cache rather than the default per-table one, because a node
-        // hosts many partitions and each one sizing its own cache is how a
-        // worker runs out of memory.
-        block_opts.set_block_cache(&Cache::new_lru_cache(64 * 1024 * 1024));
-        block_opts.set_bloom_filter(10.0, false);
-
-        let mut data_opts = Options::default();
-        data_opts.set_compression_type(DBCompressionType::Lz4);
-        data_opts.set_block_based_table_factory(&block_opts);
-        data_opts.set_compaction_filter("orbita-ttl", move |_level, _key, value| {
-            reclaim_decision(clock.now_millis(), value)
-        });
-
-        let meta_opts = Options::default();
-
-        let db = Db::open_cf_descriptors(
-            &db_opts,
-            Path::new(path),
-            vec![
-                ColumnFamilyDescriptor::new(CF_DATA, data_opts),
-                ColumnFamilyDescriptor::new(CF_META, meta_opts),
-            ],
-        )
-        .map_err(|e| Error::Internal(format!("opening partition at {path}: {e}")))?;
+        let mut state = State {
+            memtable: BTreeMap::new(),
+            memtable_bytes: 0,
+            committed: Lamport::ZERO,
+            flushed: Lamport::ZERO,
+            segments: Vec::new(),
+            index: BTreeMap::new(),
+        };
+        if let Some(snapshot) = Snapshot::open(Arc::clone(&store), path.clone())
+            .await
+            .map_err(format_error)?
+        {
+            state.index = snapshot
+                .locations()
+                .map(|(key, at)| {
+                    (
+                        key.clone(),
+                        Loc {
+                            segment: at.segment,
+                            offset: at.offset,
+                            record_length: at.record_length,
+                        },
+                    )
+                })
+                .collect();
+            state.flushed = snapshot.committed_lamport();
+            state.committed = state.flushed;
+            state.segments = snapshot.manifest().segments.clone();
+        }
 
         Ok(Self {
             runtime,
-            db: Arc::new(db),
+            store,
+            path,
             range,
-            write_lock: Mutex::new(()),
+            writer,
+            state: tokio::sync::RwLock::new(state),
         })
     }
 
@@ -186,7 +301,11 @@ impl<R: Runtime> Partition<R> {
     pub async fn get(&self, key: &[u8]) -> Result<Option<Record>> {
         self.check_key(key)?;
         let now = self.now_millis();
-        Ok(self.load(key)?.and_then(|s| s.visible_at(now)))
+        let state = self.state.read().await;
+        Ok(self
+            .load(&state, key)
+            .await?
+            .and_then(|s| s.visible_at(now)))
     }
 
     /// Writes a value at `lamport`, subject to `condition`.
@@ -218,10 +337,10 @@ impl<R: Runtime> Partition<R> {
         }
 
         let now = self.now_millis();
-        let guard = self.lock_writes();
-        self.check_lamport(lamport)?;
+        let mut state = self.state.write().await;
+        check_lamport(&state, lamport)?;
 
-        let existing = self.load(key)?;
+        let existing = self.load(&state, key).await?;
         if let Some(failure) = evaluate(condition, existing.as_ref(), now) {
             return Ok(failure);
         }
@@ -232,11 +351,7 @@ impl<R: Runtime> Partition<R> {
             deleted: false,
             value,
         };
-        self.commit(lamport, |batch, data| {
-            batch.put_cf(data, key, entry.encode());
-        })?;
-
-        drop(guard);
+        self.commit(&mut state, lamport, key, entry).await?;
         Ok(WriteOutcome::Applied {
             version: version_at(lamport),
         })
@@ -256,10 +371,10 @@ impl<R: Runtime> Partition<R> {
         self.check_key(key)?;
 
         let now = self.now_millis();
-        let guard = self.lock_writes();
-        self.check_lamport(lamport)?;
+        let mut state = self.state.write().await;
+        check_lamport(&state, lamport)?;
 
-        let existing = self.load(key)?;
+        let existing = self.load(&state, key).await?;
         if let Some(failure) = evaluate(condition, existing.as_ref(), now) {
             return Ok(failure);
         }
@@ -282,11 +397,7 @@ impl<R: Runtime> Partition<R> {
             deleted: true,
             value: Bytes::new(),
         };
-        self.commit(lamport, |batch, data| {
-            batch.put_cf(data, key, entry.encode());
-        })?;
-
-        drop(guard);
+        self.commit(&mut state, lamport, key, entry).await?;
         Ok(WriteOutcome::Applied {
             version: version_at(lamport),
         })
@@ -294,9 +405,10 @@ impl<R: Runtime> Partition<R> {
 
     /// Returns one page of keys under `prefix`, in key order.
     ///
-    /// The page is read from a RocksDB snapshot, so it is a consistent view of
-    /// the partition even while writes continue. Consistency does not extend
-    /// across pages, which the product requirements state outright.
+    /// The page is collected under the partition's read lock, so it is a
+    /// consistent view of the partition even while writes wait. Consistency
+    /// does not extend across pages, which the product requirements state
+    /// outright.
     pub async fn scan(&self, prefix: &[u8], cursor: Option<&[u8]>, limit: u32) -> Result<ScanPage> {
         if limit == 0 || limit > MAX_LIST_LIMIT {
             return Err(Error::InvalidArgument(format!(
@@ -320,15 +432,34 @@ impl<R: Runtime> Partition<R> {
         };
 
         let now = self.now_millis();
-        let data = self.cf(CF_DATA)?;
-        let snapshot = self.db.snapshot();
-        let iter = snapshot.iterator_cf(&data, IteratorMode::From(&start, Direction::Forward));
+        let state = self.state.read().await;
+        let from = (Bound::Included(start.as_slice()), Bound::Unbounded);
+        let mut table = state.memtable.range::<[u8], _>(from).peekable();
+        let mut flushed = state.index.range::<[u8], _>(from).peekable();
 
         let mut entries = Vec::new();
         let mut exhausted = true;
-        for item in iter {
-            let (key, value) =
-                item.map_err(|e| Error::Internal(format!("scanning partition: {e}")))?;
+        loop {
+            // The next key is the smaller of the two heads, and the mutable
+            // table shadows the index outright: its entry for a key is always
+            // the newer one, because a flushed record can only be overtaken by
+            // a later write and a later write sits in the table.
+            let from_table = match (table.peek(), flushed.peek()) {
+                (None, None) => break,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some((held, _)), Some((published, _))) => held <= published,
+            };
+            let (key, stored) = if from_table {
+                let (key, entry) = table.next().expect("peeked");
+                if flushed.peek().is_some_and(|(shadowed, _)| *shadowed == key) {
+                    flushed.next();
+                }
+                (key.clone(), entry.clone())
+            } else {
+                let (key, loc) = flushed.next().expect("peeked");
+                (key.clone(), self.fetch(&state, *loc, key).await?)
+            };
             if !key.starts_with(prefix) || !self.range.contains(&key) {
                 break;
             }
@@ -336,17 +467,14 @@ impl<R: Runtime> Partition<R> {
             // page is short only at the end of the range. A caller that saw
             // them would have to filter them itself, and would learn about
             // keys it is not allowed to see.
-            let Some(record) = Stored::decode(&value)?.visible_at(now) else {
+            let Some(record) = stored.visible_at(now) else {
                 continue;
             };
             if entries.len() == limit as usize {
                 exhausted = false;
                 break;
             }
-            entries.push(ScanEntry {
-                key: Bytes::copy_from_slice(&key),
-                record,
-            });
+            entries.push(ScanEntry { key, record });
         }
 
         let next = if exhausted {
@@ -366,9 +494,10 @@ impl<R: Runtime> Partition<R> {
     ///
     /// Applying the same mutation twice leaves the same state, because the
     /// partition records the highest Lamport it has committed and ignores
-    /// anything at or below it. That is what makes WAL replay after a crash
-    /// safe, and it assumes the log delivers mutations in Lamport order, which
-    /// the log guarantees.
+    /// anything at or below it. That is what makes log replay after a crash
+    /// safe, including replay of entries the manifest already covers, and it
+    /// assumes the log delivers mutations in Lamport order, which the log
+    /// guarantees.
     ///
     /// Unlike [`Partition::put`], a Lamport that has already been committed is
     /// silently ignored rather than rejected. A replayed log entry is expected
@@ -390,8 +519,8 @@ impl<R: Runtime> Partition<R> {
             }
         }
 
-        let guard = self.lock_writes();
-        if mutation.lamport <= self.load_committed_lamport()? {
+        let mut state = self.state.write().await;
+        if mutation.lamport <= state.committed {
             return Ok(());
         }
 
@@ -414,13 +543,8 @@ impl<R: Runtime> Partition<R> {
                 value: Bytes::new(),
             },
         };
-
-        self.commit(mutation.lamport, |batch, data| {
-            batch.put_cf(data, &mutation.key, entry.encode());
-        })?;
-
-        drop(guard);
-        Ok(())
+        self.commit(&mut state, mutation.lamport, &mutation.key, entry)
+            .await
     }
 
     /// The highest Lamport this partition has committed.
@@ -430,54 +554,43 @@ impl<R: Runtime> Partition<R> {
     /// One number serves both because local writes and replayed mutations
     /// advance the same sequence.
     pub async fn committed_lamport(&self) -> Result<Lamport> {
-        self.load_committed_lamport()
+        Ok(self.state.read().await.committed)
     }
 
-    /// The partition's size on disk, which is what the leader splits on.
+    /// The partition's size, which is what the leader splits on.
     ///
-    /// This is RocksDB's estimate plus the memtables, not an exact figure. A
-    /// split threshold does not need one, and computing an exact figure means
-    /// walking every key.
+    /// This is the published segments plus an estimate of the mutable table,
+    /// not an exact figure. A split threshold does not need one, and shadowed
+    /// records inflate it only until a compaction runs.
     pub async fn size_bytes(&self) -> Result<u64> {
-        let data = self.cf(CF_DATA)?;
-        let property = |name: &str| -> Result<u64> {
-            self.db
-                .property_int_value_cf(&data, name)
-                .map_err(|e| Error::Internal(format!("reading {name}: {e}")))
-                .map(|v| v.unwrap_or(0))
-        };
-        Ok(property("rocksdb.estimate-live-data-size")?
-            + property("rocksdb.cur-size-all-mem-tables")?)
+        let state = self.state.read().await;
+        Ok(state.memtable_bytes + state.segments.iter().map(|s| s.bytes).sum::<u64>())
     }
 
-    /// Forces a full compaction, which is what physically reclaims expired
-    /// records and tombstones.
+    /// Flushes the mutable table into a segment and publishes it.
     ///
-    /// Reclamation is otherwise a side effect of RocksDB's own schedule, and
-    /// the product promises "eventually" rather than a bound. This exists so
-    /// an operator, or a test, can ask for the sweep now.
+    /// A no-op when the table is empty. This is the explicit trigger ADR 0006
+    /// names; the size trigger calls the same path from inside a write.
+    pub async fn flush(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        self.flush_locked(&mut state).await
+    }
+
+    /// Merges every segment into one, which is what physically reclaims
+    /// expired records, aged tombstones, and shadowed versions.
+    ///
+    /// Reclamation otherwise waits for the segment-count trigger, and the
+    /// product promises "eventually" rather than a bound. This exists so an
+    /// operator, or a test, can ask for the sweep now. The mutable table is
+    /// flushed first so the merge sees everything.
     pub async fn compact(&self) -> Result<()> {
-        let data = self.cf(CF_DATA)?;
-        self.db
-            .compact_range_cf(&data, None::<&[u8]>, None::<&[u8]>);
-        Ok(())
+        let mut state = self.state.write().await;
+        self.flush_locked(&mut state).await?;
+        self.compact_locked(&mut state).await
     }
 
     fn now_millis(&self) -> u64 {
         self.runtime.clock().now_millis()
-    }
-
-    fn lock_writes(&self) -> std::sync::MutexGuard<'_, ()> {
-        // A poisoned lock means another writer panicked mid-write. RocksDB
-        // batches are atomic, so there is no torn state to protect against and
-        // refusing every later write would turn one panic into an outage.
-        self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn cf(&self, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'_>>> {
-        self.db
-            .cf_handle(name)
-            .ok_or_else(|| Error::Internal(format!("column family {name} is missing")))
     }
 
     fn check_key(&self, key: &[u8]) -> Result<()> {
@@ -496,75 +609,238 @@ impl<R: Runtime> Partition<R> {
         Ok(())
     }
 
-    /// Rejects a Lamport that would break the sequence versions are drawn from.
-    ///
-    /// Versions are only unique and monotonic if the Lamports are, and once a
-    /// duplicate is on disk nothing downstream can tell it happened. Callers
-    /// must assign the Lamport under the same serialization that submits the
-    /// write, which is what the owner's single write path does.
-    fn check_lamport(&self, lamport: Lamport) -> Result<()> {
-        let committed = self.load_committed_lamport()?;
-        if lamport <= committed {
-            return Err(Error::InvalidArgument(format!(
-                "lamport {lamport} is not ahead of the committed lamport {committed}"
+    /// The entry stored under `key`, wherever it lives, without regard to
+    /// visibility.
+    async fn load(&self, state: &State, key: &[u8]) -> Result<Option<Stored>> {
+        if let Some(entry) = state.memtable.get(key) {
+            return Ok(Some(entry.clone()));
+        }
+        let Some(loc) = state.index.get(key) else {
+            return Ok(None);
+        };
+        self.fetch(state, *loc, key).await.map(Some)
+    }
+
+    /// Reads one record out of its segment and verifies it is the one the
+    /// index promised.
+    async fn fetch(&self, state: &State, loc: Loc, key: &[u8]) -> Result<Stored> {
+        let name = &state.segments[loc.segment].name;
+        let raw = self
+            .store
+            .get_range(
+                &self.path.object(name),
+                loc.offset..loc.offset + u64::from(loc.record_length),
+            )
+            .await
+            .map_err(store_error)?;
+        let (record, consumed) = SegmentRecord::decode(&raw).map_err(format_error)?;
+        if consumed != raw.len() || record.key != key {
+            return Err(Error::Internal(format!(
+                "{name} holds a different record than the index claims for this key"
             )));
+        }
+
+        let deleted = record.is_tombstone();
+        let value = match record.value {
+            RecordValue::Tombstone => Bytes::new(),
+            RecordValue::Inline(value) => value,
+            RecordValue::External(external) => {
+                let (bytes, _) = self
+                    .store
+                    .get(&self.path.object(&external.name))
+                    .await
+                    .map_err(store_error)?;
+                if bytes.len() as u64 != external.length
+                    || crc32c::crc32c(&bytes) != external.crc32c
+                {
+                    return Err(Error::Internal(format!(
+                        "external value {} does not match its record",
+                        external.name
+                    )));
+                }
+                bytes
+            }
+        };
+        Ok(Stored {
+            version: Version(record.lamport.get()),
+            expires_at_millis: record.expires_at_millis,
+            deleted,
+            value,
+        })
+    }
+
+    /// Commits one entry to the mutable table and advances the Lamport, then
+    /// flushes if the table has crossed the trigger.
+    async fn commit(
+        &self,
+        state: &mut State,
+        lamport: Lamport,
+        key: &[u8],
+        entry: Stored,
+    ) -> Result<()> {
+        let key = Bytes::copy_from_slice(key);
+        let added = entry_cost(&key, &entry);
+        if let Some(replaced) = state.memtable.insert(key.clone(), entry) {
+            state.memtable_bytes = state
+                .memtable_bytes
+                .saturating_sub(entry_cost(&key, &replaced));
+        }
+        state.memtable_bytes += added;
+        state.committed = lamport;
+
+        if state.memtable_bytes >= FLUSH_TRIGGER_BYTES {
+            self.flush_locked(state).await?;
         }
         Ok(())
     }
 
-    fn load(&self, key: &[u8]) -> Result<Option<Stored>> {
-        let data = self.cf(CF_DATA)?;
-        let raw = self
-            .db
-            .get_pinned_cf(&data, key)
-            .map_err(|e| Error::Internal(format!("reading key: {e}")))?;
-        raw.map(|bytes| Stored::decode(&bytes)).transpose()
-    }
-
-    fn load_committed_lamport(&self) -> Result<Lamport> {
-        let meta = self.cf(CF_META)?;
-        let raw = self
-            .db
-            .get_pinned_cf(&meta, META_COMMITTED_LAMPORT)
-            .map_err(|e| Error::Internal(format!("reading committed lamport: {e}")))?;
-        match raw {
-            None => Ok(Lamport::ZERO),
-            Some(bytes) => bytes
-                .as_ref()
-                .try_into()
-                .map(|b| Lamport(u64::from_be_bytes(b)))
-                .map_err(|_| Error::Internal("committed lamport is corrupt".to_string())),
+    async fn flush_locked(&self, state: &mut State) -> Result<()> {
+        if state.memtable.is_empty() {
+            return Ok(());
         }
+
+        let mut builder = SegmentBuilder::new(
+            self.path.keyspace_id(),
+            self.path.partition_id(),
+            self.writer.epoch(),
+        );
+        for (key, entry) in &state.memtable {
+            builder
+                .push(&segment_record_of(key, entry))
+                .map_err(format_error)?;
+        }
+        let built = builder.finish().map_err(format_error)?;
+        let published = self
+            .writer
+            .put_segment(&built)
+            .await
+            .map_err(format_error)?;
+
+        let mut segments = state.segments.clone();
+        segments.push(published);
+        let committed = state.committed;
+        let range = self.range.clone();
+        let manifest = self
+            .writer
+            .commit(|_| CommitPlan {
+                committed_lamport: committed,
+                range: range.clone(),
+                segments: segments.clone(),
+            })
+            .await
+            .map_err(format_error)?;
+
+        // Everything in the new segment wins over anything flushed before it,
+        // because every record here carries a Lamport above the old horizon.
+        let position = manifest.segments.len() - 1;
+        for entry in built_index(&built)?.entries() {
+            state.index.insert(
+                entry.key.clone(),
+                Loc {
+                    segment: position,
+                    offset: entry.offset,
+                    record_length: entry.record_length,
+                },
+            );
+        }
+        state.segments = manifest.segments;
+        state.memtable.clear();
+        state.memtable_bytes = 0;
+        state.flushed = committed;
+
+        if state.segments.len() >= COMPACT_TRIGGER_SEGMENTS {
+            self.compact_locked(state).await?;
+        }
+        Ok(())
     }
 
-    /// Commits a change and the Lamport that produced it together.
-    ///
-    /// One batch, because a crash between the data and the marker would let a
-    /// replay either skip a mutation or apply one twice, and either one shows
-    /// up later as a version that is not what the client was told.
-    fn commit(
-        &self,
-        lamport: Lamport,
-        fill: impl FnOnce(&mut WriteBatch, &Arc<rocksdb::BoundColumnFamily<'_>>),
-    ) -> Result<()> {
-        let data = self.cf(CF_DATA)?;
-        let meta = self.cf(CF_META)?;
-        let mut batch = WriteBatch::default();
-        fill(&mut batch, &data);
-        batch.put_cf(&meta, META_COMMITTED_LAMPORT, lamport.get().to_be_bytes());
+    async fn compact_locked(&self, state: &mut State) -> Result<()> {
+        if state.segments.is_empty() {
+            return Ok(());
+        }
+        let now = self.now_millis();
 
-        // The WAL is Orbita's durability boundary and it has already synced by
-        // the time a mutation reaches RocksDB, so paying for a second fsync
-        // here buys nothing. RocksDB's own log stays on for crash consistency
-        // of the batch itself.
-        let mut opts = WriteOptions::default();
-        opts.set_sync(false);
-        self.db
-            .write_opt(batch, &opts)
-            .map_err(|e| Error::Internal(format!("committing write: {e}")))
+        let mut inputs = Vec::with_capacity(state.segments.len());
+        for entry in &state.segments {
+            let (bytes, _) = self
+                .store
+                .get(&self.path.object(&entry.name))
+                .await
+                .map_err(store_error)?;
+            let segment = Segment::decode(&bytes).map_err(format_error)?;
+            inputs.push(segment.records().to_vec());
+        }
+        // Tombstone lifetime here is time-based rather than coverage-based:
+        // even when no retained segment could resurrect an older value, a
+        // tombstone has to keep answering a retrying deleter until its
+        // retention passes. The sentinel makes the merge keep every unexpired
+        // tombstone; the expiry rule reclaims them on schedule.
+        let merged =
+            compact::merge(&inputs, now, &[keep_unexpired_tombstones()]).map_err(format_error)?;
+
+        let replaced: Vec<String> = state.segments.iter().map(|e| e.name.clone()).collect();
+        let (segments, index) = if merged.is_empty() {
+            (Vec::new(), BTreeMap::new())
+        } else {
+            let mut builder = SegmentBuilder::new(
+                self.path.keyspace_id(),
+                self.path.partition_id(),
+                self.writer.epoch(),
+            );
+            for record in &merged {
+                builder.push(record).map_err(format_error)?;
+            }
+            let built = builder.finish().map_err(format_error)?;
+            let published = self
+                .writer
+                .put_segment(&built)
+                .await
+                .map_err(format_error)?;
+
+            let mut index = BTreeMap::new();
+            for entry in built_index(&built)?.entries() {
+                index.insert(
+                    entry.key.clone(),
+                    Loc {
+                        segment: 0,
+                        offset: entry.offset,
+                        record_length: entry.record_length,
+                    },
+                );
+            }
+            (vec![published], index)
+        };
+
+        // Compaction republishes the same logical state, so the horizon must
+        // not move: the log above it still has to replay after a crash.
+        let flushed = state.flushed;
+        let range = self.range.clone();
+        let plan_segments = segments.clone();
+        let manifest = self
+            .writer
+            .commit(|_| CommitPlan {
+                committed_lamport: flushed,
+                range: range.clone(),
+                segments: plan_segments.clone(),
+            })
+            .await
+            .map_err(format_error)?;
+        state.segments = manifest.segments;
+        state.index = index;
+
+        // The replaced objects are unreferenced the moment the manifest
+        // swapped, and this is the only writer, so deleting them now is safe.
+        // An external reader hydrating from the old manifest fails its read
+        // and retries against the new one, which the format documents as the
+        // deal. Failures here strand objects for a future sweep rather than
+        // failing the compaction that already happened.
+        for name in replaced {
+            let _ = self.store.delete(&self.path.object(&name)).await;
+        }
+        Ok(())
     }
 
-    /// Where the iterator should be positioned, or `None` if this page is
+    /// Where the merged scan should start, or `None` if this page is
     /// certainly empty.
     fn scan_start(&self, prefix: &[u8], cursor: Option<&Cursor>) -> Option<Vec<u8>> {
         let mut start = prefix.to_vec().max(self.range.start().to_vec());
@@ -582,13 +858,90 @@ impl<R: Runtime> Partition<R> {
     }
 
     #[cfg(test)]
-    pub(crate) fn stored_entry(&self, key: &[u8]) -> Result<Option<Stored>> {
-        self.load(key)
+    pub(crate) async fn stored_entry(&self, key: &[u8]) -> Result<Option<Stored>> {
+        let state = self.state.read().await;
+        self.load(&state, key).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn segment_count(&self) -> usize {
+        self.state.read().await.segments.len()
+    }
+}
+
+/// Rejects a Lamport that would break the sequence versions are drawn from.
+///
+/// Versions are only unique and monotonic if the Lamports are, and once a
+/// duplicate is in a segment nothing downstream can tell it happened. Callers
+/// must assign the Lamport under the same serialization that submits the
+/// write, which is what the owner's single write path does.
+fn check_lamport(state: &State, lamport: Lamport) -> Result<()> {
+    if lamport <= state.committed {
+        return Err(Error::InvalidArgument(format!(
+            "lamport {lamport} is not ahead of the committed lamport {}",
+            state.committed
+        )));
+    }
+    Ok(())
+}
+
+/// What one entry charges against the flush trigger.
+fn entry_cost(key: &Bytes, entry: &Stored) -> u64 {
+    key.len() as u64 + entry.value.len() as u64 + ENTRY_OVERHEAD_BYTES
+}
+
+fn segment_record_of(key: &Bytes, entry: &Stored) -> SegmentRecord {
+    SegmentRecord {
+        key: key.clone(),
+        lamport: Lamport(entry.version.get()),
+        expires_at_millis: entry.expires_at_millis,
+        value: if entry.deleted {
+            RecordValue::Tombstone
+        } else {
+            RecordValue::Inline(entry.value.clone())
+        },
+    }
+}
+
+/// Decodes a just-built segment's key index without a store round trip, which
+/// is what lets a flush update the in-memory index incrementally.
+fn built_index(built: &orbita_format::segment::BuiltSegment) -> Result<SegmentIndex> {
+    let bytes = &built.bytes;
+    let tail = &bytes[bytes.len() - FOOTER_LEN as usize..];
+    let footer = SegmentFooter::decode(tail).map_err(format_error)?;
+    let range = footer
+        .index_range(bytes.len() as u64)
+        .map_err(format_error)?;
+    SegmentIndex::decode(&bytes[range.start as usize..range.end as usize], &footer)
+        .map_err(format_error)
+}
+
+/// A retained-segment sentinel that covers every legal key from Lamport zero,
+/// so [`compact::merge`] keeps every unexpired tombstone. See the call site
+/// for why the engine wants time-based tombstone lifetime.
+fn keep_unexpired_tombstones() -> SegmentEntry {
+    SegmentEntry {
+        name: String::new(),
+        bytes: 0,
+        record_count: 0,
+        min_key: Bytes::new(),
+        // One byte longer than any legal key, so `may_hold` covers them all.
+        max_key: Bytes::from(vec![0xff; MAX_KEY_BYTES + 1]),
+        min_lamport: Lamport::ZERO,
+        max_lamport: Lamport::ZERO,
     }
 }
 
 fn absolute_expiry(now_millis: u64, ttl: Duration) -> u64 {
     now_millis.saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn format_error(e: FormatError) -> Error {
+    Error::Internal(format!("partition format: {e}"))
+}
+
+fn store_error(e: ObjectError) -> Error {
+    Error::Internal(format!("object store: {e}"))
 }
 
 /// Checks a write condition, returning the failure to report if it does not
@@ -615,24 +968,10 @@ fn evaluate(
     }
 }
 
-/// Whether compaction may drop a record.
-///
-/// Anything that fails to decode is kept. A record this build does not
-/// understand is far more likely to be a format from another version than
-/// garbage, and dropping it would be unrecoverable.
-fn reclaim_decision(now_millis: u64, value: &[u8]) -> rocksdb::compaction_filter::Decision {
-    use rocksdb::compaction_filter::Decision;
-    match expiry_of(value) {
-        Some(Some(expiry)) if now_millis >= expiry => Decision::Remove,
-        _ => Decision::Keep,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{owner, owner_in_range, owner_with_clock, partition_with_clock};
-    use rocksdb::compaction_filter::Decision;
+    use crate::testing::{owner, owner_in_range, owner_with_clock, partition_with_clock, reopened};
 
     fn bytes(s: &str) -> Bytes {
         Bytes::copy_from_slice(s.as_bytes())
@@ -1011,7 +1350,7 @@ mod tests {
         );
         assert_eq!(p.get(b"k").await.unwrap(), None, "invisible to readers");
         assert_eq!(
-            p.stored_entry(b"k").unwrap().unwrap().version,
+            p.stored_entry(b"k").await.unwrap().unwrap().version,
             Version(6),
             "the tombstone still knows when the delete happened"
         );
@@ -1130,7 +1469,7 @@ mod tests {
         clock.set_millis(TOMBSTONE_RETENTION_MILLIS);
         p.compact().await.unwrap();
         assert_eq!(
-            p.stored_entry(b"lease").unwrap(),
+            p.stored_entry(b"lease").await.unwrap(),
             None,
             "the key is physically gone, which is the setup for the ABA"
         );
@@ -1255,7 +1594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_reclaims_expired_records_from_disk() {
+    async fn compaction_reclaims_expired_records() {
         let (p, clock) = owner_with_clock().await;
         clock.set_millis(0);
         p.put(
@@ -1272,17 +1611,17 @@ mod tests {
 
         clock.set_millis(1);
         assert!(
-            p.stored_entry(b"tmp").unwrap().is_some(),
-            "still on disk before the sweep"
+            p.stored_entry(b"tmp").await.unwrap().is_some(),
+            "still stored before the sweep"
         );
 
         p.compact().await.unwrap();
         assert_eq!(
-            p.stored_entry(b"tmp").unwrap(),
+            p.stored_entry(b"tmp").await.unwrap(),
             None,
             "expired records are physically gone after compaction"
         );
-        assert!(p.stored_entry(b"keep").unwrap().is_some());
+        assert!(p.stored_entry(b"keep").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1296,19 +1635,19 @@ mod tests {
 
         p.compact().await.unwrap();
         assert!(
-            p.stored_entry(b"k").unwrap().is_some(),
+            p.stored_entry(b"k").await.unwrap().is_some(),
             "a fresh tombstone still answers questions about the delete"
         );
 
         clock.set_millis(TOMBSTONE_RETENTION_MILLIS);
         p.compact().await.unwrap();
-        assert_eq!(p.stored_entry(b"k").unwrap(), None);
+        assert_eq!(p.stored_entry(b"k").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn compaction_never_reclaims_the_committed_lamport() {
-        // The marker lives outside the swept column family. Losing it would
-        // let the partition hand out a version it has already used.
+        // Reclaiming a key must not free its version for reuse, or the
+        // partition would hand out a version it has already used.
         let (p, clock) = owner_with_clock().await;
         clock.set_millis(0);
         p.put_at(Lamport(12), b"k", bytes("v"), None, WriteCondition::None)
@@ -1321,7 +1660,11 @@ mod tests {
         clock.set_millis(TOMBSTONE_RETENTION_MILLIS * 2);
         p.compact().await.unwrap();
 
-        assert_eq!(p.stored_entry(b"k").unwrap(), None, "the data is gone");
+        assert_eq!(
+            p.stored_entry(b"k").await.unwrap(),
+            None,
+            "the data is gone"
+        );
         assert_eq!(p.committed_lamport().await.unwrap(), Lamport(13));
         assert!(
             matches!(
@@ -1331,14 +1674,6 @@ mod tests {
             ),
             "a reclaimed key must not free its version for reuse"
         );
-    }
-
-    #[test]
-    fn compaction_keeps_records_it_cannot_decode() {
-        assert!(matches!(
-            reclaim_decision(u64::MAX, b"not an orbita record"),
-            Decision::Keep
-        ));
     }
 
     #[tokio::test]
@@ -1527,7 +1862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_key_is_rejected_before_rocksdb_sees_it() {
+    async fn an_oversized_key_is_rejected_before_the_engine_sees_it() {
         let p = owner().await;
         let key = vec![b'k'; MAX_KEY_BYTES + 1];
         assert!(matches!(
@@ -1551,7 +1886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_value_is_rejected_before_rocksdb_sees_it() {
+    async fn an_oversized_value_is_rejected_before_the_engine_sees_it() {
         let p = owner().await;
         let value = Bytes::from(vec![0u8; MAX_VALUE_BYTES + 1]);
         assert!(matches!(
@@ -1630,7 +1965,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(p.get(b"k").await.unwrap(), None);
-        assert_eq!(p.stored_entry(b"k").unwrap().unwrap().version, Version(2));
+        assert_eq!(
+            p.stored_entry(b"k").await.unwrap().unwrap().version,
+            Version(2)
+        );
     }
 
     #[tokio::test]
@@ -1692,5 +2030,142 @@ mod tests {
             p.size_bytes().await.unwrap() > empty + 100 * 1024,
             "the leader splits on this number, so it has to move"
         );
+    }
+
+    #[tokio::test]
+    async fn a_flush_publishes_and_a_reopen_reads_it_back() {
+        let (p, _clock) = partition_with_clock().await;
+        p.apply(&Mutation::put(Lamport(3), bytes("a"), bytes("one"), None))
+            .await
+            .unwrap();
+        p.apply(&Mutation::put(Lamport(5), bytes("b"), bytes("two"), None))
+            .await
+            .unwrap();
+        p.flush().await.unwrap();
+
+        let p = reopened(p).await;
+        assert_eq!(p.get(b"a").await.unwrap().unwrap().value, bytes("one"));
+        assert_eq!(p.get(b"b").await.unwrap().unwrap().version, Version(5));
+        assert_eq!(
+            p.committed_lamport().await.unwrap(),
+            Lamport(5),
+            "the manifest horizon is where replay starts, so it has to hold"
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_above_the_flush_horizon_are_the_logs_to_restore() {
+        // The division of labour a restart depends on: the manifest carries
+        // everything at or below its horizon, and the caller replays its log
+        // above it. Storage alone forgetting an unflushed write is correct,
+        // and replaying it back is idempotent.
+        let (p, _clock) = partition_with_clock().await;
+        let flushed = Mutation::put(Lamport(1), bytes("a"), bytes("v"), None);
+        let unflushed = Mutation::put(Lamport(2), bytes("b"), bytes("v"), None);
+        p.apply(&flushed).await.unwrap();
+        p.flush().await.unwrap();
+        p.apply(&unflushed).await.unwrap();
+
+        let p = reopened(p).await;
+        assert!(p.get(b"a").await.unwrap().is_some());
+        assert_eq!(
+            p.get(b"b").await.unwrap(),
+            None,
+            "an unflushed write is the log's to bring back"
+        );
+        assert_eq!(p.committed_lamport().await.unwrap(), Lamport(1));
+
+        p.apply(&flushed).await.unwrap();
+        p.apply(&unflushed).await.unwrap();
+        assert!(p.get(b"b").await.unwrap().is_some());
+        assert_eq!(p.committed_lamport().await.unwrap(), Lamport(2));
+    }
+
+    #[tokio::test]
+    async fn reads_and_scans_span_the_memtable_and_the_segments() {
+        let (p, _clock) = partition_with_clock().await;
+        p.apply(&Mutation::put(Lamport(1), bytes("a"), bytes("old"), None))
+            .await
+            .unwrap();
+        p.apply(&Mutation::put(
+            Lamport(2),
+            bytes("b"),
+            bytes("flushed"),
+            None,
+        ))
+        .await
+        .unwrap();
+        p.flush().await.unwrap();
+        // One key overwritten in the memtable, one new one beside it.
+        p.apply(&Mutation::put(Lamport(3), bytes("a"), bytes("new"), None))
+            .await
+            .unwrap();
+        p.apply(&Mutation::put(
+            Lamport(4),
+            bytes("c"),
+            bytes("recent"),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            p.get(b"a").await.unwrap().unwrap().value,
+            bytes("new"),
+            "the memtable shadows the segment"
+        );
+        let page = p.scan(b"", None, 10).await.unwrap();
+        let keys: Vec<Bytes> = page.entries.iter().map(|e| e.key.clone()).collect();
+        assert_eq!(keys, vec![bytes("a"), bytes("b"), bytes("c")]);
+        assert_eq!(page.entries[0].record.value, bytes("new"));
+    }
+
+    #[tokio::test]
+    async fn compaction_folds_the_segments_into_one() {
+        let (p, _clock) = partition_with_clock().await;
+        for (lamport, key) in [(1u64, "a"), (2, "b")] {
+            p.apply(&Mutation::put(
+                Lamport(lamport),
+                bytes(key),
+                bytes("v"),
+                None,
+            ))
+            .await
+            .unwrap();
+            p.flush().await.unwrap();
+        }
+        assert_eq!(p.segment_count().await, 2);
+
+        p.compact().await.unwrap();
+        assert_eq!(p.segment_count().await, 1);
+        assert!(p.get(b"a").await.unwrap().is_some());
+        assert!(p.get(b"b").await.unwrap().is_some());
+
+        let p = reopened(p).await;
+        assert!(
+            p.get(b"a").await.unwrap().is_some() && p.get(b"b").await.unwrap().is_some(),
+            "the compacted manifest is the one a reopen finds"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_key_flushes_as_a_tombstone_not_an_absence() {
+        // The distinction a conditional write needs survives the flush: a
+        // reopened partition can still tell "deleted at version 2" from
+        // "never existed".
+        let (p, _clock) = partition_with_clock().await;
+        p.apply(&Mutation::put(Lamport(1), bytes("k"), bytes("v"), None))
+            .await
+            .unwrap();
+        p.apply(&Mutation::delete(Lamport(2), bytes("k"), u64::MAX))
+            .await
+            .unwrap();
+        p.flush().await.unwrap();
+
+        let p = reopened(p).await;
+        assert_eq!(p.get(b"k").await.unwrap(), None);
+        let stored = p.stored_entry(b"k").await.unwrap().unwrap();
+        assert!(stored.deleted);
+        assert_eq!(stored.version, Version(2));
     }
 }

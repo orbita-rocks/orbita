@@ -16,11 +16,15 @@ authors.workspace = true
 [dependencies]
 orbita-core.workspace = true
 orbita-control.workspace = true
+orbita-format.workspace = true
+orbita-objectstore.workspace = true
 orbita-runtime.workspace = true
 orbita-proto.workspace = true
 orbita-storage.workspace = true
 orbita-wal.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
+crc32c.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -29,4 +33,6 @@ tonic = "0.12"
 
 [dev-dependencies]
 orbita-sim = { path = "../orbita-sim" }
+# The in-memory object store, so simulated partitions touch no filesystem.
+orbita-format = { workspace = true, features = ["testing"] }
 orbita-proto.workspace = true

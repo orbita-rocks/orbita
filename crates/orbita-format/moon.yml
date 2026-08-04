@@ -5,12 +5,4 @@ $schema: 'https://moonrepo.dev/schemas/project.json'
 # these are written out by hand rather than inferred.
 dependsOn:
   - 'orbita-core'
-  - 'orbita-control'
-  - 'orbita-format'
   - 'orbita-objectstore'
-  - 'orbita-runtime'
-  - 'orbita-proto'
-  - 'orbita-storage'
-  - 'orbita-wal'
-  - id: 'orbita-sim'
-    scope: 'development'

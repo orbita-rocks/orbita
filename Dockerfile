@@ -1,10 +1,9 @@
 # The orbita image: one binary, no entrypoint script, no init system.
 #
-# Two stages. The builder needs more than a Rust toolchain: protoc, because the
-# gRPC bindings are generated at build time from the definitions in /proto, and
-# a C++ toolchain with clang, because RocksDB is compiled from source and
-# bindgen needs libclang to read its headers. The runtime image needs none of
-# that, which is most of the reason for splitting them.
+# Two stages. The builder needs one thing beyond a Rust toolchain: protoc,
+# because the gRPC bindings are generated at build time from the definitions
+# in /proto. The runtime image needs not even that, which is most of the
+# reason for splitting them.
 #
 # Build for both architectures with buildx:
 #
@@ -12,13 +11,8 @@
 
 FROM rust:1.91-bookworm AS builder
 
-# clang and libclang are for bindgen, g++ and make come from build-essential
-# for the RocksDB sources, and protobuf-compiler is protoc.
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
-        build-essential \
-        clang \
-        libclang-dev \
         protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
@@ -30,6 +24,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/orbita-core/Cargo.toml crates/orbita-core/
 COPY crates/orbita-runtime/Cargo.toml crates/orbita-runtime/
 COPY crates/orbita-objectstore/Cargo.toml crates/orbita-objectstore/
+COPY crates/orbita-format/Cargo.toml crates/orbita-format/
 COPY crates/orbita-proto/Cargo.toml crates/orbita-proto/
 COPY crates/orbita-storage/Cargo.toml crates/orbita-storage/
 COPY crates/orbita-wal/Cargo.toml crates/orbita-wal/
@@ -40,7 +35,7 @@ COPY crates/orbita-cli/Cargo.toml crates/orbita-cli/
 RUN mkdir -p crates/orbita-cli/src \
     && echo 'fn main() {}' > crates/orbita-cli/src/main.rs \
     && echo '' > crates/orbita-cli/src/lib.rs \
-    && for c in core runtime objectstore proto storage wal control server sim; do \
+    && for c in core runtime objectstore format proto storage wal control server sim; do \
          mkdir -p "crates/orbita-$c/src" && echo '' > "crates/orbita-$c/src/lib.rs"; \
        done \
     && cargo fetch --locked
@@ -48,20 +43,10 @@ RUN mkdir -p crates/orbita-cli/src \
 COPY proto proto
 COPY crates crates
 
-# How many compile jobs to run at once. RocksDB is built from source, and each
-# parallel c++ job wants on the order of a gigabyte. Cargo's default is one job
-# per core, which on a laptop with more cores than spare gigabytes gets the
-# compiler killed part way through with a message about memory that reads like
-# a compiler bug. Four is the number that fits the default Docker Desktop
-# allocation. Raise it in CI, where the machine is bigger:
-#
-#   docker build --build-arg BUILD_JOBS=16 .
-ARG BUILD_JOBS=4
-
 # Only the binary is built. The simulator and the test suites are CI's job, and
 # building them here would put their dependencies in the image's build cache
 # for nothing.
-RUN cargo build --release --locked --jobs "${BUILD_JOBS}" --bin orbita \
+RUN cargo build --release --locked --bin orbita \
     && strip target/release/orbita
 
 FROM debian:bookworm-slim AS runtime
