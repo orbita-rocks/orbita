@@ -234,12 +234,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.ensure_leader_ready().await?;
         let index = self.log.propose(command).await?;
         self.apply_through(index).await?;
-        self.inner
-            .lock()
-            .await
-            .results
-            .remove(&index)
-            .unwrap_or(Ok(()))
+        self.outcome_at(index).await
     }
 
     async fn apply_through(&self, target: LogIndex) -> Result<()> {
@@ -258,6 +253,27 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         let floor = inner.applied.saturating_sub(1024);
         inner.results.retain(|index, _| *index > floor);
         Ok(())
+    }
+
+    async fn outcome_at(&self, target: LogIndex) -> Result<()> {
+        if let Some(outcome) = self.inner.lock().await.results.remove(&target) {
+            return outcome;
+        }
+
+        // A submitter can be descheduled after commit while another task
+        // applies enough entries to sweep its cached result. The control log
+        // is not compacted, so replay recovers the exact deterministic outcome
+        // instead of treating a missing rejection as success.
+        let mut state = ClusterState::new();
+        for entry in self.log.subscribe(0).await? {
+            let outcome = state.apply(&entry.command);
+            if entry.index == target {
+                return outcome;
+            }
+        }
+        Err(Error::Internal(format!(
+            "committed control outcome at index {target} is unavailable"
+        )))
     }
 
     /// A copy of the routing table.
@@ -281,6 +297,25 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 
     pub async fn map_version(&self) -> MapVersion {
         self.inner.lock().await.state.map_version()
+    }
+
+    /// The committed control-command index known to this consensus member.
+    pub async fn commit_index(&self) -> LogIndex {
+        self.log.commit_index().await
+    }
+
+    /// Applies local commits and proves this state machine reached an index a
+    /// leader reported as committed.
+    ///
+    /// This is the readiness seam rather than a Raft-specific lag check. It
+    /// establishes both halves that matter after restart: the local consensus
+    /// log contains the leader's decisions, and the controller has applied
+    /// them before it can participate in another rollout quorum.
+    pub async fn catch_up_through(&self, authority: LogIndex) -> Result<bool> {
+        self.recover().await?;
+        let local_commit = self.log.commit_index().await;
+        let applied = self.inner.lock().await.applied;
+        Ok(local_commit >= authority && applied >= authority)
     }
 
     /// The active cluster version.
@@ -397,6 +432,15 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         let (needs_registration, needs_revival) = {
             let mut inner = self.inner.lock().await;
             let known = inner.state.node(node).cloned();
+            if let Some(record) = &known {
+                if record.role != status.role {
+                    return Err(Error::InvalidArgument(format!(
+                        "node {node} is registered as {:?} and cannot report as {:?}; node ids \
+                         are stable across roles",
+                        record.role, status.role
+                    )));
+                }
+            }
             inner.observations.insert(
                 node,
                 Observation {
@@ -1190,6 +1234,8 @@ fn random_hex(bytes: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SingleNodeLog;
+    use orbita_sim::Simulation;
 
     #[test]
     fn silence_moves_a_node_through_suspect_before_dead() {
@@ -1222,5 +1268,38 @@ mod tests {
         let (owner, replicas) = split_placement(&[NodeId(1)], 3);
         assert_eq!(owner, Some(NodeId(1)));
         assert!(replicas.is_empty());
+    }
+
+    #[test]
+    fn a_rejected_proposal_keeps_its_outcome_after_result_cleanup() {
+        let sim = Simulation::new(1);
+        let runtime = sim.add_node(NodeId(1));
+        let opening = runtime.clone();
+        let log = sim
+            .block_on(async move { SingleNodeLog::open(&opening).await })
+            .unwrap();
+        let controller = Controller::new(runtime, Arc::clone(&log), ControlConfig::default());
+        let rejected = ControlCommand::FencePartition {
+            partition: PartitionId(99),
+            expect_epoch: Epoch(1),
+        };
+        let proposing = Arc::clone(&log);
+        let command = rejected.clone();
+        let target = sim
+            .block_on(async move { proposing.propose(command).await })
+            .expect("commit rejected command");
+        for _ in 0..1025 {
+            let proposing = Arc::clone(&log);
+            let command = rejected.clone();
+            sim.block_on(async move { proposing.propose(command).await })
+                .expect("commit command past cleanup window");
+        }
+        let recovering = controller.clone();
+        sim.block_on(async move { recovering.recover().await })
+            .expect("apply committed commands");
+
+        let outcome = sim.block_on(async move { controller.outcome_at(target).await });
+
+        assert!(matches!(outcome, Err(Error::InvalidArgument(_))));
     }
 }

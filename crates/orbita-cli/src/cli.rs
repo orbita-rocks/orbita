@@ -177,11 +177,11 @@ one to expose. --peer-listen carries traffic from other nodes in a private
 framing, and belongs on a private network: it is compatible only within a
 cluster version window, and a peer port reachable from the internet is a hole.
 
-cluster.leader_peers is the leader group as peer advertise addresses, identical
-on every node. A fresh leader forms the initial Raft configuration from it and
-ignores it once the data directory holds a Raft log, so it is safe to leave in
-a template forever. A worker uses the same list to find a leader to register
-with, and retries until one answers or --join-timeout runs out.")]
+cluster.leader_peers is the complete leader group as NODE_ID=ADDR entries,
+identical on every node. The ids are the durable Raft identities and the
+addresses are peer advertise addresses. A worker uses the same list to find a
+leader to register with, and retries until one answers or --join-timeout runs
+out.")]
     Serve(ServeArgs),
 
     /// Run a single node cluster with no configuration at all.
@@ -286,12 +286,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// The leader group, as peer advertise addresses.
+    /// The leader group, as NODE_ID=ADDR entries.
     ///
-    /// Identical on every node. A leader uses it as the initial Raft
-    /// membership and ignores it once it has a Raft log. A worker uses it as
-    /// the list of leaders to contact.
-    #[arg(long, value_name = "ADDR", value_delimiter = ',')]
+    /// Identical on every node. A leader uses the ids as fixed Raft voters and
+    /// checks them against durable state on restart. A worker uses the same
+    /// entries to contact the group.
+    #[arg(long, value_name = "NODE_ID=ADDR", value_delimiter = ',')]
     pub leader_peers: Option<Vec<String>>,
 
     /// How long to keep trying to reach the leader group before giving up,
@@ -702,7 +702,7 @@ mod tests {
             "--node-id",
             "3",
             "--leader-peers",
-            "a:7100,b:7100",
+            "1=a:7101,2=b:7101",
         ])
         .unwrap();
         let Command::Serve(args) = cli.command else {
@@ -713,7 +713,7 @@ mod tests {
         assert_eq!(layer.node.id, Some(3));
         assert_eq!(
             layer.cluster.leader_peers.as_deref(),
-            Some(["a:7100".to_owned(), "b:7100".to_owned()].as_slice())
+            Some(["1=a:7101".to_owned(), "2=b:7101".to_owned()].as_slice())
         );
     }
 

@@ -47,11 +47,10 @@ x-common-env: &common-env
   ORBITA_LISTEN: 0.0.0.0:7100
   ORBITA_PEER_LISTEN: 0.0.0.0:7101
   ORBITA_LOG_LEVEL: info
-  # The leader group, as peer addresses on the peer port, listed identically on
-  # every node. Leaders form their initial Raft configuration from it and
-  # workers use it to find someone to register with. Once a node has a Raft log
-  # this is ignored, so it is safe to leave here across restarts.
-  ORBITA_LEADER_PEERS: leader-1:7101,leader-2:7101,leader-3:7101
+  # The fixed leader voters and their peer addresses, listed identically on
+  # every node. The ids are persisted with the Raft log, so changing this set
+  # on an existing volume is rejected rather than forming another cluster.
+  ORBITA_LEADER_PEERS: 1=leader-1:7101,2=leader-2:7101,3=leader-3:7101
   # Workers start alongside the leaders and retry until the group answers, so
   # nothing here depends on getting the start order right. Two minutes rather
   # than the default five, because on a laptop a cluster that is not up in two

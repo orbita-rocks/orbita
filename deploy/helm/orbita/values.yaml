@@ -22,6 +22,13 @@ fullnameOverride: ""
 # and needs one more vote to agree.
 leader:
   replicas: 3
+  # Set this only for the first upgrade from a release whose leader pods do not
+  # run Raft. It switches this StatefulSet to OnDelete so an operator can
+  # replace two voters together, wait for their first quorum, then replace the
+  # third. Follow the exact procedure printed by `helm upgrade` and in
+  # docs/UPGRADES.md, then set it back to false. Ordinary upgrades leave this
+  # false and use readiness-gated RollingUpdate per ADR 0005.
+  firstRaftUpgrade: false
   # Long enough for a Raft leader to step down and hand off before it goes
   # away, so that a rolling restart does not spend an election per pod. The
   # server does not perform that handoff yet, and until it does this is only
@@ -178,12 +185,9 @@ podDisruptionBudget:
 #
 # Readiness and startup run `orbita cluster ready`, which exits non-zero and
 # names the unmet conditions until the node's readiness gate reports all of
-# them met. One honest caveat: the CLI does not yet pass the leader group to
-# the server, so on a node this chart starts the registration condition is met
-# by construction rather than by an accepted registration. Recovery and
-# catch-up are asserted for real; the rejoin half arrives when the CLI wiring
-# lands. docs/UPGRADES.md lists this gap and describes how to stage an upgrade
-# when the blast radius warrants it.
+# them met. Leaders wait for their durable Raft state and an elected quorum;
+# workers wait until the control plane accepts their registration. Recovery
+# and partition catch-up are asserted before either role reports Ready.
 #
 # Liveness is the opposite and stays conservative, because failing it kills the
 # pod. It runs `orbita cluster ping`, which asks only whether the process
