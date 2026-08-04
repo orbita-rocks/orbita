@@ -90,11 +90,14 @@ pub use transport::{PeerListener, PeerTransport, DEFAULT_PEER_CALL_TIMEOUT};
 use crate::node::{DataLayout, Node};
 use crate::service::{HealthService, KvService};
 
-use orbita_control::ControlClient;
+use orbita_control::{
+    AdminService, BootstrapSpec, ConsensusLog, ControlClient, ControlConfig, ControlService,
+    Controller, KeyspaceConfig, RaftLog,
+};
 use orbita_core::{Error, Result};
 use orbita_proto::v1::health_server::HealthServer;
 use orbita_proto::v1::kv_server::KvServer;
-use orbita_runtime::Runtime;
+use orbita_runtime::{Clock, Runtime, ServiceId, Transport};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -118,6 +121,8 @@ pub struct Server {
     /// The reporting loop's handle, kept so the server can answer which
     /// cluster version is active. Present only alongside `reporting`.
     reporter: Option<StatusReporter<ServerRuntime>>,
+    raft: Option<Arc<RaftLog>>,
+    control: Option<tokio::task::JoinHandle<()>>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     serving: tokio::task::JoinHandle<()>,
 }
@@ -137,6 +142,59 @@ impl Server {
             .with_peer_call_timeout(config.node_id, config.peer_call_timeout);
         for (node, address) in &config.peers {
             runtime.transport().set_peer(*node, address.clone());
+        }
+
+        let mut raft = None;
+        let mut controller = None;
+        if config.leader_member {
+            let log = RaftLog::open(&runtime, &config.leader_group).await?;
+            let control =
+                Controller::new(runtime.clone(), Arc::clone(&log), ControlConfig::default());
+            runtime
+                .transport()
+                .register(ServiceId::Control, ControlService::new(control.clone()));
+            raft = Some(log);
+            controller = Some(control);
+        }
+
+        // A leader must be reachable before an election can finish. Workers
+        // defer binding until their partition handlers are registered below.
+        let mut peer_listener = if config.leader_member {
+            Some(
+                runtime
+                    .transport()
+                    .listen(config.peer_listen_addr)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!(
+                            "binding peer port {}: {e}",
+                            config.peer_listen_addr
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        if let (Some(log), Some(control)) = (&raft, &controller) {
+            let local_address = config.peer_advertise_addr.clone().unwrap_or_else(|| {
+                // A leader listener is already bound above, so ephemeral-port
+                // tests can advertise the address the kernel selected.
+                peer_listener
+                    .as_ref()
+                    .expect("leader peer listener is bound")
+                    .local_addr()
+                    .to_string()
+            });
+            start_control_plane(
+                &runtime,
+                log,
+                control,
+                &config.leader_group,
+                &config.peers,
+                &local_address,
+            )
+            .await?;
         }
         // The node's own filesystem stands in for a bucket, which is what
         // keeps a single node runnable from a data directory alone. Pointing
@@ -178,17 +236,24 @@ impl Server {
         // Peers are served only once every handler is registered, so a peer
         // that connects the instant the port opens cannot be told that a
         // service this node does serve is missing.
-        let peers = runtime
-            .transport()
-            .listen(config.peer_listen_addr)
-            .await
-            .map_err(|e| {
-                Error::Internal(format!(
-                    "binding peer port {}: {e}",
-                    config.peer_listen_addr
-                ))
-            })?;
+        let peers = match peer_listener.take() {
+            Some(listener) => listener,
+            None => runtime
+                .transport()
+                .listen(config.peer_listen_addr)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!(
+                        "binding peer port {}: {e}",
+                        config.peer_listen_addr
+                    ))
+                })?,
+        };
         let peer_addr = peers.local_addr();
+        let peer_advertise_addr = config
+            .peer_advertise_addr
+            .clone()
+            .unwrap_or_else(|| peer_addr.to_string());
 
         // The lease heartbeat is a production loop rather than something the
         // node starts for itself, so that a simulated run drives it a step at
@@ -200,7 +265,17 @@ impl Server {
 
         let mut reporter = None;
         let reporting = control.map(|client| {
-            let status = StatusReporter::new(client.clone(), config.node_id, peer_addr.to_string());
+            let role = if config.leader_member {
+                orbita_control::NodeRole::Leader
+            } else {
+                orbita_control::NodeRole::Worker
+            };
+            let status = StatusReporter::new_with_role(
+                client.clone(),
+                config.node_id,
+                role,
+                peer_advertise_addr,
+            );
             // The server keeps a handle so version-dependent behaviour can
             // ask which cluster version is active without joining the loop.
             reporter = Some(status.clone());
@@ -213,6 +288,10 @@ impl Server {
                 config.control_poll_interval,
                 Arc::clone(&readiness),
             ))
+        });
+        let control_task = controller.as_ref().map(|controller| {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.run().await })
         });
 
         let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -227,16 +306,30 @@ impl Server {
         let (shutdown, stop) = tokio::sync::oneshot::channel();
         let service = KvServer::new(KvService::new(Arc::clone(&node)));
         let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
+        let admin = controller.map(AdminService::new);
         let serving = tokio::spawn(async move {
-            let served = tonic::transport::Server::builder()
-                .add_service(service)
-                .add_service(health)
-                .serve_with_incoming_shutdown(incoming, async {
-                    // A dropped sender means the `Server` handle went away, so
-                    // stopping is the right answer to that too.
-                    let _ = stop.await;
-                })
-                .await;
+            let shutdown = async {
+                // A dropped sender means the `Server` handle went away, so
+                // stopping is the right answer to that too.
+                let _ = stop.await;
+            };
+            let served = match admin {
+                Some(admin) => {
+                    tonic::transport::Server::builder()
+                        .add_service(service)
+                        .add_service(health)
+                        .add_service(admin.into_server())
+                        .serve_with_incoming_shutdown(incoming, shutdown)
+                        .await
+                }
+                None => {
+                    tonic::transport::Server::builder()
+                        .add_service(service)
+                        .add_service(health)
+                        .serve_with_incoming_shutdown(incoming, shutdown)
+                        .await
+                }
+            };
             if let Err(error) = served {
                 tracing::error!(%error, "the client listener stopped");
             }
@@ -253,6 +346,8 @@ impl Server {
             heartbeat,
             reporting,
             reporter,
+            raft,
+            control: control_task,
             shutdown,
             serving,
         })
@@ -288,6 +383,12 @@ impl Server {
         self.heartbeat.abort();
         if let Some(reporting) = &self.reporting {
             reporting.abort();
+        }
+        if let Some(control) = &self.control {
+            control.abort();
+        }
+        if let Some(raft) = &self.raft {
+            raft.shutdown();
         }
         self.peers.shutdown().await;
         self.serving
@@ -385,5 +486,48 @@ impl Server {
     #[must_use]
     pub fn readiness(&self) -> Arc<ReadinessGate> {
         Arc::clone(&self.readiness)
+    }
+}
+
+async fn start_control_plane(
+    runtime: &ServerRuntime,
+    log: &Arc<RaftLog>,
+    controller: &Controller<ServerRuntime, RaftLog>,
+    voters: &[orbita_core::NodeId],
+    peers: &[(orbita_core::NodeId, String)],
+    local_address: &str,
+) -> Result<()> {
+    controller.recover().await?;
+    let deadline = runtime.clock().monotonic_nanos() + Duration::from_secs(30).as_nanos() as u64;
+    loop {
+        controller.recover().await?;
+        let fresh = controller.snapshot().await.is_fresh();
+        if !fresh && log.leader().await.is_some() {
+            return Ok(());
+        }
+        if fresh && log.is_leader().await {
+            let leaders = peers
+                .iter()
+                .filter(|(node, _)| voters.contains(node))
+                .cloned()
+                .collect();
+            controller
+                .bootstrap(&BootstrapSpec {
+                    keyspace: DEFAULT_KEYSPACE.to_string(),
+                    config: KeyspaceConfig::default(),
+                    leaders,
+                    workers: Vec::new(),
+                })
+                .await?;
+            tracing::info!(address = local_address, "bootstrapped the leader group");
+            return Ok(());
+        }
+        if runtime.clock().monotonic_nanos() >= deadline {
+            return Err(Error::Unavailable(format!(
+                "leader group {:?} did not elect a leader within 30 seconds",
+                voters
+            )));
+        }
+        runtime.clock().sleep(Duration::from_millis(100)).await;
     }
 }

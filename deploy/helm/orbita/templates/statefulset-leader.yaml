@@ -8,10 +8,10 @@ metadata:
 spec:
   serviceName: {{ include "orbita.fullname" . }}-leader
   replicas: {{ .Values.leader.replicas }}
-  # Raft members need a stable identity and their own disk, and they must come
-  # up one at a time so that the first one can form the initial configuration
-  # before the others look for it.
-  podManagementPolicy: OrderedReady
+  # A fresh fixed-voter group needs a quorum before any member can become
+  # Ready, so all members must be allowed to start together. Rolling updates
+  # remain ordered by the StatefulSet update strategy below.
+  podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
   selector:

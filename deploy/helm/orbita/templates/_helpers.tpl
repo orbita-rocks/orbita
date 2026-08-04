@@ -55,7 +55,7 @@ port would look almost right and never form a quorum.
 {{- $svc := printf "%s-leader" $full -}}
 {{- $peers := list -}}
 {{- range $i := until (int .Values.leader.replicas) -}}
-{{- $peers = append $peers (printf "%s-%d.%s.%s.svc.cluster.local:%d" $svc $i $svc $.Release.Namespace (int $.Values.service.peerPort)) -}}
+{{- $peers = append $peers (printf "%d=%s-%d.%s.%s.svc.cluster.local:%d" (add1 $i) $svc $i $svc $.Release.Namespace (int $.Values.service.peerPort)) -}}
 {{- end -}}
 {{- join "," $peers -}}
 {{- end -}}

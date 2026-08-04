@@ -770,6 +770,11 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// between steps, which is how the failover ordering is actually verified.
     pub async fn tick(&self) -> Result<()> {
         if !self.log.is_leader().await {
+            // Followers apply committed entries here too. Otherwise a follower
+            // promoted after an election would make decisions from the state
+            // it held at startup rather than from the log the quorum elected
+            // it with. A leader applies through each proposal already.
+            self.recover().await?;
             return Ok(());
         }
         self.refresh_health().await?;

@@ -22,13 +22,6 @@ finished.
 - A node does not hand its partitions off on SIGTERM. The termination grace
   periods in the chart are sized for a handoff that the server does not perform
   yet, so today a restart is a failover.
-- The `orbita` binary does not yet hand the leader group configuration to the
-  server. A node started by the CLI runs without a control client, and the
-  `control-plane-joined` readiness condition is met by construction on such a
-  node rather than by an accepted registration. The server asserts the join
-  whenever it is configured with a leader group, which is how the in-process
-  cluster tests run it; the CLI wiring is the missing piece.
-
 Readiness is otherwise real: a node reports Ready only once it has recovered
 its write-ahead log and opened and caught up the partitions the map says it
 holds, and it turns unready again if a map change hands it a partition it
@@ -238,9 +231,9 @@ stateful system is broken on Kubernetes.
 - Readiness gates the rollout and the client Service. It runs `orbita cluster
   ready`, which exits non-zero and names the unmet conditions until the node
   has recovered its write-ahead log, opened and caught up its partitions, and
-  registered with the leader group where it has one. Until the CLI wires the
-  leader group through (see the gaps at the top), that last condition is met
-  by construction on a deployed node.
+  registered with the leader group where it has one. A leader-group node waits
+  for its durable Raft state and a quorum election instead of registering as a
+  worker.
 - Liveness kills the pod when it fails, so it runs `orbita cluster ping` and
   checks only that the process responds. It never checks cluster state and
   never checks whether peers are reachable, because a liveness probe that
