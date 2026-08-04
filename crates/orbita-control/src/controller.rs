@@ -125,6 +125,8 @@ struct Inner {
     /// When this controller started observing. A node it has never heard from
     /// is timed from here rather than from the beginning of time.
     observing_since: u64,
+    /// Leadership changes invalidate every local failure-detection deadline.
+    was_leader: bool,
 }
 
 /// The leader group's decision loop and the API around it.
@@ -164,6 +166,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 observations: BTreeMap::new(),
                 fenced_since: BTreeMap::new(),
                 observing_since,
+                was_leader: false,
             })),
         }
     }
@@ -178,9 +181,13 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.runtime.transport().local_node()
     }
 
-    /// Whether this node may take decisions right now.
+    /// Whether this controller may expose leader authority right now.
+    ///
+    /// This is stricter than the Raft role: it becomes true only after the
+    /// inherited committed prefix is locally applied and quorum authority is
+    /// reconfirmed.
     pub async fn log_is_leader(&self) -> bool {
-        self.log.is_leader().await
+        self.ensure_leader_ready().await.is_ok()
     }
 
     /// Who to redirect to when this node may not.
@@ -190,11 +197,32 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 
     /// Replays the log into the state machine.
     ///
-    /// Called once on start. Everything else applies as it proposes, so this
-    /// is the only place a member catches up on decisions it did not make.
+    /// Called on start and by follower sweeps. Leader-facing operations use
+    /// [`Controller::ensure_leader_ready`] instead because recovery alone does
+    /// not prove the node still has quorum authority after applying.
     pub async fn recover(&self) -> Result<()> {
         let committed = self.log.commit_index().await;
-        self.apply_through(committed).await.map(|_| ())
+        self.apply_through(committed).await
+    }
+
+    /// Establishes that this controller is authoritative for a leader-facing
+    /// operation.
+    ///
+    /// The first barrier identifies the committed prefix inherited at
+    /// election. Applying it closes the stale-state window, and the second
+    /// barrier proves leadership survived that apply. If more commands became
+    /// committed in between, the loop catches those up before authority is
+    /// exposed.
+    pub async fn ensure_leader_ready(&self) -> Result<()> {
+        let mut target = self.log.leader_barrier().await?;
+        loop {
+            self.apply_through(target).await?;
+            let confirmed = self.log.leader_barrier().await?;
+            if confirmed == target {
+                return Ok(());
+            }
+            target = confirmed;
+        }
     }
 
     /// Proposes a command and returns what applying it decided.
@@ -203,8 +231,10 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// from the propose, because a rejection is a decision the whole cluster
     /// agreed on and not a failure to reach anybody.
     pub async fn submit(&self, command: ControlCommand) -> Result<()> {
+        self.ensure_leader_ready().await?;
         let index = self.log.propose(command).await?;
-        self.apply_through(index).await
+        self.apply_through(index).await?;
+        self.outcome_at(index).await
     }
 
     async fn apply_through(&self, target: LogIndex) -> Result<()> {
@@ -217,13 +247,33 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 inner.results.insert(entry.index, outcome);
             }
         }
-        let result = inner.results.remove(&target).unwrap_or(Ok(()));
         // Results are only interesting to whoever proposed the entry. A
         // proposer whose future was dropped never collects, so old ones are
         // swept rather than kept forever.
         let floor = inner.applied.saturating_sub(1024);
         inner.results.retain(|index, _| *index > floor);
-        result
+        Ok(())
+    }
+
+    async fn outcome_at(&self, target: LogIndex) -> Result<()> {
+        if let Some(outcome) = self.inner.lock().await.results.remove(&target) {
+            return outcome;
+        }
+
+        // A submitter can be descheduled after commit while another task
+        // applies enough entries to sweep its cached result. The control log
+        // is not compacted, so replay recovers the exact deterministic outcome
+        // instead of treating a missing rejection as success.
+        let mut state = ClusterState::new();
+        for entry in self.log.subscribe(0).await? {
+            let outcome = state.apply(&entry.command);
+            if entry.index == target {
+                return outcome;
+            }
+        }
+        Err(Error::Internal(format!(
+            "committed control outcome at index {target} is unavailable"
+        )))
     }
 
     /// A copy of the routing table.
@@ -797,13 +847,29 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// simulation can drive it a step at a time and assert what changed
     /// between steps, which is how the failover ordering is actually verified.
     pub async fn tick(&self) -> Result<()> {
-        if !self.log.is_leader().await {
-            // Followers apply committed entries here too. Otherwise a follower
-            // promoted after an election would make decisions from the state
-            // it held at startup rather than from the log the quorum elected
-            // it with. A leader applies through each proposal already.
-            self.recover().await?;
-            return Ok(());
+        // Followers must apply decisions while they are followers. Otherwise a
+        // newly elected leader starts its first sweep from the state it held
+        // when it last proposed a command, which can predate an ownership
+        // fence by an arbitrary amount.
+        self.recover().await?;
+        let is_leader = self.log.is_leader().await;
+        let now = self.runtime.clock().monotonic_nanos();
+        {
+            let mut inner = self.inner.lock().await;
+            if !is_leader {
+                inner.was_leader = false;
+                return Ok(());
+            }
+            if !inner.was_leader {
+                // Heartbeat times and lease-drain instants are observations
+                // made by one leader. Carrying them across an election can
+                // fence a healthy worker immediately or promote before the
+                // new leader has waited out the old owner's leases.
+                inner.observations.clear();
+                inner.fenced_since.clear();
+                inner.observing_since = now;
+                inner.was_leader = true;
+            }
         }
         self.refresh_health().await?;
         self.fence_dead_owners().await?;
@@ -1168,6 +1234,8 @@ fn random_hex(bytes: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SingleNodeLog;
+    use orbita_sim::Simulation;
 
     #[test]
     fn silence_moves_a_node_through_suspect_before_dead() {
@@ -1200,5 +1268,38 @@ mod tests {
         let (owner, replicas) = split_placement(&[NodeId(1)], 3);
         assert_eq!(owner, Some(NodeId(1)));
         assert!(replicas.is_empty());
+    }
+
+    #[test]
+    fn a_rejected_proposal_keeps_its_outcome_after_result_cleanup() {
+        let sim = Simulation::new(1);
+        let runtime = sim.add_node(NodeId(1));
+        let opening = runtime.clone();
+        let log = sim
+            .block_on(async move { SingleNodeLog::open(&opening).await })
+            .unwrap();
+        let controller = Controller::new(runtime, Arc::clone(&log), ControlConfig::default());
+        let rejected = ControlCommand::FencePartition {
+            partition: PartitionId(99),
+            expect_epoch: Epoch(1),
+        };
+        let proposing = Arc::clone(&log);
+        let command = rejected.clone();
+        let target = sim
+            .block_on(async move { proposing.propose(command).await })
+            .expect("commit rejected command");
+        for _ in 0..1025 {
+            let proposing = Arc::clone(&log);
+            let command = rejected.clone();
+            sim.block_on(async move { proposing.propose(command).await })
+                .expect("commit command past cleanup window");
+        }
+        let recovering = controller.clone();
+        sim.block_on(async move { recovering.recover().await })
+            .expect("apply committed commands");
+
+        let outcome = sim.block_on(async move { controller.outcome_at(target).await });
+
+        assert!(matches!(outcome, Err(Error::InvalidArgument(_))));
     }
 }

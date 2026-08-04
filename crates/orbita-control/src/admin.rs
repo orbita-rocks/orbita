@@ -41,6 +41,10 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
         pb::admin_server::AdminServer::new(self)
     }
 
+    async fn ready(&self) -> Result<(), Status> {
+        self.controller.ensure_leader_ready().await.map_err(status)
+    }
+
     async fn keyspace_message(&self, keyspace: &Keyspace) -> pb::Keyspace {
         let map = self.controller.partition_map().await;
         let partitions = map.partitions().filter(|p| p.keyspace == keyspace.id);
@@ -69,6 +73,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateKeyspaceRequest>,
     ) -> Result<Response<pb::Keyspace>, Status> {
+        self.ready().await?;
         let request = request.into_inner();
         let keyspace = self
             .controller
@@ -82,6 +87,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::UpdateKeyspaceRequest>,
     ) -> Result<Response<pb::Keyspace>, Status> {
+        self.ready().await?;
         let request = request.into_inner();
         let keyspace = self
             .controller
@@ -95,6 +101,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::DeleteKeyspaceRequest>,
     ) -> Result<Response<pb::DeleteKeyspaceResponse>, Status> {
+        self.ready().await?;
         let request = request.into_inner();
         // The proto asks for the name twice so that a script cannot destroy a
         // keyspace with one careless argument. Checking it here rather than in
@@ -115,6 +122,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         _request: Request<pb::ListKeyspacesRequest>,
     ) -> Result<Response<pb::ListKeyspacesResponse>, Status> {
+        self.ready().await?;
         let mut keyspaces = Vec::new();
         for keyspace in self.controller.list_keyspaces().await {
             keyspaces.push(self.keyspace_message(&keyspace).await);
@@ -126,6 +134,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateCredentialRequest>,
     ) -> Result<Response<pb::CreateCredentialResponse>, Status> {
+        self.ready().await?;
         let request = request.into_inner();
         let permissions: Vec<Permission> = request
             .permissions
@@ -158,6 +167,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::RevokeCredentialRequest>,
     ) -> Result<Response<pb::RevokeCredentialResponse>, Status> {
+        self.ready().await?;
         self.controller
             .revoke_credential(&request.into_inner().credential_id)
             .await
@@ -169,6 +179,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::DescribeClusterRequest>,
     ) -> Result<Response<pb::DescribeClusterResponse>, Status> {
+        self.ready().await?;
         let filter = request.into_inner().keyspace;
         let view = self.controller.view().await;
         let snapshot = self.controller.snapshot().await;
@@ -242,6 +253,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         _request: Request<pb::FinalizeUpgradeRequest>,
     ) -> Result<Response<pb::FinalizeUpgradeResponse>, Status> {
+        self.ready().await?;
         let finalized = self.controller.finalize_upgrade().await.map_err(status)?;
         Ok(Response::new(pb::FinalizeUpgradeResponse {
             previous: Some(version_message(finalized.previous)),
@@ -253,6 +265,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::SplitPartitionRequest>,
     ) -> Result<Response<pb::SplitPartitionResponse>, Status> {
+        self.ready().await?;
         let request = request.into_inner();
         let at = if request.split_key.is_empty() {
             None
@@ -276,6 +289,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         _request: Request<pb::MergePartitionsRequest>,
     ) -> Result<Response<pb::MergePartitionsResponse>, Status> {
+        self.ready().await?;
         // Answering with a clear refusal rather than a half-built merge. See
         // the crate documentation for what a correct one has to guarantee.
         Err(Status::unimplemented(
@@ -287,6 +301,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::TransferOwnershipRequest>,
     ) -> Result<Response<pb::TransferOwnershipResponse>, Status> {
+        self.ready().await?;
         let request = request.into_inner();
         let partition = PartitionId(request.partition_id);
         self.controller

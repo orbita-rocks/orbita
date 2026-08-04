@@ -8,7 +8,7 @@ import time
 import grpc
 
 import harness
-from orbita.v1 import admin_pb2, admin_pb2_grpc
+from orbita.v1 import admin_pb2, admin_pb2_grpc, health_pb2, health_pb2_grpc
 
 
 def _command(binary, node_id, client_port, peer_port, peers, data_dir):
@@ -34,9 +34,9 @@ def _command(binary, node_id, client_port, peer_port, peers, data_dir):
     ]
 
 
-def _wait_for_admin(process, stub, log_path):
+def _wait_for_ready(process, stub, log_path):
     deadline = time.monotonic() + harness.STARTUP_TIMEOUT_SECONDS
-    last_error = None
+    last_response = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise AssertionError(
@@ -44,12 +44,30 @@ def _wait_for_admin(process, stub, log_path):
                 f"{log_path.read_text(errors='replace')}"
             )
         try:
-            stub.ListKeyspaces(admin_pb2.ListKeyspacesRequest(), timeout=2)
-            return
-        except grpc.RpcError as error:
-            last_error = error
+            last_response = stub.CheckReadiness(
+                health_pb2.CheckReadinessRequest(), timeout=2
+            )
+            if last_response.ready:
+                return
+        except grpc.RpcError:
+            pass
+        finally:
             time.sleep(0.05)
-    raise AssertionError(f"leader did not become ready: {last_error}")
+    raise AssertionError(f"leader did not become ready: {last_response}")
+
+
+def _leader_keyspace_names(stubs):
+    for stub in stubs:
+        try:
+            return {
+                keyspace.name
+                for keyspace in stub.ListKeyspaces(
+                    admin_pb2.ListKeyspacesRequest(), timeout=2
+                ).keyspaces
+            }
+        except grpc.RpcError as error:
+            assert error.code() == grpc.StatusCode.UNAVAILABLE
+    raise AssertionError("no configured voter served the Admin read")
 
 
 def _stop(process):
@@ -101,10 +119,11 @@ def test_two_fixed_voters_form_replicate_and_restart_with_one_peer_unavailable(
     ]
     channels = [grpc.insecure_channel(f"127.0.0.1:{port}") for port in ports[:2]]
     stubs = [admin_pb2_grpc.AdminStub(channel) for channel in channels]
+    health_stubs = [health_pb2_grpc.HealthStub(channel) for channel in channels]
 
     try:
-        for process, stub, path in zip(processes, stubs, log_paths, strict=True):
-            _wait_for_admin(process, stub, path)
+        for process, stub, path in zip(processes, health_stubs, log_paths, strict=True):
+            _wait_for_ready(process, stub, path)
 
         for stub in stubs:
             try:
@@ -117,35 +136,19 @@ def test_two_fixed_voters_form_replicate_and_restart_with_one_peer_unavailable(
         else:
             raise AssertionError("neither configured voter accepted the proposal")
 
-        def replicated_everywhere():
-            return all(
-                "replicated"
-                in {
-                    keyspace.name
-                    for keyspace in stub.ListKeyspaces(
-                        admin_pb2.ListKeyspacesRequest(), timeout=2
-                    ).keyspaces
-                }
-                for stub in stubs
-            )
-
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not replicated_everywhere():
+        while time.monotonic() < deadline and "replicated" not in _leader_keyspace_names(
+            stubs
+        ):
             time.sleep(0.05)
-        assert replicated_everywhere()
+        assert "replicated" in _leader_keyspace_names(stubs)
 
         _stop(processes[1])
         processes[1] = subprocess.Popen(
             commands[1], stdout=logs[1], stderr=subprocess.STDOUT
         )
-        _wait_for_admin(processes[1], stubs[1], log_paths[1])
-        names = {
-            keyspace.name
-            for keyspace in stubs[1]
-            .ListKeyspaces(admin_pb2.ListKeyspacesRequest(), timeout=2)
-            .keyspaces
-        }
-        assert "replicated" in names
+        _wait_for_ready(processes[1], health_stubs[1], log_paths[1])
+        assert "replicated" in _leader_keyspace_names(stubs)
     finally:
         for channel in channels:
             channel.close()

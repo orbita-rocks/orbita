@@ -48,19 +48,40 @@ fn config(
         .with_leader_member(true)
 }
 
-async fn keyspace_names(server: &Server) -> Vec<String> {
+async fn keyspace_names(server: &Server) -> Option<Vec<String>> {
     let mut client = AdminClient::connect(format!("http://{}", server.local_addr()))
         .await
-        .expect("connect to the Admin service");
-    client
-        .list_keyspaces(ListKeyspacesRequest {})
-        .await
-        .expect("list keyspaces")
-        .into_inner()
-        .keyspaces
-        .into_iter()
-        .map(|keyspace| keyspace.name)
-        .collect()
+        .ok()?;
+    Some(
+        client
+            .list_keyspaces(ListKeyspacesRequest {})
+            .await
+            .ok()?
+            .into_inner()
+            .keyspaces
+            .into_iter()
+            .map(|keyspace| keyspace.name)
+            .collect(),
+    )
+}
+
+async fn leader_keyspace_names(servers: &[&Server]) -> Vec<String> {
+    for server in servers {
+        if let Some(names) = keyspace_names(server).await {
+            return names;
+        }
+    }
+    panic!("no leader voter served the Admin read")
+}
+
+async fn wait_until_ready(server: &Server) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !server.readiness().is_ready() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("leader voter reaches readiness after control catch-up");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -81,6 +102,8 @@ async fn two_of_three_configured_leaders_form_replicate_and_restart() {
     );
     let one = one.expect("the first voter starts");
     let mut two = two.expect("the second voter starts");
+    wait_until_ready(&one).await;
+    wait_until_ready(&two).await;
 
     let mut created = false;
     for server in [&one, &two] {
@@ -102,10 +125,7 @@ async fn two_of_three_configured_leaders_form_replicate_and_restart() {
     assert!(created, "one voter must accept the control-plane proposal");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(keyspace_names(&one)
-        .await
-        .contains(&"replicated".to_string()));
-    assert!(keyspace_names(&two)
+    assert!(leader_keyspace_names(&[&one, &two])
         .await
         .contains(&"replicated".to_string()));
 
@@ -114,7 +134,8 @@ async fn two_of_three_configured_leaders_form_replicate_and_restart() {
     two = Server::start(config(NodeId(2), &dirs[1], peer_addrs[1], &peers))
         .await
         .expect("the second voter restarts from durable identity");
-    assert!(keyspace_names(&two)
+    wait_until_ready(&two).await;
+    assert!(leader_keyspace_names(&[&one, &two])
         .await
         .contains(&"replicated".to_string()));
 

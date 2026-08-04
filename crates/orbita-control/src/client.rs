@@ -215,6 +215,9 @@ impl<R: Runtime> ControlClient<R> {
                     // another member would get the same answer.
                     return Err(Error::Internal(message));
                 }
+                Ok(ControlResponse::Unavailable(message)) => {
+                    last = Some(Error::Unavailable(message));
+                }
                 Ok(response) => {
                     *self.preferred.lock().expect("control client lock poisoned") = Some(target);
                     return Ok(response);
@@ -272,14 +275,17 @@ impl<R: Runtime, L: ConsensusLog> LocalControlClient<R, L> {
     }
 
     pub async fn fetch_map(&self) -> Result<PartitionMap> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.partition_map().await)
     }
 
     pub async fn fetch_map_if_newer(&self, have: MapVersion) -> Result<Option<PartitionMap>> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.partition_map_if_newer(have).await)
     }
 
     pub async fn report_status(&self, node: NodeId, status: NodeStatus) -> Result<()> {
+        self.controller.ensure_leader_ready().await?;
         self.controller
             .record_status(node, status)
             .await
@@ -287,6 +293,7 @@ impl<R: Runtime, L: ConsensusLog> LocalControlClient<R, L> {
     }
 
     pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
+        self.controller.ensure_leader_ready().await?;
         Ok(self.controller.node_addresses().await)
     }
 }

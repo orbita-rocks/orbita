@@ -83,13 +83,19 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
 
 impl<R: Runtime, L: ConsensusLog> PeerHandler for ControlService<R, L> {
     async fn handle(&self, _from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
-        // A node that is not the leader answers with the redirect rather than
-        // with its own stale copy of the map. Serving a follower's map would
-        // be the control plane handing out routing it is not sure about, which
-        // is the one thing it exists not to do.
-        if !self.controller.log_is_leader().await {
-            let leader = self.controller.log_leader().await;
-            return Ok(ControlResponse::NotLeader { leader }.encode());
+        // Raft role alone is not authority: a new leader first applies the
+        // committed prefix it inherited, and ReadIndex proves it still has a
+        // quorum after doing so. A deposed minority therefore cannot serve its
+        // stale map, and a new majority cannot serve before its fence is
+        // visible locally.
+        if let Err(error) = self.controller.ensure_leader_ready().await {
+            let response = match error {
+                orbita_core::Error::NotLeader { leader } => ControlResponse::NotLeader { leader },
+                other => ControlResponse::Unavailable(format!(
+                    "control leader is not ready to serve: {other}"
+                )),
+            };
+            return Ok(response.encode());
         }
         // Errors travel as a response rather than as a transport failure,
         // because "the leader considered this and said no" and "the leader was
