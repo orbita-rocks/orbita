@@ -30,7 +30,7 @@ replicas. That is the whole contract, and everything here serves it.
 - Deciding who the owner is. You are told, via an epoch from the control plane.
 - Promotion and failover, which is brief 03. You provide what it needs: how far
   each replica has durably logged.
-- Applying entries to RocksDB, which is brief 01.
+- Applying entries to the storage engine, which is brief 01.
 
 ## Interface sketch
 

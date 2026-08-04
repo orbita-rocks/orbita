@@ -155,6 +155,15 @@ impl<S: ObjectStore + ?Sized> PartitionWriter<S> {
     /// only on the retry path, which is the difference between fencing a
     /// deposed owner and letting it silently erase its replacement's work: its
     /// entity tag is current, so its conditional write would succeed.
+    ///
+    /// # Two distinct commits never encode identical manifests
+    ///
+    /// A flush moves `committed_lamport` and a compaction changes the segment
+    /// list, whose names carry a never-reused sequence, so no two commits of
+    /// this writer can publish the same bytes. Stores whose entity tags are
+    /// derived from content depend on that to tell versions apart; a change
+    /// that lets a commit republish an identical manifest would silently
+    /// break their compare-and-swap.
     pub async fn commit<F>(&self, mut plan: F) -> Result<Manifest>
     where
         F: FnMut(Option<&Manifest>) -> CommitPlan,
