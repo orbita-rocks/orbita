@@ -53,6 +53,11 @@ without parsing anything.
 
 Delete `.orbita/dev` to start over, or run `orbita dev --clean`.
 
+That cargo line is fine for trying the thing out. If you are going to change
+the code, read `docs/BUILD.md` first: the build and the test suites run through
+moon, which is also what CI runs, so it is how you find out whether a change
+holds up before you push it.
+
 ## A cluster on Docker Compose
 
 Three leader group members, three workers, and MinIO standing in for S3.

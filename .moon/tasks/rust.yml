@@ -1,0 +1,97 @@
+# https://moonrepo.dev/docs/config/tasks
+$schema: 'https://moonrepo.dev/schemas/tasks.json'
+
+# Who gets these. The filename is documentation and nothing else: moon matches
+# on this setting, so without it every project inherits the file, and the
+# Python end-to-end suite ends up with a `cargo build -p e2e` and a `test` task
+# merged into nonsense.
+inheritedBy:
+  toolchain: 'rust'
+
+# Every crate under crates/ inherits these. Nothing here is crate-specific on
+# purpose: a new crate gets fmt, lint, test, and build the moment its directory
+# exists, with no file to add and nothing to remember.
+#
+# The one thing a crate does have to write down is its dependencies, in a
+# `dependsOn` in its own moon.yml. That is a duplicate of what its Cargo.toml
+# already says, and it is here under protest.
+#
+# moon infers implicit dependencies from the language's manifest, but its Rust
+# toolchain plugin only follows a dependency written as `path = "..."` in the
+# crate's own manifest:
+#
+#   https://github.com/moonrepo/plugins/blob/master/toolchains/rust/src/tier2.rs
+#
+# Every internal dependency here is written `orbita-core.workspace = true`, so
+# the path lives in the root manifest under [workspace.dependencies] and the
+# plugin does not follow it. Left alone, moon sees a workspace of ten crates
+# that depend on nothing.
+#
+# That does not affect CI, which runs every crate every time. It affects
+# `--affected`, which is the reason to reach for moon over cargo on a laptop: a
+# graph with no edges means a change to orbita-core looks like it touches
+# nothing downstream. So: if you add a crate dependency to a Cargo.toml, add it
+# here too.
+
+fileGroups:
+  sources:
+    - 'src/**/*'
+    # A glob rather than the literal `build.rs`, so the crates that do not have
+    # one match nothing instead of warning about a missing input on every run.
+    # Nothing else lives at a crate root.
+    - '*.rs'
+  tests:
+    - 'tests/**/*'
+    - 'benches/**/*'
+  # The three files that change the meaning of a build without appearing in any
+  # crate: the workspace manifest, the locked dependency versions, and the
+  # compiler. A task that ignores them reports a cache hit across a dependency
+  # bump, which is the one wrong answer that matters.
+  manifests:
+    - 'Cargo.toml'
+    - '/Cargo.toml'
+    - '/Cargo.lock'
+    - '/rust-toolchain.toml'
+
+taskOptions:
+  # Every crate compiles into the one workspace target directory, and cargo
+  # holds an exclusive lock on it. Without this, moon starts ten cargo
+  # processes that immediately sit and wait on each other, and the output is a
+  # wall of "Blocking waiting for file lock". One at a time is not slower, it
+  # is the same work with a readable log.
+  mutex: 'cargo'
+
+tasks:
+  fmt:
+    command: 'cargo fmt -p $project -- --check'
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+
+  lint:
+    # `-D warnings` lives here rather than in CI's environment so that the
+    # clippy a developer runs is the clippy that gates the merge.
+    command: 'cargo clippy -p $project --all-targets --all-features -- -D warnings'
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+      - '@group(manifests)'
+
+  test:
+    command: 'cargo test -p $project --all-features'
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+      - '@group(manifests)'
+
+  build:
+    command: 'cargo build -p $project'
+    inputs:
+      - '@group(sources)'
+      - '@group(manifests)'
+    options:
+      # Caching a build whose artifacts moon does not own is a lie waiting to
+      # happen: delete target/ and a cached task reports success over a binary
+      # that is not there. cargo is already incremental, so there is nothing to
+      # win here anyway.
+      cache: false

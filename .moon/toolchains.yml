@@ -1,0 +1,34 @@
+# https://moonrepo.dev/docs/config/toolchain
+$schema: 'https://moonrepo.dev/schemas/toolchains.json'
+
+# Registering the Rust toolchain is what gives tasks the cargo environment and
+# marks these projects as Rust, which is how .moon/tasks/rust.yml reaches them.
+#
+# There is deliberately no `version` here, and `moon toolchain add rust` will
+# put one back if you rerun it. rust-toolchain.toml already pins the compiler
+# and rustup already installs it. Setting a version here hands the install to
+# proto, which reads rust-toolchain.toml as a version file and produces a
+# toolchain with no cargo in it.
+rust: {}
+
+# The end-to-end suite runs from here. Unlike Rust, nothing in this repo
+# already owned the Python version, so pinning it here replaces the one that
+# used to live in the CI workflow and nowhere else. moon installs it, which is
+# why that workflow no longer has a setup-python step.
+#
+# This does the version and nothing else. moon has plugins that would also own
+# the virtualenv and the dependency install, but all three of them (pip, uv,
+# poetry) declare a dependency on a toolchain id that no longer exists:
+#
+#   https://github.com/moonrepo/plugins/blob/master/toolchains/python-pip/src/tier2.rs
+#
+# They only load if this block is renamed to `unstable_python`, which is a
+# workaround that breaks the day it is fixed upstream. So tests/e2e/moon.yml
+# still makes its own virtualenv, and the toolchain puts it on PATH.
+#
+# Pinned to an exact plugin release because this one is still 0.x.
+python:
+  plugin: 'github://moonrepo/plugins/python_toolchain@python_toolchain-v0.2.0'
+  version: '3.12'
+
+
