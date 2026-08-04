@@ -160,11 +160,7 @@ impl ClusterState {
         let mut candidates: Vec<(usize, NodeId)> = self
             .nodes
             .values()
-            .filter(|n| {
-                n.role == NodeRole::Worker
-                    && n.health == NodeHealth::Healthy
-                    && self.compatibility_refusal(n.speaks).is_none()
-            })
+            .filter(|n| self.new_ownership_eligibility(n.id).is_ok())
             .map(|n| (self.map.held_by(n.id).count(), n.id))
             .collect();
         candidates.sort_unstable();
@@ -266,11 +262,23 @@ impl ClusterState {
         })
     }
 
-    fn ensure_compatible_node(&self, node: NodeId) -> Result<()> {
+    /// Checks the one eligibility rule used by every new ownership path.
+    pub(crate) fn new_ownership_eligibility(&self, node: NodeId) -> Result<()> {
         let record = self
             .nodes
             .get(&node)
             .ok_or_else(|| Error::InvalidArgument(format!("unknown node {node}")))?;
+        if record.role != NodeRole::Worker {
+            return Err(Error::InvalidArgument(format!(
+                "node {node} cannot receive ownership because it is not a worker"
+            )));
+        }
+        if record.health != NodeHealth::Healthy {
+            return Err(Error::InvalidArgument(format!(
+                "node {node} cannot receive ownership while it is {:?}",
+                record.health
+            )));
+        }
         if let Some(refusal) = self.compatibility_refusal(record.speaks) {
             return Err(Error::InvalidArgument(format!(
                 "node {node} cannot receive ownership: {refusal}"
@@ -345,10 +353,10 @@ impl ClusterState {
             (*id, *created_at_millis, *first_partition, *owner);
         let name = KeyspaceName::new(name).map_err(|e| Error::InvalidArgument(e.to_string()))?;
         if let Some(owner) = owner {
-            self.ensure_compatible_node(owner)?;
+            self.new_ownership_eligibility(owner)?;
         }
         for replica in replicas {
-            self.ensure_compatible_node(*replica)?;
+            self.new_ownership_eligibility(*replica)?;
         }
         if self.keyspaces.values().any(|k| k.name == name) {
             return Err(Error::KeyspaceAlreadyExists);
@@ -538,10 +546,10 @@ impl ClusterState {
                 "the owner must not also be listed as a replica".into(),
             ));
         }
-        self.ensure_compatible_node(owner)?;
+        self.new_ownership_eligibility(owner)?;
         for replica in replicas {
             if !info.replicas.contains(replica) {
-                self.ensure_compatible_node(*replica)?;
+                self.new_ownership_eligibility(*replica)?;
             }
         }
         info.owner = Some(owner);
@@ -566,7 +574,7 @@ impl ClusterState {
         }
         for replica in replicas {
             if !info.replicas.contains(replica) {
-                self.ensure_compatible_node(*replica)?;
+                self.new_ownership_eligibility(*replica)?;
             }
         }
         info.replicas = replicas.to_vec();

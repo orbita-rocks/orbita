@@ -442,6 +442,57 @@ fn the_most_caught_up_replica_is_the_one_promoted() {
 }
 
 #[test]
+fn a_compatible_replica_beats_an_incompatible_replica_with_more_progress() {
+    check_seeds(
+        "a_compatible_replica_beats_an_incompatible_replica_with_more_progress",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let before = cluster.map().partition(partition).unwrap().clone();
+            let deposed = before.owner.expect("an owner");
+            let compatible = before.replicas[0];
+            let incompatible = before.replicas[1];
+
+            cluster.report_speaks(compatible, NodeRole::Worker, upgraded_speaks());
+            cluster.set_progress(compatible, 10);
+            cluster.set_progress(incompatible, 900);
+
+            let previous = binary_speaks().max;
+            let controller = cluster.controller.clone();
+            cluster
+                .sim
+                .block_on(async move {
+                    controller
+                        .submit(ControlCommand::SetClusterVersion {
+                            version: upgraded_speaks().max,
+                            expect: previous,
+                        })
+                        .await
+                })
+                .expect("advancing the test cluster version");
+
+            cluster.sim.crash(deposed);
+            let promoted = cluster.run_until(Duration::from_secs(10), |c| {
+                c.owner_of(partition).is_some_and(|owner| owner != deposed)
+            });
+            if !promoted {
+                return Err(cluster
+                    .sim
+                    .failure("the incompatible high-progress replica blocked every promotion"));
+            }
+            let owner = cluster.owner_of(partition);
+            if owner != Some(compatible) {
+                return Err(cluster.sim.failure(format!(
+                    "promoted {owner:?}; expected compatible node {compatible} instead of incompatible node {incompatible}"
+                )));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
 fn a_promotion_waits_out_the_deposed_owners_read_leases() {
     check_seeds(
         "a_promotion_waits_out_the_deposed_owners_read_leases",
@@ -867,6 +918,72 @@ fn a_dead_node_does_not_pin_the_cluster_to_the_old_version() {
         .block_on(async move { controller.finalize_upgrade().await })
         .expect("a dead node must not block the finalize");
     assert_eq!(finalized.active, upgraded_speaks().max);
+}
+
+#[test]
+fn an_incompatible_existing_owner_stays_live_while_its_heartbeats_continue() {
+    check_seeds(
+        "an_incompatible_existing_owner_stays_live_while_its_heartbeats_continue",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let owner = cluster.owner_of(partition).expect("an owner");
+            let previous = binary_speaks().max;
+            let active = ClusterVersion::new(previous.major, previous.minor + 1);
+            let controller = cluster.controller.clone();
+            cluster
+                .sim
+                .block_on(async move {
+                    controller
+                        .submit(ControlCommand::SetClusterVersion {
+                            version: active,
+                            expect: previous,
+                        })
+                        .await
+                })
+                .expect("advancing the test cluster version");
+
+            cluster.set_progress(owner, 77);
+            let dead_after = cluster.controller.config().dead_after;
+            cluster.sim.run_for(dead_after * 3);
+
+            let controller = cluster.controller.clone();
+            let health = cluster.sim.block_on(async move {
+                controller
+                    .snapshot()
+                    .await
+                    .node(owner)
+                    .map(|record| record.health)
+            });
+            if health != Some(orbita_control::NodeHealth::Healthy) {
+                return Err(cluster.sim.failure(format!(
+                    "heartbeating incompatible owner {owner} aged to {health:?}"
+                )));
+            }
+            if cluster.owner_of(partition) != Some(owner) {
+                return Err(cluster
+                    .sim
+                    .failure("a live incompatible owner lost its existing ownership"));
+            }
+            let controller = cluster.controller.clone();
+            let progress = cluster.sim.block_on(async move {
+                controller
+                    .view()
+                    .await
+                    .partitions
+                    .into_iter()
+                    .find(|view| view.info.id == partition)
+                    .map(|view| view.committed_lamport)
+            });
+            if progress != Some(Lamport(77)) {
+                return Err(cluster.sim.failure(format!(
+                    "incompatible owner's heartbeat progress was not retained: {progress:?}"
+                )));
+            }
+            Ok(())
+        },
+    );
 }
 
 #[test]

@@ -371,34 +371,40 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         status: NodeStatus,
     ) -> Result<RegistrationOutcome> {
         let now = self.runtime.clock().monotonic_nanos();
-        let (needs_registration, needs_revival) = {
+        let (known, mut refusal) = {
             let mut inner = self.inner.lock().await;
-            if let Some(refusal) = inner.state.compatibility_refusal(status.speaks) {
+            let known = inner.state.node(node).cloned();
+            let refusal = inner.state.compatibility_refusal(status.speaks);
+            if known.is_some() || refusal.is_none() {
+                inner.observations.insert(
+                    node,
+                    Observation {
+                        heard_at_nanos: now,
+                        status: status.clone(),
+                    },
+                );
+            }
+            (known, refusal)
+        };
+        let known_member = known.is_some();
+        if !known_member {
+            if let Some(refusal) = refusal {
                 return Ok(RegistrationOutcome::Incompatible(refusal));
             }
-            let known = inner.state.node(node).cloned();
-            inner.observations.insert(
-                node,
-                Observation {
-                    heard_at_nanos: now,
-                    status: status.clone(),
-                },
-            );
-            match known {
-                None => (true, false),
-                Some(record) => (
-                    // A changed speakable range is a re-registration too: it
-                    // is what a rolling update looks like from here, and
-                    // finalize-upgrade decides from the stored range.
-                    record.address != status.address
-                        || record.role != status.role
-                        || record.speaks != status.speaks,
-                    record.health != NodeHealth::Healthy,
-                ),
-            }
-        };
+        }
+        // A changed speakable range is a re-registration too: it is what a
+        // rolling update looks like from here, and finalize-upgrade decides
+        // from the stored range.
+        let needs_registration = known.as_ref().is_none_or(|record| {
+            record.address != status.address
+                || record.role != status.role
+                || record.speaks != status.speaks
+        });
+        let needs_revival = known
+            .as_ref()
+            .is_some_and(|record| record.health != NodeHealth::Healthy);
 
-        if needs_registration {
+        if needs_registration && refusal.is_none() {
             if let Err(error) = self
                 .submit(ControlCommand::RegisterNode {
                     node,
@@ -412,11 +418,13 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 // authority, and this read turns its refusal back into the
                 // same structured answer as the fast path above.
                 let mut inner = self.inner.lock().await;
-                if let Some(refusal) = inner.state.compatibility_refusal(status.speaks) {
-                    inner.observations.remove(&node);
-                    return Ok(RegistrationOutcome::Incompatible(refusal));
+                refusal = inner.state.compatibility_refusal(status.speaks);
+                if refusal.is_none() {
+                    return Err(error);
                 }
-                return Err(error);
+                if !known_member {
+                    inner.observations.remove(&node);
+                }
             }
         }
         if needs_revival {
@@ -429,7 +437,10 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             .await?;
         }
 
-        Ok(RegistrationOutcome::Accepted(self.map_version().await))
+        match refusal {
+            Some(refusal) => Ok(RegistrationOutcome::Incompatible(refusal)),
+            None => Ok(RegistrationOutcome::Accepted(self.map_version().await)),
+        }
     }
 
     /// Creates the first keyspace of a fresh cluster, with its single
@@ -927,7 +938,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     // until somebody reports.
                     tracing::warn!(
                         partition = %info.id,
-                        "no replica has reported a durable position; not promoting"
+                        "no eligible replica has reported a durable position; not promoting"
                     );
                     continue;
                 };
@@ -958,7 +969,11 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     tracing::info!(%partition, %owner, "promoted a replica to owner");
                     self.inner.lock().await.fenced_since.remove(&partition);
                 }
-                Err(Error::StaleEpoch { .. } | Error::InvalidArgument(_)) => {}
+                Err(Error::StaleEpoch { .. }) => {}
+                Err(e @ Error::InvalidArgument(_)) => {
+                    tracing::warn!(%partition, %owner, error = %e, "selected owner was refused");
+                    return Err(e);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1062,7 +1077,8 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     }
 }
 
-/// The most caught-up healthy replica, or `None` if nobody has reported.
+/// The most caught-up replica eligible for new ownership, or `None` if none
+/// has reported.
 ///
 /// Highest durable Lamport wins, because that is what bounds the writes the
 /// cluster has acknowledged: the WAL acknowledges at two of three, so any
@@ -1072,11 +1088,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 fn best_candidate(inner: &Inner, info: &PartitionInfo) -> Option<NodeId> {
     let mut best: Option<(Lamport, NodeId)> = None;
     for replica in &info.replicas {
-        let healthy = inner
-            .state
-            .node(*replica)
-            .is_some_and(|n| n.health == NodeHealth::Healthy);
-        if !healthy {
+        if inner.state.new_ownership_eligibility(*replica).is_err() {
             continue;
         }
         let Some(progress) = inner
