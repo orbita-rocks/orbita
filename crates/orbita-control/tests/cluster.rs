@@ -12,9 +12,9 @@
 //! split brain.
 
 use orbita_control::{
-    BootstrapSpec, ClusterState, ConsensusLog, ControlClient, ControlCommand, ControlConfig,
-    ControlService, Controller, KeyspaceConfig, NodeRole, NodeStatus, PartitionProgress,
-    SingleNodeLog,
+    binary_speaks, BootstrapSpec, ClusterState, ClusterVersion, ConsensusLog, ControlClient,
+    ControlCommand, ControlConfig, ControlService, Controller, KeyspaceConfig, NodeRole,
+    NodeStatus, PartitionProgress, SingleNodeLog, VersionRange,
 };
 use orbita_core::{Epoch, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
 use orbita_runtime::{Clock, Runtime, ServiceId, Transport};
@@ -136,6 +136,7 @@ impl Cluster {
                     role: NodeRole::Worker,
                     address: format!("10.0.0.{node}:7000"),
                     map_version: map.version(),
+                    speaks: orbita_control::binary_speaks(),
                     partitions,
                 };
                 let _ = controller.record_status(node, status).await;
@@ -186,6 +187,30 @@ impl Cluster {
                 .map(|entry| entry.command)
                 .collect()
         })
+    }
+
+    /// Reports a heartbeat for `node` claiming it can speak `speaks`, which
+    /// is what a node whose binary was replaced under it does. Applied
+    /// synchronously, with no virtual time advanced, so the harness's own
+    /// heartbeat loops cannot overwrite it before an assertion runs.
+    fn report_speaks(&self, node: NodeId, role: NodeRole, speaks: VersionRange) {
+        let controller = self.controller.clone();
+        self.sim
+            .block_on(async move {
+                controller
+                    .record_status(
+                        node,
+                        NodeStatus {
+                            role,
+                            address: format!("10.0.0.{node}:7000"),
+                            map_version: MapVersion::default(),
+                            speaks,
+                            partitions: vec![],
+                        },
+                    )
+                    .await
+            })
+            .expect("recording a status report");
     }
 
     /// Runs until `ready` holds or `limit` of virtual time has passed.
@@ -703,6 +728,147 @@ fn a_credential_round_trips_through_the_replicated_log() {
     assert!(checks.2.is_err(), "a read credential cannot write");
 }
 
+/// The window an upgraded binary one minor ahead of this one would report.
+fn upgraded_speaks() -> VersionRange {
+    let own = binary_speaks().max;
+    VersionRange::new(own, ClusterVersion::new(own.major, own.minor + 1))
+}
+
+#[test]
+fn a_fresh_cluster_starts_at_the_bootstrapping_binarys_version() {
+    let cluster = Cluster::start(20);
+    let controller = cluster.controller.clone();
+    let version = cluster
+        .sim
+        .block_on(async move { controller.cluster_version().await });
+    assert_eq!(version, binary_speaks().max);
+
+    // The log entry matters independently of the value: bootstrap must have
+    // committed the version rather than left the state machine on its
+    // default, or a member replaying the log could not agree on it.
+    let set_at_bootstrap = cluster.entries().into_iter().any(|command| {
+        command
+            == ControlCommand::SetClusterVersion {
+                version: binary_speaks().max,
+                expect: ClusterVersion::ZERO,
+            }
+    });
+    assert!(
+        set_at_bootstrap,
+        "bootstrap did not commit a cluster version"
+    );
+}
+
+#[test]
+fn finalizing_with_nothing_newer_to_speak_is_refused_with_a_reason() {
+    // Every node is on the same binary as the cluster version, so there is
+    // nothing to finalize, and the operator should be told that rather than
+    // shown a silent no-op that leaves them wondering if it worked.
+    let cluster = Cluster::start(21);
+    let controller = cluster.controller.clone();
+    let refused = cluster
+        .sim
+        .block_on(async move { controller.finalize_upgrade().await });
+    let Err(orbita_core::Error::InvalidArgument(reason)) = refused else {
+        panic!("expected a refusal, got {refused:?}");
+    };
+    assert!(reason.contains("already at"), "{reason}");
+}
+
+#[test]
+fn finalizing_advances_once_every_live_node_reports_the_new_window() {
+    let cluster = Cluster::start(22);
+    let before = binary_speaks().max;
+
+    cluster.report_speaks(LEADER, NodeRole::Leader, upgraded_speaks());
+    for worker in WORKERS {
+        cluster.report_speaks(worker, NodeRole::Worker, upgraded_speaks());
+    }
+
+    let controller = cluster.controller.clone();
+    let finalized = cluster
+        .sim
+        .block_on(async move { controller.finalize_upgrade().await })
+        .expect("every node can speak the new version");
+    assert_eq!(finalized.previous, before);
+    assert_eq!(finalized.active, upgraded_speaks().max);
+
+    // The advance is a committed log entry, not leader-local state: a member
+    // that replays the log must land on the same version.
+    let advances = cluster
+        .entries()
+        .into_iter()
+        .filter(|command| {
+            matches!(
+                command,
+                ControlCommand::SetClusterVersion { version, .. }
+                    if *version == upgraded_speaks().max
+            )
+        })
+        .count();
+    assert_eq!(advances, 1);
+}
+
+#[test]
+fn a_node_that_cannot_speak_the_new_version_blocks_the_finalize_by_name() {
+    let cluster = Cluster::start(23);
+    let before = binary_speaks().max;
+
+    cluster.report_speaks(LEADER, NodeRole::Leader, upgraded_speaks());
+    // Workers 2 and 3 are upgraded; worker 4 is still on the old binary.
+    cluster.report_speaks(WORKERS[0], NodeRole::Worker, upgraded_speaks());
+    cluster.report_speaks(WORKERS[1], NodeRole::Worker, upgraded_speaks());
+
+    let controller = cluster.controller.clone();
+    let refused = cluster
+        .sim
+        .block_on(async move { controller.finalize_upgrade().await });
+    let Err(orbita_core::Error::InvalidArgument(reason)) = refused else {
+        panic!("expected a refusal, got {refused:?}");
+    };
+    assert!(
+        reason.contains(&format!("node {}", WORKERS[2])),
+        "the error must name the node holding the upgrade back: {reason}"
+    );
+
+    let controller = cluster.controller.clone();
+    let version = cluster
+        .sim
+        .block_on(async move { controller.cluster_version().await });
+    assert_eq!(version, before, "nothing may be committed on a refusal");
+}
+
+#[test]
+fn a_dead_node_does_not_pin_the_cluster_to_the_old_version() {
+    // A node that failover already wrote off must not get a vote, or losing a
+    // node during an upgrade would leave the cluster unable to ever finalize.
+    let cluster = Cluster::start(24);
+    let doomed = WORKERS[2];
+    cluster.sim.crash(doomed);
+    let died = cluster.run_until(Duration::from_secs(10), |c| {
+        let controller = c.controller.clone();
+        c.sim.block_on(async move {
+            controller
+                .snapshot()
+                .await
+                .node(doomed)
+                .is_some_and(|n| n.health == orbita_control::NodeHealth::Dead)
+        })
+    });
+    assert!(died, "the crashed worker was never declared dead");
+
+    cluster.report_speaks(LEADER, NodeRole::Leader, upgraded_speaks());
+    cluster.report_speaks(WORKERS[0], NodeRole::Worker, upgraded_speaks());
+    cluster.report_speaks(WORKERS[1], NodeRole::Worker, upgraded_speaks());
+
+    let controller = cluster.controller.clone();
+    let finalized = cluster
+        .sim
+        .block_on(async move { controller.finalize_upgrade().await })
+        .expect("a dead node must not block the finalize");
+    assert_eq!(finalized.active, upgraded_speaks().max);
+}
+
 /// Kept separate from the scenarios so a failure points at the harness rather
 /// than at the system under test.
 #[test]
@@ -862,6 +1028,7 @@ fn a_worker_reaches_the_leader_group_over_the_transport() {
                         role: NodeRole::Worker,
                         address: "10.0.0.2:7000".into(),
                         map_version: MapVersion::default(),
+                        speaks: orbita_control::binary_speaks(),
                         partitions: vec![],
                     },
                 )

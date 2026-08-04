@@ -19,6 +19,7 @@
 use crate::command::ControlCommand;
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Credential, Keyspace, KeyspaceConfig};
+use crate::version::{ClusterVersion, VersionRange};
 
 use orbita_core::{
     Epoch, Error, KeyRange, KeyspaceId, KeyspaceName, MapVersion, NodeId, PartitionId,
@@ -53,6 +54,9 @@ pub struct NodeRecord {
     pub role: NodeRole,
     pub address: String,
     pub health: NodeHealth,
+    /// The cluster versions this node's binary asserted it can speak, from
+    /// its registration. What `finalize-upgrade` checks a target against.
+    pub speaks: VersionRange,
 }
 
 /// Everything the leader group knows, as of some prefix of the log.
@@ -65,6 +69,12 @@ pub struct ClusterState {
     credentials: BTreeMap<String, Credential>,
     next_keyspace_id: u64,
     next_partition_id: u64,
+    /// The active cluster version. Bootstrap sets it to the bootstrapping
+    /// binary's own version in the same breath as the first keyspace. A state
+    /// recovered from a 0.0 cluster legitimately holds
+    /// `ClusterVersion::ZERO`, so ZERO cannot be read as "bootstrap never
+    /// ran"; `is_fresh` answers that question.
+    version: ClusterVersion,
 }
 
 impl ClusterState {
@@ -168,7 +178,8 @@ impl ClusterState {
                 node,
                 role,
                 address,
-            } => self.register_node(*node, *role, address),
+                speaks,
+            } => self.register_node(*node, *role, address, *speaks),
             ControlCommand::SetHealth { node, health } => self.set_health(*node, *health),
             ControlCommand::ForgetNode { node } => self.forget_node(*node),
             ControlCommand::CreateKeyspace { .. } => self.create_keyspace(command),
@@ -200,6 +211,9 @@ impl ClusterState {
                 upper,
                 expect_epoch,
             } => self.split_partition(*parent, at.clone(), *lower, *upper, *expect_epoch),
+            ControlCommand::SetClusterVersion { version, expect } => {
+                self.set_cluster_version(*version, *expect)
+            }
         }
     }
 
@@ -208,7 +222,13 @@ impl ClusterState {
         self.map.set_version(next);
     }
 
-    fn register_node(&mut self, node: NodeId, role: NodeRole, address: &str) -> Result<()> {
+    fn register_node(
+        &mut self,
+        node: NodeId,
+        role: NodeRole,
+        address: &str,
+        speaks: VersionRange,
+    ) -> Result<()> {
         let entry = self.nodes.entry(node).or_insert_with(|| NodeRecord {
             id: node,
             role,
@@ -216,9 +236,37 @@ impl ClusterState {
             // A node that has just told us it exists has, by that fact, been
             // heard from.
             health: NodeHealth::Healthy,
+            speaks,
         });
         entry.role = role;
         entry.address = address.to_string();
+        entry.speaks = speaks;
+        Ok(())
+    }
+
+    /// Advances the active cluster version.
+    ///
+    /// Backwards is refused here rather than left to the proposer, because
+    /// after finalization nodes write formats the old version cannot read;
+    /// a committed step backwards would be an instruction to corrupt.
+    fn set_cluster_version(
+        &mut self,
+        version: ClusterVersion,
+        expect: ClusterVersion,
+    ) -> Result<()> {
+        if self.version != expect {
+            return Err(Error::InvalidArgument(format!(
+                "the cluster version is {}, not {expect}; re-read and retry",
+                self.version
+            )));
+        }
+        if version <= self.version && self.version != ClusterVersion::ZERO {
+            return Err(Error::InvalidArgument(format!(
+                "the cluster version can only advance; it is {} and {version} is not newer",
+                self.version
+            )));
+        }
+        self.version = version;
         Ok(())
     }
 
@@ -533,6 +581,13 @@ impl ClusterState {
     pub fn map_version(&self) -> MapVersion {
         self.map.version()
     }
+
+    /// The active cluster version: what every node has agreed to speak, and
+    /// the thing `finalize-upgrade` advances.
+    #[must_use]
+    pub fn cluster_version(&self) -> ClusterVersion {
+        self.version
+    }
 }
 
 #[cfg(test)]
@@ -546,6 +601,7 @@ mod tests {
             node: NodeId(id),
             role: NodeRole::Worker,
             address: format!("10.0.0.{id}:7000"),
+            speaks: crate::version::binary_speaks(),
         }
     }
 
@@ -887,6 +943,78 @@ mod tests {
             state.map_version() > before,
             "a worker decides what to keep by comparing versions"
         );
+    }
+
+    #[test]
+    fn a_fresh_cluster_takes_its_first_version_without_needing_one_to_advance_from() {
+        let mut state = ClusterState::new();
+        assert_eq!(state.cluster_version(), ClusterVersion::ZERO);
+        state
+            .apply(&ControlCommand::SetClusterVersion {
+                version: ClusterVersion::new(0, 1),
+                expect: ClusterVersion::ZERO,
+            })
+            .unwrap();
+        assert_eq!(state.cluster_version(), ClusterVersion::new(0, 1));
+    }
+
+    #[test]
+    fn the_cluster_version_only_advances() {
+        let mut state = ClusterState::new();
+        state
+            .apply(&ControlCommand::SetClusterVersion {
+                version: ClusterVersion::new(0, 2),
+                expect: ClusterVersion::ZERO,
+            })
+            .unwrap();
+
+        // Backwards would tell nodes to write a format the version they came
+        // from cannot read, so the state machine refuses rather than trusting
+        // every proposer to know that.
+        let back = state.apply(&ControlCommand::SetClusterVersion {
+            version: ClusterVersion::new(0, 1),
+            expect: ClusterVersion::new(0, 2),
+        });
+        assert!(back.is_err());
+        assert_eq!(state.cluster_version(), ClusterVersion::new(0, 2));
+    }
+
+    #[test]
+    fn a_version_advance_against_a_stale_expectation_is_refused() {
+        // Two operators finalizing at once: the second proposal names the
+        // version the first one already replaced, and must fail rather than
+        // advance a second time.
+        let mut state = ClusterState::new();
+        state
+            .apply(&ControlCommand::SetClusterVersion {
+                version: ClusterVersion::new(0, 2),
+                expect: ClusterVersion::ZERO,
+            })
+            .unwrap();
+        let raced = state.apply(&ControlCommand::SetClusterVersion {
+            version: ClusterVersion::new(0, 3),
+            expect: ClusterVersion::ZERO,
+        });
+        assert!(raced.is_err());
+        assert_eq!(state.cluster_version(), ClusterVersion::new(0, 2));
+    }
+
+    #[test]
+    fn re_registering_updates_the_versions_a_node_can_speak() {
+        // This is what a rolling update looks like to the state machine: the
+        // same node comes back asserting a newer window.
+        let mut state = ClusterState::new();
+        state.apply(&worker(1)).unwrap();
+        let upgraded = VersionRange::new(ClusterVersion::new(0, 9), ClusterVersion::new(0, 10));
+        state
+            .apply(&ControlCommand::RegisterNode {
+                node: NodeId(1),
+                role: NodeRole::Worker,
+                address: "10.0.0.1:7000".into(),
+                speaks: upgraded,
+            })
+            .unwrap();
+        assert_eq!(state.node(NodeId(1)).unwrap().speaks, upgraded);
     }
 
     #[test]

@@ -13,7 +13,55 @@ authors.workspace = true
 # about `orbita-core`'s types that we are not ready to make.
 publish = false
 
+[features]
+# The S3-compatible store: SigV4 signing, request shaping, and response
+# mapping, over the crate's own `HttpTransport` seam. Pure logic, no sockets.
+s3 = ["dep:hmac", "dep:sha2", "dep:percent-encoding", "dep:quick-xml"]
+# The production HTTP transport, built on hyper and rustls. Split from `s3` so
+# a simulator can drive the store through its own transport without linking a
+# TLS stack it will never use.
+hyper-client = [
+    "s3",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:tokio",
+]
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+
+# The `s3` feature. hmac and sha2 are the whole of SigV4; quick-xml parses the
+# one XML response (ListObjectsV2) rather than trusting a hand-rolled scanner
+# with entity escapes in keys.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+percent-encoding = { version = "2", optional = true }
+quick-xml = { version = "0.38", optional = true }
+
+# The `hyper-client` feature. hyper, http, and hyper-util are already in the
+# tree via tonic; rustls is pinned to ring and webpki roots so the image build
+# does not grow a cmake dependency for aws-lc.
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["http1", "client"], optional = true }
+hyper-util = { version = "0.1", features = [
+    "client-legacy",
+    "http1",
+    "tokio",
+], optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "http1",
+    "tls12",
+    "logging",
+    "ring",
+    "webpki-roots",
+], optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

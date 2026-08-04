@@ -9,9 +9,10 @@
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::membership::NodeStatus;
+use crate::version::ClusterVersion;
 use crate::wire::{
     ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
@@ -95,25 +96,61 @@ impl<R: Runtime> ControlClient<R> {
     /// node out of the failure detector, and the progress it carries is what
     /// the leader group uses to choose a replacement owner if it stops.
     pub async fn report_status(&self, node: NodeId, status: NodeStatus) -> Result<()> {
-        let payload = ReportStatusRequest { node, status }.encode();
-        match self.call(METHOD_REPORT_STATUS, payload).await? {
-            ControlResponse::Accepted { .. } => Ok(()),
-            other => Err(unexpected(&other)),
-        }
+        self.send_status(node, status).await.map(|_| ())
     }
 
-    /// The same as [`ControlClient::report_status`], but hands back the map
-    /// version the leader group is on so a caller can tell in one round trip
-    /// whether its routing is stale.
+    /// The same as [`ControlClient::report_status`], but hands back what the
+    /// leader group said yes with: the map version it is on, so a caller can
+    /// tell in one round trip whether its routing is stale, and the active
+    /// cluster version, which is how a node learns what to speak. The
+    /// version is `None` when the leader that answered predates versions.
     pub async fn report_status_for_version(
         &self,
         node: NodeId,
         status: NodeStatus,
-    ) -> Result<MapVersion> {
-        let payload = ReportStatusRequest { node, status }.encode();
-        match self.call(METHOD_REPORT_STATUS, payload).await? {
-            ControlResponse::Accepted { map_version } => Ok(map_version),
-            other => Err(unexpected(&other)),
+    ) -> Result<(MapVersion, Option<ClusterVersion>)> {
+        self.send_status(node, status).await
+    }
+
+    /// Sends a report on the version-aware method, falling back to the
+    /// v0.0.1 method when the leader does not serve it.
+    ///
+    /// The fallback is what keeps heartbeats landing mid-rollout: without it,
+    /// an upgraded worker reporting to a not-yet-upgraded leader would be
+    /// undecodable and drop out of the failure detector for the whole
+    /// rollout. Delete alongside the legacy method when the window moves
+    /// past 0.0.
+    async fn send_status(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+    ) -> Result<(MapVersion, Option<ClusterVersion>)> {
+        let payload = ReportStatusRequest {
+            node,
+            status: status.clone(),
+        }
+        .encode();
+        match self.call(METHOD_REPORT_STATUS_V2, payload).await {
+            Ok(ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            }) => Ok((map_version, cluster_version)),
+            Ok(other) => Err(unexpected(&other)),
+            // "The leader considered this and said no" here means it does not
+            // serve the method at all, which only a v0.0.1 leader says. The
+            // string match is on our own private protocol's fixed refusal, so
+            // it cannot drift without this crate changing both sides.
+            Err(Error::Internal(message)) if message.contains("unknown control method") => {
+                let payload = ReportStatusRequest { node, status }.encode_legacy();
+                match self.call(METHOD_REPORT_STATUS, payload).await? {
+                    ControlResponse::Accepted {
+                        map_version,
+                        cluster_version,
+                    } => Ok((map_version, cluster_version)),
+                    other => Err(unexpected(&other)),
+                }
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -258,4 +295,104 @@ fn unexpected(response: &ControlResponse) -> Error {
     Error::Internal(format!(
         "the leader group answered a different question: {response:?}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::membership::{NodeRole, NodeStatus};
+    use crate::wire::METHOD_REPORT_STATUS_V2;
+
+    use orbita_runtime::{PeerCall, PeerHandler, ServiceId, TransportResult};
+    use orbita_sim::Simulation;
+
+    /// Behaves exactly like a v0.0.1 leader: it does not know the
+    /// version-aware report method, and it decodes and answers the old
+    /// shapes. If the fallback in [`ControlClient::send_status`] regresses,
+    /// heartbeats to a leader like this stop landing mid-rollout.
+    struct V001Leader;
+
+    impl PeerHandler for V001Leader {
+        async fn handle(
+            &self,
+            _from: orbita_runtime::NodeId,
+            call: PeerCall,
+        ) -> TransportResult<bytes::Bytes> {
+            let response = match call.method {
+                METHOD_REPORT_STATUS => match ReportStatusRequest::decode_legacy(&call.payload) {
+                    // Decoding with the old shape is the assertion that the
+                    // fallback re-encoded without the speakable range.
+                    Ok(_) => ControlResponse::Accepted {
+                        map_version: MapVersion(9),
+                        cluster_version: None,
+                    },
+                    Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
+                },
+                other => ControlResponse::Error(format!("unknown control method {other}")),
+            };
+            Ok(response.encode())
+        }
+    }
+
+    #[test]
+    fn a_report_to_a_v0_0_1_leader_falls_back_to_the_shape_it_understands() {
+        let sim = Simulation::new(1);
+        let leader = sim.add_node(NodeId(1));
+        let worker = sim.add_node(NodeId(2));
+        orbita_runtime::Transport::register(leader.transport(), ServiceId::Control, V001Leader);
+
+        let client = ControlClient::new(worker, vec![NodeId(1)]);
+        let result = sim.block_on(async move {
+            client
+                .report_status_for_version(
+                    NodeId(2),
+                    NodeStatus::joining(NodeRole::Worker, "10.0.0.2:7000"),
+                )
+                .await
+        });
+
+        assert_eq!(
+            result,
+            Ok((MapVersion(9), None)),
+            "the report must land through the legacy method, with no version learned"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_method_triggers_the_fallback() {
+        // A leader that serves the v2 method but refuses the report must not
+        // be retried on the legacy method: the refusal is an answer, and
+        // retrying it in an older shape could turn one rejection into two
+        // registrations.
+        struct RefusingLeader;
+        impl PeerHandler for RefusingLeader {
+            async fn handle(
+                &self,
+                _from: orbita_runtime::NodeId,
+                call: PeerCall,
+            ) -> TransportResult<bytes::Bytes> {
+                let response = match call.method {
+                    METHOD_REPORT_STATUS_V2 => ControlResponse::Error("no".into()),
+                    other => panic!("the legacy method must not be tried, got {other}"),
+                };
+                Ok(response.encode())
+            }
+        }
+
+        let sim = Simulation::new(2);
+        let leader = sim.add_node(NodeId(1));
+        let worker = sim.add_node(NodeId(2));
+        orbita_runtime::Transport::register(leader.transport(), ServiceId::Control, RefusingLeader);
+
+        let client = ControlClient::new(worker, vec![NodeId(1)]);
+        let result = sim.block_on(async move {
+            client
+                .report_status_for_version(
+                    NodeId(2),
+                    NodeStatus::joining(NodeRole::Worker, "10.0.0.2:7000"),
+                )
+                .await
+        });
+        assert!(matches!(result, Err(Error::Internal(_))));
+    }
 }

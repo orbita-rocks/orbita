@@ -200,6 +200,8 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
                     NodeHealth::Dead => pb::NodeHealth::Dead,
                 } as i32,
                 is_raft_leader: node.is_control_leader,
+                speaks_min: Some(version_message(node.record.speaks.min)),
+                speaks_max: Some(version_message(node.record.speaks.max)),
             })
             .collect();
 
@@ -232,6 +234,18 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         Ok(Response::new(pb::DescribeClusterResponse {
             nodes,
             partitions,
+            cluster_version: Some(version_message(view.cluster_version)),
+        }))
+    }
+
+    async fn finalize_upgrade(
+        &self,
+        _request: Request<pb::FinalizeUpgradeRequest>,
+    ) -> Result<Response<pb::FinalizeUpgradeResponse>, Status> {
+        let finalized = self.controller.finalize_upgrade().await.map_err(status)?;
+        Ok(Response::new(pb::FinalizeUpgradeResponse {
+            previous: Some(version_message(finalized.previous)),
+            active: Some(version_message(finalized.active)),
         }))
     }
 
@@ -284,6 +298,13 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         Ok(Response::new(pb::TransferOwnershipResponse {
             partition: map.partition(partition).map(partition_message),
         }))
+    }
+}
+
+fn version_message(version: crate::version::ClusterVersion) -> pb::ClusterVersion {
+    pb::ClusterVersion {
+        major: version.major,
+        minor: version.minor,
     }
 }
 

@@ -115,6 +115,9 @@ pub struct Server {
     heartbeat: tokio::task::JoinHandle<()>,
     /// Present only for a node joined to a leader group.
     reporting: Option<tokio::task::JoinHandle<()>>,
+    /// The reporting loop's handle, kept so the server can answer which
+    /// cluster version is active. Present only alongside `reporting`.
+    reporter: Option<StatusReporter<ServerRuntime>>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     serving: tokio::task::JoinHandle<()>,
 }
@@ -195,14 +198,17 @@ impl Server {
             node.lease_interval(),
         ));
 
+        let mut reporter = None;
         let reporting = control.map(|client| {
-            let reporter =
-                StatusReporter::new(client.clone(), config.node_id, peer_addr.to_string());
+            let status = StatusReporter::new(client.clone(), config.node_id, peer_addr.to_string());
+            // The server keeps a handle so version-dependent behaviour can
+            // ask which cluster version is active without joining the loop.
+            reporter = Some(status.clone());
             let directory =
                 PeerDirectorySync::new(client, runtime.transport().clone(), config.node_id);
             tokio::spawn(Self::control_loop(
                 Arc::downgrade(&node),
-                reporter,
+                status,
                 directory,
                 config.control_poll_interval,
                 Arc::clone(&readiness),
@@ -246,9 +252,20 @@ impl Server {
             peers,
             heartbeat,
             reporting,
+            reporter,
             shutdown,
             serving,
         })
+    }
+
+    /// The active cluster version this node last learned from the leader
+    /// group, which is the version its behaviour gates on. `None` for a node
+    /// with no leader group, or one whose first heartbeat has not landed.
+    #[must_use]
+    pub fn active_cluster_version(&self) -> Option<orbita_control::ClusterVersion> {
+        self.reporter
+            .as_ref()
+            .and_then(StatusReporter::active_cluster_version)
     }
 
     /// The address clients connect to, which is what was actually bound rather

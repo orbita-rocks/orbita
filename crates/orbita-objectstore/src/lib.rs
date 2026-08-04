@@ -17,6 +17,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "s3")]
+pub mod s3;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::ops::Range;

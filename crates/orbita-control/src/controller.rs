@@ -22,6 +22,7 @@ use crate::consensus::{ConsensusLog, LogIndex};
 use crate::membership::{NodeHealth, NodeRole, NodeStatus};
 use crate::model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 use crate::state::{ClusterState, NodeRecord, PartitionPhase};
+use crate::version::{binary_speaks, ClusterVersion};
 
 use bytes::Bytes;
 use orbita_core::{
@@ -98,6 +99,16 @@ pub struct PartitionView {
 pub struct ClusterView {
     pub nodes: Vec<NodeView>,
     pub partitions: Vec<PartitionView>,
+    /// The active cluster version, so `cluster describe` answers "did the
+    /// finalize land" without a second command.
+    pub cluster_version: ClusterVersion,
+}
+
+/// What `finalize-upgrade` committed: where the cluster was and where it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalizedUpgrade {
+    pub previous: ClusterVersion,
+    pub active: ClusterVersion,
 }
 
 struct Inner {
@@ -238,6 +249,88 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.inner.lock().await.state.map_version()
     }
 
+    /// The active cluster version.
+    pub async fn cluster_version(&self) -> ClusterVersion {
+        self.inner.lock().await.state.cluster_version()
+    }
+
+    /// Advances the active cluster version to the newest one every live node
+    /// can speak, which is what `orbita cluster finalize-upgrade` runs.
+    ///
+    /// Dead nodes do not vote: they are the nodes a failover has already
+    /// written off, and refusing to finalize on their account would make a
+    /// dead node's last act pinning the cluster to an old version forever. A
+    /// suspect node does vote, because it may only be slow, and finalizing
+    /// past a node that comes back is exactly the mixed-version state the
+    /// window exists to avoid.
+    pub async fn finalize_upgrade(&self) -> Result<FinalizedUpgrade> {
+        let (previous, target) = {
+            let inner = self.inner.lock().await;
+            let previous = inner.state.cluster_version();
+            let live: Vec<&NodeRecord> = inner
+                .state
+                .nodes()
+                .filter(|n| n.health != NodeHealth::Dead)
+                .collect();
+            if live.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "no live node has registered, so there is nothing to check the upgrade against"
+                        .into(),
+                ));
+            }
+
+            // The newest version everyone can reach. Taking the minimum of
+            // the maxima is what makes a half-upgraded cluster answer "not
+            // yet" instead of advancing past the stragglers.
+            let target = live
+                .iter()
+                .map(|n| n.speaks.max)
+                .min()
+                .unwrap_or(ClusterVersion::ZERO);
+
+            if target <= previous {
+                let laggards: Vec<String> = live
+                    .iter()
+                    .filter(|n| n.speaks.max <= previous)
+                    .map(|n| format!("node {} speaks {}", n.id, n.speaks))
+                    .collect();
+                return Err(Error::InvalidArgument(format!(
+                    "the cluster is already at version {previous} and no newer version is \
+                     speakable by every live node: {}",
+                    laggards.join(", ")
+                )));
+            }
+
+            // A node whose window starts above the target has skipped past
+            // it, which the one-version window does not allow.
+            let skipped: Vec<String> = live
+                .iter()
+                .filter(|n| !n.speaks.contains(target))
+                .map(|n| format!("node {} speaks {}", n.id, n.speaks))
+                .collect();
+            if !skipped.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "version {target} is not speakable by every live node ({}); upgrades move \
+                     one version at a time, so roll those nodes to a binary that speaks {target} \
+                     first",
+                    skipped.join(", ")
+                )));
+            }
+            (previous, target)
+        };
+
+        self.submit(ControlCommand::SetClusterVersion {
+            version: target,
+            expect: previous,
+        })
+        .await?;
+        tracing::info!(%previous, active = %target, "finalized the cluster upgrade");
+        Ok(FinalizedUpgrade {
+            previous,
+            active: target,
+        })
+    }
+
     /// Every node the cluster knows, and where peers reach it.
     ///
     /// Addresses are what each node reported about itself, so a node that
@@ -280,7 +373,12 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             match known {
                 None => (true, false),
                 Some(record) => (
-                    record.address != status.address || record.role != status.role,
+                    // A changed speakable range is a re-registration too: it
+                    // is what a rolling update looks like from here, and
+                    // finalize-upgrade decides from the stored range.
+                    record.address != status.address
+                        || record.role != status.role
+                        || record.speaks != status.speaks,
                     record.health != NodeHealth::Healthy,
                 ),
             }
@@ -291,6 +389,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 node,
                 role: status.role,
                 address: status.address.clone(),
+                speaks: status.speaks,
             })
             .await?;
         }
@@ -320,11 +419,23 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             return Ok(false);
         }
 
+        // A fresh cluster's active version is the bootstrapping binary's own.
+        // Set first, so there is no committed state in which the cluster has
+        // nodes and a keyspace but no version to speak. The nodes named in
+        // the spec are admitted with this binary's window; any that run a
+        // different binary correct the record on their first heartbeat.
+        self.submit(ControlCommand::SetClusterVersion {
+            version: binary_speaks().max,
+            expect: ClusterVersion::ZERO,
+        })
+        .await?;
+
         for (node, address) in &spec.leaders {
             self.submit(ControlCommand::RegisterNode {
                 node: *node,
                 role: NodeRole::Leader,
                 address: address.clone(),
+                speaks: binary_speaks(),
             })
             .await?;
         }
@@ -333,6 +444,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 node: *node,
                 role: NodeRole::Worker,
                 address: address.clone(),
+                speaks: binary_speaks(),
             })
             .await?;
         }
@@ -644,7 +756,11 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             })
             .collect();
 
-        ClusterView { nodes, partitions }
+        ClusterView {
+            nodes,
+            partitions,
+            cluster_version: inner.state.cluster_version(),
+        }
     }
 
     /// One pass of the decision loop.

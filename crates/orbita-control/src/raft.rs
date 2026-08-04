@@ -691,6 +691,7 @@ mod tests {
             node: NodeId(id),
             role: NodeRole::Worker,
             address: format!("10.0.0.{id}:7000"),
+            speaks: crate::version::binary_speaks(),
         }
     }
 

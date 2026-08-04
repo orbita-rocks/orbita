@@ -16,7 +16,9 @@
 
 use crate::map_source::MapSource;
 
-use orbita_control::{ControlClient, NodeRole, NodeStatus, PartitionProgress};
+use orbita_control::{
+    binary_speaks, ClusterVersion, ControlClient, NodeRole, NodeStatus, PartitionProgress,
+};
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
 use orbita_runtime::Runtime;
 
@@ -134,6 +136,23 @@ pub struct StatusReporter<R: Runtime> {
     client: ControlClient<R>,
     node: NodeId,
     address: String,
+    /// The active cluster version, as of the last heartbeat that landed.
+    ///
+    /// This is the value version-dependent behaviour gates on: a node speaks
+    /// the cluster version, not its own binary version. `None` until the
+    /// first heartbeat is answered.
+    active: Arc<Mutex<Option<ClusterVersion>>>,
+}
+
+impl<R: Runtime> Clone for StatusReporter<R> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            node: self.node,
+            address: self.address.clone(),
+            active: Arc::clone(&self.active),
+        }
+    }
 }
 
 impl<R: Runtime> StatusReporter<R> {
@@ -143,11 +162,19 @@ impl<R: Runtime> StatusReporter<R> {
             client,
             node,
             address: address.into(),
+            active: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// The active cluster version, from the last heartbeat the leader group
+    /// answered. `None` means this node has not been told one yet.
+    #[must_use]
+    pub fn active_cluster_version(&self) -> Option<ClusterVersion> {
+        *self.active.lock().expect("active version poisoned")
+    }
+
     /// Sends one report, carrying how far this node has got on every partition
-    /// it holds.
+    /// it holds, and reads the active cluster version back off the reply.
     ///
     /// Answers whether the report landed. The first `true` is what marks this
     /// node as joined for readiness, because a report the leader group
@@ -161,13 +188,36 @@ impl<R: Runtime> StatusReporter<R> {
             role: NodeRole::Worker,
             address: self.address.clone(),
             map_version,
+            speaks: binary_speaks(),
             partitions,
         };
-        match self.client.report_status(self.node, status).await {
-            Ok(()) => true,
+        match self
+            .client
+            .report_status_for_version(self.node, status)
+            .await
+        {
+            // No version in the reply means the leader predates them, which
+            // mid-rollout is normal; this node keeps whatever it last knew.
+            Ok((_, None)) => true,
+            Ok((_, Some(cluster_version))) => {
+                *self.active.lock().expect("active version poisoned") = Some(cluster_version);
+                if !binary_speaks().contains(cluster_version) {
+                    // Per docs/UPGRADES.md a node outside the window keeps
+                    // running and says why, loudly, rather than exiting: a
+                    // process that exits takes its logs away in a restart
+                    // loop, and a stopped rollout needs those logs.
+                    tracing::warn!(
+                        %cluster_version,
+                        speaks = %binary_speaks(),
+                        "this binary cannot speak the active cluster version; \
+                         it is outside the supported upgrade window"
+                    );
+                }
+                true
+            }
+            // A heartbeat that does not land is what failover is built to
+            // survive, so it is worth saying and not worth stopping for.
             Err(error) => {
-                // A heartbeat that does not land is what failover is built to
-                // survive, so it is worth saying and not worth stopping for.
                 tracing::debug!(%error, "reporting status to the leader group failed");
                 false
             }
