@@ -638,6 +638,37 @@ impl Render for PingView {
     }
 }
 
+/// Whether one node is ready to serve.
+///
+/// Only a ready node is rendered; an unready one exits non-zero with the
+/// unmet conditions in the error, because a probe reads the exit code and a
+/// human reads stderr. The conditions are listed even when everything is met
+/// so the JSON output says what "ready" was checked against.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadyView {
+    pub endpoint: String,
+    pub ready: bool,
+    pub conditions: Vec<ReadyConditionView>,
+}
+
+/// One readiness condition, named the way the server names it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadyConditionView {
+    pub name: String,
+    pub met: bool,
+}
+
+impl Render for ReadyView {
+    fn render_human(&self, out: &mut String) {
+        let names: Vec<&str> = self
+            .conditions
+            .iter()
+            .map(|condition| condition.name.as_str())
+            .collect();
+        let _ = write!(out, "{} is ready ({})", self.endpoint, names.join(", "));
+    }
+}
+
 /// A split, which turns one partition into two.
 #[derive(Debug, Clone, Serialize)]
 pub struct SplitView {

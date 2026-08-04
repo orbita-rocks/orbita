@@ -64,6 +64,7 @@ mod map_source;
 mod node;
 mod pending;
 mod proxy;
+mod readiness;
 mod replication;
 mod runtime;
 mod service;
@@ -75,15 +76,17 @@ pub use config::{ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL, DEFAULT_KEYSPACE};
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 pub use map_source::{single_node_map, BoxedMapSource, MapSource, StaticMapSource};
+pub use readiness::{ReadinessCondition, ReadinessGate, ReadinessState};
 pub use runtime::ServerRuntime;
 pub use status::to_status;
 pub use transport::{PeerListener, PeerTransport, DEFAULT_PEER_CALL_TIMEOUT};
 
 use crate::node::{DataLayout, Node};
-use crate::service::KvService;
+use crate::service::{HealthService, KvService};
 
 use orbita_control::ControlClient;
 use orbita_core::{Error, Result};
+use orbita_proto::v1::health_server::HealthServer;
 use orbita_proto::v1::kv_server::KvServer;
 use orbita_runtime::Runtime;
 
@@ -100,6 +103,7 @@ pub struct Server {
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
     node: Arc<Node<ServerRuntime>>,
+    readiness: Arc<ReadinessGate>,
     transport: PeerTransport,
     peers: PeerListener,
     heartbeat: tokio::task::JoinHandle<()>,
@@ -139,12 +143,22 @@ impl Server {
             None => config.map_source,
         };
 
+        let readiness = Arc::new(ReadinessGate::new());
+        // A node with no leader group answers to nobody, so the join condition
+        // is met by construction rather than left to hang readiness forever.
+        // A joined node's condition is marked by the control loop below, on
+        // its first report the leader group accepts.
+        if control.is_none() {
+            readiness.mark(ReadinessCondition::ControlPlaneJoined);
+        }
+
         let node = Node::start(
             runtime.clone(),
             config.node_id,
             layout,
             map_source,
             config.lease_duration,
+            Arc::clone(&readiness),
         )
         .await?;
 
@@ -181,6 +195,7 @@ impl Server {
                 reporter,
                 directory,
                 config.control_poll_interval,
+                Arc::clone(&readiness),
             ))
         });
 
@@ -195,9 +210,11 @@ impl Server {
 
         let (shutdown, stop) = tokio::sync::oneshot::channel();
         let service = KvServer::new(KvService::new(Arc::clone(&node)));
+        let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
         let serving = tokio::spawn(async move {
             let served = tonic::transport::Server::builder()
                 .add_service(service)
+                .add_service(health)
                 .serve_with_incoming_shutdown(incoming, async {
                     // A dropped sender means the `Server` handle went away, so
                     // stopping is the right answer to that too.
@@ -214,6 +231,7 @@ impl Server {
             local_addr,
             peer_addr,
             node,
+            readiness,
             transport: runtime.transport().clone(),
             peers,
             heartbeat,
@@ -284,6 +302,7 @@ impl Server {
         reporter: StatusReporter<ServerRuntime>,
         directory: PeerDirectorySync<ServerRuntime>,
         interval: Duration,
+        readiness: Arc<ReadinessGate>,
     ) {
         loop {
             let Some(live) = node.upgrade() else {
@@ -293,7 +312,15 @@ impl Server {
             let progress = live.progress().await;
             // Reported before the directory is read, so that this node's own
             // address is in the answer the other nodes get on their next poll.
-            reporter.report(version, progress).await;
+            //
+            // The first accepted report is the join for readiness purposes: it
+            // is the moment the leader group knows this node's address and
+            // progress. A later report failing does not clear the condition,
+            // because a control plane outage must not unready every worker at
+            // once; see `ReadinessCondition::ControlPlaneJoined`.
+            if reporter.report(version, progress).await {
+                readiness.mark(ReadinessCondition::ControlPlaneJoined);
+            }
             directory.refresh().await;
             if let Err(error) = live.refresh_map().await {
                 tracing::debug!(%error, "could not refresh the partition map");
@@ -320,5 +347,16 @@ impl Server {
     #[must_use]
     pub fn replica_reads(&self) -> u64 {
         self.node.replica_reads()
+    }
+
+    /// The readiness gate this node reports from.
+    ///
+    /// Shared rather than snapshotted so a caller can subscribe and await a
+    /// state instead of polling the HTTP surface. This is the handle the
+    /// SIGTERM partition handoff (issue #26) consumes: a peer deciding whether
+    /// to take partitions from a draining node asks this, not the probe.
+    #[must_use]
+    pub fn readiness(&self) -> Arc<ReadinessGate> {
+        Arc::clone(&self.readiness)
     }
 }

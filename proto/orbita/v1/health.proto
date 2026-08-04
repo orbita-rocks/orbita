@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package orbita.v1;
+
+// Health, served by every node on its client port.
+//
+// Readiness is a first-class answer rather than something inferred from the
+// data API responding. A node is ready only when it has registered with the
+// leader group, recovered its write-ahead log, and opened and caught up every
+// partition the map says it holds. The deployment machinery leans on this: a
+// rolling update advances only past nodes that report Ready, so a readiness
+// answer that arrives before recovery finishes would let an upgrade outrun
+// the cluster's ability to serve.
+//
+// Liveness is deliberately not here. Whether the process is alive is answered
+// by the process answering anything at all, and a liveness check that asked
+// about the cluster would turn a partition somewhere else into a restart here.
+service Health {
+  // Whether this node is ready to serve, and if not, why not.
+  //
+  // The call succeeds whether or not the node is ready; the answer is in the
+  // body. Failing the RPC for an unready node would be indistinguishable from
+  // the transport or an interceptor failing, and would leave nowhere to say
+  // which condition is unmet.
+  rpc CheckReadiness(CheckReadinessRequest) returns (CheckReadinessResponse);
+}
+
+message CheckReadinessRequest {}
+
+// One startup condition and whether it currently holds.
+message ReadinessCondition {
+  // A stable machine-readable name, e.g. "control-plane-joined".
+  string name = 1;
+  bool met = 2;
+}
+
+message CheckReadinessResponse {
+  // True only when every condition below is met.
+  bool ready = 1;
+  // Every condition readiness is built from, met or not, so a probe log shows
+  // what a node was waiting on rather than only that it was waiting.
+  repeated ReadinessCondition conditions = 2;
+}

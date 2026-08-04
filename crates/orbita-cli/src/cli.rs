@@ -484,19 +484,36 @@ thing to look at during a failover.")]
         keyspace: Option<String>,
     },
 
-    /// Check that a node is answering, for a container health check.
+    /// Check that a node is answering, for a container liveness check.
     #[command(long_about = "\
 Ask a node whether it is up, and exit 0 if it answered.
 
-This is what a Docker health check or a Kubernetes probe should run. It is
-deliberately weaker than `cluster describe`: any answer at all counts, even an
-error, because the question is whether the process is serving rather than
-whether the cluster is well. Only a connection that could not be made or a
-request that timed out counts as down.
+This is what a liveness probe should run. It is deliberately weaker than
+`cluster describe`: any answer at all counts, even an error, because the
+question is whether the process is serving rather than whether the cluster is
+well. Only a connection that could not be made or a request that timed out
+counts as down.
 
-Use `cluster describe` to find out whether the cluster is healthy. Use this to
-find out whether one node is.")]
+Use `cluster ready` for a readiness probe, `cluster describe` to find out
+whether the cluster is healthy, and this to find out whether one process is
+alive.")]
     Ping,
+
+    /// Check that a node is ready to serve, for a readiness probe.
+    #[command(long_about = "\
+Ask a node whether it is ready to serve, and exit 0 only if it is.
+
+Ready is stronger than answering. A node is ready once it has registered with
+the leader group, recovered its write-ahead log, and opened and caught up
+every partition the map says it holds. Until then this exits non-zero and
+names the conditions still outstanding, which is what makes a rolling upgrade
+wait for the node instead of outrunning it.
+
+This is what a Kubernetes readiness or startup probe should run. Liveness
+should keep running `cluster ping`: readiness depends on the leader group, and
+a liveness probe that does would restart healthy pods during a control plane
+outage.")]
+    Ready,
 }
 
 #[derive(Debug, Subcommand)]

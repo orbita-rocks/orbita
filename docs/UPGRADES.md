@@ -16,18 +16,18 @@ finished.
 - `orbita cluster finalize-upgrade` does not exist. It is described below
   because that is where it goes, not because you can run it. There is nothing
   for it to finalize until the control plane holds a cluster version.
-- Readiness does not mean what it should. It means the process is answering on
-  the client port, not that the node has rejoined the leader group, recovered
-  its write-ahead log, opened its partitions, and caught up. A rolling update
-  can therefore advance to the next pod before the previous one is actually
-  carrying its share.
 - A node does not hand its partitions off on SIGTERM. The termination grace
   periods in the chart are sized for a handoff that the server does not perform
   yet, so today a restart is a failover.
 
-The practical consequence: stage every rollout with the `partition` field and
-check the cluster between steps. Do not let the rollout run unattended on
-anything that matters.
+Readiness does mean what it should: a node reports Ready only once it has
+rejoined the leader group, recovered its write-ahead log, and opened and
+caught up the partitions the map says it holds, so a rolling update waits at
+each pod until it is actually carrying its share again.
+
+The practical consequence of the gaps that remain: stage a rollout with the
+`partition` field and check the cluster between steps when the blast radius
+warrants it, because each pod replacement is still a failover.
 
 ## What a version means
 
@@ -79,7 +79,8 @@ kubectl --namespace orbita rollout status statefulset/orbita-worker
 
 Pods are replaced one at a time in reverse ordinal order, and the rollout does
 not move to the next pod until the current one reports Ready. That is the whole
-safety mechanism, which is why the readiness gap above matters.
+safety mechanism, which is why readiness asserts rejoin, recovery, and
+catch-up rather than just a listening socket.
 
 Upgrade the leader group and the workers separately. There are two StatefulSets
 and they are two rollouts.
@@ -209,16 +210,18 @@ a restore.
 Three probes, three different jobs. Getting these wrong is the usual way a
 stateful system is broken on Kubernetes.
 
-- Readiness gates the rollout and the client Service. It should mean the node
-  has rejoined and caught up. Today it means the process answers.
-- Liveness kills the pod when it fails, so it checks only that the process
-  responds. It never checks cluster state and never checks whether peers are
-  reachable, because a liveness probe that depended on peers would turn a
-  network partition into every pod being killed at once.
-- Startup covers a slow start. Recovering a large write-ahead log takes time,
-  and that is not the same as being wedged, so the startup budget is generous
-  where the liveness threshold is not.
+- Readiness gates the rollout and the client Service. It means the node has
+  rejoined the leader group, recovered its write-ahead log, and opened and
+  caught up its partitions. It runs `orbita cluster ready`, which exits
+  non-zero and names the unmet conditions until all of them hold.
+- Liveness kills the pod when it fails, so it runs `orbita cluster ping` and
+  checks only that the process responds. It never checks cluster state and
+  never checks whether peers are reachable, because a liveness probe that
+  depended on peers would turn a network partition into every pod being killed
+  at once.
+- Startup covers a slow start with the readiness command and its own generous
+  budget. Recovering a large write-ahead log or waiting for the leader group
+  takes time, and that is not the same as being wedged, so the startup budget
+  is generous where the liveness threshold is not.
 
-All three run `orbita cluster ping`, which is correct for liveness and startup
-and weaker than it should be for readiness. The thresholds are under `probes`
-in the chart's values.
+The thresholds are under `probes` in the chart's values.

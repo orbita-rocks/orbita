@@ -310,9 +310,16 @@ fn start_node(
     std::fs::create_dir_all(&layout.storage_root).expect("a storage directory");
     let source = BoxedMapSource::new(StaticMapSource::new(owner_and_replica_map()));
     sim.block_on(async move {
-        Node::start(runtime, node, layout, source, lease)
-            .await
-            .expect("the node starts")
+        Node::start(
+            runtime,
+            node,
+            layout,
+            source,
+            lease,
+            Arc::new(crate::ReadinessGate::new()),
+        )
+        .await
+        .expect("the node starts")
     })
 }
 

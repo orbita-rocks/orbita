@@ -99,9 +99,16 @@ fn start(sim: &Simulation, roots: &Roots, node: NodeId) -> Arc<Node<SimRuntime>>
     std::fs::create_dir_all(&layout.storage_root).expect("a storage directory");
     let source = BoxedMapSource::new(StaticMapSource::new(split_map()));
     sim.block_on(async move {
-        Node::start(runtime, node, layout, source, crate::DEFAULT_LEASE_DURATION)
-            .await
-            .expect("the node starts")
+        Node::start(
+            runtime,
+            node,
+            layout,
+            source,
+            crate::DEFAULT_LEASE_DURATION,
+            Arc::new(crate::ReadinessGate::new()),
+        )
+        .await
+        .expect("the node starts")
     })
 }
 

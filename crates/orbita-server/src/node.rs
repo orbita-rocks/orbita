@@ -28,6 +28,7 @@ use crate::host::{HostSpec, LeasePolicy, PartitionHost, PartitionPaths, Read, Wr
 use crate::lease::DEFAULT_LEASE_MARGIN;
 use crate::map_source::{BoxedMapSource, MapSource};
 use crate::proxy;
+use crate::readiness::{ReadinessCondition, ReadinessGate};
 use crate::replication::{Applies, ReplicaBridge};
 use crate::validate;
 
@@ -100,6 +101,9 @@ pub(crate) struct Node<R: Runtime> {
     /// Whether the last attempt to match the open partitions to the map
     /// failed, which is what makes the next refresh try again.
     unreconciled: std::sync::atomic::AtomicBool,
+    /// The startup conditions this node reports. The node marks recovery and
+    /// catch-up; the control loop above it marks the join.
+    readiness: Arc<ReadinessGate>,
 }
 
 /// Where a request has to go.
@@ -138,6 +142,7 @@ impl<R: Runtime> Node<R> {
         layout: DataLayout,
         source: BoxedMapSource,
         lease_duration: Duration,
+        readiness: Arc<ReadinessGate>,
     ) -> Result<Arc<Self>> {
         let map = source.fetch().await?;
         let (bridge, applies) = ReplicaBridge::start(&runtime);
@@ -162,8 +167,17 @@ impl<R: Runtime> Node<R> {
             },
             replica_reads: AtomicU64::new(0),
             unreconciled: std::sync::atomic::AtomicBool::new(false),
+            readiness,
         });
         node.reconcile().await?;
+        // Opening a partition replays its write-ahead log to the trusted end,
+        // so a reconcile that succeeded is both conditions at once: every log
+        // this node holds is recovered and every partition the map names is
+        // open. Marked here rather than inside `reconcile` because a later
+        // reconcile reopens single partitions, which is catch-up moving and
+        // not recovery happening again.
+        node.readiness.mark(ReadinessCondition::WalRecovered);
+        node.readiness.mark(ReadinessCondition::PartitionsCaughtUp);
 
         runtime
             .transport()
@@ -206,8 +220,15 @@ impl<R: Runtime> Node<R> {
         }
         let outcome = self.reconcile().await;
         self.unreconciled.store(outcome.is_err(), Ordering::Release);
-        if let Err(error) = &outcome {
-            tracing::warn!(%error, "could not open every partition this node was given");
+        // Readiness follows the reconcile outcome both ways. A node holding a
+        // partition it could not open is not ready, however long it has been
+        // running, and a node that has since opened it is ready again.
+        match &outcome {
+            Ok(()) => self.readiness.mark(ReadinessCondition::PartitionsCaughtUp),
+            Err(error) => {
+                self.readiness.clear(ReadinessCondition::PartitionsCaughtUp);
+                tracing::warn!(%error, "could not open every partition this node was given");
+            }
         }
         outcome
     }
