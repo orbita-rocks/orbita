@@ -287,17 +287,27 @@ impl PeerHandler for RaftPeer {
         _from: NodeId,
         call: PeerCall,
     ) -> impl Future<Output = TransportResult<Bytes>> + Send {
-        let result = match Message::decode(call.payload.as_ref()) {
-            Ok(message) => {
-                // A send to a stopped driver just drops the message, which is
-                // indistinguishable from the network losing it, and Raft
-                // already tolerates that.
-                let _ = self.tx.send(Event::Message(Box::new(message)));
-                Ok(Bytes::new())
+        // The method is checked before the payload so that a future second
+        // method on this service fails loudly instead of being decoded as a
+        // raft message that happens to parse.
+        let result = if call.method != METHOD_MESSAGE {
+            Err(TransportError::Remote(format!(
+                "unknown raft method {}",
+                call.method
+            )))
+        } else {
+            match Message::decode(call.payload.as_ref()) {
+                Ok(message) => {
+                    // A send to a stopped driver just drops the message,
+                    // which is indistinguishable from the network losing it,
+                    // and Raft already tolerates that.
+                    let _ = self.tx.send(Event::Message(Box::new(message)));
+                    Ok(Bytes::new())
+                }
+                Err(e) => Err(TransportError::Remote(format!(
+                    "undecodable raft message: {e}"
+                ))),
             }
-            Err(e) => Err(TransportError::Remote(format!(
-                "undecodable raft message: {e}"
-            ))),
         };
         async move { result }
     }
@@ -349,14 +359,13 @@ impl<R: Runtime> Driver<R> {
             }
 
             if let Err(e) = self.on_ready().await {
-                // A node that cannot persist cannot safely acknowledge
-                // anything, so it stops participating, which to the rest of
-                // the group looks like a crash and is handled like one.
+                // A node that cannot persist or cannot read what the quorum
+                // committed cannot safely acknowledge anything, so it stops
+                // participating, which to the rest of the group looks like a
+                // crash and is handled like one.
                 tracing::error!(node = %self.local, error = %e, "raft driver stopping");
                 for (_, reply) in self.pending.drain() {
-                    let _ = reply.send(Err(Error::Unavailable(
-                        "consensus stopped: local persistence failed".into(),
-                    )));
+                    let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
                 }
                 return;
             }
@@ -446,7 +455,7 @@ impl<R: Runtime> Driver<R> {
             "received a snapshot but snapshots are never generated"
         );
 
-        self.apply(ready.take_committed_entries());
+        self.apply(ready.take_committed_entries())?;
 
         let mut frames = BytesMut::new();
         if !ready.entries().is_empty() {
@@ -481,7 +490,7 @@ impl<R: Runtime> Driver<R> {
             self.persist(frame.freeze()).await?;
         }
         self.send_messages(light.take_messages());
-        self.apply(light.take_committed_entries());
+        self.apply(light.take_committed_entries())?;
         self.node.advance_apply();
         Ok(())
     }
@@ -508,26 +517,26 @@ impl<R: Runtime> Driver<R> {
 
     /// Feeds committed entries to the shared log and settles the proposals
     /// that produced them.
-    fn apply(&mut self, entries: Vec<Entry>) {
+    fn apply(&mut self, entries: Vec<Entry>) -> Result<()> {
         for entry in entries {
             // Leaders append an empty entry on election, and nothing here
             // proposes conf changes. Neither is a command.
             if entry.entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
                 continue;
             }
-            let command = match ControlCommand::decode(&entry.data) {
-                Ok(command) => command,
-                Err(e) => {
-                    // The quorum agreed on bytes this binary cannot read,
-                    // which means a newer binary wrote them. Skipping would
-                    // silently diverge from members that could read it, so
-                    // this is loud; it cannot happen between same-version
-                    // members, and rolling upgrades are not supported yet.
-                    tracing::error!(node = %self.local, error = %e, index = entry.index,
-                        "committed entry did not decode; dropping it");
-                    continue;
-                }
-            };
+            // The quorum agreed on bytes this binary cannot read, which means
+            // a newer binary wrote them. Skipping would shift every later
+            // index on this node and quietly diverge from the members that
+            // could read it, so the driver stops instead: to the rest of the
+            // group that is a crash, and a crashed node is recoverable where
+            // a diverged one is not. Unreachable between same-version
+            // members; the guard is for when rolling upgrades arrive.
+            let command = ControlCommand::decode(&entry.data).map_err(|e| {
+                Error::Internal(format!(
+                    "committed entry {} did not decode: {e}",
+                    entry.index
+                ))
+            })?;
             let index = {
                 let mut shared = self.shared.lock().expect("raft shared state poisoned");
                 shared.committed.push(command);
@@ -539,6 +548,7 @@ impl<R: Runtime> Driver<R> {
                 }
             }
         }
+        Ok(())
     }
 
     /// Publishes leadership for the handle to read, and fails the proposals
