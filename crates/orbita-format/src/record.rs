@@ -18,7 +18,13 @@ pub mod flags {
     pub const EXPIRY: u8 = 1 << 1;
     /// The value is stored in its own object.
     pub const EXTERNAL: u8 = 1 << 2;
-    /// Everything else, which a writer sets to zero and a reader rejects.
+    /// Reserved for the transaction work: marks a record as an uncommitted
+    /// intent. In partition-v1 it must be zero, and a reader treats it exactly
+    /// as it treats the generic reserved bits. It is named so the bit exists
+    /// before v0.1.0 freezes the bytes.
+    pub const INTENT: u8 = 1 << 3;
+    /// Everything a writer sets to zero and a reader rejects, which includes
+    /// [`INTENT`] until a future version gives it meaning.
     pub const RESERVED: u8 = !(TOMBSTONE | EXPIRY | EXTERNAL);
 }
 
@@ -114,6 +120,10 @@ impl SegmentRecord {
     pub(crate) fn encode_body(&self, out: &mut Vec<u8>) {
         out.push(self.flags());
         out.extend_from_slice(&self.lamport.get().to_le_bytes());
+        // The reserved commit timestamp. Zero in partition-v1; the field
+        // exists so the transaction work does not need a new format version
+        // for its bytes.
+        out.extend_from_slice(&0u64.to_le_bytes());
         out.extend_from_slice(&u32_len(self.key.len()).to_le_bytes());
         out.extend_from_slice(&self.key);
         if let Some(expiry) = self.expires_at_millis {
@@ -209,6 +219,13 @@ fn decode_body(body: &[u8]) -> Result<SegmentRecord> {
     }
 
     let lamport = Lamport(cursor.u64()?);
+    let commit_timestamp = cursor.u64()?;
+    if commit_timestamp != 0 {
+        return Err(FormatError::Malformed {
+            what: "record",
+            detail: format!("the reserved commit timestamp must be zero, found {commit_timestamp}"),
+        });
+    }
     let key = cursor.bytes32()?;
     let expires_at_millis = if bits & flags::EXPIRY != 0 {
         Some(cursor.u64()?)
@@ -436,7 +453,39 @@ mod tests {
     fn a_reserved_flag_bit_is_rejected_rather_than_ignored() {
         let mut body = Vec::new();
         inline().encode_body(&mut body);
-        body[0] |= 0b1000;
+        body[0] |= 0b1_0000;
+        assert!(matches!(
+            decode_body(&body),
+            Err(FormatError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn the_reserved_intent_flag_is_rejected_in_partition_v1() {
+        // The bit is named for the transaction work but carries no meaning
+        // yet, so a reader treats it exactly as a generic reserved bit.
+        let mut body = Vec::new();
+        inline().encode_body(&mut body);
+        body[0] |= flags::INTENT;
+        assert!(matches!(
+            decode_body(&body),
+            Err(FormatError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn the_reserved_commit_timestamp_is_written_as_zero() {
+        let mut body = Vec::new();
+        inline().encode_body(&mut body);
+        // flags (1) + lamport (8), then the reserved eight bytes.
+        assert_eq!(&body[9..17], &[0u8; 8]);
+    }
+
+    #[test]
+    fn a_nonzero_reserved_commit_timestamp_is_rejected() {
+        let mut body = Vec::new();
+        inline().encode_body(&mut body);
+        body[9..17].copy_from_slice(&1u64.to_le_bytes());
         assert!(matches!(
             decode_body(&body),
             Err(FormatError::Malformed { .. })
