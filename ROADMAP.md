@@ -164,12 +164,16 @@ writing that plan is the first deliverable of the release. The shape of it:
   saturation), and runbooks for the incidents every operator hits. It lands
   here because the tests-at-scale work needs the same instrumentation to be
   trustworthy. The kit also owns the scaling signals: the thresholds that
-  tell an operator when to split a partition, add a worker, or grow the
-  leader group, surfaced through `cluster describe` on top of the raw
-  numbers v0.1.0 exposes. They land here rather than with the numbers
-  because a credible threshold comes from the measured envelope the
-  tests-at-scale work produces, and a threshold invented before the
-  measurements exist is a guess with a UI.
+  tell an operator when to add a worker or grow the leader group, surfaced
+  through `cluster describe` on top of the raw numbers v0.1.0 exposes. They
+  land here rather than with the numbers because a credible threshold comes
+  from the measured envelope the tests-at-scale work produces, and a
+  threshold invented before the measurements exist is a guess with a UI.
+  Partition splitting is deliberately not on that list: the split and merge
+  machinery already exists and the decision needs no capacity the cluster
+  does not have, so the same threshold that would have paged an operator
+  triggers the split automatically instead. The operator signals are the
+  ones that require hardware to show up.
 - Correctness evidence as a stream, not a one-shot report: nightly seeded
   simulation runs published continuously, with the launch report assembled
   from them. A report ages; a public record of interleavings explored and
