@@ -23,10 +23,11 @@
 //! A lookup never consults more than one segment, so the only reason to merge
 //! is to reclaim space: expired records, aged tombstones, and shadowed
 //! versions. It runs after enough full, size-triggered flushes amortise a
-//! rewrite and on explicit request. Timer flushes do not count, because a tiny
-//! durability segment should not cause a whole-partition rewrite. Compaction
-//! republishes through the same manifest swap as a flush, so one that dies
-//! half way costs objects rather than data.
+//! rewrite, on a bounded timer cadence, and on explicit request. Timer flushes
+//! do not compact based on segment count, because tiny durability segments
+//! should not repeatedly rewrite a whole partition. Compaction republishes
+//! through the same manifest swap as a flush, so one that dies half way costs
+//! objects rather than data.
 //! The objects it replaces are deleted once the new manifest is committed;
 //! anything a crash strands is left for a sweep, which does not exist yet and
 //! is deliberate scope for later, as is a cache for values read back out of
@@ -76,6 +77,13 @@ const FLUSH_TRIGGER_BYTES: u64 = 8 * 1024 * 1024;
 /// flush-sized segments bound that waste at roughly the cost of one merge per
 /// sixteen flushes.
 const COMPACT_TRIGGER_FULL_FLUSHES: usize = 16;
+
+/// How many timer passes may elapse before small segments are compacted.
+///
+/// This is deliberately larger than the old segment-count trigger: sparse
+/// partitions should not rewrite themselves every few minutes, but even one
+/// expired timer segment must eventually be reclaimed.
+const COMPACT_TRIGGER_TIMER_FLUSHES: usize = 120;
 
 /// The bookkeeping cost charged to the flush trigger per entry, on top of the
 /// key and value bytes. An estimate is all a trigger needs.
@@ -215,6 +223,8 @@ struct State {
     index: BTreeMap<Bytes, Loc>,
     /// Timer flushes can be tiny, so only full memtables pay toward a rewrite.
     full_flushes_since_compaction: usize,
+    /// Timer passes since the last merge of a non-empty partition.
+    timer_flushes_since_compaction: usize,
     /// Memtable size at the last replica manifest refresh attempt.
     reclaim_attempted_at_bytes: u64,
 }
@@ -266,6 +276,7 @@ impl<R: Runtime> Partition<R> {
             segments: Vec::new(),
             index: BTreeMap::new(),
             full_flushes_since_compaction: 0,
+            timer_flushes_since_compaction: 0,
             reclaim_attempted_at_bytes: 0,
         };
         if let Some(snapshot) = Snapshot::open(Arc::clone(&store), path.clone())
@@ -596,7 +607,16 @@ impl<R: Runtime> Partition<R> {
     /// names; the size trigger calls the same path from inside a write.
     pub async fn flush(&self) -> Result<()> {
         let mut state = self.state.write().await;
-        self.flush_locked(&mut state, false).await
+        if !state.segments.is_empty() {
+            state.timer_flushes_since_compaction += 1;
+        }
+        self.flush_locked(&mut state, false).await?;
+        if !state.segments.is_empty()
+            && state.timer_flushes_since_compaction >= COMPACT_TRIGGER_TIMER_FLUSHES
+        {
+            self.compact_locked(&mut state).await?;
+        }
+        Ok(())
     }
 
     /// Flushes only when the mutable table has crossed the size trigger.
@@ -958,6 +978,7 @@ impl<R: Runtime> Partition<R> {
         state.segments = manifest.segments;
         state.index = index;
         state.full_flushes_since_compaction = 0;
+        state.timer_flushes_since_compaction = 0;
 
         // The replaced objects are unreferenced the moment the manifest
         // swapped, and this is the only writer, so deleting them now is safe.
@@ -2298,6 +2319,33 @@ mod tests {
             p.segment_count().await,
             COMPACT_TRIGGER_FULL_FLUSHES,
             "time-based durability must not turn sixteen tiny writes into a full rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn timer_flushes_eventually_reclaim_an_expired_sparse_segment() {
+        let (p, clock) = partition_with_clock().await;
+        clock.set_millis(0);
+        p.apply(&Mutation::put(
+            Lamport(1),
+            bytes("expired"),
+            bytes("value"),
+            Some(1),
+        ))
+        .await
+        .unwrap();
+        p.flush().await.unwrap();
+        clock.set_millis(1);
+        assert!(p.stored_entry(b"expired").await.unwrap().is_some());
+
+        for _ in 0..COMPACT_TRIGGER_TIMER_FLUSHES {
+            p.flush().await.unwrap();
+        }
+
+        assert_eq!(
+            p.stored_entry(b"expired").await.unwrap(),
+            None,
+            "timer-only partitions still receive eventual physical reclamation"
         );
     }
 

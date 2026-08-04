@@ -4,6 +4,7 @@
 *.sw[onp]
 /.claude
 .DS_Store
+/.agents/worktrees/
 
 #
 # Rust build output

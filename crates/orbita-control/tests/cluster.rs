@@ -14,9 +14,9 @@
 use orbita_control::{
     binary_speaks, BootstrapSpec, ClusterState, ClusterVersion, ConsensusLog, ControlClient,
     ControlCommand, ControlConfig, ControlService, Controller, KeyspaceConfig, NodeRole,
-    NodeStatus, PartitionProgress, SingleNodeLog, VersionRange,
+    NodeStatus, PartitionProgress, RegistrationOutcome, SingleNodeLog, VersionRange,
 };
-use orbita_core::{Epoch, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
+use orbita_core::{Epoch, Error, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
 use orbita_runtime::{Clock, Runtime, ServiceId, Transport};
 use orbita_sim::{check_seeds, DiskFaults, DiskPolicy, Failure, SimConfig, SimRuntime, Simulation};
 
@@ -434,6 +434,68 @@ fn the_most_caught_up_replica_is_the_one_promoted() {
                 return Err(cluster.sim.failure(format!(
                     "promoted {promoted:?}, but {} was further ahead",
                     replicas[1]
+                )));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn an_incompatible_most_durable_replica_blocks_promotion_until_a_compatible_copy_catches_up() {
+    check_seeds(
+        "an_incompatible_most_durable_replica_blocks_promotion_until_a_compatible_copy_catches_up",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let before = cluster.map().partition(partition).unwrap().clone();
+            let deposed = before.owner.expect("an owner");
+            let compatible = before.replicas[0];
+            let incompatible = before.replicas[1];
+
+            cluster.report_speaks(compatible, NodeRole::Worker, upgraded_speaks());
+            // A 2-of-3 acknowledgement permits the failed owner and this
+            // incompatible replica to hold the acknowledged tail at 900 while
+            // the remaining compatible replica is still at 10.
+            cluster.set_progress(compatible, 10);
+            cluster.set_progress(incompatible, 900);
+
+            let previous = binary_speaks().max;
+            let controller = cluster.controller.clone();
+            cluster
+                .sim
+                .block_on(async move {
+                    controller
+                        .submit(ControlCommand::SetClusterVersion {
+                            version: upgraded_speaks().max,
+                            expect: previous,
+                        })
+                        .await
+                })
+                .expect("advancing the test cluster version");
+
+            cluster.sim.crash(deposed);
+            cluster.sim.run_for(Duration::from_secs(10));
+            if cluster.owner_of(partition).is_some() {
+                return Err(cluster
+                    .sim
+                    .failure("a compatible replica behind the acknowledged tail was promoted"));
+            }
+
+            cluster.set_progress(compatible, 900);
+            let promoted = cluster.run_until(Duration::from_secs(10), |c| {
+                c.owner_of(partition) == Some(compatible)
+            });
+            if !promoted {
+                return Err(cluster.sim.failure(
+                    "the compatible replica was not promoted after reaching the durable tail",
+                ));
+            }
+            let owner = cluster.owner_of(partition);
+            if owner != Some(compatible) {
+                return Err(cluster.sim.failure(format!(
+                    "promoted {owner:?}; expected caught-up compatible node {compatible} instead of incompatible node {incompatible}"
                 )));
             }
             Ok(())
@@ -869,6 +931,155 @@ fn a_dead_node_does_not_pin_the_cluster_to_the_old_version() {
     assert_eq!(finalized.active, upgraded_speaks().max);
 }
 
+#[test]
+fn an_incompatible_existing_owner_stays_live_while_its_heartbeats_continue() {
+    check_seeds(
+        "an_incompatible_existing_owner_stays_live_while_its_heartbeats_continue",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let owner = cluster.owner_of(partition).expect("an owner");
+            let previous = binary_speaks().max;
+            let active = ClusterVersion::new(previous.major, previous.minor + 1);
+            let controller = cluster.controller.clone();
+            cluster
+                .sim
+                .block_on(async move {
+                    controller
+                        .submit(ControlCommand::SetClusterVersion {
+                            version: active,
+                            expect: previous,
+                        })
+                        .await
+                })
+                .expect("advancing the test cluster version");
+
+            cluster.set_progress(owner, 77);
+            let dead_after = cluster.controller.config().dead_after;
+            cluster.sim.run_for(dead_after * 3);
+
+            let controller = cluster.controller.clone();
+            let health = cluster.sim.block_on(async move {
+                controller
+                    .snapshot()
+                    .await
+                    .node(owner)
+                    .map(|record| record.health)
+            });
+            if health != Some(orbita_control::NodeHealth::Healthy) {
+                return Err(cluster.sim.failure(format!(
+                    "heartbeating incompatible owner {owner} aged to {health:?}"
+                )));
+            }
+            if cluster.owner_of(partition) != Some(owner) {
+                return Err(cluster
+                    .sim
+                    .failure("a live incompatible owner lost its existing ownership"));
+            }
+            let controller = cluster.controller.clone();
+            let progress = cluster.sim.block_on(async move {
+                controller
+                    .view()
+                    .await
+                    .partitions
+                    .into_iter()
+                    .find(|view| view.info.id == partition)
+                    .map(|view| view.committed_lamport)
+            });
+            if progress != Some(Lamport(77)) {
+                return Err(cluster.sim.failure(format!(
+                    "incompatible owner's heartbeat progress was not retained: {progress:?}"
+                )));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn incompatible_joins_are_rejected_under_deterministic_simulation() {
+    check_seeds(
+        "incompatible_joins_are_rejected_under_deterministic_simulation",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let active = binary_speaks().max;
+            let too_new = VersionRange::new(
+                ClusterVersion::new(active.major, active.minor + 1),
+                ClusterVersion::new(active.major, active.minor + 2),
+            );
+            let controller = cluster.controller.clone();
+            let outcome = cluster.sim.block_on(async move {
+                controller
+                    .record_status(
+                        NodeId(9),
+                        NodeStatus {
+                            role: NodeRole::Worker,
+                            address: "10.0.0.9:7000".into(),
+                            map_version: MapVersion::default(),
+                            speaks: too_new,
+                            partitions: vec![],
+                        },
+                    )
+                    .await
+            });
+            match outcome {
+                Ok(RegistrationOutcome::Incompatible(refusal))
+                    if refusal.speaks == too_new && refusal.active == active => {}
+                other => {
+                    return Err(cluster
+                        .sim
+                        .failure(format!("incompatible join was not refused: {other:?}")))
+                }
+            }
+            let controller = cluster.controller.clone();
+            let admitted = cluster
+                .sim
+                .block_on(async move { controller.snapshot().await.node(NodeId(9)).is_some() });
+            if admitted {
+                return Err(cluster.sim.failure("the refused node became a member"));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn rolling_upgrade_ranges_are_accepted_under_deterministic_simulation() {
+    check_seeds(
+        "rolling_upgrade_ranges_are_accepted_under_deterministic_simulation",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let active = binary_speaks().max;
+            let rolling =
+                VersionRange::new(active, ClusterVersion::new(active.major, active.minor + 1));
+            let controller = cluster.controller.clone();
+            let outcome = cluster.sim.block_on(async move {
+                controller
+                    .record_status(
+                        NodeId(9),
+                        NodeStatus {
+                            role: NodeRole::Worker,
+                            address: "10.0.0.9:7000".into(),
+                            map_version: MapVersion::default(),
+                            speaks: rolling,
+                            partitions: vec![],
+                        },
+                    )
+                    .await
+            });
+            if !matches!(outcome, Ok(RegistrationOutcome::Accepted(_))) {
+                return Err(cluster
+                    .sim
+                    .failure(format!("rolling upgrade join was refused: {outcome:?}")));
+            }
+            Ok(())
+        },
+    );
+}
+
 /// Kept separate from the scenarios so a failure points at the harness rather
 /// than at the system under test.
 #[test]
@@ -1036,6 +1247,55 @@ fn a_worker_reaches_the_leader_group_over_the_transport() {
         }
     });
     assert_eq!(reported, Ok(()));
+}
+
+#[test]
+fn a_worker_cannot_overwrite_a_registered_leader_identity() {
+    let cluster = Cluster::start(12);
+    let controller = cluster.controller.clone();
+    let result = cluster.sim.block_on(async move {
+        controller
+            .record_status(
+                LEADER,
+                NodeStatus::joining(NodeRole::Worker, "10.0.0.99:7000"),
+            )
+            .await
+    });
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(ref message)) if message.contains("cannot report as")),
+        "a cross-role registration must be rejected, got {result:?}"
+    );
+    let controller = cluster.controller.clone();
+    let state = cluster
+        .sim
+        .block_on(async move { controller.snapshot().await });
+    let record = state.node(LEADER).cloned().expect("leader remains");
+    assert_eq!(record.role, NodeRole::Leader);
+}
+
+#[test]
+fn catch_up_requires_the_local_log_and_controller_to_reach_the_authority() {
+    let cluster = Cluster::start(13);
+    let current = cluster.controller.clone();
+    let authority = cluster
+        .sim
+        .block_on(async move { current.commit_index().await });
+
+    let caught_up = cluster.controller.clone();
+    assert_eq!(
+        cluster
+            .sim
+            .block_on(async move { caught_up.catch_up_through(authority).await }),
+        Ok(true)
+    );
+
+    let lagging = cluster.controller.clone();
+    assert_eq!(
+        cluster
+            .sim
+            .block_on(async move { lagging.catch_up_through(u64::MAX).await }),
+        Ok(false)
+    );
 }
 
 #[test]

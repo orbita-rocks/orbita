@@ -102,9 +102,8 @@ engineer whose whole job is judging failure modes.
 - Raft under `ConsensusLog` via an existing implementation, openraft or
   raft-rs, with its storage and network wired through `orbita_runtime` so the
   simulator can drive it.
-- The leader peer wiring the CLI already stubs out (`TODO(leader-peers)` and
-  the peer listener in `orbita-cli`), so a three-node leader group is a
-  configuration rather than a diagram.
+- Leader peer wiring through the CLI and peer listener, so a three-node leader
+  group is a configuration rather than a diagram.
 - Leader group failover under fault injection in the simulator, since the
   failover ordering argument (epoch commit before promotion) now has to hold
   across a real election.

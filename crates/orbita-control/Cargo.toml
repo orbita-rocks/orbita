@@ -32,6 +32,19 @@ sha2 = "0.10"
 # here spawns, sleeps, or touches the Tokio reactor, so the control plane runs
 # unchanged under the simulator's single threaded scheduler.
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# The consensus state machine under `RaftLog`. Chosen over openraft because it
+# owns no IO at all: the driver in `src/raft.rs` ticks it, carries its
+# messages, and persists its log, all through orbita-runtime's seams, which is
+# what keeps elections reproducible under the simulator.
+raft = { version = "0.7", default-features = false, features = ["prost-codec"] }
+# raft's message types are prost 0.11 messages, and encoding them needs the
+# trait from the same prost the types were generated with. This is not the
+# workspace's protobuf story; orbita-proto has its own.
+prost = "0.11"
+# raft insists on a slog logger. It gets slog::Discard, and everything worth
+# saying is said through `tracing` by the driver instead.
+slog = "2"
 
 [dev-dependencies]
 orbita-sim = { path = "../orbita-sim" }
+orbita-wal.workspace = true

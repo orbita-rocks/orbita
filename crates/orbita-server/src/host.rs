@@ -833,6 +833,13 @@ impl<R: Runtime> PartitionHost<R> {
                 );
                 continue;
             }
+            if let Err(error) = self.storage.reclaim_published_if_needed().await {
+                tracing::warn!(
+                    partition = self.id.get(),
+                    %error,
+                    "replica could not reclaim entries covered by the published manifest"
+                );
+            }
             self.read_state
                 .lock()
                 .expect("read state poisoned")
@@ -984,14 +991,6 @@ async fn apply_loop<R: Runtime>(
                     );
                 }
             }
-        } else if applied {
-            if let Err(error) = storage.reclaim_published_if_needed().await {
-                tracing::warn!(
-                    partition = partition.get(),
-                    %error,
-                    "replica could not reclaim entries covered by the published manifest"
-                );
-            }
         }
         pending
             .lock()
@@ -1142,7 +1141,7 @@ mod tests {
     use orbita_objectstore::{ETag, ObjectError, ObjectMeta, ObjectResult, Precondition};
     use orbita_sim::{SimRuntime, Simulation};
     use std::ops::Range;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn record(version: u64) -> Record {
         Record {
@@ -1156,6 +1155,7 @@ mod tests {
         inner: MemoryStore,
         fail_segment: AtomicBool,
         fail_manifest: AtomicBool,
+        range_reads: AtomicUsize,
     }
 
     impl FaultStore {
@@ -1164,6 +1164,7 @@ mod tests {
                 inner: MemoryStore::new(),
                 fail_segment: AtomicBool::new(false),
                 fail_manifest: AtomicBool::new(false),
+                range_reads: AtomicUsize::new(0),
             }
         }
 
@@ -1206,6 +1207,7 @@ mod tests {
         }
 
         async fn get_range(&self, key: &str, range: Range<u64>) -> ObjectResult<Bytes> {
+            self.range_reads.fetch_add(1, Ordering::Relaxed);
             self.inner.get_range(key, range).await
         }
 
@@ -1250,6 +1252,32 @@ mod tests {
             )
             .await
             .expect("the owner opens")
+        })
+    }
+
+    fn start_replica(
+        sim: &Simulation,
+        runtime: SimRuntime,
+        store: Arc<FaultStore>,
+    ) -> Arc<PartitionHost<SimRuntime>> {
+        let paths = PartitionPaths {
+            store,
+            path: partition_path(),
+            wal_dir: "wal/replica-p1".to_string(),
+        };
+        sim.block_on(async move {
+            PartitionHost::open_replica(
+                runtime,
+                HostSpec {
+                    id: PartitionId(1),
+                    epoch: Epoch(1),
+                    range: KeyRange::unbounded(),
+                    lease: LeasePolicy::default(),
+                },
+                &paths,
+            )
+            .await
+            .expect("the replica opens")
         })
     }
 
@@ -1329,6 +1357,63 @@ mod tests {
         assert_eq!(manifest.segments.len(), 1);
         assert_eq!(checkpoint, manifest.committed_lamport);
         assert_eq!(segment.records()[0].key, Bytes::from_static(b"key"));
+    }
+
+    #[test]
+    fn committed_replica_applies_reclaim_the_owners_published_horizon() {
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        let replica = start_replica(&sim, runtime.clone(), Arc::clone(&store));
+
+        let entries: Vec<WalEntry> = (1..=32)
+            .map(|lamport| WalEntry {
+                lamport: Lamport(lamport),
+                epoch: Epoch(1),
+                partition: PartitionId(1),
+                op: WalOp::Put {
+                    key: Bytes::from(format!("k{lamport}")),
+                    value: Bytes::from(vec![lamport as u8; orbita_core::MAX_VALUE_BYTES]),
+                    expires_at_millis: None,
+                },
+            })
+            .collect();
+        for entry in &entries {
+            let replica = Arc::clone(&replica);
+            let entry = entry.clone();
+            sim.block_on(async move { replica.apply_replicated(&entry).await.unwrap() });
+        }
+
+        sim.block_on({
+            let store = Arc::clone(&store);
+            let entries = entries.clone();
+            async move {
+                let owner = Partition::open(
+                    runtime,
+                    store as Arc<dyn ObjectStore>,
+                    partition_path(),
+                    Epoch(1),
+                    KeyRange::unbounded(),
+                )
+                .await
+                .unwrap();
+                for entry in &entries {
+                    owner.apply(&mutation_of(entry)).await.unwrap();
+                }
+                owner.flush().await.unwrap();
+            }
+        });
+
+        let replica_to_commit = Arc::clone(&replica);
+        sim.block_on(async move { replica_to_commit.commit_through(Lamport(32)).await });
+        let replica_to_read = Arc::clone(&replica);
+        sim.block_on(async move {
+            assert!(replica_to_read.get(b"k32").await.unwrap().is_some());
+        });
+        assert!(
+            store.range_reads.load(Ordering::Relaxed) > 0,
+            "the host's production release path replaced the memtable with the published index"
+        );
     }
 
     #[test]
