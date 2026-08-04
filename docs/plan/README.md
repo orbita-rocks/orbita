@@ -43,6 +43,7 @@ Brief 06 can start any time and is mostly independent.
 | [04](04-server.md) | `orbita-server` | 01, 02, 03 | medium |
 | [05](05-sim.md) | `orbita-sim` | contracts only | high |
 | [06](06-ops.md) | `orbita-cli`, packaging | 04 for a real binary | low |
+| [07](07-format.md) | `orbita-format` | contracts only | medium |
 
 Partition merge, in brief 03, is the single riskiest requirement in v1. It is
 the last thing that should be built and the first thing that should be cut if

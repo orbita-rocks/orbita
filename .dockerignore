@@ -6,6 +6,10 @@ target
 .github
 .claude
 .agents
+# The image builds with cargo directly, so it needs none of the moon
+# configuration. Switching it to moon means removing these two lines.
+.moon
+.prototools
 docs
 deploy
 data

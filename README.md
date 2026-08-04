@@ -105,8 +105,8 @@ better tool and we would rather say so than pretend otherwise.
 ## Contributing
 
 Start with [CONTRIBUTING.md](CONTRIBUTING.md). The short version is that
-`cargo fmt`, `cargo clippy`, and `cargo test` all have to pass, and a change to
-behavior wants a simulation seed that fails without it. Participation is
+`moon run :fmt :lint :test` has to pass, and a change to behavior wants a
+simulation seed that fails without it. Participation is
 governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 To report a security issue, follow [SECURITY.md](SECURITY.md) rather than

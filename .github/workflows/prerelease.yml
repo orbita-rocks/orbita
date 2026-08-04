@@ -21,6 +21,9 @@ env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/orbita-rocks/orbita
 
+  # Keep in step with .prototools and with ci.yml.
+  MOONREPO_CLI_VERSION: '2.4.6'
+
 permissions:
   contents: read
 
@@ -70,15 +73,25 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - uses: arduino/setup-protoc@v3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: moonrepo/setup-toolchain@v0
+        with:
+          auto-install: false
+          moon-version: ${{ env.MOONREPO_CLI_VERSION }}
+
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo build --release --locked --bin orbita
+      # The same task a release runs, so a develop binary and a released one
+      # are built the same way and a problem with the build shows up here
+      # first rather than during a release.
+      - run: moon run orbita-cli:build-release
 
       # One target rather than the release matrix. Somebody who needs a
       # develop build on a Mac can build it, and paying for four runners on

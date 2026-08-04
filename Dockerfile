@@ -30,6 +30,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/orbita-core/Cargo.toml crates/orbita-core/
 COPY crates/orbita-runtime/Cargo.toml crates/orbita-runtime/
 COPY crates/orbita-objectstore/Cargo.toml crates/orbita-objectstore/
+COPY crates/orbita-format/Cargo.toml crates/orbita-format/
 COPY crates/orbita-proto/Cargo.toml crates/orbita-proto/
 COPY crates/orbita-storage/Cargo.toml crates/orbita-storage/
 COPY crates/orbita-wal/Cargo.toml crates/orbita-wal/
@@ -40,7 +41,7 @@ COPY crates/orbita-cli/Cargo.toml crates/orbita-cli/
 RUN mkdir -p crates/orbita-cli/src \
     && echo 'fn main() {}' > crates/orbita-cli/src/main.rs \
     && echo '' > crates/orbita-cli/src/lib.rs \
-    && for c in core runtime objectstore proto storage wal control server sim; do \
+    && for c in core runtime objectstore format proto storage wal control server sim; do \
          mkdir -p "crates/orbita-$c/src" && echo '' > "crates/orbita-$c/src/lib.rs"; \
        done \
     && cargo fetch --locked

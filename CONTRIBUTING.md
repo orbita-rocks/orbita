@@ -29,26 +29,40 @@ doing it. Inside any other crate, structure things however you like.
 ## Setting up
 
 You need a Rust toolchain, which `rust-toolchain.toml` pins so your laptop and
-CI cannot drift apart, and `protoc` for the protocol definitions.
+CI cannot drift apart, `protoc` for the protocol definitions, and moon, which
+is what runs the build and the test suites.
 
 ```bash
-brew install protobuf   # or: apt-get install -y protobuf-compiler
-cargo build
+brew install protobuf                  # or: apt-get install -y protobuf-compiler
+curl -fsSL https://moonrepo.dev/install/proto.sh | bash
+proto install moon
+moon run :build
 ```
+
+Do not run `proto use` here. proto reads `rust-toolchain.toml` as a version
+file, so it takes the Rust install away from rustup and hands it to proto,
+which on a clean machine produces a toolchain with no cargo in it.
+[docs/BUILD.md](docs/BUILD.md) has the rest.
 
 ## What has to pass
 
 CI runs these, so run them before you push:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+moon run :fmt :lint :test --query "language=rust"
 ```
 
-The `-D warnings` is not decoration. CI sets it globally through `RUSTFLAGS`,
-so a clippy run without it passes on your laptop and fails on your pull
-request, which is the most annoying way to find out.
+Or just the crates your change touches, which is the reason to prefer moon over
+cargo locally:
+
+```bash
+moon run :fmt :lint :test --query "language=rust" --affected
+```
+
+The `-D warnings` on clippy is not decoration, and it lives in the task
+definition rather than in CI's environment, so the clippy you run is the clippy
+that gates the merge. That used to be a `RUSTFLAGS` that only CI set, which
+meant a clean laptop run and a red pull request.
 
 The end-to-end suite drives a running node from Python over a real socket,
 using stubs generated from `/proto` by stock `protoc`. It exists to catch the
@@ -57,9 +71,11 @@ both ends were generated together. Run it when you touch the protocol or the
 server surface. See [tests/e2e/README.md](tests/e2e/README.md).
 
 ```bash
-cd tests/e2e && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest
+moon run e2e:test
 ```
+
+That builds the binary, creates the virtualenv, installs the dependencies into
+it, and runs pytest, because the task graph says those are what it needs.
 
 ## Simulation is how we argue about correctness
 
@@ -68,7 +84,7 @@ simulation. That is the methodology, not a testing phase at the end, and it is
 the basis of the claim the project is built on.
 
 ```bash
-cargo test -p orbita-sim --release
+moon run orbita-sim:sim
 ```
 
 A failing seed prints the command that replays it exactly. Pin a single run

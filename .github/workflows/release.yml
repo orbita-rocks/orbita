@@ -18,6 +18,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/orbita-rocks/orbita
 
+  # Keep in step with .prototools and with ci.yml. moonrepo/setup-toolchain
+  # does not read .prototools, so the version has to be passed in. Not called
+  # MOON_VERSION, because moon reads that itself to report its own version.
+  MOONREPO_CLI_VERSION: '2.4.6'
+
 permissions:
   contents: read
 
@@ -72,16 +77,17 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
-  # The same checks a pull request gets, with far more simulation. This is the
-  # one place where the wall clock is worth spending, because the seeds that
-  # only fail one time in ten thousand are exactly the ones nobody wants to
-  # meet for the first time in a released build.
+  # The same checks a pull request gets, with the nightly simulation batch
+  # instead of the short one. This is the one place where the wall clock is
+  # worth spending, because the seeds that only fail one time in ten thousand
+  # are exactly the ones nobody wants to meet for the first time in a released
+  # build.
   test:
     name: full test suite
     needs: verify
     uses: ./.github/workflows/ci.yml
     with:
-      sim_seeds: "100000"
+      long_sim: true
 
   binaries:
     name: ${{ matrix.target }}
@@ -104,23 +110,39 @@ jobs:
             runner: macos-13
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # protoc is a system dependency moon does not manage, and it is needed on
+      # four different operating systems here, which is what this action is
+      # for. CI installs it with apt because CI is Linux only.
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Rust first: moon runs cargo, it does not install it.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - uses: moonrepo/setup-toolchain@v0
+        with:
+          # Off for the same reason as in ci.yml: proto reads
+          # rust-toolchain.toml as a version file and takes the Rust install
+          # away from rustup, leaving a toolchain with no cargo in it.
+          auto-install: false
+          moon-version: ${{ env.MOONREPO_CLI_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      # --locked, because a release built against a dependency graph that is
-      # not the one in the lockfile is not the thing that was tested.
+      # The task carries --release and --locked, so what a release builds is
+      # written down in crates/orbita-cli/moon.yml rather than here. --locked
+      # matters most: a release built against a dependency graph that is not
+      # the one in the lockfile is not the thing that was tested.
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin orbita
+        run: moon run orbita-cli:build-release -- --target ${{ matrix.target }}
 
       - name: Package
         run: |

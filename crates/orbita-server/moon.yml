@@ -1,0 +1,14 @@
+# https://moonrepo.dev/docs/config/project
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+# Mirrors this crate's Cargo dependencies. See .moon/tasks/rust.yml for why
+# these are written out by hand rather than inferred.
+dependsOn:
+  - 'orbita-core'
+  - 'orbita-control'
+  - 'orbita-runtime'
+  - 'orbita-proto'
+  - 'orbita-storage'
+  - 'orbita-wal'
+  - id: 'orbita-sim'
+    scope: 'development'
