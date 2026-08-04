@@ -21,7 +21,7 @@ pub mod flags {
     /// Reserved for the transaction work: marks a record as an uncommitted
     /// intent. In partition-v1 it must be zero, and a reader treats it exactly
     /// as it treats the generic reserved bits. It is named so the bit exists
-    /// before the format's first release freezes the bytes.
+    /// before v0.1.0 freezes the bytes.
     pub const INTENT: u8 = 1 << 3;
     /// Everything a writer sets to zero and a reader rejects, which includes
     /// [`INTENT`] until a future version gives it meaning.
