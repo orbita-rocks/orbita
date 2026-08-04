@@ -65,7 +65,7 @@ be taken back: once the image is pulled and the binary is downloaded, deleting
 the tag does not help anybody.
 
 Pushing the tag starts the **Release** workflow, which verifies the tag against
-the tree, reruns the full test suite with a hundred thousand simulation seeds,
+the tree, reruns the full test suite with the nightly simulation batch,
 builds binaries for four targets, builds and signs a multi-architecture image,
 publishes the chart if its version moved, and creates the GitHub release. The
 publishing jobs sit behind the `release` environment, so there is a second
@@ -107,6 +107,22 @@ direction; cut a minor release rather than arguing with it.
 - `cliff.toml` decides which commit types reach the changelog. It follows the
   visible and hidden split in the conventional commit skill, with anything
   marked breaking promoted regardless of type.
+
+What a release builds is not in any of those. It is the
+`orbita-cli:build-release` task, next to the rest of the tasks in
+`crates/orbita-cli/moon.yml`, for the reason [BUILD.md](BUILD.md) gives for
+moving the others there: the way to find out what CI runs should not be reading
+a workflow file. The release matrix passes the target through:
+
+```bash
+moon run orbita-cli:build-release -- --target aarch64-apple-darwin
+```
+
+The image is the exception. `Dockerfile` calls cargo directly, because the
+build happens inside a container that has no moon in it and adding one would
+buy nothing. It does mean the crate manifests are listed there by hand, so a
+new crate needs a line in the `COPY` block and a word in the stub loop below
+it, or the dependency layer fails to resolve the workspace.
 
 ## Repository settings this assumes
 
