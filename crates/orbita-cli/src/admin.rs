@@ -12,11 +12,11 @@ use anyhow::{bail, Result};
 use orbita_proto::v1::admin_client::AdminClient;
 use orbita_proto::v1::health_client::HealthClient;
 use orbita_proto::v1::{
-    CheckReadinessRequest, CreateCredentialRequest, CreateKeyspaceRequest, DeleteKeyspaceRequest,
-    DescribeClusterRequest, DescribeClusterResponse, Keyspace, KeyspaceConfig,
-    ListKeyspacesRequest, MergePartitionsRequest, Node, NodeHealth, NodeRole, Partition,
-    Permission, RevokeCredentialRequest, SplitPartitionRequest, TransferOwnershipRequest,
-    UpdateKeyspaceRequest,
+    CheckReadinessRequest, ClusterVersion, CreateCredentialRequest, CreateKeyspaceRequest,
+    DeleteKeyspaceRequest, DescribeClusterRequest, DescribeClusterResponse, FinalizeUpgradeRequest,
+    Keyspace, KeyspaceConfig, ListKeyspacesRequest, MergePartitionsRequest, Node, NodeHealth,
+    NodeRole, Partition, Permission, RevokeCredentialRequest, SplitPartitionRequest,
+    TransferOwnershipRequest, UpdateKeyspaceRequest,
 };
 use tonic::transport::Channel;
 
@@ -27,9 +27,9 @@ use crate::cli::{
 use crate::client::{authed, channel};
 use crate::config::Config;
 use crate::output::{
-    render, Ack, Blob, ClusterView, CredentialView, Format, KeyspaceConfigView, KeyspaceListView,
-    KeyspaceView, NodeView, PartitionResultView, PartitionView, PingView, ReadyConditionView,
-    ReadyView, ReplicaView, SplitView,
+    render, Ack, Blob, ClusterView, CredentialView, FinalizeUpgradeView, Format,
+    KeyspaceConfigView, KeyspaceListView, KeyspaceView, NodeView, PartitionResultView,
+    PartitionView, PingView, ReadyConditionView, ReadyView, ReplicaView, SplitView,
 };
 
 /// Opens an admin client against the configured endpoint.
@@ -188,6 +188,17 @@ pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -
                 },
             )
         }
+        ClusterCommand::FinalizeUpgrade => {
+            let request = authed(config, FinalizeUpgradeRequest {})?;
+            let response = client.finalize_upgrade(request).await?.into_inner();
+            render(
+                format,
+                &FinalizeUpgradeView {
+                    previous: version_text(response.previous.as_ref()),
+                    active: version_text(response.active.as_ref()),
+                },
+            )
+        }
         ClusterCommand::Ready => {
             let mut health = connect_health(config)?;
             let request = authed(config, CheckReadinessRequest {})?;
@@ -229,6 +240,26 @@ pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -
                 },
             )
         }
+    }
+}
+
+/// Renders a wire version as "major.minor", or "unknown" when the server did
+/// not send one, which a script can still branch on.
+fn version_text(version: Option<&ClusterVersion>) -> String {
+    version.map_or_else(
+        || "unknown".to_owned(),
+        |v| format!("{}.{}", v.major, v.minor),
+    )
+}
+
+/// Renders a node's speakable window the way the docs write one.
+fn speaks_text(min: Option<&ClusterVersion>, max: Option<&ClusterVersion>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) if min != max => {
+            format!("{}..{}", version_text(Some(min)), version_text(Some(max)))
+        }
+        (_, Some(max)) => version_text(Some(max)),
+        _ => "unknown".to_owned(),
     }
 }
 
@@ -406,6 +437,7 @@ pub fn node_view(node: &Node) -> NodeView {
         role: role.to_owned(),
         health: health.to_owned(),
         raft_leader: node.is_raft_leader,
+        speaks: speaks_text(node.speaks_min.as_ref(), node.speaks_max.as_ref()),
     }
 }
 
@@ -415,6 +447,12 @@ pub fn cluster_view(response: &DescribeClusterResponse) -> ClusterView {
     ClusterView::new(
         response.nodes.iter().map(node_view).collect(),
         response.partitions.iter().map(partition_view).collect(),
+    )
+    .with_cluster_version(
+        response
+            .cluster_version
+            .as_ref()
+            .map(|v| version_text(Some(v))),
     )
 }
 
@@ -464,9 +502,23 @@ mod tests {
             role: 99,
             health: 99,
             is_raft_leader: false,
+            speaks_min: None,
+            speaks_max: None,
         });
         assert_eq!(view.role, "unknown");
         assert_eq!(view.health, "unknown");
+        assert_eq!(
+            view.speaks, "unknown",
+            "a server that predates version reporting still renders"
+        );
+    }
+
+    #[test]
+    fn a_speakable_window_renders_the_way_the_docs_write_one() {
+        let v = |major, minor| Some(ClusterVersion { major, minor });
+        assert_eq!(speaks_text(v(0, 1).as_ref(), v(0, 2).as_ref()), "0.1..0.2");
+        assert_eq!(speaks_text(v(0, 0).as_ref(), v(0, 0).as_ref()), "0.0");
+        assert_eq!(speaks_text(None, v(0, 2).as_ref()), "0.2");
     }
 
     #[test]

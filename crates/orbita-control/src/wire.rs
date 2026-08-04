@@ -10,6 +10,7 @@
 
 use crate::codec::{CodecError, CodecResult, Reader, Writer};
 use crate::membership::NodeStatus;
+use crate::version::ClusterVersion;
 
 use bytes::Bytes;
 use orbita_core::{
@@ -18,8 +19,17 @@ use orbita_core::{
 };
 
 pub const METHOD_FETCH_MAP: u16 = 1;
+/// The v0.0.1 status report: no speakable range in the request, no cluster
+/// version in the reply. Served for one release window so that a rolling
+/// update between 0.0 and the first version-aware release does not black out
+/// heartbeats across the boundary; delete when the window moves past 0.0.
 pub const METHOD_REPORT_STATUS: u16 = 2;
 pub const METHOD_FETCH_NODES: u16 = 3;
+/// The status report carrying the speakable range, answered with the active
+/// cluster version. A client that gets "unknown control method" back falls
+/// back to [`METHOD_REPORT_STATUS`], which is how a new worker heartbeats an
+/// old leader mid-rollout.
+pub const METHOD_REPORT_STATUS_V2: u16 = 4;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -71,6 +81,22 @@ impl ReportStatusRequest {
         r.done()?;
         Ok(Self { node, status })
     }
+
+    /// The v0.0.1 payload shape, for [`super::wire::METHOD_REPORT_STATUS`].
+    pub(crate) fn encode_legacy(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_legacy(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_legacy(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_legacy(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
 }
 
 /// The one response shape both methods share.
@@ -80,6 +106,15 @@ pub(crate) enum ControlResponse {
     Map(Option<PartitionMap>),
     Accepted {
         map_version: MapVersion,
+        /// The active cluster version, carried on every heartbeat reply so a
+        /// node learns which version to speak in the same round trip that
+        /// keeps it out of the failure detector.
+        ///
+        /// Optional because it rides at the end of the message: a v0.0.1
+        /// leader's reply simply ends after the map version, and a reply to a
+        /// v0.0.1 worker must end there too or the worker rejects it as
+        /// trailing bytes. `None` means "the other side predates versions".
+        cluster_version: Option<ClusterVersion>,
     },
     /// Carries the leader so the caller retries in one hop rather than
     /// sweeping the whole group.
@@ -113,8 +148,14 @@ impl ControlResponse {
                     }
                 }
             }
-            ControlResponse::Accepted { map_version } => {
+            ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            } => {
                 w.u8(STATUS_ACCEPTED).u64(map_version.get());
+                if let Some(cluster_version) = cluster_version {
+                    cluster_version.encode(&mut w);
+                }
             }
             ControlResponse::NotLeader { leader } => {
                 w.u8(STATUS_NOT_LEADER)
@@ -145,6 +186,14 @@ impl ControlResponse {
             }
             STATUS_ACCEPTED => ControlResponse::Accepted {
                 map_version: MapVersion(r.u64()?),
+                // The version is the last field, so a reply from a v0.0.1
+                // leader is one that ends here. Absent is an answer, not an
+                // error; the caller treats it as "no version learned".
+                cluster_version: if r.has_more() {
+                    Some(ClusterVersion::decode(&mut r)?)
+                } else {
+                    None
+                },
             },
             STATUS_NOT_LEADER => ControlResponse::NotLeader {
                 leader: r.opt_u64()?.map(NodeId),
@@ -308,6 +357,13 @@ mod tests {
             ControlResponse::Map(None),
             ControlResponse::Accepted {
                 map_version: MapVersion(9),
+                cluster_version: Some(ClusterVersion::new(0, 2)),
+            },
+            // What a v0.0.1 leader sends, and what a leader answering a
+            // v0.0.1 worker must send.
+            ControlResponse::Accepted {
+                map_version: MapVersion(9),
+                cluster_version: None,
             },
             ControlResponse::NotLeader {
                 leader: Some(NodeId(2)),
@@ -330,6 +386,7 @@ mod tests {
                 role: NodeRole::Worker,
                 address: "10.0.0.7:7000".into(),
                 map_version: MapVersion(3),
+                speaks: crate::version::binary_speaks(),
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),
@@ -341,6 +398,32 @@ mod tests {
         assert_eq!(
             ReportStatusRequest::decode(&request.encode()),
             Ok(request.clone())
+        );
+    }
+
+    #[test]
+    fn a_v0_0_1_status_report_still_decodes_through_the_legacy_method() {
+        // The legacy encoding is byte for byte what v0.0.1 sends on
+        // METHOD_REPORT_STATUS. If this breaks, an old worker heartbeating a
+        // new leader mid-rollout drops out of the failure detector.
+        let request = ReportStatusRequest {
+            node: NodeId(7),
+            status: NodeStatus {
+                role: NodeRole::Worker,
+                address: "10.0.0.7:7000".into(),
+                map_version: MapVersion(3),
+                speaks: crate::version::VersionRange::exactly(crate::version::ClusterVersion::ZERO),
+                partitions: vec![PartitionProgress {
+                    partition: PartitionId(1),
+                    durable_lamport: Lamport(10),
+                    applied_lamport: Lamport(9),
+                    size_bytes: 1024,
+                }],
+            },
+        };
+        assert_eq!(
+            ReportStatusRequest::decode_legacy(&request.encode_legacy()),
+            Ok(request)
         );
     }
 

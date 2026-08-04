@@ -29,6 +29,7 @@ def test_the_proto_still_declares_the_admin_surface_we_expect():
         "SplitPartition",
         "MergePartitions",
         "TransferOwnership",
+        "FinalizeUpgrade",
     }
 
 
