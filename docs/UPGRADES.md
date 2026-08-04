@@ -68,7 +68,7 @@ helm upgrade orbita deploy/helm/orbita --namespace orbita --set image.tag=0.4.0
 Or directly:
 
 ```
-kubectl --namespace orbita set image statefulset/orbita-worker orbita=ghcr.io/bradhe/orbita:0.4.0
+kubectl --namespace orbita set image statefulset/orbita-worker orbita=ghcr.io/orbita-rocks/orbita:0.4.0
 ```
 
 Watch it:

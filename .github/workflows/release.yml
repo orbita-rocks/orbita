@@ -1,0 +1,310 @@
+name: Release
+
+# What a tag does.
+#
+# Everything published carries the same version, and that version comes from
+# the workspace manifest rather than from the tag, so a tag that disagrees with
+# the tree fails before anything is built. The order matters: verify, then run
+# the full test suite again, then build, then publish. A release that is
+# already half published when a test fails is the thing this ordering exists to
+# prevent.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/orbita-rocks/orbita
+
+  # Keep in step with .prototools and with ci.yml. moonrepo/setup-toolchain
+  # does not read .prototools, so the version has to be passed in. Not called
+  # MOON_VERSION, because moon reads that itself to report its own version.
+  MOONREPO_CLI_VERSION: '2.4.6'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: v
+        name: The tag, the manifest, and the chart have to agree
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+
+          manifest="$(perl -0ne 'print $1 if /\[workspace\.package\]\nversion = "([^"]+)"/' Cargo.toml)"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::the tag says $version but the workspace version is $manifest"
+            exit 1
+          fi
+
+          chart="$(perl -ne 'print $1 if /^appVersion: "([^"]+)"/' deploy/helm/orbita/Chart.yaml)"
+          if [ "$chart" != "$version" ]; then
+            echo "::error::the tag says $version but the chart appVersion is $chart"
+            exit 1
+          fi
+
+          # A tag anywhere but main would publish code that never went through
+          # a release pull request.
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is not reachable from main"
+            exit 1
+          fi
+
+          case "$version" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+
+          if [ "$prerelease" = "false" ] && ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  # The same checks a pull request gets, with the nightly simulation batch
+  # instead of the short one. This is the one place where the wall clock is
+  # worth spending, because the seeds that only fail one time in ten thousand
+  # are exactly the ones nobody wants to meet for the first time in a released
+  # build.
+  test:
+    name: full test suite
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+    with:
+      long_sim: true
+
+  binaries:
+    name: ${{ matrix.target }}
+    needs: [verify, test]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners for every target. Cross-compiling would mean
+          # cross-compiling RocksDB and its C++ toolchain, which is a much
+          # larger problem than renting four machines.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # protoc is a system dependency moon does not manage, and it is needed on
+      # four different operating systems here, which is what this action is
+      # for. CI installs it with apt because CI is Linux only.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Rust first: moon runs cargo, it does not install it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: moonrepo/setup-toolchain@v0
+        with:
+          # Off for the same reason as in ci.yml: proto reads
+          # rust-toolchain.toml as a version file and takes the Rust install
+          # away from rustup, leaving a toolchain with no cargo in it.
+          auto-install: false
+          moon-version: ${{ env.MOONREPO_CLI_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The task carries --release and --locked, so what a release builds is
+      # written down in crates/orbita-cli/moon.yml rather than here. --locked
+      # matters most: a release built against a dependency graph that is not
+      # the one in the lockfile is not the thing that was tested.
+      - name: Build
+        run: moon run orbita-cli:build-release -- --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          version="${{ needs.verify.outputs.version }}"
+          name="orbita-v${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/orbita" "dist/$name/"
+          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          tar -czf "dist/${name}.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  image:
+    name: container image
+    needs: [verify, test]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The moving tags are only moved for a real release. A prerelease that
+      # took `latest` with it would be handed to anybody who did not pin, which
+      # is most people running the quickstart.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=${{ needs.verify.outputs.prerelease == 'false' }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.verify.outputs.prerelease == 'false' }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The Dockerfile defaults to four parallel compile jobs so it fits a
+          # laptop. The runner has more room.
+          build-args: BUILD_JOBS=8
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      # Provenance and a signature so that somebody pulling the image can check
+      # it came from this repository and this workflow, rather than trusting
+      # the registry.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign
+        run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+  chart:
+    name: helm chart
+    needs: [verify, image]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Package and push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+          # The chart's own version tracks the templates and moves on its own
+          # schedule, so it is taken from Chart.yaml rather than from the tag.
+          # If it has not moved since the last release there is nothing to
+          # publish, which is a normal outcome and not a failure.
+          chart_version="$(helm show chart deploy/helm/orbita | awk '/^version:/ {print $2}')"
+          if helm show chart "oci://${{ env.REGISTRY }}/orbita-rocks/charts/orbita" \
+               --version "$chart_version" >/dev/null 2>&1; then
+            echo "::notice::chart $chart_version is already published, skipping"
+            exit 0
+          fi
+
+          helm package deploy/helm/orbita --destination dist
+          helm push "dist/orbita-${chart_version}.tgz" \
+            "oci://${{ env.REGISTRY }}/orbita-rocks/charts"
+
+  publish:
+    name: github release
+    needs: [verify, binaries, image]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: dist
+
+      # One checksum file for every artifact, so verifying a download is one
+      # command rather than one per file.
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Extract the release notes
+        run: |
+          version="${{ needs.verify.outputs.version }}"
+          if [ "${{ needs.verify.outputs.prerelease }}" = "true" ]; then
+            echo "A prerelease build of v${version}. Not for production." > /tmp/notes.md
+          else
+            awk -v v="$version" '
+              $0 ~ "^## \\["v"\\]" {found=1; next}
+              found && /^## \[/ {exit}
+              found {print}
+            ' CHANGELOG.md > /tmp/notes.md
+          fi
+          cat >> /tmp/notes.md <<EOF
+
+          ## Artifacts
+
+          \`\`\`
+          docker pull ${{ env.IMAGE }}:${version}
+          \`\`\`
+
+          The chart is at \`oci://ghcr.io/orbita-rocks/charts/orbita\`. Binaries
+          are attached below; \`SHA256SUMS\` covers all of them.
+          EOF
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: /tmp/notes.md
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true

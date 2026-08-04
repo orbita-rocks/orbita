@@ -309,6 +309,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -819,7 +828,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "orbita-cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -841,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-control"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -860,15 +869,31 @@ dependencies = [
 
 [[package]]
 name = "orbita-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "thiserror",
 ]
 
 [[package]]
+name = "orbita-format"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "crc32c",
+ "orbita-core",
+ "orbita-objectstore",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "orbita-objectstore"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -877,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-proto"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "prost",
  "tonic",
@@ -886,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-runtime"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "orbita-core",
@@ -896,7 +921,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-server"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "orbita-control",
@@ -915,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-sim"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "orbita-core",
@@ -925,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-storage"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "orbita-core",
@@ -938,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-wal"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -1200,6 +1225,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1223,6 +1257,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

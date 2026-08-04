@@ -7,6 +7,15 @@ wire contract from outside the Rust build.
 ## Running them
 
 ```
+moon run e2e:test
+```
+
+That builds the binary, creates the virtualenv, installs the dependencies into
+it, and runs pytest, because the task graph says those are what it needs.
+
+By hand, if you would rather not have moon in the loop:
+
+```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m pytest
 ```

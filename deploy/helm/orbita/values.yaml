@@ -5,7 +5,7 @@
 # everything on local disks.
 
 image:
-  repository: ghcr.io/bradhe/orbita
+  repository: ghcr.io/orbita-rocks/orbita
   # Empty means the chart's appVersion, so the image and the chart cannot drift
   # apart by accident.
   tag: ""

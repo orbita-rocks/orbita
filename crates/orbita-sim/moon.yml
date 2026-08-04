@@ -1,0 +1,34 @@
+# https://moonrepo.dev/docs/config/project
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+# Mirrors this crate's Cargo dependencies. See .moon/tasks/rust.yml for why
+# these are written out by hand rather than inferred.
+dependsOn:
+  - 'orbita-core'
+  - 'orbita-runtime'
+
+tasks:
+  # The simulation is the one suite where the release profile is not an
+  # optimisation but a requirement: seeds per hour is what decides how much of
+  # the state space gets explored, and a debug build explores roughly none of
+  # it. This is separate from the inherited `test` task, which builds the
+  # crate's own unit tests in debug like every other crate.
+  sim:
+    command: 'cargo test -p orbita-sim --release'
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+      - '@group(manifests)'
+
+  # The nightly batch. The seed count is the knob to raise when a release is
+  # close; a failure reports the seed that reproduces it exactly, so a run here
+  # turning red is directly actionable rather than a mystery.
+  sim-long:
+    extends: 'sim'
+    env:
+      ORBITA_SIM_SEEDS: '50000'
+    options:
+      # Deliberately never cached. The point of this task is to explore new
+      # ground on every run, so "nothing changed since last time" is not a
+      # reason to skip it.
+      cache: false

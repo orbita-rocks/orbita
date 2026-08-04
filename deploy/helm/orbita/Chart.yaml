@@ -6,11 +6,11 @@ type: application
 # The chart version tracks the chart, and appVersion tracks the binary. They
 # move independently because a fix to a template is not a release of the store.
 version: 0.1.0
-appVersion: "0.0.0"
+appVersion: "0.0.1"
 
-home: https://github.com/bradhe/orbita
+home: https://github.com/orbita-rocks/orbita
 sources:
-  - https://github.com/bradhe/orbita
+  - https://github.com/orbita-rocks/orbita
 keywords:
   - key-value
   - coordination
