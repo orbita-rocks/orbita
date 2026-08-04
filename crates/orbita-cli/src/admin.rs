@@ -205,6 +205,12 @@ pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -
                     .filter(|condition| !condition.met)
                     .map(|condition| condition.name.as_str())
                     .collect();
+                // A server that says "not ready" without naming a condition is
+                // violating the response contract, but the probe log should
+                // still read as a sentence rather than trail off.
+                if waiting.is_empty() {
+                    bail!("the node is not ready, and named no unmet condition");
+                }
                 bail!("the node is not ready, waiting on: {}", waiting.join(", "));
             }
             render(

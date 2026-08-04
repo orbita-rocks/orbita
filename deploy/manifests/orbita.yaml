@@ -232,13 +232,13 @@ spec:
             - name: peer
               containerPort: 7101
           # Readiness is what gates the next pod in a rolling update, so it is
-          # the safety mechanism of an upgrade rather than a formality. It
-          # means that this node has registered with the leader group,
-          # recovered its log, opened its partitions, and caught up, which is
-          # what `cluster ready` asserts: it exits non-zero and names the
-          # unmet conditions until every one of them holds. A rolling update
-          # therefore waits at each pod until it has rejoined and caught up.
-          # See docs/UPGRADES.md.
+          # the safety mechanism of an upgrade rather than a formality.
+          # `cluster ready` exits non-zero and names the unmet conditions
+          # until the node has recovered its log, opened its partitions, and
+          # caught up. The registration condition is met by construction for
+          # now: the CLI does not yet pass the leader group to the server, so
+          # rejoin is not asserted on a deployed node. docs/UPGRADES.md lists
+          # that gap.
           #
           # Liveness stays conservative, because failing it kills the pod. It
           # runs `cluster ping`, which never asks anything about the cluster
@@ -377,13 +377,13 @@ spec:
             - name: peer
               containerPort: 7101
           # Readiness is what gates the next pod in a rolling update, so it is
-          # the safety mechanism of an upgrade rather than a formality. It
-          # means that this node has registered with the leader group,
-          # recovered its log, opened its partitions, and caught up, which is
-          # what `cluster ready` asserts: it exits non-zero and names the
-          # unmet conditions until every one of them holds. A rolling update
-          # therefore waits at each pod until it has rejoined and caught up.
-          # See docs/UPGRADES.md.
+          # the safety mechanism of an upgrade rather than a formality.
+          # `cluster ready` exits non-zero and names the unmet conditions
+          # until the node has recovered its log, opened its partitions, and
+          # caught up. The registration condition is met by construction for
+          # now: the CLI does not yet pass the leader group to the server, so
+          # rejoin is not asserted on a deployed node. docs/UPGRADES.md lists
+          # that gap.
           #
           # Liveness stays conservative, because failing it kills the pod. It
           # runs `cluster ping`, which never asks anything about the cluster

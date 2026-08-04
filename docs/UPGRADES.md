@@ -19,15 +19,23 @@ finished.
 - A node does not hand its partitions off on SIGTERM. The termination grace
   periods in the chart are sized for a handoff that the server does not perform
   yet, so today a restart is a failover.
+- The `orbita` binary does not yet hand the leader group configuration to the
+  server. A node started by the CLI runs without a control client, and the
+  `control-plane-joined` readiness condition is met by construction on such a
+  node rather than by an accepted registration. The server asserts the join
+  whenever it is configured with a leader group, which is how the in-process
+  cluster tests run it; the CLI wiring is the missing piece.
 
-Readiness does mean what it should: a node reports Ready only once it has
-rejoined the leader group, recovered its write-ahead log, and opened and
-caught up the partitions the map says it holds, so a rolling update waits at
-each pod until it is actually carrying its share again.
+Readiness is otherwise real: a node reports Ready only once it has recovered
+its write-ahead log and opened and caught up the partitions the map says it
+holds, and it turns unready again if a map change hands it a partition it
+cannot open. What a deployed cluster does not get yet is the rejoin half,
+per the gap above.
 
 The practical consequence of the gaps that remain: stage a rollout with the
 `partition` field and check the cluster between steps when the blast radius
-warrants it, because each pod replacement is still a failover.
+warrants it, because each pod replacement is still a failover and the rollout
+does not wait for a rejoin it cannot see.
 
 ## What a version means
 
@@ -79,8 +87,9 @@ kubectl --namespace orbita rollout status statefulset/orbita-worker
 
 Pods are replaced one at a time in reverse ordinal order, and the rollout does
 not move to the next pod until the current one reports Ready. That is the whole
-safety mechanism, which is why readiness asserts rejoin, recovery, and
-catch-up rather than just a listening socket.
+safety mechanism, which is why readiness asserts recovery and catch-up rather
+than just a listening socket, and why the rejoin gap above is a gap worth
+closing rather than a footnote.
 
 Upgrade the leader group and the workers separately. There are two StatefulSets
 and they are two rollouts.
@@ -210,10 +219,12 @@ a restore.
 Three probes, three different jobs. Getting these wrong is the usual way a
 stateful system is broken on Kubernetes.
 
-- Readiness gates the rollout and the client Service. It means the node has
-  rejoined the leader group, recovered its write-ahead log, and opened and
-  caught up its partitions. It runs `orbita cluster ready`, which exits
-  non-zero and names the unmet conditions until all of them hold.
+- Readiness gates the rollout and the client Service. It runs `orbita cluster
+  ready`, which exits non-zero and names the unmet conditions until the node
+  has recovered its write-ahead log, opened and caught up its partitions, and
+  registered with the leader group where it has one. Until the CLI wires the
+  leader group through (see the gaps at the top), that last condition is met
+  by construction on a deployed node.
 - Liveness kills the pod when it fails, so it runs `orbita cluster ping` and
   checks only that the process responds. It never checks cluster state and
   never checks whether peers are reachable, because a liveness probe that

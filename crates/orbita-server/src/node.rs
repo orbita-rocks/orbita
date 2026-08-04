@@ -171,13 +171,11 @@ impl<R: Runtime> Node<R> {
         });
         node.reconcile().await?;
         // Opening a partition replays its write-ahead log to the trusted end,
-        // so a reconcile that succeeded is both conditions at once: every log
-        // this node holds is recovered and every partition the map names is
-        // open. Marked here rather than inside `reconcile` because a later
-        // reconcile reopens single partitions, which is catch-up moving and
-        // not recovery happening again.
+        // so the initial reconcile succeeding means every log this node holds
+        // is recovered. Marked here rather than inside `reconcile` because a
+        // later reconcile reopens single partitions, which is catch-up moving
+        // and not recovery happening again. `reconcile` marks catch-up itself.
         node.readiness.mark(ReadinessCondition::WalRecovered);
-        node.readiness.mark(ReadinessCondition::PartitionsCaughtUp);
 
         runtime
             .transport()
@@ -218,7 +216,26 @@ impl<R: Runtime> Node<R> {
                 return Ok(());
             }
         }
-        let outcome = self.reconcile().await;
+        self.reconcile().await
+    }
+
+    /// Brings the set of open partitions in line with the map, and records how
+    /// it went.
+    ///
+    /// The retry flag and the readiness condition are updated while the
+    /// `hosts` write lock is still held. `refresh_map` runs concurrently, from
+    /// the control loop, from misroute repair, and from the admin surface, and
+    /// the lock is the only thing serializing the reconciles underneath them.
+    /// Recording after the lock dropped would let a stale failure overwrite a
+    /// fresher success: the node would sit unready with the retry flag saying
+    /// there is nothing to retry, and nothing would ever re-mark it until the
+    /// map version moved.
+    async fn reconcile(&self) -> Result<()> {
+        let map = self.map();
+        let wanted: Vec<PartitionInfo> = map.held_by(self.node_id).cloned().collect();
+
+        let mut hosts = self.hosts.write().await;
+        let outcome = self.reconcile_locked(&mut hosts, wanted).await;
         self.unreconciled.store(outcome.is_err(), Ordering::Release);
         // Readiness follows the reconcile outcome both ways. A node holding a
         // partition it could not open is not ready, however long it has been
@@ -233,12 +250,13 @@ impl<R: Runtime> Node<R> {
         outcome
     }
 
-    /// Brings the set of open partitions in line with the map.
-    async fn reconcile(&self) -> Result<()> {
-        let map = self.map();
-        let wanted: Vec<PartitionInfo> = map.held_by(self.node_id).cloned().collect();
-
-        let mut hosts = self.hosts.write().await;
+    /// The body of a reconcile, run under the `hosts` write lock the caller
+    /// holds so the outcome it returns is the outcome that gets recorded.
+    async fn reconcile_locked(
+        &self,
+        hosts: &mut HashMap<PartitionId, Arc<PartitionHost<R>>>,
+        wanted: Vec<PartitionInfo>,
+    ) -> Result<()> {
         hosts.retain(|id, _| {
             let keep = wanted.iter().any(|p| p.id == *id);
             if !keep {
@@ -847,6 +865,125 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map_source::StaticMapSource;
+    use orbita_core::{Epoch, KeyRange, KeyspaceName, MapVersion};
+    use orbita_sim::Simulation;
+
+    fn keyspace_info() -> KeyspaceInfo {
+        KeyspaceInfo {
+            id: KeyspaceId(1),
+            name: KeyspaceName::new("default").unwrap(),
+            default_ttl_millis: None,
+            max_value_bytes: None,
+            max_storage_bytes: None,
+            max_reads_per_second: None,
+            max_writes_per_second: None,
+        }
+    }
+
+    fn partition(id: u64, range: KeyRange) -> PartitionInfo {
+        PartitionInfo {
+            id: PartitionId(id),
+            keyspace: KeyspaceId(1),
+            range,
+            owner: Some(NodeId(1)),
+            epoch: Epoch(1),
+            replicas: Vec::new(),
+        }
+    }
+
+    /// One unbounded partition, which is what the node opens at start.
+    fn one_partition_map() -> PartitionMap {
+        let mut map = PartitionMap::new(MapVersion(1));
+        map.insert_keyspace(keyspace_info());
+        map.insert_partition(partition(1, KeyRange::unbounded()));
+        map
+    }
+
+    /// The same keyspace split in two, handing this node a second partition.
+    fn two_partition_map() -> PartitionMap {
+        let mut map = PartitionMap::new(MapVersion(2));
+        map.insert_keyspace(keyspace_info());
+        map.insert_partition(partition(
+            1,
+            KeyRange::new(Bytes::new(), Some(Bytes::from_static(b"m"))).unwrap(),
+        ));
+        map.insert_partition(partition(
+            2,
+            KeyRange::new(Bytes::from_static(b"m"), None).unwrap(),
+        ));
+        assert_eq!(map.check_coverage(), Ok(()));
+        map
+    }
+
+    /// The transition the readiness gate adds beyond startup: a reconcile that
+    /// cannot open a partition unreadies the node, and the retry on the next
+    /// refresh, with the map version unchanged, readies it again once the
+    /// open succeeds.
+    #[test]
+    fn a_failed_reconcile_unreadies_the_node_until_a_retry_opens_the_partition() {
+        let root =
+            std::env::temp_dir().join(format!("orbita-readiness-reconcile-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+
+        let sim = Simulation::new(7);
+        let runtime = sim.add_node(NodeId(1));
+        let layout = DataLayout {
+            storage_root: root.join("n1"),
+            wal_root: "wal".to_string(),
+        };
+        std::fs::create_dir_all(&layout.storage_root).expect("a storage directory");
+        let blocked = layout.storage_root.join("p2");
+
+        let source = StaticMapSource::new(one_partition_map());
+        let gate = Arc::new(ReadinessGate::new());
+        let node = {
+            let layout = layout.clone();
+            let source = BoxedMapSource::new(source.clone());
+            let gate = Arc::clone(&gate);
+            sim.block_on(async move {
+                Node::start(
+                    runtime,
+                    NodeId(1),
+                    layout,
+                    source,
+                    crate::DEFAULT_LEASE_DURATION,
+                    gate,
+                )
+                .await
+                .expect("the node starts")
+            })
+        };
+        assert!(
+            gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
+            "the initial open marks catch-up"
+        );
+
+        // A plain file where the new partition's storage engine wants a
+        // directory, which stands in for the transient open failures the
+        // reconcile comment describes.
+        std::fs::write(&blocked, b"in the way").expect("the blocking file");
+        source.set(two_partition_map());
+        let refreshing = Arc::clone(&node);
+        let outcome = sim.block_on(async move { refreshing.refresh_map().await });
+        assert!(outcome.is_err(), "the blocked partition cannot open");
+        assert!(
+            !gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
+            "a node holding a partition it could not open is not ready"
+        );
+
+        std::fs::remove_file(&blocked).expect("unblocking the partition");
+        let refreshing = Arc::clone(&node);
+        sim.block_on(async move { refreshing.refresh_map().await })
+            .expect("the retry reconciles even though the map version is unchanged");
+        assert!(
+            gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
+            "readiness returns once every partition is open again"
+        );
+
+        drop(node);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn a_cursor_carries_both_the_routing_key_and_the_engines_own() {
