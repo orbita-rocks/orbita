@@ -77,6 +77,10 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "ORBITA_JOIN_TIMEOUT",
         "cluster.join_timeout, a duration, or 0 to retry forever",
     ),
+    (
+        "ORBITA_DRAIN_TIMEOUT",
+        "cluster.drain_timeout, bounded by the orchestrator grace period",
+    ),
     ("ORBITA_OBJECT_STORE_ENDPOINT", "object_store.endpoint"),
     ("ORBITA_OBJECT_STORE_BUCKET", "object_store.bucket"),
     ("ORBITA_OBJECT_STORE_REGION", "object_store.region"),
@@ -210,6 +214,9 @@ pub struct ClusterConfig {
     /// How long to keep trying before giving up and exiting. Zero means retry
     /// forever.
     pub join_timeout_millis: u64,
+    /// The process-side handoff budget. Kubernetes should allow a little more
+    /// than this before SIGKILL so the timeout is reported clearly.
+    pub drain_timeout_millis: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -296,6 +303,7 @@ pub struct ClusterLayer {
     pub join_backoff_initial: Option<String>,
     pub join_backoff_max: Option<String>,
     pub join_timeout: Option<String>,
+    pub drain_timeout: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -361,7 +369,8 @@ impl Layer {
             allow_version_skew,
             join_backoff_initial,
             join_backoff_max,
-            join_timeout
+            join_timeout,
+            drain_timeout
         );
         overlay!(
             self.object_store,
@@ -463,6 +472,7 @@ impl Layer {
                 join_backoff_initial: get("ORBITA_JOIN_BACKOFF_INITIAL").map(str::to_owned),
                 join_backoff_max: get("ORBITA_JOIN_BACKOFF_MAX").map(str::to_owned),
                 join_timeout: get("ORBITA_JOIN_TIMEOUT").map(str::to_owned),
+                drain_timeout: get("ORBITA_DRAIN_TIMEOUT").map(str::to_owned),
             },
             object_store: ObjectStoreLayer {
                 endpoint: get("ORBITA_OBJECT_STORE_ENDPOINT").map(str::to_owned),
@@ -544,6 +554,9 @@ impl Layer {
         // silently for a day is not.
         let join_timeout_millis =
             duration_millis("cluster.join_timeout", self.cluster.join_timeout)?.unwrap_or(300_000);
+        let drain_timeout_millis =
+            duration_millis("cluster.drain_timeout", self.cluster.drain_timeout)?
+                .unwrap_or(290_000);
         if join_backoff_max_millis < join_backoff_initial_millis {
             bail!(
                 "cluster.join_backoff_max is {join_backoff_max_millis} ms, below \
@@ -585,6 +598,7 @@ impl Layer {
                 join_backoff_initial_millis,
                 join_backoff_max_millis,
                 join_timeout_millis,
+                drain_timeout_millis,
             },
             object_store: ObjectStoreConfig {
                 endpoint: self.object_store.endpoint,

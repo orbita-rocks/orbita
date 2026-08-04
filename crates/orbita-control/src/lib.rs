@@ -51,11 +51,12 @@
 //! 3. The new owner waits out the deposed owner's read leases.
 //! 4. One entry names the most caught-up replica as owner.
 //!
-//! Steps two and four cannot be reordered or fused, and that is enforced in
-//! [`ClusterState`] rather than in the code that drives a failover:
-//! `AssignOwner` is rejected for a partition that still has an owner, and the
-//! only thing that removes an owner is `FencePartition`, which bumps the epoch
-//! in the same entry. A caller cannot get the order wrong even by trying.
+//! Steps two and four cannot be reordered or fused during failover, and that
+//! is enforced in [`ClusterState`] rather than in the code that drives it:
+//! `AssignOwner` is rejected for a partition that still has an owner. Planned
+//! shutdown is different because the old owner is present to quiesce writes
+//! and drain leases first. Its `TransferOwnership` entry moves the owner and
+//! bumps the epoch atomically, avoiding the ownerless interval failover needs.
 //!
 //! Step three is why [`ControlConfig`] keeps the lease duration next to the
 //! failure detection thresholds. Per
@@ -125,6 +126,6 @@ pub use version::{
     binary_speaks, binary_version, ClusterVersion, CompatibilityRefusal, VersionRange,
 };
 pub use wire::{
-    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
-    METHOD_REPORT_STATUS_V2,
+    METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
+    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
 };

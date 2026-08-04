@@ -17,8 +17,8 @@
 use crate::map_source::MapSource;
 
 use orbita_control::{
-    binary_speaks, ClusterVersion, CompatibilityRefusal, ControlClient, NodeRole, NodeStatus,
-    PartitionProgress, StatusReportResponse,
+    binary_speaks, binary_version, ClusterVersion, CompatibilityRefusal, ControlClient, NodeRole,
+    NodeStatus, PartitionProgress, StatusReportResponse,
 };
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
 use orbita_runtime::Runtime;
@@ -188,6 +188,12 @@ impl<R: Runtime> StatusReporter<R> {
         *self.active.lock().expect("active version poisoned")
     }
 
+    /// Whether this worker may use the finalized lifecycle protocol.
+    #[must_use]
+    pub fn can_handoff(&self) -> bool {
+        self.role == NodeRole::Worker && self.active_cluster_version() == Some(binary_version())
+    }
+
     /// Sends one report, carrying how far this node has got on every partition
     /// it holds, and reads the active cluster version back off the reply.
     ///
@@ -198,19 +204,28 @@ impl<R: Runtime> StatusReporter<R> {
         &self,
         map_version: MapVersion,
         partitions: Vec<PartitionProgress>,
+        ready: bool,
+        draining: bool,
     ) -> Result<StatusReportResponse> {
         let status = NodeStatus {
             role: self.role,
             address: self.address.clone(),
             map_version,
             speaks: binary_speaks(),
+            ready,
+            draining,
             partitions,
         };
-        match self
-            .client
-            .report_status_for_version(self.node, status)
-            .await?
-        {
+        let response = if self.can_handoff() {
+            self.client
+                .report_status_with_lifecycle(self.node, status)
+                .await?
+        } else {
+            self.client
+                .report_status_for_version(self.node, status)
+                .await?
+        };
+        match response {
             // No version in the reply means the leader predates them, which
             // mid-rollout is normal; this node keeps whatever it last knew.
             StatusReportResponse::Accepted {
@@ -257,5 +272,10 @@ impl<R: Runtime> StatusReporter<R> {
                 Ok(StatusReportResponse::Incompatible(refusal))
             }
         }
+    }
+
+    /// Requests one control-plane drain pass for this node.
+    pub async fn drain_node(&self) -> Result<bool> {
+        self.client.drain_node(self.node).await
     }
 }

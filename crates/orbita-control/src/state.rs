@@ -10,11 +10,12 @@
 //!
 //! It is enforced here rather than in the code that drives a failover.
 //! [`ControlCommand::AssignOwner`] is rejected for a partition that still has
-//! an owner, and the only thing that removes an owner is
+//! an owner, and failover removes one only through
 //! [`ControlCommand::FencePartition`], which bumps the epoch as it does so. A
-//! caller cannot promote before fencing even by accident, because the state
-//! machine will not apply the entry. Putting the rule in the driver would make
-//! it a convention; putting it here makes it an invariant.
+//! caller cannot promote before fencing even by accident. A planned
+//! [`ControlCommand::TransferOwnership`] is the narrow exception: the old
+//! owner has quiesced writes and leases first, so ownership and the epoch move
+//! in one entry without an unavailable interval.
 
 use crate::command::ControlCommand;
 use crate::membership::{NodeHealth, NodeRole};
@@ -57,6 +58,23 @@ pub struct NodeRecord {
     /// The cluster versions this node's binary asserted it can speak, from
     /// its registration. What `finalize-upgrade` checks a target against.
     pub speaks: VersionRange,
+    /// Replicated because ownership decisions must survive a control leader
+    /// change without turning process liveness into readiness.
+    pub ready: bool,
+    /// Draining workers keep their current ownership until each transfer
+    /// commits, but are excluded from every new placement.
+    pub draining: bool,
+}
+
+/// The acknowledgement a planned transfer still needs from its receiver.
+///
+/// This is replicated with ownership so a control leader change cannot lose
+/// the narrower completion condition and fall back to waiting on the whole
+/// cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HandoffCheckpoint {
+    pub receiver: NodeId,
+    pub map_version: MapVersion,
 }
 
 /// Everything the leader group knows, as of some prefix of the log.
@@ -66,6 +84,7 @@ pub struct ClusterState {
     keyspaces: BTreeMap<KeyspaceId, Keyspace>,
     phases: BTreeMap<PartitionId, PartitionPhase>,
     nodes: BTreeMap<NodeId, NodeRecord>,
+    handoffs: BTreeMap<NodeId, BTreeMap<PartitionId, HandoffCheckpoint>>,
     credentials: BTreeMap<String, Credential>,
     next_keyspace_id: u64,
     next_partition_id: u64,
@@ -111,6 +130,13 @@ impl ClusterState {
     #[must_use]
     pub fn node(&self, id: NodeId) -> Option<&NodeRecord> {
         self.nodes.get(&id)
+    }
+
+    pub(crate) fn handoffs_from(
+        &self,
+        node: NodeId,
+    ) -> Option<&BTreeMap<PartitionId, HandoffCheckpoint>> {
+        self.handoffs.get(&node)
     }
 
     #[must_use]
@@ -167,6 +193,22 @@ impl ClusterState {
         candidates.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// Whether the replicated membership state permits new ownership.
+    ///
+    /// Every proposer uses this same predicate before emitting a command, and
+    /// apply checks it again because membership may change before the command
+    /// commits.
+    #[must_use]
+    pub(crate) fn is_eligible_owner(&self, node: NodeId) -> bool {
+        self.new_ownership_eligibility(node).is_ok()
+    }
+
+    /// Whether the finalized cluster protocol carries worker lifecycle state.
+    #[must_use]
+    pub fn lifecycle_enabled(&self) -> bool {
+        self.version_initialized && self.version == crate::version::binary_version()
+    }
+
     /// Applies one command, returning the same result on every member.
     ///
     /// An error here is a decision, not a transport failure: the command was
@@ -180,7 +222,9 @@ impl ClusterState {
                 role,
                 address,
                 speaks,
-            } => self.register_node(*node, *role, address, *speaks),
+                ready,
+                draining,
+            } => self.register_node(*node, *role, address, *speaks, *ready, *draining),
             ControlCommand::SetHealth { node, health } => self.set_health(*node, *health),
             ControlCommand::ForgetNode { node } => self.forget_node(*node),
             ControlCommand::CreateKeyspace { .. } => self.create_keyspace(command),
@@ -200,6 +244,13 @@ impl ClusterState {
                 replicas,
                 expect_epoch,
             } => self.assign_owner(*partition, *owner, replicas, *expect_epoch),
+            ControlCommand::TransferOwnership {
+                partition,
+                from,
+                to,
+                replicas,
+                expect_epoch,
+            } => self.transfer_ownership(*partition, *from, *to, replicas, *expect_epoch),
             ControlCommand::SetReplicas {
                 partition,
                 replicas,
@@ -229,6 +280,8 @@ impl ClusterState {
         role: NodeRole,
         address: &str,
         speaks: VersionRange,
+        ready: bool,
+        draining: bool,
     ) -> Result<()> {
         if let Some(refusal) = self.compatibility_refusal(speaks) {
             return Err(Error::InvalidArgument(refusal.to_string()));
@@ -241,10 +294,20 @@ impl ClusterState {
             // heard from.
             health: NodeHealth::Healthy,
             speaks,
+            ready,
+            draining,
         });
         entry.role = role;
         entry.address = address.to_string();
         entry.speaks = speaks;
+        entry.ready = ready;
+        entry.draining = draining;
+        if !draining {
+            // A node id may drain more than once over its lifetime. Its next
+            // healthy registration starts a new handoff set rather than
+            // inheriting acknowledgements from the previous process.
+            self.handoffs.remove(&node);
+        }
         Ok(())
     }
 
@@ -282,6 +345,11 @@ impl ClusterState {
         if let Some(refusal) = self.compatibility_refusal(record.speaks) {
             return Err(Error::InvalidArgument(format!(
                 "node {node} cannot receive ownership: {refusal}"
+            )));
+        }
+        if self.lifecycle_enabled() && (!record.ready || record.draining) {
+            return Err(Error::InvalidArgument(format!(
+                "node {node} cannot receive ownership unless it is ready and not draining"
             )));
         }
         Ok(())
@@ -560,6 +628,48 @@ impl ClusterState {
         Ok(())
     }
 
+    fn transfer_ownership(
+        &mut self,
+        partition: PartitionId,
+        from: NodeId,
+        to: NodeId,
+        replicas: &[NodeId],
+        expect_epoch: Epoch,
+    ) -> Result<()> {
+        let mut info = self.check_epoch(partition, expect_epoch)?;
+        if info.owner != Some(from) {
+            return Err(Error::InvalidArgument(format!(
+                "node {from} is not the owner of partition {partition}"
+            )));
+        }
+        if !info.replicas.contains(&to) {
+            return Err(Error::InvalidArgument(format!(
+                "node {to} is not a replica of partition {partition}"
+            )));
+        }
+        self.new_ownership_eligibility(to)?;
+        if replicas.contains(&to) {
+            return Err(Error::InvalidArgument(
+                "the owner must not also be listed as a replica".into(),
+            ));
+        }
+
+        info.owner = Some(to);
+        info.epoch = info.epoch.next();
+        info.replicas = replicas.to_vec();
+        self.replace_partition(info);
+        self.phases.insert(partition, PartitionPhase::Serving);
+        self.bump_map_version();
+        self.handoffs.entry(from).or_default().insert(
+            partition,
+            HandoffCheckpoint {
+                receiver: to,
+                map_version: self.map.version(),
+            },
+        );
+        Ok(())
+    }
+
     fn set_replicas(
         &mut self,
         partition: PartitionId,
@@ -663,6 +773,8 @@ mod tests {
             role: NodeRole::Worker,
             address: format!("10.0.0.{id}:7000"),
             speaks: crate::version::binary_speaks(),
+            ready: true,
+            draining: false,
         }
     }
 
@@ -681,6 +793,8 @@ mod tests {
             role: NodeRole::Worker,
             address: format!("10.0.0.{id}:7000"),
             speaks,
+            ready: false,
+            draining: false,
         })
     }
 
@@ -997,6 +1111,36 @@ mod tests {
             })
             .unwrap();
         assert!(!state.placement_candidates().contains(&NodeId(2)));
+    }
+
+    #[test]
+    fn a_draining_worker_refuses_new_ownership_assignments() {
+        let mut state = bootstrapped();
+        set_version(&mut state, crate::version::binary_version());
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: PartitionId(1),
+                expect_epoch: Epoch(1),
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::RegisterNode {
+                node: NodeId(2),
+                role: NodeRole::Worker,
+                address: "10.0.0.2:7000".into(),
+                speaks: crate::version::binary_speaks(),
+                ready: true,
+                draining: true,
+            })
+            .unwrap();
+
+        let result = state.apply(&ControlCommand::AssignOwner {
+            partition: PartitionId(1),
+            owner: NodeId(2),
+            replicas: vec![NodeId(3)],
+            expect_epoch: Epoch(2),
+        });
+        assert!(result.is_err());
     }
 
     #[test]

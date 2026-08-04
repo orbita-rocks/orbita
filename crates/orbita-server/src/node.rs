@@ -50,7 +50,7 @@ use orbita_runtime::{
 use orbita_wal::WalService;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
@@ -104,6 +104,11 @@ pub(crate) struct Node<R: Runtime> {
     /// The startup conditions this node reports. The node marks recovery and
     /// catch-up; the control loop above it marks the join.
     readiness: Arc<ReadinessGate>,
+    accepting_writes: AtomicBool,
+    /// A drain takes the write side after closing admission. Existing writes
+    /// hold the read side through their acknowledgement, so the final progress
+    /// report cannot race an acknowledged write.
+    writes: tokio::sync::RwLock<()>,
 }
 
 /// Where a request has to go.
@@ -168,6 +173,8 @@ impl<R: Runtime> Node<R> {
             replica_reads: AtomicU64::new(0),
             unreconciled: std::sync::atomic::AtomicBool::new(false),
             readiness,
+            accepting_writes: AtomicBool::new(true),
+            writes: tokio::sync::RwLock::new(()),
         });
         node.reconcile().await?;
         // Opening a partition replays its write-ahead log to the trusted end,
@@ -424,6 +431,7 @@ impl<R: Runtime> Node<R> {
     }
 
     pub(crate) async fn set(&self, request: SetRequest, forwarded: bool) -> Result<SetResponse> {
+        let _permit = self.write_permit().await?;
         match self.try_set(&request, forwarded).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
@@ -481,6 +489,7 @@ impl<R: Runtime> Node<R> {
         request: DeleteRequest,
         forwarded: bool,
     ) -> Result<DeleteResponse> {
+        let _permit = self.write_permit().await?;
         match self.try_delete(&request, forwarded).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
@@ -699,10 +708,39 @@ impl<R: Runtime> Node<R> {
         progress
     }
 
+    async fn write_permit(&self) -> Result<tokio::sync::RwLockReadGuard<'_, ()>> {
+        if !self.accepting_writes.load(Ordering::Acquire) {
+            return Err(Error::Unavailable("the node is draining".into()));
+        }
+        let permit = self.writes.read().await;
+        if !self.accepting_writes.load(Ordering::Acquire) {
+            return Err(Error::Unavailable("the node is draining".into()));
+        }
+        Ok(permit)
+    }
+
+    /// Closes write admission and waits for every write already admitted to
+    /// resolve. Reads continue while the returned guard is held.
+    pub(crate) async fn begin_draining(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.accepting_writes.store(false, Ordering::Release);
+        self.writes.write().await
+    }
+
+    pub(crate) fn owned_partition_count(&self) -> usize {
+        self.map()
+            .partitions()
+            .filter(|partition| partition.owner == Some(self.node_id))
+            .count()
+    }
+
     /// How often the lease heartbeat has to run for this node's leases to stay
     /// live.
     pub(crate) fn lease_interval(&self) -> Duration {
         self.lease.heartbeat_interval()
+    }
+
+    pub(crate) fn lease_drain(&self) -> Duration {
+        self.lease.duration + self.lease.margin
     }
 
     /// Renews every lease this node's owned partitions have out.

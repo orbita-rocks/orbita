@@ -79,6 +79,9 @@ data:
     join_backoff_initial = "250ms"
     join_backoff_max = "10s"
     join_timeout = "5m"
+    # The pod allows 300 seconds. Keeping ten seconds outside the process
+    # budget makes a failed drain visible before Kubernetes sends SIGKILL.
+    drain_timeout = "290s"
 
     [object_store]
     # endpoint = "https://s3.us-east-1.amazonaws.com"
@@ -328,7 +331,8 @@ spec:
       # Long enough for this worker to hand each partition to a caught-up
       # replica before the process goes away. A rolling restart of three
       # workers is an ordinary weekly event and must not cost three separate
-      # failover windows. The server does not do the handoff yet.
+      # failover windows. The process uses 290 seconds of this budget and
+      # reports failure before the final ten seconds are exhausted.
       terminationGracePeriodSeconds: 300
       securityContext:
         runAsNonRoot: true

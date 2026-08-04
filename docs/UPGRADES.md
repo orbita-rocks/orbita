@@ -17,21 +17,19 @@ finished.
   `cluster-version-compatible` and `control-plane-joined` as unmet readiness
   conditions, and logs both its range and the active version. No behaviour
   actually changes with the version yet because no format has two versions to
-  choose between, so mixed-version operation is enforced but still has little
-  practical work to do today.
-- A node does not hand its partitions off on SIGTERM. The termination grace
-  periods in the chart are sized for a handoff that the server does not perform
-  yet, so today a restart is a failover.
+  choose between. Planned worker handoff is the first version-gated behavior:
+  workers continue using the previous status protocol and ordinary failover
+  until the operator finalizes the new cluster version.
 Readiness is otherwise real: a node reports Ready only once it has recovered
 its write-ahead log and opened and caught up the partitions the map says it
 holds, and it turns unready again if a map change hands it a partition it
 cannot open. A leader voter also has to apply through the commit index reported
 by the current Raft leader. Seeing a leader is not enough.
 
-The practical consequence of the gaps that remain: stage a rollout with the
-`partition` field and check the cluster between steps when the blast radius
-warrants it, because each pod replacement is still a failover and the rollout
-does not wait for a rejoin it cannot see.
+Stage a rollout with the `partition` field and check the cluster between steps
+when the blast radius warrants it. After finalization, a worker drains its
+partitions on SIGTERM; before finalization it exits through ordinary failover so
+the rollback-compatible control protocol remains on the replicated log.
 
 ## What a version means
 

@@ -40,15 +40,19 @@ pub enum ReadinessCondition {
     /// partition it cannot open, because a node refusing requests for a
     /// partition it was given is not ready no matter how it got there.
     PartitionsCaughtUp,
+    /// The node has not begun a planned shutdown. Clearing this makes the
+    /// readiness probe fail before ownership starts moving away.
+    AcceptingOwnership,
 }
 
 impl ReadinessCondition {
     /// Every condition, in the order reports list them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ClusterVersionCompatible,
         Self::ControlPlaneJoined,
         Self::WalRecovered,
         Self::PartitionsCaughtUp,
+        Self::AcceptingOwnership,
     ];
 
     /// A stable machine-readable name, which is what crosses the wire and what
@@ -60,6 +64,7 @@ impl ReadinessCondition {
             Self::ControlPlaneJoined => "control-plane-joined",
             Self::WalRecovered => "wal-recovered",
             Self::PartitionsCaughtUp => "partitions-caught-up",
+            Self::AcceptingOwnership => "accepting-ownership",
         }
     }
 }
@@ -80,13 +85,18 @@ pub struct ReadinessState {
     joined: bool,
     recovered: bool,
     caught_up: bool,
+    accepting_ownership: bool,
 }
 
 impl ReadinessState {
     /// Whether every condition holds.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.compatible && self.joined && self.recovered && self.caught_up
+        self.compatible
+            && self.joined
+            && self.recovered
+            && self.caught_up
+            && self.accepting_ownership
     }
 
     /// Whether one condition holds.
@@ -97,6 +107,7 @@ impl ReadinessState {
             ReadinessCondition::ControlPlaneJoined => self.joined,
             ReadinessCondition::WalRecovered => self.recovered,
             ReadinessCondition::PartitionsCaughtUp => self.caught_up,
+            ReadinessCondition::AcceptingOwnership => self.accepting_ownership,
         }
     }
 
@@ -115,6 +126,7 @@ impl ReadinessState {
             ReadinessCondition::ControlPlaneJoined => self.joined = met,
             ReadinessCondition::WalRecovered => self.recovered = met,
             ReadinessCondition::PartitionsCaughtUp => self.caught_up = met,
+            ReadinessCondition::AcceptingOwnership => self.accepting_ownership = met,
         }
     }
 }

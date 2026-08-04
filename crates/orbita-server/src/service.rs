@@ -161,7 +161,8 @@ mod tests {
             [
                 "cluster-version-compatible",
                 "control-plane-joined",
-                "partitions-caught-up"
+                "partitions-caught-up",
+                "accepting-ownership"
             ]
         );
     }

@@ -84,6 +84,12 @@ pub struct NodeStatus {
     /// binary changed under the same node id corrects the record without an
     /// operator noticing anything.
     pub speaks: VersionRange,
+    /// Whether the node has recovered and caught up every partition it holds.
+    /// This is reported readiness, not process liveness.
+    pub ready: bool,
+    /// A draining node remains healthy and serves its current ownership, but
+    /// must not receive another assignment.
+    pub draining: bool,
     pub partitions: Vec<PartitionProgress>,
 }
 
@@ -97,6 +103,8 @@ impl NodeStatus {
             address: address.into(),
             map_version: MapVersion::default(),
             speaks: crate::version::binary_speaks(),
+            ready: false,
+            draining: false,
             partitions: Vec::new(),
         }
     }
@@ -110,6 +118,14 @@ impl NodeStatus {
     }
 
     pub(crate) fn encode(&self, w: &mut Writer) {
+        self.encode_head(w);
+        self.speaks.encode(w);
+        w.u8(u8::from(self.ready)).u8(u8::from(self.draining));
+        w.seq(&self.partitions, |w, p| p.encode(w));
+    }
+
+    /// The first version-aware encoding, which predates readiness reporting.
+    pub(crate) fn encode_v2(&self, w: &mut Writer) {
         self.encode_head(w);
         self.speaks.encode(w);
         w.seq(&self.partitions, |w, p| p.encode(w));
@@ -141,6 +157,23 @@ impl NodeStatus {
             address,
             map_version,
             speaks: VersionRange::decode(r)?,
+            ready: r.u8()? != 0,
+            draining: r.u8()? != 0,
+            partitions: r.seq(PartitionProgress::decode)?,
+        })
+    }
+
+    /// Decodes the first version-aware encoding. Absence is not evidence of
+    /// readiness, so an old node is never selected as a planned handoff target.
+    pub(crate) fn decode_v2(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let (role, address, map_version) = Self::decode_head(r)?;
+        Ok(Self {
+            role,
+            address,
+            map_version,
+            speaks: VersionRange::decode(r)?,
+            ready: false,
+            draining: false,
             partitions: r.seq(PartitionProgress::decode)?,
         })
     }
@@ -157,6 +190,8 @@ impl NodeStatus {
             address,
             map_version,
             speaks: VersionRange::exactly(crate::version::ClusterVersion::ZERO),
+            ready: false,
+            draining: false,
             partitions: r.seq(PartitionProgress::decode)?,
         })
     }
@@ -190,6 +225,8 @@ mod tests {
                 crate::version::ClusterVersion::new(0, 1),
                 crate::version::ClusterVersion::new(0, 2),
             ),
+            ready: true,
+            draining: false,
             partitions: vec![PartitionProgress {
                 partition: PartitionId(3),
                 durable_lamport: Lamport(90),

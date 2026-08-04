@@ -33,6 +33,10 @@ pub const METHOD_REPORT_STATUS_V2: u16 = 4;
 /// Reads the leader's committed control-command index. A restarting voter uses
 /// this as catch-up authority before it reports Ready.
 pub const METHOD_FETCH_COMMIT_INDEX: u16 = 5;
+/// Status reporting with readiness and draining state.
+pub const METHOD_REPORT_STATUS_V3: u16 = 6;
+/// A worker asks the control leader to hand off every partition it owns.
+pub const METHOD_DRAIN_NODE: u16 = 7;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -42,6 +46,7 @@ const STATUS_NODES: u8 = 4;
 const STATUS_COMMIT_INDEX: u8 = 5;
 const STATUS_UNAVAILABLE: u8 = 6;
 const STATUS_INCOMPATIBLE: u8 = 7;
+const STATUS_DRAIN_PROGRESS: u8 = 8;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -88,6 +93,21 @@ impl ReportStatusRequest {
         Ok(Self { node, status })
     }
 
+    pub(crate) fn encode_v2(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v2(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v2(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v2(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
     /// The v0.0.1 payload shape, for [`super::wire::METHOD_REPORT_STATUS`].
     pub(crate) fn encode_legacy(&self) -> Bytes {
         let mut w = Writer::new();
@@ -102,6 +122,26 @@ impl ReportStatusRequest {
         let status = NodeStatus::decode_legacy(&mut r)?;
         r.done()?;
         Ok(Self { node, status })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrainNodeRequest {
+    pub node: NodeId,
+}
+
+impl DrainNodeRequest {
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new().u64(self.node.get()).finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
     }
 }
 
@@ -135,6 +175,12 @@ pub(crate) enum ControlResponse {
     /// answer, and handing it back is what lets an operator configure the
     /// leader group and nothing else.
     Nodes(Vec<(NodeId, String)>),
+    /// A drain request was accepted. `complete` becomes true only after every
+    /// receiver in this node's handoff set has reported its transfer version.
+    DrainProgress {
+        complete: bool,
+        map_version: MapVersion,
+    },
     /// The leader's committed control-command index.
     CommitIndex(crate::LogIndex),
     /// This member cannot establish leader authority right now. Unlike a
@@ -179,6 +225,14 @@ impl ControlResponse {
                     w.u64(node.get()).str(address);
                 });
             }
+            ControlResponse::DrainProgress {
+                complete,
+                map_version,
+            } => {
+                w.u8(STATUS_DRAIN_PROGRESS)
+                    .u8(u8::from(*complete))
+                    .u64(map_version.get());
+            }
             ControlResponse::Incompatible(refusal) => {
                 w.u8(STATUS_INCOMPATIBLE);
                 refusal.speaks.encode(&mut w);
@@ -222,6 +276,10 @@ impl ControlResponse {
                 leader: r.opt_u64()?.map(NodeId),
             },
             STATUS_NODES => ControlResponse::Nodes(r.seq(|r| Ok((NodeId(r.u64()?), r.string()?)))?),
+            STATUS_DRAIN_PROGRESS => ControlResponse::DrainProgress {
+                complete: r.u8()? != 0,
+                map_version: MapVersion(r.u64()?),
+            },
             STATUS_INCOMPATIBLE => ControlResponse::Incompatible(CompatibilityRefusal {
                 speaks: VersionRange::decode(&mut r)?,
                 active: ClusterVersion::decode(&mut r)?,
@@ -398,6 +456,10 @@ mod tests {
                 leader: Some(NodeId(2)),
             },
             ControlResponse::NotLeader { leader: None },
+            ControlResponse::DrainProgress {
+                complete: false,
+                map_version: MapVersion(10),
+            },
             ControlResponse::Incompatible(CompatibilityRefusal {
                 speaks: VersionRange::new(ClusterVersion::new(0, 3), ClusterVersion::new(0, 4)),
                 active: ClusterVersion::new(0, 2),
@@ -414,6 +476,25 @@ mod tests {
     }
 
     #[test]
+    fn drain_progress_round_trips_distinct_from_a_refusal() {
+        for complete in [false, true] {
+            let progress = ControlResponse::DrainProgress {
+                complete,
+                map_version: MapVersion(12),
+            };
+            assert_eq!(ControlResponse::decode(&progress.encode()), Ok(progress));
+        }
+
+        let progress = ControlResponse::DrainProgress {
+            complete: false,
+            map_version: MapVersion(12),
+        };
+        let refusal = ControlResponse::Error("node is not draining".into());
+        assert_ne!(progress.encode()[0], refusal.encode()[0]);
+        assert_eq!(ControlResponse::decode(&refusal.encode()), Ok(refusal));
+    }
+
+    #[test]
     fn a_status_report_round_trips() {
         let request = ReportStatusRequest {
             node: NodeId(7),
@@ -422,6 +503,8 @@ mod tests {
                 address: "10.0.0.7:7000".into(),
                 map_version: MapVersion(3),
                 speaks: crate::version::binary_speaks(),
+                ready: true,
+                draining: false,
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),
@@ -448,6 +531,8 @@ mod tests {
                 address: "10.0.0.7:7000".into(),
                 map_version: MapVersion(3),
                 speaks: crate::version::VersionRange::exactly(crate::version::ClusterVersion::ZERO),
+                ready: false,
+                draining: false,
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),

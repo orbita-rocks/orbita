@@ -4,10 +4,11 @@
 //! `ORBITA_SIM_SEED=7 cargo test -p orbita-control --test raft_failover a_promoted_owner_fences_partitioned_old_owner_writes_and_restores_liveness -- --exact --nocapture`.
 
 use orbita_control::{
-    BootstrapSpec, ClusterState, ConsensusLog, ControlClient, ControlCommand, ControlConfig,
-    ControlService, Controller, KeyspaceConfig, RaftLog,
+    binary_speaks, BootstrapSpec, ClusterState, ClusterVersion, ConsensusLog, ControlClient,
+    ControlCommand, ControlConfig, ControlService, Controller, KeyspaceConfig, NodeRole,
+    NodeStatus, RaftLog,
 };
-use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId};
+use orbita_core::{Epoch, Error, Lamport, MapVersion, NodeId, PartitionId};
 use orbita_runtime::{Runtime, ServiceId, Transport};
 use orbita_sim::{check_seeds, Failure, SimRuntime, Simulation};
 use orbita_wal::{PartitionLog, Wal, WalConfig, WalOp, WalService, DEFAULT_SEGMENT_TARGET_BYTES};
@@ -84,6 +85,37 @@ impl Group {
             let controller = controller.clone();
             sim.block_on(async move { controller.recover().await })
                 .expect("apply bootstrap");
+        }
+
+        let controller = controllers[index_of(leader)].clone();
+        for worker in WORKERS {
+            let reporting = controller.clone();
+            sim.block_on(async move {
+                reporting
+                    .record_status(
+                        worker,
+                        NodeStatus {
+                            role: NodeRole::Worker,
+                            address: format!("10.0.0.{worker}:7000"),
+                            map_version: MapVersion::default(),
+                            speaks: binary_speaks(),
+                            ready: true,
+                            draining: false,
+                            partitions: vec![],
+                        },
+                    )
+                    .await
+            })
+            .expect("worker reports ready");
+        }
+        let assigning = controller.clone();
+        sim.block_on(async move { assigning.tick().await })
+            .expect("assign bootstrap partition");
+        sim.run_for(REPLICATION_GRACE);
+        for controller in &controllers {
+            let controller = controller.clone();
+            sim.block_on(async move { controller.recover().await })
+                .expect("apply worker readiness and placement");
         }
 
         let controller = controllers[index_of(leader)].clone();
@@ -246,6 +278,91 @@ fn put(key: &'static [u8]) -> WalOp {
         value: Bytes::from_static(b"value"),
         expires_at_millis: None,
     }
+}
+
+#[test]
+fn pre_finalization_raft_log_remains_readable_by_the_previous_binary() {
+    const PREVIOUS_BINARY_MAX_TAG: u8 = 14;
+
+    let sim = Simulation::new(6);
+    for node in CONTROL {
+        sim.add_node(node);
+    }
+    let logs: Vec<_> = CONTROL
+        .iter()
+        .map(|node| {
+            let runtime = sim.runtime(*node);
+            sim.block_on(async move {
+                RaftLog::open(&runtime, &CONTROL)
+                    .await
+                    .expect("open raft log")
+            })
+        })
+        .collect();
+    sim.run_for(ELECTION_GRACE);
+    let leader = exactly_one_leader(&sim, &logs, &CONTROL).expect("initial election");
+    let controller = Controller::new(
+        sim.runtime(leader),
+        Arc::clone(&logs[index_of(leader)]),
+        ControlConfig::default(),
+    );
+
+    let setup = controller.clone();
+    sim.block_on(async move {
+        setup
+            .submit(ControlCommand::SetClusterVersion {
+                version: ClusterVersion::ZERO,
+                expect: ClusterVersion::ZERO,
+            })
+            .await?;
+        setup
+            .record_status(
+                NodeId(11),
+                NodeStatus {
+                    role: NodeRole::Worker,
+                    address: "10.0.0.11:7000".into(),
+                    map_version: MapVersion::default(),
+                    speaks: binary_speaks(),
+                    ready: true,
+                    draining: true,
+                    partitions: vec![],
+                },
+            )
+            .await?;
+        orbita_core::Result::Ok(())
+    })
+    .expect("establish a pre-finalization cluster");
+
+    let draining = controller.clone();
+    let refused = sim.block_on(async move { draining.drain_node(NodeId(11)).await });
+    assert!(
+        matches!(refused, Err(Error::InvalidArgument(_))),
+        "planned handoff must remain disabled before finalization: {refused:?}"
+    );
+
+    sim.run_for(REPLICATION_GRACE);
+    let entries = {
+        let log = Arc::clone(&logs[index_of(leader)]);
+        sim.block_on(async move { log.subscribe(0).await })
+            .expect("read committed raft entries")
+    };
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.command.encode()[0] <= PREVIOUS_BINARY_MAX_TAG),
+        "pre-finalization committed a command the previous binary cannot decode: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry.command,
+            ControlCommand::RegisterNode {
+                ready: false,
+                draining: false,
+                ..
+            }
+        )),
+        "the lifecycle report must be persisted in the V2 registration shape"
+    );
 }
 
 #[test]

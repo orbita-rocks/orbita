@@ -168,6 +168,11 @@ impl Worker {
         let server = self.server.take().expect("this worker is still running");
         server.shutdown().await.expect("the listener stops");
     }
+
+    async fn drain(&mut self, timeout: Duration) -> orbita_core::Result<()> {
+        let server = self.server.take().expect("this worker is still running");
+        server.drain(timeout).await
+    }
 }
 
 fn set(key: &str, value: &str) -> SetRequest {
@@ -303,6 +308,14 @@ async fn a_cluster_survives_losing_the_owner_without_losing_an_acknowledged_writ
             .into_inner();
         assert!(found.found, "{key} was missing from the replica");
         assert_eq!(String::from_utf8_lossy(&found.value), *value);
+    }
+    let deadline = Instant::now() + BUDGET * 3;
+    while workers[replica_index].server().replica_reads() == 0 && Instant::now() < deadline {
+        let _ = workers[replica_index]
+            .client
+            .get(get(&acknowledged[0].0))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
         workers[replica_index].server().replica_reads() > 0,
@@ -492,6 +505,126 @@ async fn a_joined_worker_reports_ready_once_the_leader_group_has_heard_from_it()
     assert!(response.ready, "unmet: {:?}", response.conditions);
 
     worker.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_planned_shutdown_hands_off_acknowledged_writes_and_retires_the_old_owner() {
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+    let mut workers = Vec::new();
+    for id in WORKERS {
+        workers.push(start_worker(id, &group.address, lease).await);
+    }
+
+    let seen = group.controller.clone();
+    let placed = Arc::new(std::sync::Mutex::new((None, Vec::new())));
+    let watch = Arc::clone(&placed);
+    tokio::spawn(async move {
+        loop {
+            *watch.lock().unwrap() = placement(&seen.partition_map().await);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    until("the partition to be replicated", BUDGET * 4, || {
+        placed.lock().unwrap().1.len() == 2
+    })
+    .await;
+    let old_owner = placed.lock().unwrap().0.unwrap();
+    let old_index = workers
+        .iter()
+        .position(|worker| worker.id == old_owner)
+        .unwrap();
+
+    let deadline = Instant::now() + BUDGET * 4;
+    loop {
+        let outcome = workers[old_index]
+            .client
+            .set(set("drain-warmup", "ready"))
+            .await;
+        if matches!(&outcome, Ok(response) if response.get_ref().applied) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cluster never became writable"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut writer = workers[old_index].client.clone();
+    let writes = tokio::spawn(async move {
+        let mut acknowledged = Vec::new();
+        for i in 0..50u64 {
+            let key = format!("drain-{i}");
+            match writer.set(set(&key, &i.to_string())).await {
+                Ok(response) if response.get_ref().applied => acknowledged.push((key, i)),
+                Ok(_) | Err(_) => break,
+            }
+        }
+        acknowledged
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    workers[old_index]
+        .drain(BUDGET * 6)
+        .await
+        .expect("the planned handoff completes");
+    let acknowledged = writes.await.expect("the writer task finishes");
+    assert!(
+        !acknowledged.is_empty(),
+        "the concurrent writer proved nothing"
+    );
+
+    let map = group.controller.partition_map().await;
+    let (new_owner, _) = placement(&map);
+    let new_owner = new_owner.expect("the partition remains owned");
+    assert_ne!(new_owner, old_owner);
+    let new_index = workers
+        .iter()
+        .position(|worker| worker.id == new_owner)
+        .unwrap();
+    for (key, value) in acknowledged {
+        let response = workers[new_index]
+            .client
+            .get(get(&key))
+            .await
+            .expect("an acknowledged write is readable from the new owner")
+            .into_inner();
+        assert_eq!(String::from_utf8_lossy(&response.value), value.to_string());
+    }
+
+    assert!(
+        workers[old_index].client.get(get("drain-0")).await.is_err(),
+        "the stale owner endpoint must stop serving after transfer"
+    );
+    for worker in &mut workers {
+        if worker.server.is_some() {
+            worker.kill().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_timeout_is_reported_as_failure() {
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+    let mut worker = start_worker(WORKERS[0], &group.address, lease).await;
+
+    let deadline = Instant::now() + BUDGET * 3;
+    while !worker.server().readiness().is_ready() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        worker.server().readiness().is_ready(),
+        "worker never became ready"
+    );
+
+    let error = worker
+        .drain(Duration::from_millis(10))
+        .await
+        .expect_err("a ten millisecond budget cannot drain a live lease");
+    assert!(error.to_string().contains("drain timed out"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
