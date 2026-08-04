@@ -27,8 +27,10 @@ pub struct ClusterVersion {
 }
 
 impl ClusterVersion {
-    /// The version of a cluster that has never had one set, which only a
-    /// fresh state machine holds and only until bootstrap commits.
+    /// Version 0.0, which is both the value of a state machine bootstrap has
+    /// not reached and, while the workspace version is 0.0.x, the legitimate
+    /// active version of a bootstrapped cluster. It is a floor for the
+    /// advance rule, not a "never set" sentinel.
     pub const ZERO: Self = Self { major: 0, minor: 0 };
 
     #[must_use]

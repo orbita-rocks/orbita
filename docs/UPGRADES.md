@@ -115,6 +115,15 @@ has written a new format yet:
 kubectl --namespace orbita rollout undo statefulset/orbita-worker
 ```
 
+One caveat for the transition off 0.0 specifically. The first version-aware
+release writes control log entries the 0.0 binary cannot read, and 0.0's
+recovery truncates its log at the first entry it cannot decode. So once a
+control-plane node has run the new binary, rolling that node's binary back to
+0.0 discards whatever the new binary committed. The upgraded binary reads
+everything 0.0 wrote, so the forward direction is safe; it is the return to
+0.0 that is not, and this is a one-time cost of the version machinery not
+existing yet when 0.0 shipped.
+
 A node that cannot speak the cluster's active version is meant to start,
 report itself not Ready, and say why in its logs. It is not meant to exit.
 That is deliberate: a pod that is running and not Ready stops the rollout at

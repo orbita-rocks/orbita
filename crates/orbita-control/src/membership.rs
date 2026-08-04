@@ -110,17 +110,58 @@ impl NodeStatus {
     }
 
     pub(crate) fn encode(&self, w: &mut Writer) {
+        self.encode_head(w);
+        self.speaks.encode(w);
+        w.seq(&self.partitions, |w, p| p.encode(w));
+    }
+
+    /// The v0.0.1 encoding, which has no speakable range.
+    ///
+    /// Sent only when the leader answering turned out to be a v0.0.1 binary,
+    /// so a mid-rollout heartbeat lands instead of being undecodable. Delete
+    /// this when the compatibility window moves past 0.0.
+    pub(crate) fn encode_legacy(&self, w: &mut Writer) {
+        self.encode_head(w);
+        w.seq(&self.partitions, |w, p| p.encode(w));
+    }
+
+    fn encode_head(&self, w: &mut Writer) {
         w.u8(match self.role {
             NodeRole::Leader => 0,
             NodeRole::Worker => 1,
         })
         .str(&self.address)
         .u64(self.map_version.get());
-        self.speaks.encode(w);
-        w.seq(&self.partitions, |w, p| p.encode(w));
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let (role, address, map_version) = Self::decode_head(r)?;
+        Ok(Self {
+            role,
+            address,
+            map_version,
+            speaks: VersionRange::decode(r)?,
+            partitions: r.seq(PartitionProgress::decode)?,
+        })
+    }
+
+    /// Decodes the v0.0.1 encoding.
+    ///
+    /// The range defaults to "speaks nothing but 0.0", which is what a binary
+    /// old enough to send this shape actually speaks. Delete alongside
+    /// [`NodeStatus::encode_legacy`].
+    pub(crate) fn decode_legacy(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let (role, address, map_version) = Self::decode_head(r)?;
+        Ok(Self {
+            role,
+            address,
+            map_version,
+            speaks: VersionRange::exactly(crate::version::ClusterVersion::ZERO),
+            partitions: r.seq(PartitionProgress::decode)?,
+        })
+    }
+
+    fn decode_head(r: &mut Reader<'_>) -> CodecResult<(NodeRole, String, MapVersion)> {
         let role = match r.u8()? {
             0 => NodeRole::Leader,
             1 => NodeRole::Worker,
@@ -131,13 +172,7 @@ impl NodeStatus {
                 })
             }
         };
-        Ok(Self {
-            role,
-            address: r.string()?,
-            map_version: MapVersion(r.u64()?),
-            speaks: VersionRange::decode(r)?,
-            partitions: r.seq(PartitionProgress::decode)?,
-        })
+        Ok((role, r.string()?, MapVersion(r.u64()?)))
     }
 }
 

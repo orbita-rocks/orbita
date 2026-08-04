@@ -119,4 +119,6 @@ pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 pub use service::ControlService;
 pub use state::{ClusterState, NodeRecord, PartitionPhase};
 pub use version::{binary_speaks, binary_version, ClusterVersion, VersionRange};
-pub use wire::{METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS};
+pub use wire::{
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+};

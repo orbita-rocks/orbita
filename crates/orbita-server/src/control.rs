@@ -188,7 +188,10 @@ impl<R: Runtime> StatusReporter<R> {
             .report_status_for_version(self.node, status)
             .await
         {
-            Ok((_, cluster_version)) => {
+            // No version in the reply means the leader predates them, which
+            // mid-rollout is normal; this node keeps whatever it last knew.
+            Ok((_, None)) => {}
+            Ok((_, Some(cluster_version))) => {
                 *self.active.lock().expect("active version poisoned") = Some(cluster_version);
                 if !binary_speaks().contains(cluster_version) {
                     // Per docs/UPGRADES.md a node outside the window keeps

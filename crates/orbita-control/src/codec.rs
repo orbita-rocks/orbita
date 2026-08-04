@@ -202,6 +202,17 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    /// Whether any bytes remain.
+    ///
+    /// This exists for one job: telling a message written by the previous
+    /// release, which simply ends earlier, apart from one that carries a
+    /// newer trailing field. It is only sound for a field at the very end of
+    /// a message, and every use should say which release it tolerates so the
+    /// tolerance can be deleted when the window moves past it.
+    pub fn has_more(&self) -> bool {
+        self.pos < self.buf.len()
+    }
+
     /// Rejects trailing bytes, which mean the sender and the receiver disagree
     /// about the shape of the message.
     pub fn done(&self) -> CodecResult<()> {

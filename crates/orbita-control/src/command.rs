@@ -27,6 +27,11 @@ use crate::version::{ClusterVersion, VersionRange};
 use bytes::Bytes;
 use orbita_core::{Epoch, KeyspaceId, NodeId, PartitionId};
 
+// Kept as decode-only legacy. v0.0.1 persisted `RegisterNode` entries under
+// this tag with nothing after the address, and recovery treats an entry it
+// cannot decode as the end of the trustworthy log and truncates there.
+// Reusing the tag with a longer payload would make upgrading a v0.0.1
+// control-plane node silently discard its committed state.
 const TAG_REGISTER_NODE: u8 = 1;
 const TAG_SET_HEALTH: u8 = 2;
 const TAG_FORGET_NODE: u8 = 3;
@@ -40,6 +45,9 @@ const TAG_ASSIGN_OWNER: u8 = 10;
 const TAG_SET_REPLICAS: u8 = 11;
 const TAG_SPLIT_PARTITION: u8 = 12;
 const TAG_SET_CLUSTER_VERSION: u8 = 13;
+// `RegisterNode` with the speakable version range appended. New entries are
+// written with this tag; the old tag stays readable for the release window.
+const TAG_REGISTER_NODE_V2: u8 = 14;
 
 /// One decision, committed once and applied everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +187,7 @@ impl ControlCommand {
                 address,
                 speaks,
             } => {
-                w.u8(TAG_REGISTER_NODE)
+                w.u8(TAG_REGISTER_NODE_V2)
                     .u64(node.get())
                     .u8(role_tag(*role))
                     .str(address);
@@ -283,11 +291,15 @@ impl ControlCommand {
     pub fn decode(buf: &[u8]) -> CodecResult<Self> {
         let mut r = Reader::new(buf);
         let command = match r.u8()? {
+            // A v0.0.1 entry. It carries no speakable range because the
+            // concept postdates it; `exactly(ZERO)` is the honest default,
+            // and the node's next heartbeat corrects the record, since a
+            // changed range triggers re-registration.
             TAG_REGISTER_NODE => ControlCommand::RegisterNode {
                 node: NodeId(r.u64()?),
                 role: role_from_tag(r.u8()?)?,
                 address: r.string()?,
-                speaks: VersionRange::decode(&mut r)?,
+                speaks: VersionRange::exactly(ClusterVersion::ZERO),
             },
             TAG_SET_HEALTH => ControlCommand::SetHealth {
                 node: NodeId(r.u64()?),
@@ -349,6 +361,12 @@ impl ControlCommand {
             TAG_SET_CLUSTER_VERSION => ControlCommand::SetClusterVersion {
                 version: ClusterVersion::decode(&mut r)?,
                 expect: ClusterVersion::decode(&mut r)?,
+            },
+            TAG_REGISTER_NODE_V2 => ControlCommand::RegisterNode {
+                node: NodeId(r.u64()?),
+                role: role_from_tag(r.u8()?)?,
+                address: r.string()?,
+                speaks: VersionRange::decode(&mut r)?,
             },
             tag => {
                 return Err(CodecError::UnknownTag {
@@ -486,6 +504,30 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_register_node_entry_written_by_v0_0_1_still_decodes() {
+        // v0.0.1 clusters hold these in their control logs, and recovery
+        // truncates the log at the first entry it cannot decode. This is the
+        // old shape byte for byte: tag 1, node, role, address, nothing else.
+        // If this test breaks, upgrading a v0.0.1 control-plane node destroys
+        // its committed state.
+        let legacy = Writer::new()
+            .u8(1)
+            .u64(7)
+            .u8(2)
+            .str("10.0.0.7:7000")
+            .finish();
+        assert_eq!(
+            ControlCommand::decode(&legacy),
+            Ok(ControlCommand::RegisterNode {
+                node: NodeId(7),
+                role: NodeRole::Worker,
+                address: "10.0.0.7:7000".into(),
+                speaks: VersionRange::exactly(ClusterVersion::ZERO),
+            })
+        );
     }
 
     #[test]

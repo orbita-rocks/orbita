@@ -8,7 +8,7 @@ use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::wire::{
     ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
 };
 
 use bytes::Bytes;
@@ -41,7 +41,10 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 }
                 Err(e) => ControlResponse::Error(format!("undecodable fetch: {e}")),
             },
-            METHOD_REPORT_STATUS => match ReportStatusRequest::decode(&call.payload) {
+            // The v0.0.1 shape, from a worker old enough not to know about
+            // versions. The reply must end at the map version, because that
+            // worker rejects trailing bytes.
+            METHOD_REPORT_STATUS => match ReportStatusRequest::decode_legacy(&call.payload) {
                 Ok(request) => match self
                     .controller
                     .record_status(request.node, request.status)
@@ -49,7 +52,21 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 {
                     Ok(map_version) => ControlResponse::Accepted {
                         map_version,
-                        cluster_version: self.controller.cluster_version().await,
+                        cluster_version: None,
+                    },
+                    Err(e) => ControlResponse::Error(e.to_string()),
+                },
+                Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
+            },
+            METHOD_REPORT_STATUS_V2 => match ReportStatusRequest::decode(&call.payload) {
+                Ok(request) => match self
+                    .controller
+                    .record_status(request.node, request.status)
+                    .await
+                {
+                    Ok(map_version) => ControlResponse::Accepted {
+                        map_version,
+                        cluster_version: Some(self.controller.cluster_version().await),
                     },
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
