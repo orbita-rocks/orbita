@@ -29,6 +29,8 @@ fn register(id: u64) -> ControlCommand {
         role: NodeRole::Worker,
         address: format!("10.0.0.{id}:7000"),
         speaks: orbita_control::binary_speaks(),
+        ready: true,
+        draining: false,
     }
 }
 
