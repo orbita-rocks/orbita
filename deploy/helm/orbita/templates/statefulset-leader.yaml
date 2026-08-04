@@ -13,7 +13,14 @@ spec:
   # remain ordered by the StatefulSet update strategy below.
   podManagementPolicy: Parallel
   updateStrategy:
+    {{- if .Values.leader.firstRaftUpgrade }}
+    # The pre-Raft binaries cannot vote, so the first capable pod would never
+    # become Ready under a one-at-a-time RollingUpdate. OnDelete lets the
+    # operator replace two voters together and establish the first quorum.
+    type: OnDelete
+    {{- else }}
     type: RollingUpdate
+    {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "orbita.name" . }}

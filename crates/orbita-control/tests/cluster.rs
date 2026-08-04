@@ -16,7 +16,7 @@ use orbita_control::{
     ControlCommand, ControlConfig, ControlService, Controller, KeyspaceConfig, NodeRole,
     NodeStatus, PartitionProgress, SingleNodeLog, VersionRange,
 };
-use orbita_core::{Epoch, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
+use orbita_core::{Epoch, Error, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
 use orbita_runtime::{Clock, Runtime, ServiceId, Transport};
 use orbita_sim::{check_seeds, DiskFaults, DiskPolicy, Failure, SimConfig, SimRuntime, Simulation};
 
@@ -1036,6 +1036,55 @@ fn a_worker_reaches_the_leader_group_over_the_transport() {
         }
     });
     assert_eq!(reported, Ok(()));
+}
+
+#[test]
+fn a_worker_cannot_overwrite_a_registered_leader_identity() {
+    let cluster = Cluster::start(12);
+    let controller = cluster.controller.clone();
+    let result = cluster.sim.block_on(async move {
+        controller
+            .record_status(
+                LEADER,
+                NodeStatus::joining(NodeRole::Worker, "10.0.0.99:7000"),
+            )
+            .await
+    });
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(ref message)) if message.contains("cannot report as")),
+        "a cross-role registration must be rejected, got {result:?}"
+    );
+    let controller = cluster.controller.clone();
+    let state = cluster
+        .sim
+        .block_on(async move { controller.snapshot().await });
+    let record = state.node(LEADER).cloned().expect("leader remains");
+    assert_eq!(record.role, NodeRole::Leader);
+}
+
+#[test]
+fn catch_up_requires_the_local_log_and_controller_to_reach_the_authority() {
+    let cluster = Cluster::start(13);
+    let current = cluster.controller.clone();
+    let authority = cluster
+        .sim
+        .block_on(async move { current.commit_index().await });
+
+    let caught_up = cluster.controller.clone();
+    assert_eq!(
+        cluster
+            .sim
+            .block_on(async move { caught_up.catch_up_through(authority).await }),
+        Ok(true)
+    );
+
+    let lagging = cluster.controller.clone();
+    assert_eq!(
+        cluster
+            .sim
+            .block_on(async move { lagging.catch_up_through(u64::MAX).await }),
+        Ok(false)
+    );
 }
 
 #[test]

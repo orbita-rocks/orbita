@@ -25,8 +25,8 @@ finished.
 Readiness is otherwise real: a node reports Ready only once it has recovered
 its write-ahead log and opened and caught up the partitions the map says it
 holds, and it turns unready again if a map change hands it a partition it
-cannot open. What a deployed cluster does not get yet is the rejoin half,
-per the gap above.
+cannot open. A leader voter also has to apply through the commit index reported
+by the current Raft leader. Seeing a leader is not enough.
 
 The practical consequence of the gaps that remain: stage a rollout with the
 `partition` field and check the cluster between steps when the blast radius
@@ -60,6 +60,55 @@ segment header and the storage record format byte both do already. A node reads
 any format version its window allows and writes the version the active cluster
 version calls for. That is what makes the rollback window below real rather
 than a hope.
+
+## The first upgrade to Raft leaders
+
+This section is a one-time transition for a release whose leader pods do not
+run Raft. Skip it when the installed release already has a working leader
+quorum.
+
+A normal StatefulSet rolling update cannot cross this boundary. It replaces
+one pod and waits for that pod to become Ready before replacing the next. The
+first new pod is one Raft-capable voter beside two old processes that cannot
+vote, so it cannot reach two-of-three and can never become Ready.
+`podManagementPolicy: Parallel` does not change rolling replacement order; it
+only changes initial creation and scaling.
+
+Render the one-time transition by setting:
+
+```
+helm upgrade orbita deploy/helm/orbita --namespace orbita \
+  --set image.tag=0.1.0 \
+  --set leader.firstRaftUpgrade=true
+```
+
+This changes the leader StatefulSet to `OnDelete`. It does not replace any pod
+on its own. Replace ordinals 1 and 2 together, then wait for both new processes
+to form a quorum and pass the catch-up readiness gate:
+
+```
+kubectl --namespace orbita delete pod orbita-leader-1 orbita-leader-2
+kubectl --namespace orbita wait --for=condition=Ready \
+  pod/orbita-leader-1 pod/orbita-leader-2 --timeout=10m
+```
+
+Do not continue unless both are Ready. Once they are, replace the remaining old
+voter and wait for its local Raft log and controller to catch up:
+
+```
+kubectl --namespace orbita delete pod orbita-leader-0
+kubectl --namespace orbita wait --for=condition=Ready \
+  pod/orbita-leader-0 --timeout=10m
+```
+
+Run Helm once more with `leader.firstRaftUpgrade=false`. The pod template is
+already current, so this restores `RollingUpdate` without another restart.
+Every later upgrade follows the ordinary procedure below.
+
+This exception replaces two leader pods together because no one-at-a-time
+sequence can create the first quorum. The worker data plane remains available
+on its last map while the leader group forms. It is not a general permission to
+restart two Raft voters together after this transition.
 
 ## The rollout
 

@@ -11,8 +11,8 @@ use crate::controller::Controller;
 use crate::membership::NodeStatus;
 use crate::version::ClusterVersion;
 use crate::wire::{
-    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
@@ -85,6 +85,21 @@ impl<R: Runtime> ControlClient<R> {
     pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
         match self.call(METHOD_FETCH_NODES, bytes::Bytes::new()).await? {
             ControlResponse::Nodes(nodes) => Ok(nodes),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The current leader's committed control-command index.
+    ///
+    /// A voter compares this authority with its own log and applied state
+    /// before becoming Ready. Merely observing a leader does not prove the
+    /// voter has the decisions that leader may need for the next quorum.
+    pub async fn fetch_commit_index(&self) -> Result<crate::LogIndex> {
+        match self
+            .call(METHOD_FETCH_COMMIT_INDEX, bytes::Bytes::new())
+            .await?
+        {
+            ControlResponse::CommitIndex(index) => Ok(index),
             other => Err(unexpected(&other)),
         }
     }

@@ -30,12 +30,16 @@ pub const METHOD_FETCH_NODES: u16 = 3;
 /// back to [`METHOD_REPORT_STATUS`], which is how a new worker heartbeats an
 /// old leader mid-rollout.
 pub const METHOD_REPORT_STATUS_V2: u16 = 4;
+/// Reads the leader's committed control-command index. A restarting voter uses
+/// this as catch-up authority before it reports Ready.
+pub const METHOD_FETCH_COMMIT_INDEX: u16 = 5;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
 const STATUS_NOT_LEADER: u8 = 2;
 const STATUS_ERROR: u8 = 3;
 const STATUS_NODES: u8 = 4;
+const STATUS_COMMIT_INDEX: u8 = 5;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -129,6 +133,8 @@ pub(crate) enum ControlResponse {
     /// answer, and handing it back is what lets an operator configure the
     /// leader group and nothing else.
     Nodes(Vec<(NodeId, String)>),
+    /// The leader's committed control-command index.
+    CommitIndex(crate::LogIndex),
     Error(String),
 }
 
@@ -167,6 +173,9 @@ impl ControlResponse {
                     w.u64(node.get()).str(address);
                 });
             }
+            ControlResponse::CommitIndex(index) => {
+                w.u8(STATUS_COMMIT_INDEX).u64(*index);
+            }
             ControlResponse::Error(message) => {
                 w.u8(STATUS_ERROR).str(message);
             }
@@ -199,6 +208,7 @@ impl ControlResponse {
                 leader: r.opt_u64()?.map(NodeId),
             },
             STATUS_NODES => ControlResponse::Nodes(r.seq(|r| Ok((NodeId(r.u64()?), r.string()?)))?),
+            STATUS_COMMIT_INDEX => ControlResponse::CommitIndex(r.u64()?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
             tag => {
                 return Err(CodecError::UnknownTag {
@@ -370,6 +380,7 @@ mod tests {
             },
             ControlResponse::NotLeader { leader: None },
             ControlResponse::Error("no".into()),
+            ControlResponse::CommitIndex(42),
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),

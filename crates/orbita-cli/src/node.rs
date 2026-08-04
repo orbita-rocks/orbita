@@ -288,6 +288,15 @@ pub fn preflight(config: &Config, options: &NodeOptions) -> Result<()> {
     }
     if !options.dev {
         let peers = parse_leader_peers(&config.cluster.leader_peers)?;
+        if config.node.role == Role::Worker
+            && peers.iter().any(|(node, _)| node.get() == config.node.id)
+        {
+            bail!(
+                "worker node id {} is also a fixed leader voter id in cluster.leader_peers; \
+                 assign the worker an id outside the voter set",
+                config.node.id
+            );
+        }
         if config.node.role == Role::Leader {
             let local = NodeId(config.node.id);
             let configured = peers
@@ -310,6 +319,13 @@ pub fn preflight(config: &Config, options: &NodeOptions) -> Result<()> {
                     configured
                 );
             }
+        }
+        if !peers.is_empty() && peers.len() < 3 {
+            bail!(
+                "cluster.leader_peers has {} voters, but a production leader group needs at \
+                 least 3. Use `orbita dev` for a supported single-node cluster",
+                peers.len()
+            );
         }
         if let Some(option) = unroutable("node.advertise", &config.node.advertise) {
             bail!(
@@ -641,6 +657,40 @@ mod tests {
         layer.node.peer_advertise = Some("leader-1:7101".to_owned());
         let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
         assert!(format!("{error:#}").contains("maps it to old-leader:7101"));
+    }
+
+    #[test]
+    fn a_worker_cannot_reuse_a_fixed_voter_id() {
+        let mut layer = layer(
+            Role::Worker,
+            &["1=leader-1:7101", "2=leader-2:7101", "3=leader-3:7101"],
+            "worker-1:7100",
+        );
+        layer.node.id = Some(2);
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("also a fixed leader voter id"));
+    }
+
+    #[test]
+    fn a_production_leader_group_needs_at_least_three_voters() {
+        let mut layer = layer(
+            Role::Leader,
+            &["1=leader-1:7101", "2=leader-2:7101"],
+            "leader-1:7100",
+        );
+        layer.node.id = Some(1);
+        layer.node.peer_advertise = Some("leader-1:7101".to_owned());
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("needs at least 3"));
+    }
+
+    #[test]
+    fn dev_remains_the_explicit_single_node_exemption() {
+        let dev = NodeOptions {
+            create_keyspace: Some("default".to_owned()),
+            dev: true,
+        };
+        assert!(preflight(&config(Role::Leader, &[], "127.0.0.1:7100"), &dev).is_ok());
     }
 
     #[test]

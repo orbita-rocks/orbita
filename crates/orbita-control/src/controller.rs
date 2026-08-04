@@ -249,6 +249,25 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.inner.lock().await.state.map_version()
     }
 
+    /// The committed control-command index known to this consensus member.
+    pub async fn commit_index(&self) -> LogIndex {
+        self.log.commit_index().await
+    }
+
+    /// Applies local commits and proves this state machine reached an index a
+    /// leader reported as committed.
+    ///
+    /// This is the readiness seam rather than a Raft-specific lag check. It
+    /// establishes both halves that matter after restart: the local consensus
+    /// log contains the leader's decisions, and the controller has applied
+    /// them before it can participate in another rollout quorum.
+    pub async fn catch_up_through(&self, authority: LogIndex) -> Result<bool> {
+        self.recover().await?;
+        let local_commit = self.log.commit_index().await;
+        let applied = self.inner.lock().await.applied;
+        Ok(local_commit >= authority && applied >= authority)
+    }
+
     /// The active cluster version.
     pub async fn cluster_version(&self) -> ClusterVersion {
         self.inner.lock().await.state.cluster_version()
@@ -363,6 +382,15 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         let (needs_registration, needs_revival) = {
             let mut inner = self.inner.lock().await;
             let known = inner.state.node(node).cloned();
+            if let Some(record) = &known {
+                if record.role != status.role {
+                    return Err(Error::InvalidArgument(format!(
+                        "node {node} is registered as {:?} and cannot report as {:?}; node ids \
+                         are stable across roles",
+                        record.role, status.role
+                    )));
+                }
+            }
             inner.observations.insert(
                 node,
                 Observation {

@@ -280,11 +280,14 @@ impl Server {
             // ask which cluster version is active without joining the loop.
             reporter = Some(status.clone());
             let directory =
-                PeerDirectorySync::new(client, runtime.transport().clone(), config.node_id);
+                PeerDirectorySync::new(client.clone(), runtime.transport().clone(), config.node_id);
+            let leader_controller = controller.clone();
             tokio::spawn(Self::control_loop(
                 Arc::downgrade(&node),
                 status,
                 directory,
+                client,
+                leader_controller,
                 config.control_poll_interval,
                 Arc::clone(&readiness),
             ))
@@ -429,6 +432,8 @@ impl Server {
         node: std::sync::Weak<Node<ServerRuntime>>,
         reporter: StatusReporter<ServerRuntime>,
         directory: PeerDirectorySync<ServerRuntime>,
+        client: ControlClient<ServerRuntime>,
+        leader_controller: Option<Controller<ServerRuntime, RaftLog>>,
         interval: Duration,
         readiness: Arc<ReadinessGate>,
     ) {
@@ -446,8 +451,19 @@ impl Server {
             // progress. A later report failing does not clear the condition,
             // because a control plane outage must not unready every worker at
             // once; see `ReadinessCondition::ControlPlaneJoined`.
-            if reporter.report(version, progress).await {
-                readiness.mark(ReadinessCondition::ControlPlaneJoined);
+            let reported = reporter.report(version, progress).await;
+            match &leader_controller {
+                Some(controller) => {
+                    let caught_up = match client.fetch_commit_index().await {
+                        Ok(authority) => controller
+                            .catch_up_through(authority)
+                            .await
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    update_control_readiness(&readiness, reported, Some(caught_up));
+                }
+                None => update_control_readiness(&readiness, reported, None),
             }
             directory.refresh().await;
             if let Err(error) = live.refresh_map().await {
@@ -497,13 +513,18 @@ async fn start_control_plane(
     peers: &[(orbita_core::NodeId, String)],
     local_address: &str,
 ) -> Result<()> {
+    let client = ControlClient::new(runtime.clone(), voters.to_vec());
     controller.recover().await?;
     let deadline = runtime.clock().monotonic_nanos() + Duration::from_secs(30).as_nanos() as u64;
     loop {
         controller.recover().await?;
         let fresh = controller.snapshot().await.is_fresh();
-        if !fresh && log.leader().await.is_some() {
-            return Ok(());
+        if !fresh {
+            if let Ok(authority) = client.fetch_commit_index().await {
+                if controller.catch_up_through(authority).await? {
+                    return Ok(());
+                }
+            }
         }
         if fresh && log.is_leader().await {
             let leaders = peers
@@ -529,5 +550,67 @@ async fn start_control_plane(
             )));
         }
         runtime.clock().sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn update_control_readiness(
+    readiness: &ReadinessGate,
+    reported: bool,
+    leader_caught_up: Option<bool>,
+) {
+    match leader_caught_up {
+        Some(true)
+            if reported
+                || readiness
+                    .state()
+                    .is_met(ReadinessCondition::ControlPlaneJoined) =>
+        {
+            readiness.mark(ReadinessCondition::ControlPlaneJoined);
+        }
+        Some(_) => readiness.clear(ReadinessCondition::ControlPlaneJoined),
+        None if reported => readiness.mark(ReadinessCondition::ControlPlaneJoined),
+        None => {}
+    }
+}
+
+#[cfg(test)]
+mod leader_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn an_accepted_leader_report_does_not_make_a_lagging_voter_ready() {
+        let readiness = ReadinessGate::new();
+        readiness.mark(ReadinessCondition::WalRecovered);
+        readiness.mark(ReadinessCondition::PartitionsCaughtUp);
+
+        update_control_readiness(&readiness, true, Some(false));
+
+        assert_eq!(
+            readiness.state().unmet(),
+            vec![ReadinessCondition::ControlPlaneJoined]
+        );
+    }
+
+    #[test]
+    fn a_voter_becomes_ready_after_applying_through_the_leader_authority() {
+        let readiness = ReadinessGate::new();
+        readiness.mark(ReadinessCondition::WalRecovered);
+        readiness.mark(ReadinessCondition::PartitionsCaughtUp);
+
+        update_control_readiness(&readiness, true, Some(true));
+
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn a_ready_voter_turns_unready_when_it_falls_behind() {
+        let readiness = ReadinessGate::new();
+        for condition in ReadinessCondition::ALL {
+            readiness.mark(condition);
+        }
+
+        update_control_readiness(&readiness, true, Some(false));
+
+        assert!(!readiness.is_ready());
     }
 }

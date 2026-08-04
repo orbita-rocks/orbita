@@ -7,8 +7,8 @@
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::wire::{
-    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    ControlResponse, FetchMapRequest, ReportStatusRequest, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
 };
 
 use bytes::Bytes;
@@ -73,6 +73,9 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
             },
             METHOD_FETCH_NODES => ControlResponse::Nodes(self.controller.node_addresses().await),
+            METHOD_FETCH_COMMIT_INDEX => {
+                ControlResponse::CommitIndex(self.controller.commit_index().await)
+            }
             other => ControlResponse::Error(format!("unknown control method {other}")),
         }
     }
