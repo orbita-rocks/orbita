@@ -221,6 +221,7 @@ impl Server {
         // its first report the leader group accepts.
         if control.is_none() {
             readiness.mark(ReadinessCondition::ControlPlaneJoined);
+            readiness.mark(ReadinessCondition::ClusterVersionCompatible);
         }
 
         let node = Node::start(
@@ -451,7 +452,23 @@ impl Server {
             // progress. A later report failing does not clear the condition,
             // because a control plane outage must not unready every worker at
             // once; see `ReadinessCondition::ControlPlaneJoined`.
-            let reported = reporter.report(version, progress).await;
+            let reported = match reporter.report(version, progress).await {
+                Ok(orbita_control::StatusReportResponse::Accepted { .. }) => {
+                    readiness.mark(ReadinessCondition::ClusterVersionCompatible);
+                    true
+                }
+                Ok(orbita_control::StatusReportResponse::Incompatible(_)) => {
+                    readiness.clear(ReadinessCondition::ClusterVersionCompatible);
+                    readiness.clear(ReadinessCondition::ControlPlaneJoined);
+                    false
+                }
+                // A heartbeat outage does not clear a completed join or make
+                // the data plane unavailable on its own.
+                Err(error) => {
+                    tracing::debug!(%error, "reporting status to the leader group failed");
+                    false
+                }
+            };
             match &leader_controller {
                 Some(controller) => {
                     let caught_up = match client.fetch_commit_index().await {
@@ -580,6 +597,7 @@ mod leader_readiness_tests {
     #[test]
     fn an_accepted_leader_report_does_not_make_a_lagging_voter_ready() {
         let readiness = ReadinessGate::new();
+        readiness.mark(ReadinessCondition::ClusterVersionCompatible);
         readiness.mark(ReadinessCondition::WalRecovered);
         readiness.mark(ReadinessCondition::PartitionsCaughtUp);
 
@@ -594,6 +612,7 @@ mod leader_readiness_tests {
     #[test]
     fn a_voter_becomes_ready_after_applying_through_the_leader_authority() {
         let readiness = ReadinessGate::new();
+        readiness.mark(ReadinessCondition::ClusterVersionCompatible);
         readiness.mark(ReadinessCondition::WalRecovered);
         readiness.mark(ReadinessCondition::PartitionsCaughtUp);
 

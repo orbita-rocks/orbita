@@ -22,7 +22,7 @@ use crate::consensus::{ConsensusLog, LogIndex};
 use crate::membership::{NodeHealth, NodeRole, NodeStatus};
 use crate::model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 use crate::state::{ClusterState, NodeRecord, PartitionPhase};
-use crate::version::{binary_speaks, ClusterVersion};
+use crate::version::{binary_speaks, ClusterVersion, CompatibilityRefusal};
 
 use bytes::Bytes;
 use orbita_core::{
@@ -109,6 +109,13 @@ pub struct ClusterView {
 pub struct FinalizedUpgrade {
     pub previous: ClusterVersion,
     pub active: ClusterVersion,
+}
+
+/// The replicated control plane's decision on one status report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    Accepted(MapVersion),
+    Incompatible(CompatibilityRefusal),
 }
 
 struct Inner {
@@ -427,9 +434,13 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     ///
     /// Returns the current map version so the reporting node learns in the
     /// same round trip whether the map it is routing on is stale.
-    pub async fn record_status(&self, node: NodeId, status: NodeStatus) -> Result<MapVersion> {
+    pub async fn record_status(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+    ) -> Result<RegistrationOutcome> {
         let now = self.runtime.clock().monotonic_nanos();
-        let (needs_registration, needs_revival) = {
+        let (known, mut refusal) = {
             let mut inner = self.inner.lock().await;
             let known = inner.state.node(node).cloned();
             if let Some(record) = &known {
@@ -441,35 +452,58 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     )));
                 }
             }
-            inner.observations.insert(
-                node,
-                Observation {
-                    heard_at_nanos: now,
-                    status: status.clone(),
-                },
-            );
-            match known {
-                None => (true, false),
-                Some(record) => (
-                    // A changed speakable range is a re-registration too: it
-                    // is what a rolling update looks like from here, and
-                    // finalize-upgrade decides from the stored range.
-                    record.address != status.address
-                        || record.role != status.role
-                        || record.speaks != status.speaks,
-                    record.health != NodeHealth::Healthy,
-                ),
+            let refusal = inner.state.compatibility_refusal(status.speaks);
+            if known.is_some() || refusal.is_none() {
+                inner.observations.insert(
+                    node,
+                    Observation {
+                        heard_at_nanos: now,
+                        status: status.clone(),
+                    },
+                );
             }
+            (known, refusal)
         };
+        let known_member = known.is_some();
+        if !known_member {
+            if let Some(refusal) = refusal {
+                return Ok(RegistrationOutcome::Incompatible(refusal));
+            }
+        }
+        // A changed speakable range is a re-registration too: it is what a
+        // rolling update looks like from here, and finalize-upgrade decides
+        // from the stored range.
+        let needs_registration = known.as_ref().is_none_or(|record| {
+            record.address != status.address
+                || record.role != status.role
+                || record.speaks != status.speaks
+        });
+        let needs_revival = known
+            .as_ref()
+            .is_some_and(|record| record.health != NodeHealth::Healthy);
 
-        if needs_registration {
-            self.submit(ControlCommand::RegisterNode {
-                node,
-                role: status.role,
-                address: status.address.clone(),
-                speaks: status.speaks,
-            })
-            .await?;
+        if needs_registration && refusal.is_none() {
+            if let Err(error) = self
+                .submit(ControlCommand::RegisterNode {
+                    node,
+                    role: status.role,
+                    address: status.address.clone(),
+                    speaks: status.speaks,
+                })
+                .await
+            {
+                // Finalization can race the proposal. The state machine is the
+                // authority, and this read turns its refusal back into the
+                // same structured answer as the fast path above.
+                let mut inner = self.inner.lock().await;
+                refusal = inner.state.compatibility_refusal(status.speaks);
+                if refusal.is_none() {
+                    return Err(error);
+                }
+                if !known_member {
+                    inner.observations.remove(&node);
+                }
+            }
         }
         if needs_revival {
             // A node that came back has to be marked healthy through the log,
@@ -481,7 +515,10 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             .await?;
         }
 
-        Ok(self.map_version().await)
+        match refusal {
+            Some(refusal) => Ok(RegistrationOutcome::Incompatible(refusal)),
+            None => Ok(RegistrationOutcome::Accepted(self.map_version().await)),
+        }
     }
 
     /// Creates the first keyspace of a fresh cluster, with its single
@@ -1000,7 +1037,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     // until somebody reports.
                     tracing::warn!(
                         partition = %info.id,
-                        "no replica has reported a durable position; not promoting"
+                        "no eligible replica has reported a durable position; not promoting"
                     );
                     continue;
                 };
@@ -1031,7 +1068,11 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     tracing::info!(%partition, %owner, "promoted a replica to owner");
                     self.inner.lock().await.fenced_since.remove(&partition);
                 }
-                Err(Error::StaleEpoch { .. } | Error::InvalidArgument(_)) => {}
+                Err(Error::StaleEpoch { .. }) => {}
+                Err(e @ Error::InvalidArgument(_)) => {
+                    tracing::warn!(%partition, %owner, error = %e, "selected owner was refused");
+                    return Err(e);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1135,7 +1176,8 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     }
 }
 
-/// The most caught-up healthy replica, or `None` if nobody has reported.
+/// The most caught-up replica eligible for new ownership, or `None` if an
+/// eligible replica has not reached the most durable surviving position.
 ///
 /// Highest durable Lamport wins, because that is what bounds the writes the
 /// cluster has acknowledged: the WAL acknowledges at two of three, so any
@@ -1143,34 +1185,36 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 /// furthest survivor cannot lose one. Ties break on node id so the choice is
 /// reproducible from a seed.
 fn best_candidate(inner: &Inner, info: &PartitionInfo) -> Option<NodeId> {
-    let mut best: Option<(Lamport, NodeId)> = None;
-    for replica in &info.replicas {
-        let healthy = inner
-            .state
-            .node(*replica)
-            .is_some_and(|n| n.health == NodeHealth::Healthy);
-        if !healthy {
-            continue;
-        }
-        let Some(progress) = inner
-            .observations
-            .get(replica)
-            .and_then(|obs| obs.status.progress(info.id))
-        else {
-            continue;
-        };
-        let candidate = (progress.durable_lamport, *replica);
-        let wins = match best {
-            None => true,
-            Some((lamport, node)) => {
-                candidate.0 > lamport || (candidate.0 == lamport && candidate.1 < node)
-            }
-        };
-        if wins {
-            best = Some(candidate);
-        }
-    }
-    best.map(|(_, node)| node)
+    let durable_required = info
+        .replicas
+        .iter()
+        .filter(|replica| {
+            inner
+                .state
+                .node(**replica)
+                .is_some_and(|node| node.health == NodeHealth::Healthy)
+        })
+        .filter_map(|replica| {
+            inner
+                .observations
+                .get(replica)
+                .and_then(|obs| obs.status.progress(info.id))
+                .map(|progress| progress.durable_lamport)
+        })
+        .max()?;
+
+    info.replicas
+        .iter()
+        .filter(|replica| inner.state.new_ownership_eligibility(**replica).is_ok())
+        .filter(|replica| {
+            inner
+                .observations
+                .get(replica)
+                .and_then(|obs| obs.status.progress(info.id))
+                .is_some_and(|progress| progress.durable_lamport == durable_required)
+        })
+        .min()
+        .copied()
 }
 
 /// Splits an ordered candidate list into an owner and a replica set.

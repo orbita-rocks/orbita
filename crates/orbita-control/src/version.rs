@@ -115,6 +115,26 @@ impl std::fmt::Display for VersionRange {
     }
 }
 
+/// An authoritative refusal to admit a node into the active cluster.
+///
+/// Both sides of the comparison are retained as data so peer clients can
+/// expose an actionable readiness failure without parsing an error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompatibilityRefusal {
+    pub speaks: VersionRange,
+    pub active: ClusterVersion,
+}
+
+impl std::fmt::Display for CompatibilityRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "node speaks cluster versions {} but the active cluster version is {}; install a binary whose supported range includes {}",
+            self.speaks, self.active, self.active
+        )
+    }
+}
+
 /// The cluster version this binary was built to speak, taken from the crate
 /// version, which is the workspace version.
 #[must_use]
