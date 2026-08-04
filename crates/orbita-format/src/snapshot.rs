@@ -62,7 +62,24 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
     }
 
     /// Builds the index for a manifest already in hand.
+    ///
+    /// The manifest has to agree with the directory it was found in. A manifest
+    /// copied into the wrong partition's directory, which is an operator error
+    /// rather than an exotic one, would otherwise be served as that partition's
+    /// contents, and the identifiers are in the manifest precisely so that the
+    /// mistake is detectable.
     pub async fn of(store: Arc<S>, path: PartitionPath, manifest: Manifest) -> Result<Self> {
+        if manifest.keyspace_id != path.keyspace_id()
+            || manifest.partition_id != path.partition_id()
+        {
+            return Err(FormatError::Corrupt(format!(
+                "a manifest for keyspace {} partition {} is stored under {}",
+                manifest.keyspace_id,
+                manifest.partition_id,
+                path.prefix()
+            )));
+        }
+
         let mut snapshot = Self {
             store,
             path,
@@ -120,6 +137,21 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
     /// overlap the manifest already answers this, and where they do the
     /// Lamports are read from the records themselves: nine bytes in, eight
     /// bytes long, no value involved.
+    ///
+    /// # Tie detection here is partial, and deliberately so
+    ///
+    /// Two records for one key at one Lamport is a corrupt partition rather
+    /// than a tie to break, and this reports it when the tie involves the
+    /// record that would have won. It does not report a tie between two losers:
+    /// with segments at Lamports 5, 9, and 5 for one key, the 9 is the right
+    /// answer and this returns it without ever comparing the two 5s.
+    ///
+    /// Catching that would mean fetching a Lamport for every candidate rather
+    /// than only for the ones the manifest cannot separate, which is a request
+    /// per duplicate key on the hydration path in exchange for finding
+    /// corruption that does not change what any read returns.
+    /// [`crate::compact::merge`] has every record in hand already and checks
+    /// exhaustively, so a scrub is where this is found.
     async fn winner(&self, existing: Location, candidate: Location) -> Result<Location> {
         let a = &self.manifest.segments[existing.segment];
         let b = &self.manifest.segments[candidate.segment];
@@ -538,6 +570,26 @@ mod tests {
             snapshot.get(b"a", 0).await,
             Err(FormatError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_manifest_found_under_the_wrong_partition_is_refused() {
+        let store = partition(&[vec![put("a", 1, "v")]]).await;
+        let elsewhere = PartitionPath::new("orbita", KEYSPACE, PartitionId(8));
+        let (manifest, _) = crate::commit::load_manifest(store.as_ref(), &path())
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .put(&elsewhere.manifest(), manifest.encode())
+            .await
+            .unwrap();
+
+        let outcome = Snapshot::open(store, elsewhere).await.err();
+        assert!(
+            matches!(outcome, Some(FormatError::Corrupt(_))),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]

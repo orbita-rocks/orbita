@@ -30,34 +30,41 @@ use std::collections::BTreeMap;
 /// alone, so it can say "might" where reading the segment would say "does not",
 /// and the cost of being wrong that way is a tombstone that survives one more
 /// compaction.
+/// # This is where duplicate Lamports are caught exhaustively
+///
+/// A merge already has every record for a key in hand, so it compares all of
+/// them rather than only each against the current leader. Three segments
+/// holding one key at Lamports 5, 9, and 5 is a corrupt partition, and a check
+/// that only ever compared against the leader would let the second 5 lose to
+/// the 9 and say nothing. [`crate::snapshot`] cannot afford this, since it
+/// would have to fetch a Lamport for every candidate rather than only for the
+/// ones the manifest cannot separate, so a scrub is what finds these.
 pub fn merge(
     inputs: &[Vec<SegmentRecord>],
     now_millis: u64,
     retained: &[SegmentEntry],
 ) -> Result<Vec<SegmentRecord>> {
-    let mut winners: BTreeMap<&[u8], &SegmentRecord> = BTreeMap::new();
+    let mut grouped: BTreeMap<&[u8], Vec<&SegmentRecord>> = BTreeMap::new();
     for records in inputs {
         for record in records {
-            match winners.get(record.key.as_ref()) {
-                None => {
-                    winners.insert(record.key.as_ref(), record);
-                }
-                Some(existing) if existing.lamport < record.lamport => {
-                    winners.insert(record.key.as_ref(), record);
-                }
-                Some(existing) if existing.lamport == record.lamport => {
-                    return Err(FormatError::Corrupt(format!(
-                        "two records for {:?} at lamport {}",
-                        record.key, record.lamport
-                    )));
-                }
-                Some(_) => {}
-            }
+            grouped.entry(record.key.as_ref()).or_default().push(record);
         }
     }
 
+    let mut winners: Vec<&SegmentRecord> = Vec::with_capacity(grouped.len());
+    for (key, mut candidates) in grouped {
+        candidates.sort_by_key(|record| record.lamport);
+        if let Some(pair) = candidates.windows(2).find(|p| p[0].lamport == p[1].lamport) {
+            return Err(FormatError::Corrupt(format!(
+                "two records for {key:?} at lamport {}",
+                pair[0].lamport
+            )));
+        }
+        winners.push(candidates.pop().expect("a group holds at least one record"));
+    }
+
     Ok(winners
-        .into_values()
+        .into_iter()
         .filter(|record| !record.is_expired_at(now_millis))
         .filter(|record| {
             !record.is_tombstone()
@@ -201,6 +208,23 @@ mod tests {
         .unwrap();
         assert_eq!(merged.len(), 1, "a write after a delete is not a delete");
         assert_eq!(merged[0].lamport, Lamport(9));
+    }
+
+    #[test]
+    fn a_tie_is_caught_even_when_a_higher_lamport_would_have_won() {
+        // 5, 9, 5. A check that only compared each record against the current
+        // leader would let the second 5 lose to the 9 and report nothing, and
+        // the partition would stay corrupt with no error raised.
+        let outcome = merge(
+            &[
+                vec![put("a", 5, "one")],
+                vec![put("a", 9, "winner")],
+                vec![put("a", 5, "two")],
+            ],
+            0,
+            &[],
+        );
+        assert!(matches!(outcome, Err(FormatError::Corrupt(_))));
     }
 
     #[test]

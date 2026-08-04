@@ -196,15 +196,23 @@ impl SegmentFooter {
     }
 
     /// Where the index section sits, given the object's size.
+    ///
+    /// Every arithmetic step here is checked. The offsets come out of an object
+    /// somebody else wrote, and a footer whose own checksum agrees is not the
+    /// same thing as a footer that makes sense: CRC32C is computable by anyone,
+    /// so a hostile object arrives with a valid one. Arithmetic that wrapped
+    /// here would turn a rejection into a panic in the scrub path.
     pub fn index_range(&self, object_bytes: u64) -> Result<std::ops::Range<u64>> {
+        let overflowed = || FormatError::Malformed {
+            what: "segment footer",
+            detail: "the index runs past the end of the address space".to_string(),
+        };
         let end = self
             .index_offset
             .checked_add(self.index_length)
-            .ok_or_else(|| FormatError::Malformed {
-                what: "segment footer",
-                detail: "the index runs past the end of the address space".to_string(),
-            })?;
-        if self.index_offset < HEADER_LEN || end + FOOTER_LEN > object_bytes {
+            .ok_or_else(overflowed)?;
+        let tail = end.checked_add(FOOTER_LEN).ok_or_else(overflowed)?;
+        if self.index_offset < HEADER_LEN || tail > object_bytes {
             return Err(FormatError::Malformed {
                 what: "segment footer",
                 detail: format!(
@@ -696,6 +704,38 @@ mod tests {
             SegmentFooter::decode(tail),
             Err(FormatError::UnsupportedVersion { found: 2, .. })
         ));
+    }
+
+    #[test]
+    fn an_index_offset_near_the_top_of_the_address_space_is_rejected_not_wrapped() {
+        // A footer's own checksum agreeing is not the same as its offsets
+        // making sense, since anyone can compute a CRC32C. This one wraps if
+        // the bounds check adds without checking, and the scrub then slices
+        // past the object.
+        let footer = SegmentFooter {
+            index_offset: u64::MAX - FOOTER_LEN + 1,
+            index_length: 0,
+            record_count: 0,
+            min_lamport: Lamport::ZERO,
+            max_lamport: Lamport::ZERO,
+            data_crc32c: 0,
+            index_crc32c: 0,
+        };
+        let encoded = footer.encode();
+        let decoded = SegmentFooter::decode(&encoded).expect("its own checksum is valid");
+        assert!(matches!(
+            decoded.index_range(1024),
+            Err(FormatError::Malformed { .. })
+        ));
+
+        let mut crafted = vec![0u8; HEADER_LEN as usize];
+        crafted[..6].copy_from_slice(HEADER_MAGIC);
+        crafted[6..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        crafted.extend_from_slice(&encoded);
+        assert!(
+            Segment::decode(&crafted).is_err(),
+            "the scrub rejects it rather than crashing on it"
+        );
     }
 
     #[test]

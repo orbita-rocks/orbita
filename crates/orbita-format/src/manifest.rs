@@ -63,9 +63,14 @@ impl SegmentEntry {
 
     /// The byte range holding the footer, for a reader that cannot make a
     /// suffix request.
+    ///
+    /// Saturating rather than panicking on an entry too small to hold a footer.
+    /// A validated manifest cannot produce one, but these fields are public, and
+    /// an empty range that the store refuses is a better answer than a panic in
+    /// a caller that hand-built an entry.
     #[must_use]
     pub fn footer_range(&self) -> std::ops::Range<u64> {
-        self.bytes - crate::segment::FOOTER_LEN..self.bytes
+        self.bytes.saturating_sub(crate::segment::FOOTER_LEN)..self.bytes
     }
 }
 
@@ -157,7 +162,13 @@ impl Manifest {
 
 /// The JSON shape, kept separate from the validated type so that nothing
 /// constructs a [`Manifest`] by deserialising into it directly.
+///
+/// Unknown fields are refused rather than skipped. The compatibility rules say
+/// there is no extension mechanism and that a version number is where a change
+/// is argued about, so a field this build does not know is a manifest from a
+/// format this build does not implement, whatever its `format_version` claims.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Wire {
     format_version: u64,
     keyspace_id: u64,
@@ -169,6 +180,7 @@ struct Wire {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireRange {
     /// Empty means unbounded below, and it is the only way to say that.
     start: String,
@@ -178,6 +190,7 @@ struct WireRange {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireSegment {
     name: String,
     bytes: u64,
@@ -251,9 +264,15 @@ impl Wire {
                     segment.name
                 )));
             }
-            if !segment.name.starts_with(&format!("{SEGMENTS_DIR}/")) {
+            // Not merely under segments/, but a name this format could have
+            // produced. A manifest naming something else describes a partition
+            // that cannot exist, and the sweep, which parses names strictly,
+            // would not recognise the reference as one.
+            if !segment.name.starts_with(&format!("{SEGMENTS_DIR}/"))
+                || crate::paths::parse_object_name(&segment.name).is_none()
+            {
                 return Err(malformed(&format!(
-                    "segment name {} is not under {SEGMENTS_DIR}/",
+                    "segment name {} is not a name this format produces",
                     segment.name
                 )));
             }
@@ -473,6 +492,40 @@ mod tests {
             Manifest::decode(json.as_bytes()).unwrap().committed_lamport,
             Lamport(9000)
         );
+    }
+
+    #[test]
+    fn a_segment_name_this_format_could_not_have_produced_is_rejected() {
+        for name in [
+            "segments/notes.txt",
+            "segments/5-11.oseg",
+            "values/0000000000000005-0000000000000011.oval",
+        ] {
+            let json =
+                SPEC_EXAMPLE.replace("segments/0000000000000005-0000000000000011.oseg", name);
+            assert!(
+                matches!(
+                    Manifest::decode(json.as_bytes()),
+                    Err(FormatError::Malformed { .. })
+                ),
+                "{name} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_is_rejected_rather_than_skipped() {
+        // There is no extension mechanism, on purpose. A field this build does
+        // not know came from a format it does not implement, and skipping it is
+        // how a reader silently returns something other than what was stored.
+        let json = SPEC_EXAMPLE.replace(
+            "\"committed_lamport\": 4000",
+            "\"committed_lamport\": 4000,\n      \"compression\": \"zstd\"",
+        );
+        assert!(matches!(
+            Manifest::decode(json.as_bytes()),
+            Err(FormatError::Malformed { .. })
+        ));
     }
 
     #[test]
