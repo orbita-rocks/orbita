@@ -229,7 +229,7 @@ impl<R: Runtime> StatusReporter<R> {
     }
 
     /// Requests one control-plane drain pass for this node.
-    pub async fn drain_node(&self) -> Result<()> {
+    pub async fn drain_node(&self) -> Result<bool> {
         self.client.drain_node(self.node).await
     }
 }

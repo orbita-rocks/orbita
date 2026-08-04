@@ -89,14 +89,10 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
             },
             METHOD_DRAIN_NODE => match DrainNodeRequest::decode(&call.payload) {
                 Ok(request) => match self.controller.drain_node(request.node).await {
-                    Ok(true) => ControlResponse::Accepted {
+                    Ok(complete) => ControlResponse::DrainProgress {
+                        complete,
                         map_version: self.controller.map_version().await,
-                        cluster_version: Some(self.controller.cluster_version().await),
                     },
-                    Ok(false) => ControlResponse::Error(
-                        "ownership transfers committed; waiting for receiving owners to report the new map ready"
-                            .into(),
-                    ),
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable drain request: {e}")),

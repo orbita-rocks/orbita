@@ -705,13 +705,12 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     .and_then(|observation| observation.status.progress(info.id))
                     .map_or(Lamport::ZERO, |progress| progress.durable_lamport);
                 let target = info.replicas.iter().copied().find(|candidate| {
-                    inner.state.node(*candidate).is_some_and(|record| {
-                        record.health == NodeHealth::Healthy && record.ready && !record.draining
-                    }) && inner
-                        .observations
-                        .get(candidate)
-                        .and_then(|observation| observation.status.progress(info.id))
-                        .is_some_and(|progress| progress.durable_lamport >= owner_progress)
+                    inner.state.is_eligible_owner(*candidate)
+                        && inner
+                            .observations
+                            .get(candidate)
+                            .and_then(|observation| observation.status.progress(info.id))
+                            .is_some_and(|progress| progress.durable_lamport >= owner_progress)
                 });
                 let Some(target) = target else {
                     return Err(Error::Unavailable(format!(
@@ -737,18 +736,23 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 
         if commands.is_empty() {
             let inner = self.inner.lock().await;
-            let map_version = inner.state.map_version();
-            let receivers_ready = inner.state.map().partitions().all(|partition| {
-                partition.owner.is_some_and(|owner| {
-                    inner.observations.get(&owner).is_some_and(|observation| {
-                        observation.status.ready && observation.status.map_version >= map_version
-                    })
-                })
-            });
+            let receivers_ready =
+                inner
+                    .state
+                    .handoffs_from(node)
+                    .into_iter()
+                    .flatten()
+                    .all(|(_, checkpoint)| {
+                        inner
+                            .observations
+                            .get(&checkpoint.receiver)
+                            .is_some_and(|observation| {
+                                observation.status.ready
+                                    && observation.status.map_version >= checkpoint.map_version
+                            })
+                    });
             if !receivers_ready {
-                return Err(Error::Unavailable(format!(
-                    "handoff is committed at map version {map_version}, but a receiving owner has not reported that version ready"
-                )));
+                return Ok(false);
             }
             return Ok(true);
         }
@@ -1020,7 +1024,16 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     tracing::info!(%partition, %owner, "promoted a replica to owner");
                     self.inner.lock().await.fenced_since.remove(&partition);
                 }
-                Err(Error::StaleEpoch { .. } | Error::InvalidArgument(_)) => {}
+                Err(Error::StaleEpoch { .. }) => {}
+                Err(error @ Error::InvalidArgument(_)) => {
+                    tracing::warn!(
+                        %partition,
+                        %owner,
+                        %error,
+                        "an eligible failover promotion was refused"
+                    );
+                    return Err(error);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1124,7 +1137,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     }
 }
 
-/// The most caught-up healthy replica, or `None` if nobody has reported.
+/// The most caught-up replica eligible to own, or `None` if nobody has reported.
 ///
 /// Highest durable Lamport wins, because that is what bounds the writes the
 /// cluster has acknowledged: the WAL acknowledges at two of three, so any
@@ -1134,11 +1147,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 fn best_candidate(inner: &Inner, info: &PartitionInfo) -> Option<NodeId> {
     let mut best: Option<(Lamport, NodeId)> = None;
     for replica in &info.replicas {
-        let healthy = inner
-            .state
-            .node(*replica)
-            .is_some_and(|n| n.health == NodeHealth::Healthy);
-        if !healthy {
+        if !inner.state.is_eligible_owner(*replica) {
             continue;
         }
         let Some(progress) = inner

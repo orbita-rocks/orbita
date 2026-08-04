@@ -113,15 +113,14 @@ impl<R: Runtime> ControlClient<R> {
         self.send_status(node, status).await
     }
 
-    /// Asks the leader to transfer every partition this node still owns. The
-    /// node must first have reported `draining`, and retries until this returns
-    /// successfully with no ownership left.
-    pub async fn drain_node(&self, node: NodeId) -> Result<()> {
+    /// Asks the leader to transfer every partition this node still owns.
+    /// Returns whether every receiver has acknowledged its handoff map.
+    pub async fn drain_node(&self, node: NodeId) -> Result<bool> {
         match self
             .call(METHOD_DRAIN_NODE, DrainNodeRequest { node }.encode())
             .await?
         {
-            ControlResponse::Accepted { .. } => Ok(()),
+            ControlResponse::DrainProgress { complete, .. } => Ok(complete),
             other => Err(unexpected(&other)),
         }
     }

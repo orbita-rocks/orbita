@@ -41,6 +41,8 @@ const STATUS_ACCEPTED: u8 = 1;
 const STATUS_NOT_LEADER: u8 = 2;
 const STATUS_ERROR: u8 = 3;
 const STATUS_NODES: u8 = 4;
+// Tag 5 is reserved for the structured compatibility refusal.
+const STATUS_DRAIN_PROGRESS: u8 = 6;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -169,6 +171,12 @@ pub(crate) enum ControlResponse {
     /// answer, and handing it back is what lets an operator configure the
     /// leader group and nothing else.
     Nodes(Vec<(NodeId, String)>),
+    /// A drain request was accepted. `complete` becomes true only after every
+    /// receiver in this node's handoff set has reported its transfer version.
+    DrainProgress {
+        complete: bool,
+        map_version: MapVersion,
+    },
     Error(String),
 }
 
@@ -207,6 +215,14 @@ impl ControlResponse {
                     w.u64(node.get()).str(address);
                 });
             }
+            ControlResponse::DrainProgress {
+                complete,
+                map_version,
+            } => {
+                w.u8(STATUS_DRAIN_PROGRESS)
+                    .u8(u8::from(*complete))
+                    .u64(map_version.get());
+            }
             ControlResponse::Error(message) => {
                 w.u8(STATUS_ERROR).str(message);
             }
@@ -239,6 +255,10 @@ impl ControlResponse {
                 leader: r.opt_u64()?.map(NodeId),
             },
             STATUS_NODES => ControlResponse::Nodes(r.seq(|r| Ok((NodeId(r.u64()?), r.string()?)))?),
+            STATUS_DRAIN_PROGRESS => ControlResponse::DrainProgress {
+                complete: r.u8()? != 0,
+                map_version: MapVersion(r.u64()?),
+            },
             STATUS_ERROR => ControlResponse::Error(r.string()?),
             tag => {
                 return Err(CodecError::UnknownTag {
@@ -409,6 +429,10 @@ mod tests {
                 leader: Some(NodeId(2)),
             },
             ControlResponse::NotLeader { leader: None },
+            ControlResponse::DrainProgress {
+                complete: false,
+                map_version: MapVersion(10),
+            },
             ControlResponse::Error("no".into()),
         ] {
             assert_eq!(
@@ -416,6 +440,25 @@ mod tests {
                 Ok(response.clone())
             );
         }
+    }
+
+    #[test]
+    fn drain_progress_round_trips_distinct_from_a_refusal() {
+        for complete in [false, true] {
+            let progress = ControlResponse::DrainProgress {
+                complete,
+                map_version: MapVersion(12),
+            };
+            assert_eq!(ControlResponse::decode(&progress.encode()), Ok(progress));
+        }
+
+        let progress = ControlResponse::DrainProgress {
+            complete: false,
+            map_version: MapVersion(12),
+        };
+        let refusal = ControlResponse::Error("node is not draining".into());
+        assert_ne!(progress.encode()[0], refusal.encode()[0]);
+        assert_eq!(ControlResponse::decode(&refusal.encode()), Ok(refusal));
     }
 
     #[test]

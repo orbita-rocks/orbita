@@ -429,15 +429,34 @@ impl Server {
             }
 
             // No lease can outlive this point because renewal stopped before
-            // write admission closed. Reads remain available from the owner.
-            tokio::time::sleep(node.lease_drain()).await;
+            // write admission closed. Keep reporting the draining state while
+            // waiting so a delayed executor cannot turn a planned transfer
+            // into failover by letting the failure detector fence this node.
+            let leases_expire_at = tokio::time::Instant::now() + node.lease_drain();
+            while tokio::time::Instant::now() < leases_expire_at {
+                tokio::time::sleep_until(
+                    leases_expire_at.min(tokio::time::Instant::now() + interval),
+                )
+                .await;
+                let _ = reporter
+                    .report(node.map().version(), node.progress().await, false, true)
+                    .await;
+            }
             loop {
+                let _ = reporter
+                    .report(node.map().version(), node.progress().await, false, true)
+                    .await;
                 match reporter.drain_node().await {
-                    Ok(()) => {
+                    Ok(true) => {
                         node.refresh_map().await?;
                         if node.owned_partition_count() == 0 {
                             return Ok::<(), Error>(());
                         }
+                    }
+                    Ok(false) => {
+                        *failure.lock().expect("drain failure lock poisoned") = Some(
+                            "waiting for receiving owners to acknowledge their handoff maps".into(),
+                        );
                     }
                     Err(error) => {
                         *failure.lock().expect("drain failure lock poisoned") =

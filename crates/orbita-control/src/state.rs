@@ -66,6 +66,17 @@ pub struct NodeRecord {
     pub draining: bool,
 }
 
+/// The acknowledgement a planned transfer still needs from its receiver.
+///
+/// This is replicated with ownership so a control leader change cannot lose
+/// the narrower completion condition and fall back to waiting on the whole
+/// cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HandoffCheckpoint {
+    pub receiver: NodeId,
+    pub map_version: MapVersion,
+}
+
 /// Everything the leader group knows, as of some prefix of the log.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterState {
@@ -73,6 +84,7 @@ pub struct ClusterState {
     keyspaces: BTreeMap<KeyspaceId, Keyspace>,
     phases: BTreeMap<PartitionId, PartitionPhase>,
     nodes: BTreeMap<NodeId, NodeRecord>,
+    handoffs: BTreeMap<NodeId, BTreeMap<PartitionId, HandoffCheckpoint>>,
     credentials: BTreeMap<String, Credential>,
     next_keyspace_id: u64,
     next_partition_id: u64,
@@ -117,6 +129,13 @@ impl ClusterState {
     #[must_use]
     pub fn node(&self, id: NodeId) -> Option<&NodeRecord> {
         self.nodes.get(&id)
+    }
+
+    pub(crate) fn handoffs_from(
+        &self,
+        node: NodeId,
+    ) -> Option<&BTreeMap<PartitionId, HandoffCheckpoint>> {
+        self.handoffs.get(&node)
     }
 
     #[must_use]
@@ -166,16 +185,26 @@ impl ClusterState {
         let mut candidates: Vec<(usize, NodeId)> = self
             .nodes
             .values()
-            .filter(|n| {
-                n.role == NodeRole::Worker
-                    && n.health == NodeHealth::Healthy
-                    && n.ready
-                    && !n.draining
-            })
+            .filter(|n| self.is_eligible_owner(n.id))
             .map(|n| (self.map.held_by(n.id).count(), n.id))
             .collect();
         candidates.sort_unstable();
         candidates.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Whether the replicated membership state permits new ownership.
+    ///
+    /// Every proposer uses this same predicate before emitting a command, and
+    /// apply checks it again because membership may change before the command
+    /// commits.
+    #[must_use]
+    pub(crate) fn is_eligible_owner(&self, node: NodeId) -> bool {
+        self.nodes.get(&node).is_some_and(|node| {
+            node.role == NodeRole::Worker
+                && node.health == NodeHealth::Healthy
+                && node.ready
+                && !node.draining
+        })
     }
 
     /// Applies one command, returning the same result on every member.
@@ -268,6 +297,12 @@ impl ClusterState {
         entry.speaks = speaks;
         entry.ready = ready;
         entry.draining = draining;
+        if !draining {
+            // A node id may drain more than once over its lifetime. Its next
+            // healthy registration starts a new handoff set rather than
+            // inheriting acknowledgements from the previous process.
+            self.handoffs.remove(&node);
+        }
         Ok(())
     }
 
@@ -564,17 +599,18 @@ impl ClusterState {
         self.replace_partition(info);
         self.phases.insert(partition, PartitionPhase::Serving);
         self.bump_map_version();
+        self.handoffs.entry(from).or_default().insert(
+            partition,
+            HandoffCheckpoint {
+                receiver: to,
+                map_version: self.map.version(),
+            },
+        );
         Ok(())
     }
 
     fn require_eligible_owner(&self, owner: NodeId) -> Result<()> {
-        let eligible = self.nodes.get(&owner).is_some_and(|node| {
-            node.role == NodeRole::Worker
-                && node.health == NodeHealth::Healthy
-                && node.ready
-                && !node.draining
-        });
-        if !eligible {
+        if !self.is_eligible_owner(owner) {
             return Err(Error::InvalidArgument(format!(
                 "node {owner} is not an eligible ready worker"
             )));
