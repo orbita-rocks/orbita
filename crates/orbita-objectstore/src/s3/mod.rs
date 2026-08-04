@@ -234,9 +234,7 @@ fn error_for(key: &str, response: &HttpResponse) -> ObjectError {
             detail("no further detail")
         )),
         501 => ObjectError::Other(format!(
-            "{key}: the backend answered 501 Not Implemented, which for a conditional \
-             write means it cannot guard the manifest swap; upgrade the backend or use \
-             one that supports conditional PUT ({})",
+            "{key}: the backend answered 501 Not Implemented ({})",
             detail("no further detail")
         )),
         status => ObjectError::Other(format!(
@@ -298,6 +296,17 @@ impl ObjectStore for S3Store {
         };
         let request = self.request("PUT", Some(key), vec![], vec![header], data);
         let response = self.execute(request).await?;
+        if response.status == 501 {
+            // Only here does a 501 mean the backend cannot guard the manifest
+            // swap; the generic mapper does not know the request was
+            // conditional, so the finding is named at the one call site where
+            // it is true.
+            return Err(ObjectError::Other(format!(
+                "{key}: the backend answered 501 Not Implemented to a conditional write, \
+                 so it cannot guard the manifest swap; upgrade the backend or use one \
+                 that supports conditional PUT"
+            )));
+        }
         if response.status != 200 {
             return Err(error_for(key, &response));
         }
@@ -534,6 +543,21 @@ mod tests {
         match result {
             Err(ObjectError::Other(message)) => {
                 assert!(message.contains("conditional"), "{message}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_501_on_a_plain_read_does_not_blame_conditional_writes() {
+        let transport = ScriptedTransport::new(vec![Ok(response(501, &[], ""))]);
+        let result = store(transport).get("k").await;
+        match result {
+            Err(ObjectError::Other(message)) => {
+                assert!(
+                    !message.contains("conditional"),
+                    "a GET cannot fail for lack of conditional-write support: {message}"
+                );
             }
             other => panic!("expected Other, got {other:?}"),
         }

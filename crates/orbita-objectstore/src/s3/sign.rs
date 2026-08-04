@@ -16,13 +16,30 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 /// Static credentials, as S3-compatible stores hand them out.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credentials {
     pub access_key_id: String,
     pub secret_access_key: String,
     /// Present when the credentials came from STS; sent as
     /// `x-amz-security-token` and included in the signature.
     pub session_token: Option<String>,
+}
+
+/// Manual so a `{:?}` of a config, an error context, or a panic message never
+/// writes the live secret to a log. The access key id is an identifier, not a
+/// secret, so it stays; it is what an operator needs to tell two credential
+/// sets apart.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Signs `request` in place: adds `host`, `x-amz-date`,
@@ -213,6 +230,47 @@ mod tests {
         assert!(
             authorization.contains("x-amz-security-token"),
             "the token header must be signed, not merely sent: {authorization}"
+        );
+    }
+
+    #[test]
+    fn a_debug_logged_signed_request_is_not_replayable() {
+        let mut credentials = example_credentials();
+        credentials.session_token = Some("the-session-token".to_string());
+        let mut request = HttpRequest {
+            method: "PUT",
+            scheme: Scheme::Https,
+            authority: "examplebucket.s3.amazonaws.com".to_string(),
+            path: "/manifest".to_string(),
+            query: vec![],
+            headers: vec![],
+            body: Bytes::from_static(b"v1"),
+        };
+        sign(&mut request, &credentials, "us-east-1", 1_369_353_600_000);
+
+        let formatted = format!("{request:?}");
+        assert!(
+            !formatted.contains("Signature=") && !formatted.contains("the-session-token"),
+            "a replayable credential leaked into Debug output: {formatted}"
+        );
+        assert!(
+            formatted.contains("/manifest") && formatted.contains("x-amz-date"),
+            "the parts a debugging session needs must survive: {formatted}"
+        );
+    }
+
+    #[test]
+    fn the_plaintext_secret_never_reaches_a_debug_log() {
+        let mut credentials = example_credentials();
+        credentials.session_token = Some("the-session-token".to_string());
+        let formatted = format!("{credentials:?}");
+        assert!(
+            !formatted.contains("wJalrXUtnFEMI") && !formatted.contains("the-session-token"),
+            "secrets leaked into Debug output: {formatted}"
+        );
+        assert!(
+            formatted.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the access key id is how an operator tells credentials apart: {formatted}"
         );
     }
 

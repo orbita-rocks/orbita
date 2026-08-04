@@ -45,7 +45,7 @@ impl Scheme {
 /// The path is already percent-encoded and the query pairs are raw; the store
 /// encodes the query exactly once, in [`HttpRequest::canonical_query`], so the
 /// string that was signed is byte-for-byte the string on the wire.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: &'static str,
     pub scheme: Scheme,
@@ -106,6 +106,38 @@ impl HttpRequest {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Manual so a debug-logged request is not a replayable one. A signed request
+/// carries the `authorization` header and, for STS credentials, the session
+/// token; either is enough to reissue the request within its validity window,
+/// so both are elided while everything a debugging session actually needs,
+/// the method, URL, and remaining headers, stays.
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                if name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("x-amz-security-token")
+                {
+                    (name.as_str(), "<redacted>")
+                } else {
+                    (name.as_str(), value.as_str())
+                }
+            })
+            .collect();
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("scheme", &self.scheme)
+            .field("authority", &self.authority)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("headers", &headers)
+            .field("body_len", &self.body.len())
+            .finish()
     }
 }
 
