@@ -341,12 +341,19 @@ pub struct NodeView {
     /// The cluster versions this node's binary can speak, such as "0.1..0.2",
     /// or "unknown" from a server that predates version reporting.
     pub speaks: String,
+    /// What the partition indexes this node holds cost in memory. Zero from a
+    /// node that has not reported one, which is what a leader looks like and
+    /// what any node looks like mid-rollout.
+    pub index_memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplicaView {
     pub node_id: u64,
     pub applied_lamport: u64,
+    /// How far this replica has made the log durable. Ahead of what it has
+    /// applied, and behind the owner by whatever replication has not caught.
+    pub durable_lamport: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -361,6 +368,8 @@ pub struct PartitionView {
     pub epoch: u64,
     pub committed_lamport: u64,
     pub size_bytes: u64,
+    /// What the owner's memory-resident index for this partition costs.
+    pub index_bytes: u64,
     pub replicas: Vec<ReplicaView>,
 }
 
@@ -374,6 +383,21 @@ impl PartitionView {
         self.replicas
             .iter()
             .map(|r| self.committed_lamport.saturating_sub(r.applied_lamport))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The furthest any replica trails the owner in the write-ahead log.
+    ///
+    /// Distinct from [`PartitionView::max_replica_lag`], and the two answer
+    /// different questions: this one is how much replication is behind, and
+    /// that one is how much of what arrived is not yet readable. A replica
+    /// can be durable to the owner's position and still applying.
+    #[must_use]
+    pub fn max_wal_lag(&self) -> u64 {
+        self.replicas
+            .iter()
+            .map(|r| self.committed_lamport.saturating_sub(r.durable_lamport))
             .max()
             .unwrap_or(0)
     }
@@ -417,7 +441,9 @@ const PARTITION_COLUMNS: &[&str] = &[
     "epoch",
     "lamport",
     "size",
+    "index",
     "lag",
+    "wal lag",
     "replicas",
 ];
 
@@ -449,7 +475,9 @@ fn partition_row(p: &PartitionView, health: Option<&BTreeMap<u64, String>>) -> V
         p.epoch.to_string(),
         p.committed_lamport.to_string(),
         format_bytes(p.size_bytes),
+        format_bytes(p.index_bytes),
         p.max_replica_lag().to_string(),
+        p.max_wal_lag().to_string(),
         p.replica_summary(),
     ]
 }
@@ -472,6 +500,11 @@ pub struct ClusterSummaryView {
     pub partitions_with_no_replica: usize,
     pub partitions_with_an_unhealthy_owner: usize,
     pub max_replica_lag: u64,
+    pub max_wal_lag: u64,
+    /// What every node's partition indexes cost, added up. ADR 0006 makes
+    /// this the resource a cluster exhausts first, and a total is what an
+    /// operator compares against the memory they bought.
+    pub index_memory_bytes: u64,
 }
 
 impl ClusterSummaryView {
@@ -497,6 +530,48 @@ pub struct ClusterView {
     pub cluster_version: Option<String>,
     pub nodes: Vec<NodeView>,
     pub partitions: Vec<PartitionView>,
+    /// What each keyspace is storing against the quota it was given. Empty
+    /// from a server that predates quota reporting.
+    pub keyspaces: Vec<KeyspaceUsageView>,
+}
+
+/// One keyspace's storage against its quota.
+///
+/// The saturation is reported and nothing is concluded from it. What counts
+/// as too full depends on a measured envelope this project does not have yet,
+/// so a number an operator can read beats a threshold we would be guessing at.
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyspaceUsageView {
+    pub id: u64,
+    pub name: String,
+    pub partition_count: u32,
+    pub stored_bytes: u64,
+    /// Absent means the keyspace has no storage quota, which is the default.
+    pub max_storage_bytes: Option<u64>,
+}
+
+impl KeyspaceUsageView {
+    /// Stored bytes as a fraction of the quota, or `None` when there is no
+    /// quota to be a fraction of.
+    #[must_use]
+    pub fn saturation(&self) -> Option<f64> {
+        match self.max_storage_bytes {
+            Some(0) | None => None,
+            Some(limit) => Some(self.stored_bytes as f64 / limit as f64),
+        }
+    }
+
+    fn quota_text(&self) -> String {
+        self.max_storage_bytes
+            .map_or_else(|| "none".to_owned(), format_bytes)
+    }
+
+    fn saturation_text(&self) -> String {
+        self.saturation().map_or_else(
+            || "-".to_owned(),
+            |fraction| format!("{:.1}%", fraction * 100.0),
+        )
+    }
 }
 
 impl ClusterView {
@@ -535,6 +610,12 @@ impl ClusterView {
                 .map(PartitionView::max_replica_lag)
                 .max()
                 .unwrap_or(0),
+            max_wal_lag: partitions
+                .iter()
+                .map(PartitionView::max_wal_lag)
+                .max()
+                .unwrap_or(0),
+            index_memory_bytes: nodes.iter().map(|n| n.index_memory_bytes).sum(),
         };
 
         Self {
@@ -542,7 +623,22 @@ impl ClusterView {
             cluster_version: None,
             nodes,
             partitions,
+            keyspaces: Vec::new(),
         }
+    }
+
+    /// Attaches per-keyspace usage, which is where quota saturation lives.
+    ///
+    /// Separate from [`Self::new`] for the same reason the cluster version
+    /// is: the commands that print a partial view after a split or a
+    /// transfer have no keyspace list to attach and should not invent one.
+    #[must_use]
+    pub fn with_keyspaces(mut self, mut keyspaces: Vec<KeyspaceUsageView>) -> Self {
+        // Sorted here for the same reason the nodes and partitions are: two
+        // describes a minute apart have to diff cleanly.
+        keyspaces.sort_by(|a, b| a.name.cmp(&b.name));
+        self.keyspaces = keyspaces;
+        self
     }
 
     /// Attaches the active cluster version, kept separate from [`Self::new`]
@@ -579,7 +675,12 @@ impl Render for ClusterView {
             "  partitions   {} total, {} with an unhealthy owner, {} with no replica",
             s.partition_count, s.partitions_with_an_unhealthy_owner, s.partitions_with_no_replica
         );
-        let _ = writeln!(out, "  worst lag    {}", s.max_replica_lag);
+        let _ = writeln!(
+            out,
+            "  worst lag    {} applied, {} wal",
+            s.max_replica_lag, s.max_wal_lag
+        );
+        let _ = writeln!(out, "  index memory {}", format_bytes(s.index_memory_bytes));
         if s.healthy() {
             out.push_str("  everything reporting is healthy\n");
         }
@@ -599,11 +700,42 @@ impl Render for ClusterView {
                         n.health.clone(),
                         if n.raft_leader { "yes" } else { "no" }.to_owned(),
                         n.speaks.clone(),
+                        format_bytes(n.index_memory_bytes),
                     ]
                 })
                 .collect();
             out.push_str(&indent(&table(
-                &["id", "address", "role", "health", "raft leader", "speaks"],
+                &[
+                    "id",
+                    "address",
+                    "role",
+                    "health",
+                    "raft leader",
+                    "speaks",
+                    "index memory",
+                ],
+                &rows,
+            )));
+        }
+
+        if !self.keyspaces.is_empty() {
+            out.push_str("\nKEYSPACES\n");
+            let rows: Vec<Vec<String>> = self
+                .keyspaces
+                .iter()
+                .map(|k| {
+                    vec![
+                        k.name.clone(),
+                        k.id.to_string(),
+                        k.partition_count.to_string(),
+                        format_bytes(k.stored_bytes),
+                        k.quota_text(),
+                        k.saturation_text(),
+                    ]
+                })
+                .collect();
+            out.push_str(&indent(&table(
+                &["name", "id", "partitions", "stored", "quota", "used"],
                 &rows,
             )));
         }
@@ -626,7 +758,8 @@ impl Render for ClusterView {
             out.push_str(
                 "\nLag is how far a replica trails the owner's committed lamport. A replica at \
                  zero\ncan serve a linearizable read locally and would lose nothing if it were \
-                 promoted.\n",
+                 promoted.\nThe wal lag column measures the same distance at the log rather than \
+                 at what has\nbeen applied, so it is what a promotion would have to hand over.\n",
             );
         }
     }
@@ -1053,14 +1186,17 @@ mod tests {
             epoch: 2,
             committed_lamport: 100,
             size_bytes: 2048,
+            index_bytes: 4096,
             replicas: vec![
                 ReplicaView {
                     node_id: 4,
                     applied_lamport: 100,
+                    durable_lamport: 100,
                 },
                 ReplicaView {
                     node_id: 5,
                     applied_lamport: 91,
+                    durable_lamport: 96,
                 },
             ],
         }
@@ -1074,6 +1210,92 @@ mod tests {
     #[test]
     fn a_replica_summary_shows_how_far_each_replica_trails_the_owner() {
         assert_eq!(partition(1).replica_summary(), "4(-0) 5(-9)");
+    }
+
+    #[test]
+    fn describe_reports_wal_lag_separately_from_applied_lag() {
+        // A replica can hold the log and still be applying it. Reporting one
+        // number for both would hide whichever problem the operator has.
+        let p = partition(1);
+        assert_eq!(p.max_replica_lag(), 9);
+        assert_eq!(p.max_wal_lag(), 4);
+    }
+
+    #[test]
+    fn describe_reports_the_index_memory_a_partition_and_a_cluster_hold() {
+        let view = ClusterView::new(
+            vec![
+                node(1, "leader", "healthy", true),
+                node(3, "worker", "healthy", false),
+            ],
+            vec![partition(1)],
+        );
+        assert_eq!(view.summary.index_memory_bytes, 1024 + 3072);
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("index memory"), "{text}");
+        assert!(
+            text.contains("4.0 KiB"),
+            "the partition's index is a column: {text}"
+        );
+    }
+
+    #[test]
+    fn describe_reports_quota_saturation_and_says_nothing_about_it() {
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], Vec::new())
+            .with_keyspaces(vec![
+                KeyspaceUsageView {
+                    id: 1,
+                    name: "orders".to_owned(),
+                    partition_count: 2,
+                    stored_bytes: 512,
+                    max_storage_bytes: Some(1024),
+                },
+                KeyspaceUsageView {
+                    id: 2,
+                    name: "audit".to_owned(),
+                    partition_count: 1,
+                    stored_bytes: 999,
+                    max_storage_bytes: None,
+                },
+            ]);
+
+        assert_eq!(view.keyspaces[0].name, "audit", "sorted for a clean diff");
+        assert_eq!(view.keyspaces[1].saturation(), Some(0.5));
+        assert_eq!(
+            view.keyspaces[0].saturation(),
+            None,
+            "a keyspace with no quota has no saturation, rather than zero"
+        );
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("KEYSPACES"), "{text}");
+        assert!(text.contains("50.0%"), "{text}");
+        assert!(
+            text.contains("none"),
+            "an unlimited keyspace says so: {text}"
+        );
+    }
+
+    #[test]
+    fn a_quota_of_zero_reports_no_saturation_rather_than_dividing_by_it() {
+        let usage = KeyspaceUsageView {
+            id: 1,
+            name: "orders".to_owned(),
+            partition_count: 1,
+            stored_bytes: 10,
+            max_storage_bytes: Some(0),
+        };
+        assert_eq!(usage.saturation(), None);
+        assert_eq!(usage.saturation_text(), "-");
+    }
+
+    #[test]
+    fn a_cluster_without_keyspace_usage_prints_no_keyspace_section() {
+        // A server that predates quota reporting sends none, and inventing an
+        // empty table would read as "this cluster has no keyspaces".
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], Vec::new());
+        let text = render(Format::Human, &view).unwrap();
+        assert!(!text.contains("KEYSPACES"), "{text}");
     }
 
     #[test]
@@ -1096,6 +1318,7 @@ mod tests {
             health: health.to_owned(),
             raft_leader,
             speaks: "0.1..0.2".to_owned(),
+            index_memory_bytes: 1024 * id,
         }
     }
 

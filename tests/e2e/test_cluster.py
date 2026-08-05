@@ -92,6 +92,83 @@ def _disjoint_port_pairs(count):
     return ports
 
 
+def test_describe_reports_storage_against_the_quota_each_keyspace_was_given(
+    orbita_binary, tmp_path
+):
+    """Quota saturation needs both halves, and only the server holds the limit.
+
+    The cluster shape is the one the suite already proves out: three
+    configured voters with two of them running, so a quorum exists and either
+    member may be the one that answers.
+    """
+    ports = _disjoint_port_pairs(3)
+    peers = ",".join(
+        f"{node_id}=127.0.0.1:{port + 1}"
+        for node_id, port in enumerate(ports, start=1)
+    )
+    commands = [
+        _command(
+            orbita_binary,
+            node_id,
+            ports[node_id - 1],
+            ports[node_id - 1] + 1,
+            peers,
+            tmp_path / f"leader-{node_id}",
+        )
+        for node_id in (1, 2)
+    ]
+    log_paths = [tmp_path / "leader-1.log", tmp_path / "leader-2.log"]
+    logs = [path.open("ab") for path in log_paths]
+    processes = [
+        subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        for command, log in zip(commands, logs, strict=True)
+    ]
+    channels = [grpc.insecure_channel(f"127.0.0.1:{port}") for port in ports[:2]]
+    stubs = [admin_pb2_grpc.AdminStub(channel) for channel in channels]
+    health_stubs = [health_pb2_grpc.HealthStub(channel) for channel in channels]
+
+    def _on_the_leader(call):
+        for stub in stubs:
+            try:
+                return call(stub)
+            except grpc.RpcError as error:
+                assert error.code() == grpc.StatusCode.UNAVAILABLE
+        raise AssertionError("no configured voter served the Admin call")
+
+    try:
+        for process, stub, path in zip(processes, health_stubs, log_paths, strict=True):
+            _wait_for_ready(process, stub, path)
+
+        _on_the_leader(
+            lambda stub: stub.CreateKeyspace(
+                admin_pb2.CreateKeyspaceRequest(
+                    name="quotad",
+                    config=admin_pb2.KeyspaceConfig(max_storage_bytes=1024),
+                ),
+                timeout=5,
+            )
+        )
+        described = _on_the_leader(
+            lambda stub: stub.DescribeCluster(
+                admin_pb2.DescribeClusterRequest(keyspace="quotad"), timeout=5
+            )
+        )
+
+        keyspaces = {k.name: k for k in described.keyspaces}
+        assert "quotad" in keyspaces, described
+        assert keyspaces["quotad"].config.max_storage_bytes == 1024
+        assert (
+            described.HasField("cluster_version") is True
+        ), "the describe surface still answers everything it used to"
+    finally:
+        for channel in channels:
+            channel.close()
+        for process in processes:
+            _stop(process)
+        for log in logs:
+            log.close()
+
+
 def test_two_fixed_voters_form_replicate_and_restart_with_one_peer_unavailable(
     orbita_binary, tmp_path
 ):
