@@ -840,18 +840,14 @@ fn a_control_leader_restart_keeps_the_unacknowledged_handoff_set() {
 }
 
 #[test]
-fn a_split_leaves_every_key_owned_at_every_committed_instant() {
+fn a_split_is_refused_until_child_storage_can_be_prepared() {
     check_seeds(
-        "a_split_leaves_every_key_owned_at_every_committed_instant",
+        "a_split_is_refused_until_child_storage_can_be_prepared",
         16,
         |seed| {
             let cluster = Cluster::start(seed);
             let parent = cluster.only_partition();
-            let keyspace = cluster
-                .map()
-                .partition(parent)
-                .expect("the partition")
-                .keyspace;
+            let before = cluster.map();
 
             let controller = cluster.controller.clone();
             let split = cluster.sim.block_on(async move {
@@ -859,38 +855,34 @@ fn a_split_leaves_every_key_owned_at_every_committed_instant() {
                     .split_partition(parent, Some(bytes::Bytes::from_static(b"m")))
                     .await
             });
-            let Ok((lower, upper)) = split else {
-                return Err(cluster.sim.failure(format!("the split failed: {split:?}")));
-            };
-            cluster.sim.run_for(Duration::from_secs(1));
-
-            if let Err(reason) = coverage_holds_through_every_entry(&cluster.entries()) {
-                return Err(cluster.sim.failure(reason));
+            if !matches!(split, Err(Error::Unavailable(_))) {
+                return Err(cluster.sim.failure(format!(
+                    "the unsafe split should be unavailable, got {split:?}"
+                )));
             }
-
-            let map = cluster.map();
-            for (key, expected) in [
-                (&b"a"[..], lower),
-                (b"l", lower),
-                (b"m", upper),
-                (b"zz", upper),
-            ] {
-                match map.lookup(keyspace, key) {
-                    Some(info) if info.id == expected => {}
-                    other => {
-                        return Err(cluster.sim.failure(format!(
-                            "key {key:?} resolved to {:?}, expected {expected}",
-                            other.map(|i| i.id)
-                        )))
-                    }
-                }
+            let epoch = before.partition(parent).expect("the parent").epoch;
+            let controller = cluster.controller.clone();
+            let bypass = cluster.sim.block_on(async move {
+                controller
+                    .submit(ControlCommand::SplitPartition {
+                        parent,
+                        at: bytes::Bytes::from_static(b"m"),
+                        lower: PartitionId(100),
+                        upper: PartitionId(101),
+                        expect_epoch: epoch,
+                    })
+                    .await
+            });
+            if !matches!(bypass, Err(Error::Unavailable(_))) {
+                return Err(cluster.sim.failure(format!(
+                    "submitting a split command bypassed the safety guard: {bypass:?}"
+                )));
             }
-            if map.partition(parent).is_some() {
-                return Err(cluster
+            (cluster.map() == before).then_some(()).ok_or_else(|| {
+                cluster
                     .sim
-                    .failure("the parent partition outlived the split"));
-            }
-            Ok(())
+                    .failure("a refused split changed the partition map")
+            })
         },
     );
 }
@@ -899,18 +891,18 @@ fn a_split_leaves_every_key_owned_at_every_committed_instant() {
 fn the_partition_map_survives_a_full_restart() {
     check_seeds("the_partition_map_survives_a_full_restart", 16, |seed| {
         let cluster = Cluster::start(seed);
-        let partition = cluster.only_partition();
-
         // Move the map somewhere non-trivial first, so that surviving means
         // more than "the bootstrap ran again".
         let controller = cluster.controller.clone();
-        let split = cluster.sim.block_on(async move {
+        let created = cluster.sim.block_on(async move {
             controller
-                .split_partition(partition, Some(bytes::Bytes::from_static(b"m")))
+                .create_keyspace("second", KeyspaceConfig::default())
                 .await
         });
-        if split.is_err() {
-            return Err(cluster.sim.failure(format!("the split failed: {split:?}")));
+        if created.is_err() {
+            return Err(cluster
+                .sim
+                .failure(format!("keyspace creation failed: {created:?}")));
         }
         cluster.sim.run_for(Duration::from_secs(2));
         let before = cluster.map();
@@ -1435,13 +1427,12 @@ fn a_control_log_that_survived_failed_writes_still_replays_in_full() {
         32,
         |seed| {
             let cluster = Cluster::start_with(flaky_disk(seed));
-            let partition = cluster.only_partition();
             cluster.sim.run_for(Duration::from_secs(3));
 
             let controller = cluster.controller.clone();
             let _ = cluster.sim.block_on(async move {
                 controller
-                    .split_partition(partition, Some(bytes::Bytes::from_static(b"m")))
+                    .create_keyspace("second", KeyspaceConfig::default())
                     .await
             });
             cluster.sim.run_for(Duration::from_secs(3));

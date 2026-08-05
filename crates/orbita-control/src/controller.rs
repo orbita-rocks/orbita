@@ -238,6 +238,11 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// from the propose, because a rejection is a decision the whole cluster
     /// agreed on and not a failure to reach anybody.
     pub async fn submit(&self, command: ControlCommand) -> Result<()> {
+        if matches!(command, ControlCommand::SplitPartition { .. }) {
+            return Err(Error::Unavailable(
+                "partition split is disabled until child storage preparation is implemented".into(),
+            ));
+        }
         self.ensure_leader_ready().await?;
         let index = self.log.propose(command).await?;
         self.apply_through(index).await?;
@@ -694,55 +699,20 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         Ok(())
     }
 
-    /// Splits a partition at `at`, or at the midpoint the owner suggests when
-    /// `at` is `None`.
+    /// Refuses splits until the worker-side data protocol exists.
     ///
-    /// The map change is a single committed entry, so there is no instant at
-    /// which a key in the parent's range is unowned or doubly owned. Both
-    /// children start at the parent's epoch plus one, which fences any write
-    /// the owner had in flight against the parent.
-    ///
-    /// What is not here yet is the data side of a split: the owner has to
-    /// quiesce, flush, and report a boundary before the children can accept
-    /// writes independently. The metadata operation is the part that has to be
-    /// atomic, and it is; the handshake is a worker protocol.
+    /// Publishing child metadata before their storage has been prepared makes
+    /// every record under the retired parent inaccessible. Keeping the entry
+    /// point fail-closed prevents automatic callers from bypassing the same
+    /// safety guard exposed by the Admin service.
     pub async fn split_partition(
         &self,
-        partition: PartitionId,
-        at: Option<Bytes>,
+        _partition: PartitionId,
+        _at: Option<Bytes>,
     ) -> Result<(PartitionId, PartitionId)> {
-        let (command, lower, upper) = {
-            let inner = self.inner.lock().await;
-            let info = inner
-                .state
-                .map()
-                .partition(partition)
-                .ok_or_else(|| Error::InvalidArgument(format!("no partition {partition}")))?
-                .clone();
-            let at = match at {
-                Some(at) => at,
-                None => suggested_split_key(&info).ok_or_else(|| {
-                    Error::InvalidArgument(
-                        "no split key was given and none could be derived from the range".into(),
-                    )
-                })?,
-            };
-            let lower = inner.state.next_partition_id();
-            let upper = lower.next();
-            (
-                ControlCommand::SplitPartition {
-                    parent: partition,
-                    at,
-                    lower,
-                    upper,
-                    expect_epoch: info.epoch,
-                },
-                lower,
-                upper,
-            )
-        };
-        self.submit(command).await?;
-        Ok((lower, upper))
+        Err(Error::Unavailable(
+            "partition split is disabled until child storage preparation is implemented".into(),
+        ))
     }
 
     /// Hands a partition to one of its replicas, deliberately.
@@ -1076,7 +1046,6 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 .collect()
         };
 
-        let now = self.runtime.clock().monotonic_nanos();
         for (partition, expect_epoch) in doomed {
             // The epoch bump and the loss of the owner are one entry, and it
             // commits strictly before anything is promoted. That ordering is
@@ -1091,7 +1060,12 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             {
                 Ok(()) => {
                     tracing::info!(%partition, "fenced a dead owner");
-                    self.inner.lock().await.fenced_since.insert(partition, now);
+                    let committed_at = self.runtime.clock().monotonic_nanos();
+                    self.inner
+                        .lock()
+                        .await
+                        .fenced_since
+                        .insert(partition, committed_at);
                 }
                 // Another sweep or another leader got there first. The
                 // partition is fenced either way, which is all this pass
@@ -1133,7 +1107,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 if now.saturating_sub(since) < drain {
                     continue;
                 }
-                let Some(owner) = best_candidate(&inner, &info) else {
+                let Some(owner) = best_candidate(&inner, &info, since) else {
                     // No replica has reported its position yet. Promoting one
                     // blind could pick a node that is behind and lose an
                     // acknowledged write, so the partition stays unavailable
@@ -1284,32 +1258,35 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     }
 }
 
-/// The most caught-up replica eligible for new ownership, or `None` if an
-/// eligible replica has not reached the most durable surviving position.
+/// The most caught-up replica eligible for new ownership, or `None` until
+/// every surviving replica has reported its durable position after the fence.
 ///
 /// Highest durable Lamport wins, because that is what bounds the writes the
 /// cluster has acknowledged: the WAL acknowledges at two of three, so any
 /// acknowledged entry is on at least one surviving node, and promoting the
-/// furthest survivor cannot lose one. Ties break on node id so the choice is
-/// reproducible from a seed.
-fn best_candidate(inner: &Inner, info: &PartitionInfo) -> Option<NodeId> {
-    let durable_required = info
-        .replicas
-        .iter()
-        .filter(|replica| {
-            inner
-                .state
-                .node(**replica)
-                .is_some_and(|node| node.health == NodeHealth::Healthy)
-        })
-        .filter_map(|replica| {
-            inner
-                .observations
-                .get(replica)
-                .and_then(|obs| obs.status.progress(info.id))
-                .map(|progress| progress.durable_lamport)
-        })
-        .max()?;
+/// furthest survivor cannot lose one. A missing report, or one generated from
+/// a pre-fence map, is an unknown upper bound rather than evidence that the
+/// replica is behind. Ties break on node id so the choice is reproducible from
+/// a seed.
+fn best_candidate(inner: &Inner, info: &PartitionInfo, fenced_since_nanos: u64) -> Option<NodeId> {
+    let mut durable_required = None;
+    for replica in &info.replicas {
+        let node = inner.state.node(*replica)?;
+        if node.health == NodeHealth::Dead {
+            continue;
+        }
+        let observation = inner.observations.get(replica)?;
+        if observation.heard_at_nanos <= fenced_since_nanos {
+            return None;
+        }
+        if observation.status.map_version < inner.state.map().version() {
+            return None;
+        }
+        let durable = observation.status.progress(info.id)?.durable_lamport;
+        durable_required =
+            Some(durable_required.map_or(durable, |seen: Lamport| seen.max(durable)));
+    }
+    let durable_required = durable_required?;
 
     info.replicas
         .iter()
@@ -1348,31 +1325,6 @@ fn classify(silence_nanos: u64, config: &ControlConfig) -> NodeHealth {
         NodeHealth::Suspect
     } else {
         NodeHealth::Healthy
-    }
-}
-
-/// A boundary key derived from the range alone, used only when the caller did
-/// not supply one.
-///
-/// This is a poor split point and it is meant to be: it exists so a manual
-/// split with no key does something rather than failing, and the doc comment
-/// on [`Controller::split_candidates`] explains why a good one has to come
-/// from the owner.
-fn suggested_split_key(info: &PartitionInfo) -> Option<Bytes> {
-    let start = info.range.start();
-    match info.range.end() {
-        // An unbounded range has no midpoint to compute, so the split point is
-        // one byte past the start, which at least produces two legal ranges.
-        None => {
-            let mut key = start.to_vec();
-            key.push(0);
-            Some(Bytes::from(key))
-        }
-        Some(end) => {
-            let mut key = start.to_vec();
-            key.push(0);
-            (key.as_slice() < end).then(|| Bytes::from(key))
-        }
     }
 }
 
@@ -1420,6 +1372,160 @@ mod tests {
         let (owner, replicas) = split_placement(&[NodeId(1)], 3);
         assert_eq!(owner, Some(NodeId(1)));
         assert!(replicas.is_empty());
+    }
+
+    #[test]
+    fn promotion_waits_until_every_surviving_replica_reports_progress() {
+        let sim = Simulation::new(1);
+        let leader = sim.add_node(NodeId(1));
+        for worker in [NodeId(2), NodeId(3), NodeId(4)] {
+            sim.add_node(worker);
+        }
+        let opening = leader.clone();
+        let log = sim
+            .block_on(async move { SingleNodeLog::open(&opening).await })
+            .expect("open control log");
+        let controller = Controller::new(leader, log, ControlConfig::default());
+        let bootstrapping = controller.clone();
+        sim.block_on(async move {
+            bootstrapping
+                .bootstrap(&BootstrapSpec {
+                    keyspace: "default".into(),
+                    config: KeyspaceConfig::default(),
+                    leaders: vec![(NodeId(1), "leader".into())],
+                    workers: vec![
+                        (NodeId(2), "worker-2".into()),
+                        (NodeId(3), "worker-3".into()),
+                        (NodeId(4), "worker-4".into()),
+                    ],
+                })
+                .await
+        })
+        .expect("bootstrap cluster");
+        for worker in [NodeId(2), NodeId(3), NodeId(4)] {
+            let recording = controller.clone();
+            sim.block_on(async move {
+                recording
+                    .record_status(
+                        worker,
+                        NodeStatus {
+                            role: NodeRole::Worker,
+                            address: format!("worker-{worker}"),
+                            map_version: MapVersion::default(),
+                            speaks: binary_speaks(),
+                            ready: true,
+                            draining: false,
+                            partitions: Vec::new(),
+                        },
+                    )
+                    .await
+            })
+            .expect("mark worker ready");
+        }
+        let sweeping = controller.clone();
+        sim.block_on(async move { sweeping.tick().await })
+            .expect("place replicas");
+
+        let map = sim.block_on({
+            let controller = controller.clone();
+            async move { controller.partition_map().await }
+        });
+        let info = map
+            .partitions()
+            .next()
+            .expect("bootstrap partition")
+            .clone();
+        let [lagging, freshest] = info.replicas.as_slice() else {
+            panic!("expected two replicas");
+        };
+        let (lagging, freshest) = (*lagging, *freshest);
+        let report = |node, durable| NodeStatus {
+            role: NodeRole::Worker,
+            address: format!("worker-{node}"),
+            map_version: map.version(),
+            speaks: binary_speaks(),
+            ready: true,
+            draining: false,
+            partitions: vec![crate::membership::PartitionProgress {
+                partition: info.id,
+                durable_lamport: Lamport(durable),
+                applied_lamport: Lamport(durable),
+                size_bytes: 0,
+            }],
+        };
+        sim.run_for(std::time::Duration::from_nanos(1));
+
+        let recording = controller.clone();
+        let lagging_status = report(lagging, 10);
+        sim.block_on(async move { recording.record_status(lagging, lagging_status).await })
+            .expect("record lagging replica");
+        let candidate = sim.block_on({
+            let controller = controller.clone();
+            let info = info.clone();
+            async move {
+                let inner = controller.inner.lock().await;
+                best_candidate(&inner, &info, 0)
+            }
+        });
+        assert_eq!(
+            candidate, None,
+            "an unreported survivor may hold a later acknowledged write"
+        );
+
+        let recording = controller.clone();
+        let freshest_status = report(freshest, 900);
+        sim.block_on(async move { recording.record_status(freshest, freshest_status).await })
+            .expect("record freshest replica");
+        let candidate = sim.block_on({
+            let controller = controller.clone();
+            let info = info.clone();
+            async move {
+                let inner = controller.inner.lock().await;
+                best_candidate(&inner, &info, 0)
+            }
+        });
+        assert_eq!(candidate, Some(freshest));
+
+        let fenced_at = sim.now_nanos();
+        let candidate = sim.block_on({
+            let controller = controller.clone();
+            let info = info.clone();
+            async move {
+                let inner = controller.inner.lock().await;
+                best_candidate(&inner, &info, fenced_at)
+            }
+        });
+        assert_eq!(
+            candidate, None,
+            "reports at or before the fence cannot bound later acknowledged writes"
+        );
+
+        sim.block_on({
+            let controller = controller.clone();
+            async move {
+                controller
+                    .inner
+                    .lock()
+                    .await
+                    .observations
+                    .get_mut(&freshest)
+                    .expect("freshest observation")
+                    .status
+                    .map_version = MapVersion::default();
+            }
+        });
+        let candidate = sim.block_on({
+            let controller = controller.clone();
+            let info = info.clone();
+            async move {
+                let inner = controller.inner.lock().await;
+                best_candidate(&inner, &info, 0)
+            }
+        });
+        assert_eq!(
+            candidate, None,
+            "a delayed report generated from a pre-fence map is not current progress"
+        );
     }
 
     #[test]
