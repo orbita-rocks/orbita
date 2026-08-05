@@ -40,7 +40,8 @@ pub struct ControlConfig {
     /// owner. Three gives the two-of-three durability quorum the WAL assumes.
     pub replication_factor: usize,
 
-    /// Size at which a partition is reported as a split candidate.
+    /// Reserved size threshold for worker-prepared splits. Split execution is
+    /// disabled until that protocol is implemented.
     pub split_threshold_bytes: u64,
 }
 
@@ -150,6 +151,8 @@ impl ControlConfig {
     /// | Stage | Worst case |
     /// |---|---|
     /// | Detect the failure and promote a replacement | `failover_budget()` |
+    /// | Commit the completed lease drain, then promote on the next sweep | one `sweep_interval` |
+    /// | Every survivor reports at or past the fence's map version | two `heartbeat_interval` |
     /// | Repair the replica set the failure left short | one `sweep_interval` |
     /// | Each worker fetches the map, then reports it | two `heartbeat_interval` |
     /// | The same round trip for the repair's map bump | two `heartbeat_interval` |
@@ -158,21 +161,32 @@ impl ControlConfig {
     ///
     /// A map round trip costs two heartbeats because that is what it costs in
     /// production: a worker learns of a new map on one poll and reports that
-    /// it is routing on it on the next. Three of them are counted because the
+    /// it is routing on it on the next. Four of them are counted because the
     /// stages are serial in the worst case, even though they usually overlap.
+    ///
+    /// The second and third rows are not in `failover_budget`, and the gap is
+    /// deliberate rather than an oversight in either. Committing the completed
+    /// drain and waiting for post-fence evidence are what stop a promotion
+    /// from being repeated after a leader change or decided on a report that
+    /// predates the fence. They lengthen the path to a new owner without
+    /// lengthening the window in which writes are unavailable for a reason
+    /// anyone would call a failover, so the two numbers measure different
+    /// things on purpose.
     ///
     /// The last row is not slack. It is how a controller loop that has
     /// finished is told apart from one that is still retrying every interval,
     /// and without it a cluster flapping forever between two decisions would
     /// pass by being observed at the right moment.
     ///
-    /// At the default timings this is 6.3 seconds, against a 4.05 second
-    /// failover budget. The seeded batches converge in 4.0 seconds at worst,
-    /// so the margin is real without being generous enough to hide a stage
-    /// that has stopped happening.
+    /// At the default timings this is 7.05 seconds, against a 4.05 second
+    /// failover budget. The margin is measured rather than argued: across the
+    /// seeded control-plane batches the slowest cluster to converge takes 4.5
+    /// seconds, and the median takes 0.5. That leaves room for a stage landing
+    /// badly against a sweep without leaving enough to hide a stage that has
+    /// stopped happening altogether.
     #[must_use]
     pub fn convergence_bound(&self) -> Duration {
-        self.failover_budget() + 3 * self.sweep_interval + 6 * self.heartbeat_interval
+        self.failover_budget() + 4 * self.sweep_interval + 8 * self.heartbeat_interval
     }
 }
 
@@ -215,7 +229,7 @@ mod tests {
         // exceed the failover budget would be asserting the wrong thing.
         let config = ControlConfig::default();
         assert!(config.convergence_bound() > config.failover_budget());
-        assert_eq!(config.convergence_bound(), Duration::from_millis(6_300));
+        assert_eq!(config.convergence_bound(), Duration::from_millis(7_050));
     }
 
     #[test]

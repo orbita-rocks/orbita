@@ -5,6 +5,7 @@ use orbita_core::NodeId;
 use orbita_runtime::{Clock, Runtime};
 use orbita_sim::Simulation;
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -122,6 +123,57 @@ fn wall_time_and_monotonic_time_advance_together_from_a_fixed_origin() {
         clock.now_millis()
     });
     assert_eq!(after, origin + 250);
+}
+
+/// A future carried out of the task that first polled it.
+///
+/// A wrapper rather than a bare pinned box because handing an awaitable out of
+/// an `async` block is normally a mistake, and here it is the whole point.
+struct Handover(std::pin::Pin<Box<dyn Future<Output = ()> + Send>>);
+
+#[test]
+fn a_pending_future_polled_by_one_task_is_woken_by_the_task_it_moves_to() {
+    // The shape this protects is `orbita_wal`'s: an owner polls a call to each
+    // replica, stops as soon as the quorum answers, and hands the calls still
+    // in flight to background tasks so a lagging replica is not abandoned. The
+    // moved future was already polled once, so the timer behind it was
+    // registered against a task that has since finished.
+    //
+    // The simulator used to keep that first waker. The timer fired, the wake
+    // went to a task that no longer existed, and the moved future was never
+    // polled again, which surfaced as the world going idle with a write still
+    // outstanding. Polling with a fresh waker is something a future has to
+    // tolerate, so the fix is here rather than in the caller.
+    let sim = Simulation::new(1);
+    let node = sim.add_node(NodeId(1));
+    let clock = node.clock().clone();
+
+    let handed_over = sim.block_on(async move {
+        let mut sleeping: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> =
+            Box::pin(async move { clock.sleep(Duration::from_millis(50)).await });
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(sleeping.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "the future has to still be waiting for this to prove anything"
+        );
+        Handover(sleeping)
+    });
+
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let finished = Arc::clone(&finished);
+        sim.spawn(async move {
+            handed_over.0.await;
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    sim.run_until_idle();
+
+    assert!(
+        finished.load(std::sync::atomic::Ordering::SeqCst),
+        "the moved future was never woken, so the world went idle with work outstanding"
+    );
 }
 
 #[test]

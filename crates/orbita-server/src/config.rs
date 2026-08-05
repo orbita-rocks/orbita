@@ -28,6 +28,17 @@ pub const DEFAULT_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// How long acknowledged writes normally wait for cluster-wide durability.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How large a write-ahead log segment grows before a new one is started.
+///
+/// This is the granularity truncation works at, and truncation is what bounds
+/// an owner's disk. A checkpoint removes whole segments, so the oldest entry
+/// an owner still holds is the first entry of its oldest retained segment,
+/// which makes this number the size of the window a replica may fall behind by
+/// and still be caught up from the log. Until hydration lands in issue #17,
+/// falling outside that window is unrecoverable, so shrinking this shrinks how
+/// much lag a partition survives.
+pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES;
+
 /// One S3-compatible bucket and the credentials used to reach it.
 #[derive(Debug, Clone)]
 pub struct S3StorageConfig {
@@ -116,6 +127,12 @@ pub struct ServerConfig {
     /// How often owners publish their applied writes to object storage.
     pub flush_interval: Duration,
 
+    /// How large a write-ahead log segment grows before it is rolled.
+    ///
+    /// See [`DEFAULT_WAL_SEGMENT_BYTES`]: this sets how far a replica may lag
+    /// before its owner can no longer catch it up from the log.
+    pub wal_segment_bytes: u64,
+
     /// Where the partition map comes from. A single node uses a static map; a
     /// real cluster will use an adapter over the control plane.
     pub map_source: BoxedMapSource,
@@ -148,6 +165,7 @@ impl Default for ServerConfig {
             data_dir: PathBuf::from("data"),
             object_store: None,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
             map_source: BoxedMapSource::new(StaticMapSource::new(single_node_map(
                 node_id,
                 &[KeyspaceName::new(DEFAULT_KEYSPACE).expect("a literal name is valid")],
@@ -253,6 +271,15 @@ impl ServerConfig {
     #[must_use]
     pub fn with_flush_interval(mut self, interval: Duration) -> Self {
         self.flush_interval = interval;
+        self
+    }
+
+    /// Sets the write-ahead log segment size, and with it how much replication
+    /// lag a partition can absorb before a replica falls off the retention
+    /// horizon.
+    #[must_use]
+    pub fn with_wal_segment_bytes(mut self, bytes: u64) -> Self {
+        self.wal_segment_bytes = bytes;
         self
     }
 

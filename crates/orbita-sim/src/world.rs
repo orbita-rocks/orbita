@@ -455,12 +455,23 @@ impl Future for SimSleep {
             }
             return std::task::Poll::Ready(());
         }
-        if me.key.is_none() {
-            let seq = state.seq();
-            let key = (me.deadline, seq);
-            state.timers.insert(key, cx.waker().clone());
-            me.key = Some(key);
-        }
+        // The waker is refreshed on every poll, not only on the first. A
+        // future can be polled by one task, left pending, and then moved into
+        // another: `orbita_wal` does exactly that when a batch reaches its
+        // quorum before every replica has answered and the remaining calls are
+        // handed to background tasks. Keeping the first waker meant the timer
+        // fired against a task that had already finished, the wake was
+        // discarded, and the moved future was never polled again, which the
+        // driver reported as the world going idle with work outstanding.
+        let key = match me.key {
+            Some(key) => key,
+            None => {
+                let seq = state.seq();
+                (me.deadline, seq)
+            }
+        };
+        state.timers.insert(key, cx.waker().clone());
+        me.key = Some(key);
         std::task::Poll::Pending
     }
 }

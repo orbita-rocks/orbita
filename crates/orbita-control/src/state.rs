@@ -29,6 +29,8 @@ use orbita_core::{
 
 use std::collections::BTreeMap;
 
+const PROTOCOL_0_1: ClusterVersion = ClusterVersion::new(0, 1);
+
 /// Where a partition is in its ownership lifecycle.
 ///
 /// The distinction between `Unowned` and `Fenced` is the read lease. A
@@ -45,7 +47,15 @@ pub enum PartitionPhase {
     /// Has an owner.
     Serving,
     /// The owner was fenced. Waiting out its read leases before promoting.
-    Fenced { deposed: NodeId },
+    Fenced {
+        deposed: NodeId,
+        /// The map version produced by the fence. Replica reports at or beyond
+        /// this version have observed this partition's new epoch.
+        map_version: MapVersion,
+        /// Replicated so a new leader does not repeat a wait its predecessor
+        /// already completed.
+        drain_complete: bool,
+    },
 }
 
 /// A node as the leader group records it.
@@ -216,6 +226,7 @@ impl ClusterState {
     /// did not. That is why the errors are `orbita_core::Error` values a
     /// client can be told about rather than a separate internal type.
     pub fn apply(&mut self, command: &ControlCommand) -> Result<()> {
+        self.ensure_command_permitted(command)?;
         match command {
             ControlCommand::RegisterNode {
                 node,
@@ -238,6 +249,10 @@ impl ClusterState {
                 partition,
                 expect_epoch,
             } => self.fence_partition(*partition, *expect_epoch),
+            ControlCommand::CompleteFenceDrain {
+                partition,
+                expect_epoch,
+            } => self.complete_fence_drain(*partition, *expect_epoch),
             ControlCommand::AssignOwner {
                 partition,
                 owner,
@@ -267,6 +282,25 @@ impl ClusterState {
                 self.set_cluster_version(*version, *expect)
             }
         }
+    }
+
+    pub(crate) fn ensure_command_permitted(&self, command: &ControlCommand) -> Result<()> {
+        if matches!(command, ControlCommand::SplitPartition { .. })
+            && self.version_initialized
+            && self.version >= PROTOCOL_0_1
+        {
+            return Err(Error::Unavailable(
+                "partition split is disabled until child storage preparation is implemented".into(),
+            ));
+        }
+        if matches!(command, ControlCommand::CompleteFenceDrain { .. })
+            && (!self.version_initialized || self.version < PROTOCOL_0_1)
+        {
+            return Err(Error::Unavailable(
+                "replicated fence-drain completion requires active cluster protocol 0.1".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn bump_map_version(&mut self) {
@@ -587,9 +621,27 @@ impl ClusterState {
         info.epoch = info.epoch.next();
         info.replicas.retain(|r| *r != deposed);
         self.replace_partition(info);
-        self.phases
-            .insert(partition, PartitionPhase::Fenced { deposed });
         self.bump_map_version();
+        self.phases.insert(
+            partition,
+            PartitionPhase::Fenced {
+                deposed,
+                map_version: self.map.version(),
+                drain_complete: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn complete_fence_drain(&mut self, partition: PartitionId, expect_epoch: Epoch) -> Result<()> {
+        self.check_epoch(partition, expect_epoch)?;
+        let Some(PartitionPhase::Fenced { drain_complete, .. }) = self.phases.get_mut(&partition)
+        else {
+            return Err(Error::InvalidArgument(format!(
+                "partition {partition} is not waiting on fenced-owner leases"
+            )));
+        };
+        *drain_complete = true;
         Ok(())
     }
 
@@ -903,9 +955,40 @@ mod tests {
         assert_eq!(
             state.phase(before.id),
             Some(PartitionPhase::Fenced {
-                deposed: before.owner.unwrap()
+                deposed: before.owner.unwrap(),
+                map_version: state.map().version(),
+                drain_complete: false,
             })
         );
+    }
+
+    #[test]
+    fn a_completed_fence_drain_is_replicated_for_the_next_leader() {
+        let mut state = bootstrapped();
+        set_version(&mut state, ClusterVersion::new(0, 1));
+        let before = state.map().partitions().next().unwrap().clone();
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: before.id,
+                expect_epoch: before.epoch,
+            })
+            .unwrap();
+        let fenced_epoch = state.map().partition(before.id).unwrap().epoch;
+
+        state
+            .apply(&ControlCommand::CompleteFenceDrain {
+                partition: before.id,
+                expect_epoch: fenced_epoch,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            state.phase(before.id),
+            Some(PartitionPhase::Fenced {
+                drain_complete: true,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -979,8 +1062,9 @@ mod tests {
     }
 
     #[test]
-    fn a_split_leaves_coverage_intact_and_every_key_with_one_owner() {
+    fn a_historical_split_leaves_coverage_intact_and_every_key_with_one_owner() {
         let mut state = bootstrapped();
+        set_version(&mut state, ClusterVersion::ZERO);
         let parent = state.map().partitions().next().unwrap().clone();
         let ks = parent.keyspace;
 
@@ -999,6 +1083,25 @@ mod tests {
         assert_eq!(state.map().lookup(ks, b"m").unwrap().id, PartitionId(11));
         assert_eq!(state.map().lookup(ks, b"zzz").unwrap().id, PartitionId(11));
         assert!(state.map().partition(parent.id).is_none(), "parent is gone");
+    }
+
+    #[test]
+    fn an_active_cluster_rejects_a_split_without_changing_the_map() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let before = state.map().clone();
+        let parent = before.partitions().next().unwrap();
+
+        let result = state.apply(&ControlCommand::SplitPartition {
+            parent: parent.id,
+            at: Bytes::from_static(b"m"),
+            lower: PartitionId(10),
+            upper: PartitionId(11),
+            expect_epoch: parent.epoch,
+        });
+
+        assert!(matches!(result, Err(Error::Unavailable(_))));
+        assert_eq!(state.map(), &before);
     }
 
     #[test]
