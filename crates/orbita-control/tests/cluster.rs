@@ -18,7 +18,16 @@
 //! one, and it is worth the line: every defect this project has found in
 //! ownership movement so far left the cluster safe and stuck rather than
 //! wrong.
+//!
+//! Convergence is checked in both of the senses that matter. Ownership has to
+//! land somewhere live, and the data has to follow it: [`Replication`] gives
+//! the harness a committed position per partition so "every surviving replica
+//! has caught up" is something the check reads rather than something it
+//! assumes. Without it the condition would be satisfied by every node sitting
+//! at the same Lamport forever, which is the shape review caught this file in
+//! once already.
 
+use bytes::Bytes;
 use orbita_control::{
     binary_speaks, BootstrapSpec, ClusterState, ClusterVersion, ConsensusLog, ControlClient,
     ControlCommand, ControlConfig, ControlService, Controller, KeyspaceConfig, NodeHealth,
@@ -26,7 +35,7 @@ use orbita_control::{
     StatusReportResponse, VersionRange,
 };
 use orbita_core::{Epoch, Error, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
-use orbita_runtime::{Clock, Runtime, ServiceId, Transport};
+use orbita_runtime::{Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_sim::{
     check_seeds, converge_within, expect_converged, DiskFaults, DiskPolicy, Failure, NetworkFaults,
     SimConfig, SimRuntime, Simulation, Unmet,
@@ -43,10 +52,106 @@ const WORKERS: [NodeId; 3] = [NodeId(2), NodeId(3), NodeId(4)];
 type Log = SingleNodeLog<SimRuntime>;
 type Ctl = Controller<SimRuntime, Log>;
 
-/// How far each worker claims to have got. The test sets these so that
-/// promotion can be checked against a known answer rather than against
-/// whichever node happened to be first.
-type Progress = Arc<Mutex<HashMap<NodeId, u64>>>;
+/// Where the data actually is, as the harness models it.
+///
+/// This exists because a convergence check that only watches map versions
+/// certifies a property it never looks at. An owner accepts writes and its
+/// replicas trail it, and without something standing in for that every node
+/// sits at the same Lamport forever and "every surviving replica has caught
+/// up" is true by arithmetic rather than by replication.
+///
+/// The model is deliberately thin. An owner commits one write per heartbeat,
+/// a replica adopts the owner's committed position when it next reports and
+/// can reach it, and a position never moves backwards, which is what lets a
+/// scenario pin a replica ahead of its owner to choose who gets promoted.
+///
+/// What it is not is a WAL. It says nothing about how the bytes travel or how
+/// long they take, only about whether the cluster ever re-establishes the flow
+/// after a fault, which is the only part of replication a control-plane
+/// liveness check is entitled to an opinion on.
+#[derive(Default)]
+struct Replication {
+    /// The committed position of each partition, advanced by whoever owns it.
+    committed: HashMap<PartitionId, u64>,
+    /// Where each node has got to on each partition it holds.
+    positions: HashMap<(NodeId, PartitionId), u64>,
+    /// Set once the convergence window opens. Replicas cannot catch up with a
+    /// target that keeps moving, so quiescence has to include the workload:
+    /// against a live writer the honest condition would be "within one
+    /// heartbeat of the owner", which measures throughput rather than
+    /// liveness.
+    ///
+    /// A draining owner stops writing for the same reason and without needing
+    /// this flag, since the handoff it is waiting for requires a replica to
+    /// reach its exact position. That is not a convenience: it is what the
+    /// crate docs mean by a planned shutdown quiescing writes before it
+    /// drains, and a drain against a live writer would never find a receiver.
+    frozen: bool,
+    /// Nodes that have stopped following their owner. What a replica that
+    /// cannot reach its owner looks like from here, and the only way to hold
+    /// one behind on purpose now that replication moves it forward.
+    held_back: BTreeSet<NodeId>,
+}
+
+impl Replication {
+    /// One heartbeat's worth of progress for `node` on the partitions it
+    /// holds, and what it should now report.
+    fn advance(
+        &mut self,
+        node: NodeId,
+        held: &[(PartitionId, bool, bool)],
+        writing: bool,
+    ) -> HashMap<PartitionId, u64> {
+        let mut reported = HashMap::new();
+        for (partition, is_owner, reachable) in held {
+            let committed = self.committed.get(partition).copied().unwrap_or(0);
+            let mut position = self
+                .positions
+                .get(&(node, *partition))
+                .copied()
+                .unwrap_or(0)
+                // Never backwards. A replica a scenario put ahead of its owner
+                // stays ahead, which is how the promotion tests choose the
+                // node they mean to have promoted.
+                .max(committed);
+            if *is_owner {
+                // The owner defines the committed tail rather than tracking
+                // it, because it is the node accepting writes. A promoted
+                // replica therefore carries its own position up with it, which
+                // is what gives the nodes behind it something to catch up to.
+                if writing && !self.frozen {
+                    position += 1;
+                }
+                self.committed.insert(*partition, position);
+            } else if self.held_back.contains(&node) || !reachable {
+                // Not following, either because a scenario said so or because
+                // it could not reach its owner this round. Whatever it had
+                // already reached is still durable, so it keeps that and
+                // reports it, which is what makes it a lagging copy rather
+                // than an absent one.
+                position = self
+                    .positions
+                    .get(&(node, *partition))
+                    .copied()
+                    .unwrap_or(0);
+            }
+            self.positions.insert((node, *partition), position);
+            reported.insert(*partition, position);
+        }
+        reported
+    }
+
+    /// Puts a node at a position of the scenario's choosing on every partition
+    /// it holds, and moves the partition's committed tail with it when the
+    /// node owns it.
+    fn pin(&mut self, node: NodeId, held: &[PartitionId], lamport: u64) {
+        for partition in held {
+            self.positions.insert((node, *partition), lamport);
+        }
+    }
+}
+
+type Progress = Arc<Mutex<Replication>>;
 
 struct Cluster {
     sim: Simulation,
@@ -64,6 +169,21 @@ struct Cluster {
     /// command every interval are indistinguishable in a single sample.
     log_progress: Arc<Mutex<(u64, u64)>>,
     wiring: Wiring,
+}
+
+/// The seam a replica reaches its owner through, so a severed link stops
+/// replication rather than being invisible to it.
+#[derive(Clone)]
+struct ReplicationEndpoint;
+
+impl orbita_runtime::PeerHandler for ReplicationEndpoint {
+    async fn handle(
+        &self,
+        _from: NodeId,
+        _call: PeerCall,
+    ) -> Result<Bytes, orbita_runtime::TransportError> {
+        Ok(Bytes::new())
+    }
 }
 
 /// How a worker's heartbeat reaches the leader group.
@@ -131,7 +251,7 @@ impl Cluster {
             sim,
             controller,
             log,
-            progress: Arc::new(Mutex::new(HashMap::new())),
+            progress: Arc::new(Mutex::new(Replication::default())),
             readiness: Arc::new(Mutex::new(
                 WORKERS.into_iter().map(|node| (node, true)).collect(),
             )),
@@ -148,6 +268,18 @@ impl Cluster {
                 ServiceId::Control,
                 ControlService::new(cluster.controller.clone()),
             );
+            // What a replica calls to follow its owner. It carries no payload
+            // because the position lives in the harness's model; what is being
+            // simulated is whether the two nodes can talk at all, which is the
+            // only part of replication a control-plane liveness check cares
+            // about.
+            for worker in WORKERS {
+                cluster
+                    .sim
+                    .runtime(worker)
+                    .transport()
+                    .register(ServiceId::Wal, ReplicationEndpoint);
+            }
         }
         for worker in WORKERS {
             cluster.spawn_heartbeats(worker);
@@ -181,6 +313,7 @@ impl Cluster {
         // Built once outside the loop so a worker remembers which member
         // answered last, the way the real refresh loop does.
         let client = ControlClient::new(runtime.clone(), vec![LEADER]);
+        let transport = runtime.transport().clone();
         let wiring = self.wiring;
         // A worker that cannot reach the leader group keeps routing on the map
         // it already holds, so the loop has to survive a failed fetch rather
@@ -204,20 +337,54 @@ impl Cluster {
                         }
                     }
                 }
-                let lamport = Lamport(
-                    *progress
-                        .lock()
-                        .expect("progress lock poisoned")
-                        .get(&node)
-                        .unwrap_or(&0),
+                // Writes land and replicas follow, one heartbeat at a time. A
+                // node that is down is not running this loop, so it stops
+                // following, which is what leaves it behind to catch up on.
+                //
+                // Under the networked wiring a replica has to actually reach
+                // its owner to follow it, so a partition between the two
+                // leaves the replica behind the way a real one would. Without
+                // the probe the model would replicate through a severed link
+                // and the check would never see a lagging copy at all.
+                let mut holdings: Vec<(PartitionId, bool, bool)> = Vec::new();
+                for info in held.held_by(node) {
+                    let owns = info.owner == Some(node);
+                    let reachable = match (wiring, info.owner) {
+                        (Wiring::Networked, Some(owner)) if !owns => transport
+                            .call(
+                                owner,
+                                PeerCall {
+                                    service: ServiceId::Wal,
+                                    method: 1,
+                                    payload: Bytes::new(),
+                                },
+                            )
+                            .await
+                            .is_ok(),
+                        _ => true,
+                    };
+                    holdings.push((info.id, owns, reachable));
+                }
+                let is_draining = *draining
+                    .lock()
+                    .expect("draining lock poisoned")
+                    .get(&node)
+                    .unwrap_or(&false);
+                let positions = progress.lock().expect("progress lock poisoned").advance(
+                    node,
+                    &holdings,
+                    !is_draining,
                 );
-                let partitions: Vec<PartitionProgress> = held
-                    .held_by(node)
-                    .map(|info| PartitionProgress {
-                        partition: info.id,
-                        durable_lamport: lamport,
-                        applied_lamport: lamport,
-                        size_bytes: 0,
+                let partitions: Vec<PartitionProgress> = holdings
+                    .iter()
+                    .map(|(partition, _, _)| {
+                        let lamport = Lamport(positions.get(partition).copied().unwrap_or(0));
+                        PartitionProgress {
+                            partition: *partition,
+                            durable_lamport: lamport,
+                            applied_lamport: lamport,
+                            size_bytes: 0,
+                        }
                     })
                     .collect();
                 let status = NodeStatus {
@@ -261,11 +428,35 @@ impl Cluster {
         });
     }
 
+    /// Puts a node at a chosen data position, so a promotion can be checked
+    /// against a known answer rather than against whichever node happened to
+    /// report first.
+    ///
+    /// A pin is a starting point rather than a fixture. Replication carries
+    /// the node forward from here as soon as it holds a partition whose owner
+    /// is further ahead, which is the behaviour the convergence check is there
+    /// to require.
     fn set_progress(&self, node: NodeId, lamport: u64) {
+        let map = self.map();
+        let held: Vec<PartitionId> = map.held_by(node).map(|info| info.id).collect();
         self.progress
             .lock()
             .expect("progress lock poisoned")
-            .insert(node, lamport);
+            .pin(node, &held, lamport);
+    }
+
+    /// Stops a replica following its owner, or lets it follow again.
+    ///
+    /// A replica that cannot reach its owner looks exactly like this from the
+    /// leader group: still alive, still heartbeating, still reporting a
+    /// position, and that position no longer moving.
+    fn set_following(&self, node: NodeId, following: bool) {
+        let mut replication = self.progress.lock().expect("progress lock poisoned");
+        if following {
+            replication.held_back.remove(&node);
+        } else {
+            replication.held_back.insert(node);
+        }
     }
 
     fn set_ready(&self, node: NodeId, ready: bool) {
@@ -370,18 +561,21 @@ impl Cluster {
     /// routing on a map two versions old, a drain waiting on an
     /// acknowledgement that is never coming.
     ///
-    /// Deliberately not here: anything comparing Lamport positions between
-    /// replicas. This harness makes those numbers up, so a condition written
-    /// against them would be testing the harness. What the control plane
-    /// genuinely knows about catch-up is the map version each node reports it
-    /// is routing on, and that is what is used instead.
+    /// Catch-up is checked in both of the senses that matter, and they are not
+    /// the same thing. `ROUTING` is control-plane catch-up: has this worker
+    /// seen the decision the leader published. `REPLICATED` is data catch-up:
+    /// has this replica actually reached the position its owner has committed.
+    /// A check that only asked the first would certify the second without ever
+    /// looking at it, which is worse than not checking at all, because it
+    /// makes the gap look covered.
     fn unmet(&self) -> Vec<Unmet> {
         const NOTICED: &str = "the leader has had time to notice the last fault";
         const OWNED: &str = "every partition has an owner";
         const LIVE_OWNER: &str = "every owner is a node the leader believes is alive";
         const NO_DEAD_REPLICAS: &str = "no replica set names a node the leader gave up on";
         const REDUNDANT: &str = "every partition holds as many replicas as the cluster can give it";
-        const CAUGHT_UP: &str = "every surviving worker is routing on the current map";
+        const ROUTING: &str = "every surviving worker is routing on the current map";
+        const REPLICATED: &str = "every surviving replica has caught up with its owner";
         const DRAINED: &str = "every requested drain has completed";
         const SETTLED: &str = "the sweep has stopped proposing commands";
 
@@ -485,12 +679,35 @@ impl Cluster {
                 .is_none_or(|seen| seen < map_version)
             {
                 unmet.push(Unmet::new(
-                    CAUGHT_UP,
+                    ROUTING,
                     format!(
                         "healthy worker {} last reported map version {:?}, not {map_version}",
                         node.record.id, node.reported_map_version
                     ),
                 ));
+            }
+        }
+
+        // Data catch-up, read from the leader's own observations: the owner's
+        // committed position is what the cluster has acknowledged, and a
+        // replica short of it is a copy that would lose writes if it were
+        // promoted. A node the leader has given up on is excluded, since a
+        // dead replica is not evidence of anything and never catches up.
+        for partition in &view.partitions {
+            for (replica, position) in &partition.replica_progress {
+                let surviving = state
+                    .node(*replica)
+                    .is_some_and(|record| record.health != NodeHealth::Dead);
+                if surviving && *position < partition.committed_lamport {
+                    unmet.push(Unmet::new(
+                        REPLICATED,
+                        format!(
+                            "replica {replica} of partition {} is at {position}, behind the \
+                             committed position {} its owner {:?} reports",
+                            partition.info.id, partition.committed_lamport, partition.info.owner
+                        ),
+                    ));
+                }
             }
         }
 
@@ -552,6 +769,13 @@ impl Cluster {
     /// reproduces the run.
     fn converged(&self) -> Result<(), Failure> {
         let config = self.controller.config().clone();
+        // The workload stops with the faults. `converge_within` freezes the
+        // one because a cluster still being torn at owes nobody a finished
+        // recovery, and this freezes the other for the same reason: a replica
+        // cannot reach a target that moves every heartbeat, so against a live
+        // writer the strongest true statement would be "within one heartbeat
+        // of the owner", which measures throughput rather than liveness.
+        self.progress.lock().expect("progress lock poisoned").frozen = true;
         converge_within(
             &self.sim,
             config.convergence_bound(),
@@ -561,6 +785,33 @@ impl Cluster {
             config.sweep_interval.min(config.heartbeat_interval),
             || self.unmet(),
         )
+    }
+
+    /// The position the leader believes a replica has reached, which is what
+    /// the convergence check reads.
+    fn replica_position(&self, partition: PartitionId, replica: NodeId) -> Lamport {
+        let controller = self.controller.clone();
+        let view = self.sim.block_on(async move { controller.view().await });
+        view.partitions
+            .iter()
+            .find(|p| p.info.id == partition)
+            .and_then(|p| {
+                p.replica_progress
+                    .iter()
+                    .find(|(node, _)| *node == replica)
+                    .map(|(_, position)| *position)
+            })
+            .unwrap_or(Lamport::ZERO)
+    }
+
+    /// The position the partition's owner has committed to.
+    fn committed_position(&self, partition: PartitionId) -> Lamport {
+        let controller = self.controller.clone();
+        let view = self.sim.block_on(async move { controller.view().await });
+        view.partitions
+            .iter()
+            .find(|p| p.info.id == partition)
+            .map_or(Lamport::ZERO, |p| p.committed_lamport)
     }
 
     /// Runs until `ready` holds or `limit` of virtual time has passed.
@@ -1576,7 +1827,12 @@ fn an_incompatible_existing_owner_stays_live_while_its_heartbeats_continue() {
                     .find(|view| view.info.id == partition)
                     .map(|view| view.committed_lamport)
             });
-            if progress != Some(Lamport(77)) {
+            // At or past where the test put it, rather than exactly there: an
+            // owner that is still live is still committing writes, so pinning
+            // the equality would be asserting that it had stopped. What is
+            // being protected is that the leader keeps recording an
+            // incompatible owner's position instead of dropping it.
+            if progress.is_none_or(|committed| committed < Lamport(77)) {
                 return Err(cluster.sim.failure(format!(
                     "incompatible owner's heartbeat progress was not retained: {progress:?}"
                 )));
@@ -1742,11 +1998,16 @@ fn hostile_network(seed: u64) -> SimConfig {
     }
 }
 
-/// Ignored because it reaches the defect in issue #76 on 11 of the first
-/// 20000 seeds, 2807 being the lowest, and a scenario that goes red on the
+/// Ignored because it reaches the defect in issue #76 on 16 of the first
+/// 20000 seeds, 130 being the lowest, and a scenario that goes red on the
 /// nightly batch is a scenario people learn to ignore for real. The invariant
 /// is not relaxed to get it green: the check is right and the cluster is
 /// wrong. Remove the ignore with the fix.
+///
+/// Those seed numbers move whenever the traffic this scenario generates
+/// changes, since a seed names an interleaving rather than a state. The
+/// deterministic reproduction below is the one to work from; these are here
+/// to say how often the defect is reachable, not to be replayed.
 #[test]
 #[ignore = "finds the known liveness defect tracked by issue #76"]
 fn a_cluster_converges_after_the_network_stops_eating_heartbeats() {
@@ -1843,6 +2104,42 @@ fn a_partition_fenced_with_an_empty_replica_set_is_placed_again() {
     );
 }
 
+#[test]
+fn a_replica_that_fell_behind_catches_up_once_it_can_follow_again() {
+    // The failover scenarios all check that ownership lands somewhere. This
+    // one checks the half that ownership does not cover: a copy that stopped
+    // following has to be brought back to the owner's position, or the cluster
+    // is one node's disk away from losing writes it has already acknowledged
+    // while every ownership assertion in the file still passes.
+    check_seeds(
+        "a_replica_that_fell_behind_catches_up_once_it_can_follow_again",
+        32,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let stalled = cluster.map().partition(partition).unwrap().replicas[0];
+
+            cluster.set_following(stalled, false);
+            cluster
+                .sim
+                .run_for(Duration::from_millis(500 + cluster.sim.random_below(4_000)));
+
+            let owner = cluster.owner_of(partition).expect("an owner");
+            let behind = cluster.replica_position(partition, stalled);
+            let ahead = cluster.committed_position(partition);
+            if behind >= ahead {
+                return Err(cluster.sim.failure(format!(
+                    "replica {stalled} was supposed to fall behind owner {owner}, but sits at \
+                     {behind} against {ahead}"
+                )));
+            }
+
+            cluster.set_following(stalled, true);
+            cluster.converged()
+        },
+    );
+}
+
 /// The test of the liveness test.
 ///
 /// A convergence check that cannot fail is worse than no check at all,
@@ -1879,6 +2176,43 @@ fn a_cluster_that_cannot_promote_fails_the_convergence_check_by_name() {
     assert!(
         failure.reason.contains("the last fault landed at"),
         "the failure must say what it is measuring recovery from: {}",
+        failure.reason
+    );
+}
+
+/// The same test for the half of the invariant that is about data rather than
+/// ownership.
+///
+/// Review caught this check certifying replica catch-up while only ever
+/// looking at map versions, and a scenario existed in which a surviving
+/// replica sat at Lamport 10 against an owner at 900 and convergence still
+/// passed. This is what stops that from being reintroduced quietly: if the
+/// condition is ever weakened back into a map-version check, this test starts
+/// passing when it should fail.
+#[test]
+fn a_replica_stuck_behind_its_owner_fails_the_convergence_check_by_name() {
+    let cluster = Cluster::start(43);
+    let partition = cluster.only_partition();
+    let stalled = cluster.map().partition(partition).unwrap().replicas[0];
+
+    // Alive, heartbeating, in the replica set, routing on the current map, and
+    // not following. Every other condition holds; only the data is behind.
+    cluster.set_following(stalled, false);
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let failure = cluster
+        .converged()
+        .expect_err("a replica short of its owner has not converged");
+    assert!(
+        failure
+            .reason
+            .contains("every surviving replica has caught up with its owner"),
+        "the failure must name the condition that broke: {}",
+        failure.reason
+    );
+    assert!(
+        failure.reason.contains(&format!("replica {stalled}")),
+        "the failure must name the replica that is behind: {}",
         failure.reason
     );
 }
