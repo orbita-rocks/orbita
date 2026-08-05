@@ -68,6 +68,27 @@
 //! which truncates above the point the new owner says its history ends. There
 //! is no path where a divergent entry survives and is later replayed.
 //!
+//! ## A catch-up carries the committed prefix, and not one entry more
+//!
+//! Replication is driven by appends, so a replica placed onto a partition that
+//! then goes quiet, or one belonging to an owner that has closed write
+//! admission to drain, has nothing coming to move it forward. `Wal` can push
+//! to those replicas without a write behind it, and the question that decision
+//! turns on is how far.
+//!
+//! It is the committed prefix, meaning `Wal::committed_lamport`, and never the
+//! local durable position. The two differ by exactly the entries that reached
+//! this node's disk and no other, whose `commit` returned `Unavailable`. Those
+//! entries are allowed to stay in the log, because a later batch's
+//! acknowledgement can still rescue them, but rescuing them is the job of a
+//! write with a client waiting on the answer. A push that carried them would
+//! put a reported failure onto a second node with nobody to report to, and the
+//! section above is then the trap: whatever a promoted owner has on its disk
+//! becomes history and gets replayed into storage, so the write the client was
+//! told had failed comes back as a value. The same reasoning bounds a draining
+//! owner, which gives that tail up entirely rather than advertise a position
+//! no replica may be carried to.
+//!
 //! # Failure stance
 //!
 //! An owner that is fenced, or whose own disk fails a write or an fsync, stops
@@ -102,6 +123,6 @@ pub use format::{WalEntry, WalOp};
 pub use log::{
     PartitionLog, RecoveryState, Truncation, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES,
 };
-pub use owner::{Wal, WalConfig};
+pub use owner::{CatchUp, Wal, WalConfig};
 pub use replica::{Hydration, PartitionHydrator, ReplicaObserver, WalService};
 pub use wire::{METHOD_APPEND, METHOD_FENCE, METHOD_STATUS};

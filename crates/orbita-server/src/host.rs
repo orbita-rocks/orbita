@@ -42,7 +42,7 @@ use orbita_format::PartitionPath;
 use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_storage::{Mutation, Partition, ScanPage, TOMBSTONE_RETENTION_MILLIS};
-use orbita_wal::{Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
+use orbita_wal::{CatchUp, Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -442,16 +442,50 @@ impl<R: Runtime> PartitionHost<R> {
         true
     }
 
-    /// Pushes this partition's log to any replica that is behind it.
+    /// Carries any replica that is behind up to the committed prefix.
     ///
-    /// Called when a replica set has just changed and on every pass of a
-    /// drain. Both are moments where a replica can be behind with no write
-    /// coming to carry it forward, and where leaving it behind means the
-    /// partition has fewer real copies than the map claims. A replica does
-    /// nothing here: it has no peers of its own to feed.
-    pub(crate) async fn sync_replicas(&self) -> Result<()> {
+    /// Called whenever this node notices an advertised copy that has not
+    /// confirmed the prefix, and on every pass of a drain. Both are moments
+    /// where a replica can be behind with no write coming to carry it forward,
+    /// and where leaving it behind means the partition has fewer real copies
+    /// than the map claims. A replica does nothing here: it has no peers of
+    /// its own to feed.
+    ///
+    /// The horizon is deliberately the committed prefix rather than this
+    /// node's durable position; see [`orbita_wal::Wal::catch_up_replicas`].
+    pub(crate) async fn catch_up_replicas(&self) -> Result<CatchUp> {
         match self.wal.as_ref() {
-            Some(wal) => wal.sync_replicas().await,
+            Some(wal) => wal.catch_up_replicas().await,
+            None => Ok(CatchUp {
+                horizon: Lamport::ZERO,
+                caught_up: Vec::new(),
+                behind: Vec::new(),
+            }),
+        }
+    }
+
+    /// The advertised replicas that have not confirmed they hold the committed
+    /// prefix.
+    ///
+    /// This is what keeps a failed catch-up pending. It is answered from the
+    /// per-replica acknowledgements the append path already records, so it
+    /// stays true without a second source of truth to drift from: a healthy
+    /// partition under load reports nothing behind without anyone asking.
+    pub(crate) fn replicas_behind(&self) -> Vec<NodeId> {
+        self.wal
+            .as_ref()
+            .map(|wal| wal.replicas_behind())
+            .unwrap_or_default()
+    }
+
+    /// Closes this partition's log and drops the tail no client was told
+    /// about, so that what it advertises is a position a replica can reach.
+    ///
+    /// See [`orbita_wal::Wal::quiesce`]. Only meaningful for an owner, and
+    /// only correct once write admission is closed.
+    pub(crate) async fn quiesce(&self) -> Result<()> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.quiesce().await.map(|_| ()),
             None => Ok(()),
         }
     }

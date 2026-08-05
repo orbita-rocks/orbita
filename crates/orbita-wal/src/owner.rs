@@ -85,9 +85,42 @@ struct Batch {
     acked: bool,
 }
 
+/// How far one catch-up pass got, replica by replica.
+///
+/// Reported per node rather than as a single yes or no because a pass that
+/// reached one of two replicas has not finished the job: the partition still
+/// advertises a copy that does not hold the history. A caller that treated
+/// "somebody answered" as success would clear the work and never look again,
+/// and on an idle partition nothing else ever raises the question.
+#[derive(Debug, Clone)]
+pub struct CatchUp {
+    /// The committed prefix every replica was carried to. See
+    /// [`Wal::committed_lamport`] for why the horizon is that watermark and
+    /// not the local durable one.
+    pub horizon: Lamport,
+    /// Replicas that have confirmed, in a reply, that they hold `horizon`.
+    pub caught_up: Vec<NodeId>,
+    /// Replicas that have not, whatever the reason.
+    pub behind: Vec<NodeId>,
+}
+
+impl CatchUp {
+    /// Whether every advertised copy now really exists.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.behind.is_empty()
+    }
+}
+
 struct OwnerState {
     epoch: Epoch,
     next_lamport: Lamport,
+    /// How far this node's own log has been fsynced.
+    ///
+    /// A local number and nothing more. It runs ahead of `replicated` by every
+    /// entry that reached this disk and no other, which is exactly the set of
+    /// writes whose clients were told `Unavailable`. Treating it as a
+    /// replication target is what copies those writes onto a second node.
     durable_local: Lamport,
     /// Assigned a Lamport, not yet written. The next flusher takes the whole
     /// queue, which is where several concurrent writes come to share an fsync.
@@ -109,6 +142,9 @@ struct OwnerState {
     /// the invalidation, and that is a question about named nodes rather than
     /// about how many answered.
     acked: HashMap<NodeId, Lamport>,
+    /// Set when this owner has given up its uncommitted tail and will never
+    /// assign another Lamport. See [`Wal::quiesce`].
+    quiesced: bool,
     /// Set when this node must stop being an owner: it was fenced, or its own
     /// disk stopped telling the truth.
     fatal: Option<Error>,
@@ -190,6 +226,7 @@ impl<R: Runtime> Wal<R> {
                 replicated: durable,
                 failed_through: Lamport::ZERO,
                 acked: HashMap::new(),
+                quiesced: false,
                 fatal: None,
             }),
             progress: tokio::sync::Notify::new(),
@@ -233,16 +270,68 @@ impl<R: Runtime> Wal<R> {
 
     /// How far this node has durably logged, for the control plane's promotion
     /// decision.
+    ///
+    /// This is a claim about one disk, not about the cluster. It can stand
+    /// above [`Wal::committed_lamport`], and everything in that gap is a write
+    /// this node holds alone and whose client was told it failed.
     #[must_use]
     pub fn durable_lamport(&self) -> Lamport {
         self.state().durable_local
     }
 
-    /// How far a two-of-three acknowledgement has reached. Every Lamport at or
-    /// below this was reported to a client as committed.
+    /// The committed prefix: the highest Lamport a durability quorum has
+    /// confirmed under this owner's epoch.
+    ///
+    /// This is the one watermark the guarantees are stated against, so it is
+    /// worth being exact about what it is and is not.
+    ///
+    /// It only moves when [`Wal::replicate`] reports that enough replicas
+    /// stored a batch, which is the same event that resolves the client's
+    /// `commit`. So every Lamport at or below it is on at least two nodes and
+    /// may have been reported to a client as applied, which makes it the
+    /// no-lost-write floor: a promotion that keeps this prefix keeps every
+    /// acknowledged write. And nothing above it has been acknowledged to
+    /// anyone, which makes it the no-phantom-write ceiling for any transfer
+    /// that is not itself a write in flight.
+    ///
+    /// It is deliberately not `durable_local`. That watermark counts entries
+    /// that reached this node's disk and no other, whose `commit` returned
+    /// `Unavailable`. Those entries stay in the log because a later batch's
+    /// acknowledgement can still rescue them — a replica that stores entry
+    /// N+1 has proved it stores N — but rescuing them is a write's job. A
+    /// catch-up that shipped them would put a reported failure onto a second
+    /// node with no write behind it, and a promotion turns anything on a
+    /// promoted node's disk into history.
     #[must_use]
     pub fn committed_lamport(&self) -> Lamport {
         self.state().replicated
+    }
+
+    /// The advertised replicas that are not known to hold the committed
+    /// prefix.
+    ///
+    /// Answered from the per-replica acknowledgements the append path already
+    /// records, so a replica counts as caught up only because it said so in a
+    /// reply, never because a call to somebody else succeeded.
+    ///
+    /// The evidence is remembered rather than re-established, which bounds
+    /// what this can notice: a replica that acknowledged the prefix and then
+    /// lost its disk reports as current until something moves the prefix and
+    /// the next append finds the gap. That is the same hole recovery has
+    /// always had for a replica whose storage is replaced under it, and
+    /// closing it is a question about detecting silent data loss rather than
+    /// about placement.
+    #[must_use]
+    pub fn replicas_behind(&self) -> Vec<NodeId> {
+        let replicas = self.replicas();
+        let state = self.state();
+        replicas
+            .iter()
+            .copied()
+            .filter(|node| {
+                state.acked.get(node).copied().unwrap_or(Lamport::ZERO) < state.replicated
+            })
+            .collect()
     }
 
     #[must_use]
@@ -326,6 +415,12 @@ impl<R: Runtime> Wal<R> {
             if let Some(fatal) = &state.fatal {
                 return Err(fatal.clone());
             }
+            if state.quiesced {
+                return Err(Error::Unavailable(format!(
+                    "partition {} is quiesced for handoff",
+                    self.partition
+                )));
+            }
             let lamport = state.next_lamport.next();
             state.next_lamport = lamport;
             let entry = WalEntry {
@@ -400,8 +495,8 @@ impl<R: Runtime> Wal<R> {
         Ok(())
     }
 
-    /// Brings every replica up to this owner's durable position without
-    /// waiting for a new write to carry the entries there.
+    /// Brings every replica up to the committed prefix without waiting for a
+    /// new write to carry the entries there.
     ///
     /// Replication is otherwise driven entirely by appends, and an append only
     /// happens when a client writes. Two situations leave replicas behind with
@@ -411,58 +506,128 @@ impl<R: Runtime> Wal<R> {
     /// hand a partition to a replica that has caught up, so an owner that
     /// cannot push has nothing to hand off and drains forever.
     ///
-    /// This sends a zero-entry append at the owner's durable position. A
+    /// The horizon is [`Wal::committed_lamport`] and not the local durable
+    /// position, and that is the whole safety argument here. A write is
+    /// carried above the committed prefix by exactly one thing, the `commit`
+    /// that is trying to make it committed, and that carrier reports the
+    /// outcome to a client. Everything this method could otherwise pick up is
+    /// a write whose client was already told `Unavailable`; putting it on a
+    /// second node with no client waiting turns a reported failure into a
+    /// value the next promoted owner will replay into storage and serve.
+    ///
+    /// Mechanically this is a zero-entry append at the committed prefix. A
     /// replica that already holds it answers plainly; one that is behind
     /// answers with a gap, which the existing catch-up path fills from this
-    /// node's own log. Nothing new is invented on the wire.
-    pub async fn sync_replicas(&self) -> Result<()> {
+    /// node's own log, bounded by the same horizon. Nothing new is invented on
+    /// the wire.
+    ///
+    /// Errors only when this owner has been fenced, which is not a retryable
+    /// condition. A replica that could not be reached comes back in
+    /// [`CatchUp::behind`] so the caller keeps the work pending.
+    pub async fn catch_up_replicas(&self) -> Result<CatchUp> {
         let replicas = self.replicas();
-        if replicas.is_empty() {
-            return Ok(());
-        }
-        let (epoch, committed, durable, fatal) = {
+        let (epoch, horizon, fatal) = {
             let state = self.state();
-            (
-                state.epoch,
-                state.replicated,
-                state.durable_local,
-                state.fatal.clone(),
-            )
+            (state.epoch, state.replicated, state.fatal.clone())
         };
         if let Some(fatal) = fatal {
             return Err(fatal);
         }
+        let mut result = CatchUp {
+            horizon,
+            caught_up: Vec::new(),
+            behind: Vec::new(),
+        };
+        if replicas.is_empty() {
+            return Ok(result);
+        }
+
         let request = AppendRequest {
             partition: self.partition,
             epoch,
-            prev_lamport: durable,
-            committed,
+            prev_lamport: horizon,
+            committed: horizon,
             entries: Vec::new(),
         };
 
-        let mut behind = 0usize;
         for node in replicas.iter() {
-            match self.call_replica(*node, request.clone()).await {
-                Outcome::Acked => {}
-                Outcome::Stale(current) => {
-                    let error = Error::StaleEpoch {
-                        partition: self.partition,
-                        got: epoch,
-                        current,
-                    };
-                    self.set_fatal(error.clone());
-                    return Err(error);
-                }
-                Outcome::Failed => behind += 1,
+            if let Outcome::Stale(current) = self.call_replica(*node, request.clone()).await {
+                let error = Error::StaleEpoch {
+                    partition: self.partition,
+                    got: epoch,
+                    current,
+                };
+                self.set_fatal(error.clone());
+                return Err(error);
+            }
+            // Judged on what the replica said about itself rather than on
+            // whether the call returned, because those differ: a reply can
+            // arrive from a replica that is still short of the horizon, and a
+            // node that answered nothing has proved nothing.
+            if self.acked_through(*node) >= horizon {
+                result.caught_up.push(*node);
+            } else {
+                result.behind.push(*node);
             }
         }
-        if behind == replicas.len() {
-            return Err(Error::Unavailable(format!(
-                "partition {} could not reach any replica to catch it up",
-                self.partition
-            )));
+        Ok(result)
+    }
+
+    /// Stops assigning Lamports and drops the tail no client was told about.
+    ///
+    /// A draining owner has to advertise a position a replica can be carried
+    /// to, or the control plane finds no caught-up handoff target and the
+    /// drain burns its whole budget. With write admission closed and every
+    /// admitted write resolved, everything above the committed prefix is a
+    /// write that reached this disk alone and whose client was told it failed,
+    /// and this node is the last one that still knows that. Discarding it here
+    /// is what makes the failure final instead of leaving it for a future
+    /// promotion to resolve as a success.
+    ///
+    /// This is one-way. Further commits are refused rather than assigned a
+    /// Lamport the log has just given back, because reissuing a version would
+    /// break [ADR 0002] and appending above the cut would leave the hole the
+    /// replication protocol exists to prevent.
+    ///
+    /// Returns the durable position afterwards, which is now the committed
+    /// prefix.
+    ///
+    /// [ADR 0002]: https://github.com/orbita-rocks/orbita/blob/develop/docs/adr/0002-key-versions-are-partition-lamports.md
+    pub async fn quiesce(&self) -> Result<Lamport> {
+        let (committed, durable) = {
+            let mut state = self.state();
+            if let Some(fatal) = &state.fatal {
+                return Err(fatal.clone());
+            }
+            // Set before the check below, so that a caller that has to retry
+            // is not racing new writes on the way back in.
+            state.quiesced = true;
+            if !state.pending.is_empty() {
+                return Err(Error::Internal(format!(
+                    "partition {} was quiesced with {} writes still unflushed",
+                    self.partition,
+                    state.pending.len()
+                )));
+            }
+            (state.replicated, state.durable_local)
+        };
+        if durable <= committed {
+            return Ok(durable);
         }
-        Ok(())
+
+        self.log.truncate_above(committed).await?;
+        let durable = self.log.durable_lamport().await;
+        {
+            let mut state = self.state();
+            state.durable_local = durable;
+            state.next_lamport = durable;
+            // A batch that is gone from the log cannot be rescued by a reply
+            // that is still on the wire. `advance` clamps as well; this keeps
+            // the two from disagreeing about what is even in flight.
+            state.inflight.retain(|batch| batch.last <= durable);
+        }
+        self.progress.notify_waiters();
+        Ok(durable)
     }
 
     /// Asks a peer how far it has durably logged, which is what the control
@@ -829,6 +994,13 @@ enum Outcome {
 /// too, because the protocol refuses a batch that would leave a hole. So a
 /// later batch's acknowledgement rescues an earlier one whose own reply was
 /// lost.
+///
+/// Clamped to what this node itself holds. The committed prefix is a claim
+/// that a quorum stored the entry, and this node is a member of every quorum
+/// it counts, so a watermark above `durable_local` would be a claim about
+/// entries this node has given back. Only [`Wal::quiesce`] can lower the
+/// durable position, and only after the replies that could arrive late were
+/// already for entries no client is waiting on.
 fn advance(state: &mut OwnerState) {
     let mut best = state.replicated;
     for batch in &state.inflight {
@@ -836,6 +1008,7 @@ fn advance(state: &mut OwnerState) {
             best = batch.last;
         }
     }
-    state.replicated = best;
-    state.inflight.retain(|b| b.last > best);
+    state.replicated = best.min(state.durable_local);
+    let released = state.replicated;
+    state.inflight.retain(|b| b.last > released);
 }

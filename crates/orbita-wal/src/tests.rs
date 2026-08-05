@@ -752,6 +752,58 @@ fn a_manifest_behind_the_sender_does_not_fence_the_sender() {
 }
 
 #[test]
+fn quiescing_a_hydrated_owner_gives_up_its_tail_without_giving_up_its_horizon() {
+    // Where hydration meets the drain path. Quiescing drops the writes that
+    // reached this node's disk alone, and it does that by cutting the log,
+    // which is the one operation that lowers a durable position. Hydration
+    // puts a floor under that cut at the manifest horizon.
+    //
+    // The two cannot disagree, and the reason is worth stating rather than
+    // trusting: a manifest only ever covers writes that were applied, an apply
+    // only ever happens after the acknowledgement, so the horizon is at or
+    // below the committed prefix by construction. The floor is therefore never
+    // the thing that stops a quiesce, and the tail above the prefix still
+    // goes.
+    let base = TestRuntime::solo(95);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        // A replica that is registered but never reachable, so every write
+        // this owner takes reaches its own disk and no second copy.
+        let wal = Wal::open(
+            runtime,
+            WalConfig::new(PARTITION, DIR, Epoch(2))
+                .with_replicas(vec![PEER_A])
+                .with_hydration(Hydration {
+                    epoch: Epoch(2),
+                    through: Lamport(10),
+                }),
+        )
+        .await
+        .expect("open");
+        assert_eq!(wal.durable_lamport(), Lamport(10));
+        assert_eq!(wal.committed_lamport(), Lamport(10));
+
+        for i in 0..3 {
+            let _unavailable = wal.commit(op(&format!("one copy {i}"))).await;
+        }
+        assert!(
+            wal.durable_lamport() > Lamport(10),
+            "the writes reached this node's own log"
+        );
+
+        let after = wal.quiesce().await.expect("quiesce");
+        assert_eq!(
+            after,
+            Lamport(10),
+            "the tail no client was told about goes, down to the committed prefix, which \
+             here is exactly the horizon this owner was built to"
+        );
+        assert_eq!(wal.log().hydrated_through().await, Lamport(10));
+    });
+}
+
+#[test]
 fn a_worker_granted_a_superseded_epoch_refuses_to_open_as_owner() {
     // The same evidence at the other end of its life. A replacement worker has
     // no fence record of its own, so without the manifest a stale grant would
@@ -980,6 +1032,107 @@ fn losing_two_replicas_fails_the_write_rather_than_acknowledging_it() {
         c.net.heal(PEER_A);
         assert_eq!(c.owner.commit(op("again")).await.unwrap(), Lamport(2));
         assert_eq!(c.peers[0].durable().await, Lamport(2));
+    });
+}
+
+#[test]
+fn a_catch_up_stops_at_the_committed_prefix_rather_than_the_local_tail() {
+    let base = TestRuntime::solo(112);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        // Acknowledged at two of three, so this is the committed prefix.
+        c.owner.commit(op("kept")).await.unwrap();
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+
+        // Reached this node's disk and nowhere else. The client was told
+        // `Unavailable`, and the local durable position now runs ahead of what
+        // anybody was promised.
+        c.net.isolate(PEER_A);
+        c.net.isolate(PEER_B);
+        assert!(c.owner.commit(op("ghost")).await.is_err());
+        assert_eq!(c.owner.durable_lamport(), Lamport(2));
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+
+        c.net.heal(PEER_A);
+        c.net.heal(PEER_B);
+        let caught_up = c.owner.catch_up_replicas().await.unwrap();
+        assert_eq!(caught_up.horizon, Lamport(1), "the horizon is the prefix");
+        assert!(caught_up.is_complete());
+
+        // The failed write stays on one copy. Putting it on a second is all it
+        // takes for the next promotion to replay it into storage and serve it.
+        for peer in &c.peers {
+            assert_eq!(
+                peer.durable().await,
+                Lamport(1),
+                "a catch-up carried a write whose client was told it had failed"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_catch_up_names_the_replica_that_did_not_answer_rather_than_calling_the_pass_done() {
+    let base = TestRuntime::solo(113);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        // One peer misses the write, so two of three is still met and the
+        // entry is acknowledged while one advertised copy holds nothing.
+        c.net.isolate(PEER_B);
+        c.owner.commit(op("first")).await.unwrap();
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+
+        // A pass judged on whether any call returned would call this finished,
+        // and the partition would go on advertising a copy that is empty.
+        let caught_up = c.owner.catch_up_replicas().await.unwrap();
+        assert_eq!(caught_up.caught_up, vec![PEER_A]);
+        assert_eq!(caught_up.behind, vec![PEER_B]);
+        assert!(!caught_up.is_complete());
+        assert_eq!(c.owner.replicas_behind(), vec![PEER_B]);
+
+        c.net.heal(PEER_B);
+        let caught_up = c.owner.catch_up_replicas().await.unwrap();
+        assert!(caught_up.is_complete(), "the retry finishes the job");
+        assert!(c.owner.replicas_behind().is_empty());
+        assert_eq!(c.peers[1].durable().await, Lamport(1));
+    });
+}
+
+#[test]
+fn quiescing_gives_up_the_tail_no_client_was_told_about_and_keeps_the_rest() {
+    let base = TestRuntime::solo(114);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        c.owner.commit(op("kept")).await.unwrap();
+
+        c.net.isolate(PEER_A);
+        c.net.isolate(PEER_B);
+        assert!(c.owner.commit(op("ghost")).await.is_err());
+        assert_eq!(c.owner.durable_lamport(), Lamport(2));
+
+        // A draining owner has to advertise a position a replica may be
+        // carried to, and a catch-up may not go past the committed prefix. The
+        // only honest way to meet in the middle is to give up the entries this
+        // node holds alone and already reported as failed.
+        assert_eq!(c.owner.quiesce().await.unwrap(), Lamport(1));
+        assert_eq!(c.owner.durable_lamport(), Lamport(1));
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+        assert_eq!(
+            c.owner_peer.durable().await,
+            Lamport(1),
+            "the entry is gone from the log, not merely from the watermark"
+        );
+
+        // One way. A Lamport the log has given back must never be reissued, or
+        // two writes would share a version.
+        assert!(matches!(
+            c.owner.commit(op("after")).await,
+            Err(Error::Unavailable(_))
+        ));
+
+        // And it stays a no-op afterwards, because a drain calls it on every
+        // pass rather than once.
+        assert_eq!(c.owner.quiesce().await.unwrap(), Lamport(1));
     });
 }
 
