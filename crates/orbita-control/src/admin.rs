@@ -213,6 +213,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
                 is_raft_leader: node.is_control_leader,
                 speaks_min: Some(version_message(node.record.speaks.min)),
                 speaks_max: Some(version_message(node.record.speaks.max)),
+                index_memory_bytes: node.index_memory_bytes,
             })
             .collect();
 
@@ -233,19 +234,32 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
                 replicas: p
                     .replica_progress
                     .iter()
-                    .map(|(node, applied)| pb::Replica {
-                        node_id: node.get(),
-                        applied_lamport: applied.get(),
+                    .map(|r| pb::Replica {
+                        node_id: r.node.get(),
+                        applied_lamport: r.applied_lamport.get(),
+                        durable_lamport: r.durable_lamport.get(),
                     })
                     .collect(),
                 size_bytes: p.size_bytes,
+                index_bytes: p.index_bytes,
             })
             .collect();
+
+        // Quota saturation needs both halves, and only the keyspace records
+        // carry the limit. Filtered the same way the partitions are, so a
+        // describe scoped to one keyspace does not leak the others' usage.
+        let mut keyspaces = Vec::new();
+        for keyspace in self.controller.list_keyspaces().await {
+            if wanted.is_none_or(|id| keyspace.id == id) {
+                keyspaces.push(self.keyspace_message(&keyspace).await);
+            }
+        }
 
         Ok(Response::new(pb::DescribeClusterResponse {
             nodes,
             partitions,
             cluster_version: Some(version_message(view.cluster_version)),
+            keyspaces,
         }))
     }
 
@@ -338,9 +352,11 @@ fn partition_message(info: &PartitionInfo) -> pb::Partition {
             .map(|node| pb::Replica {
                 node_id: node.get(),
                 applied_lamport: 0,
+                durable_lamport: 0,
             })
             .collect(),
         size_bytes: 0,
+        index_bytes: 0,
     }
 }
 

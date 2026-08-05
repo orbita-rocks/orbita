@@ -700,6 +700,7 @@ impl<R: Runtime> Node<R> {
                 durable_lamport: host.durable_lamport().await,
                 applied_lamport: host.committed_lamport().await.unwrap_or_default(),
                 size_bytes: host.size_bytes().await.unwrap_or_default(),
+                index_bytes: host.index_bytes().await.unwrap_or_default(),
             });
         }
         // Sorted so that two reports of the same state are the same bytes,

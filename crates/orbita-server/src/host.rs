@@ -473,6 +473,15 @@ impl<R: Runtime> PartitionHost<R> {
         self.storage.size_bytes().await
     }
 
+    /// What this partition's memory-resident index costs on this node.
+    ///
+    /// Reported to the leader group because the node is the only place the
+    /// number exists, and because ADR 0006 makes it the resource that runs
+    /// out before disk does.
+    pub(crate) async fn index_bytes(&self) -> Result<u64> {
+        self.storage.index_bytes().await
+    }
+
     /// Publishes every applied write and checkpoints only after the manifest
     /// swap is durable.
     pub(crate) async fn flush(&self) -> Result<()> {

@@ -44,10 +44,22 @@ pub struct PartitionProgress {
     pub durable_lamport: Lamport,
     pub applied_lamport: Lamport,
     pub size_bytes: u64,
+    /// What this node's memory-resident index for the partition costs. ADR
+    /// 0006 makes memory the resource a worker runs out of first, and a node
+    /// is the only place that number exists, so it rides the heartbeat that
+    /// already reports everything else about the partition.
+    pub index_bytes: u64,
 }
 
 impl PartitionProgress {
     pub(crate) fn encode(&self, w: &mut Writer) {
+        self.encode_v3(w);
+        w.u64(self.index_bytes);
+    }
+
+    /// The encoding without index memory, which is what every report shape up
+    /// to and including [`super::wire::METHOD_REPORT_STATUS_V3`] carries.
+    pub(crate) fn encode_v3(&self, w: &mut Writer) {
         w.u64(self.partition.get())
             .u64(self.durable_lamport.get())
             .u64(self.applied_lamport.get())
@@ -55,11 +67,21 @@ impl PartitionProgress {
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let mut progress = Self::decode_v3(r)?;
+        progress.index_bytes = r.u64()?;
+        Ok(progress)
+    }
+
+    /// Decodes a report from a node that does not measure index memory. Zero
+    /// is the honest answer there: the node did not say, and a describe that
+    /// invented a number would be worse than one showing nothing.
+    pub(crate) fn decode_v3(r: &mut Reader<'_>) -> CodecResult<Self> {
         Ok(Self {
             partition: PartitionId(r.u64()?),
             durable_lamport: Lamport(r.u64()?),
             applied_lamport: Lamport(r.u64()?),
             size_bytes: r.u64()?,
+            index_bytes: 0,
         })
     }
 }
@@ -124,11 +146,24 @@ impl NodeStatus {
         w.seq(&self.partitions, |w, p| p.encode(w));
     }
 
+    /// The encoding that predates index memory reporting.
+    ///
+    /// Sent when the leader answering turned out to be a binary from before
+    /// the resource fields existed. The consumption numbers are worth
+    /// nothing next to a heartbeat that lands, so the fallback drops them
+    /// rather than the report.
+    pub(crate) fn encode_v3(&self, w: &mut Writer) {
+        self.encode_head(w);
+        self.speaks.encode(w);
+        w.u8(u8::from(self.ready)).u8(u8::from(self.draining));
+        w.seq(&self.partitions, |w, p| p.encode_v3(w));
+    }
+
     /// The first version-aware encoding, which predates readiness reporting.
     pub(crate) fn encode_v2(&self, w: &mut Writer) {
         self.encode_head(w);
         self.speaks.encode(w);
-        w.seq(&self.partitions, |w, p| p.encode(w));
+        w.seq(&self.partitions, |w, p| p.encode_v3(w));
     }
 
     /// The v0.0.1 encoding, which has no speakable range.
@@ -138,7 +173,7 @@ impl NodeStatus {
     /// this when the compatibility window moves past 0.0.
     pub(crate) fn encode_legacy(&self, w: &mut Writer) {
         self.encode_head(w);
-        w.seq(&self.partitions, |w, p| p.encode(w));
+        w.seq(&self.partitions, |w, p| p.encode_v3(w));
     }
 
     fn encode_head(&self, w: &mut Writer) {
@@ -163,6 +198,20 @@ impl NodeStatus {
         })
     }
 
+    /// Decodes the encoding that predates index memory reporting.
+    pub(crate) fn decode_v3(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let (role, address, map_version) = Self::decode_head(r)?;
+        Ok(Self {
+            role,
+            address,
+            map_version,
+            speaks: VersionRange::decode(r)?,
+            ready: r.u8()? != 0,
+            draining: r.u8()? != 0,
+            partitions: r.seq(PartitionProgress::decode_v3)?,
+        })
+    }
+
     /// Decodes the first version-aware encoding. Absence is not evidence of
     /// readiness, so an old node is never selected as a planned handoff target.
     pub(crate) fn decode_v2(r: &mut Reader<'_>) -> CodecResult<Self> {
@@ -174,7 +223,7 @@ impl NodeStatus {
             speaks: VersionRange::decode(r)?,
             ready: false,
             draining: false,
-            partitions: r.seq(PartitionProgress::decode)?,
+            partitions: r.seq(PartitionProgress::decode_v3)?,
         })
     }
 
@@ -192,7 +241,7 @@ impl NodeStatus {
             speaks: VersionRange::exactly(crate::version::ClusterVersion::ZERO),
             ready: false,
             draining: false,
-            partitions: r.seq(PartitionProgress::decode)?,
+            partitions: r.seq(PartitionProgress::decode_v3)?,
         })
     }
 
@@ -232,6 +281,7 @@ mod tests {
                 durable_lamport: Lamport(90),
                 applied_lamport: Lamport(88),
                 size_bytes: 4096,
+                index_bytes: 512,
             }],
         };
 
@@ -242,6 +292,43 @@ mod tests {
         let mut r = Reader::new(&encoded);
         assert_eq!(NodeStatus::decode(&mut r).unwrap(), status);
         assert_eq!(r.done(), Ok(()));
+    }
+
+    #[test]
+    fn a_report_to_a_leader_without_index_memory_keeps_everything_else() {
+        // The fallback exists so a heartbeat lands mid-rollout. Losing the
+        // resource numbers for the length of a rollout is the price; losing
+        // the report would drop the node out of the failure detector.
+        let status = NodeStatus {
+            role: NodeRole::Worker,
+            address: "10.0.0.4:7000".into(),
+            map_version: MapVersion(12),
+            speaks: crate::version::binary_speaks(),
+            ready: true,
+            draining: true,
+            partitions: vec![PartitionProgress {
+                partition: PartitionId(3),
+                durable_lamport: Lamport(90),
+                applied_lamport: Lamport(88),
+                size_bytes: 4096,
+                index_bytes: 512,
+            }],
+        };
+
+        let mut w = Writer::new();
+        status.encode_v3(&mut w);
+        let encoded = w.finish();
+
+        let mut r = Reader::new(&encoded);
+        let decoded = NodeStatus::decode_v3(&mut r).unwrap();
+        assert_eq!(r.done(), Ok(()));
+        assert_eq!(decoded.ready, status.ready);
+        assert_eq!(decoded.draining, status.draining);
+        assert_eq!(decoded.partitions[0].size_bytes, 4096);
+        assert_eq!(
+            decoded.partitions[0].index_bytes, 0,
+            "a node that did not report index memory reports zero, not a guess"
+        );
     }
 
     #[test]

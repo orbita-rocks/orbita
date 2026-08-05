@@ -43,6 +43,10 @@ struct Cluster {
     progress: Progress,
     readiness: Arc<Mutex<HashMap<NodeId, bool>>>,
     draining: Arc<Mutex<HashMap<NodeId, bool>>>,
+    /// What each worker claims its index costs, per partition it holds. Set
+    /// by the tests so that the describe surface can be checked against a
+    /// known answer rather than against whatever the storage layer produced.
+    index_bytes: Arc<Mutex<HashMap<NodeId, u64>>>,
 }
 
 impl Cluster {
@@ -91,6 +95,7 @@ impl Cluster {
             draining: Arc::new(Mutex::new(
                 WORKERS.into_iter().map(|node| (node, false)).collect(),
             )),
+            index_bytes: Arc::new(Mutex::new(HashMap::new())),
         };
         cluster.spawn_sweep(&leader);
         for worker in WORKERS {
@@ -122,6 +127,7 @@ impl Cluster {
         let progress = Arc::clone(&self.progress);
         let readiness = Arc::clone(&self.readiness);
         let draining = Arc::clone(&self.draining);
+        let index_bytes = Arc::clone(&self.index_bytes);
 
         runtime.spawn(async move {
             loop {
@@ -133,6 +139,11 @@ impl Cluster {
                         .get(&node)
                         .unwrap_or(&0),
                 );
+                let index = *index_bytes
+                    .lock()
+                    .expect("index bytes lock poisoned")
+                    .get(&node)
+                    .unwrap_or(&0);
                 let partitions: Vec<PartitionProgress> = map
                     .held_by(node)
                     .map(|info| PartitionProgress {
@@ -140,6 +151,7 @@ impl Cluster {
                         durable_lamport: lamport,
                         applied_lamport: lamport,
                         size_bytes: 0,
+                        index_bytes: index,
                     })
                     .collect();
                 let status = NodeStatus {
@@ -170,6 +182,13 @@ impl Cluster {
             .lock()
             .expect("progress lock poisoned")
             .insert(node, lamport);
+    }
+
+    fn set_index_bytes(&self, node: NodeId, bytes: u64) {
+        self.index_bytes
+            .lock()
+            .expect("index bytes lock poisoned")
+            .insert(node, bytes);
     }
 
     fn set_ready(&self, node: NodeId, ready: bool) {
@@ -297,6 +316,88 @@ fn bootstrap_produces_a_single_unbounded_partition_with_an_owner() {
     assert_eq!(partition.range.end(), None, "and is unbounded");
     assert!(partition.owner.is_some(), "and somebody owns it");
     assert_eq!(partition.epoch, Epoch(1));
+}
+
+#[test]
+fn describe_reports_the_index_memory_each_node_holds() {
+    let cluster = Cluster::start(3);
+    for (offset, worker) in WORKERS.iter().enumerate() {
+        cluster.set_index_bytes(*worker, 1_000 * (offset as u64 + 1));
+    }
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+
+    let partitions_held = |node: NodeId| cluster.map().held_by(node).count() as u64;
+    for (offset, worker) in WORKERS.iter().enumerate() {
+        let node = view
+            .nodes
+            .iter()
+            .find(|n| n.record.id == *worker)
+            .expect("every worker is in the description");
+        assert_eq!(
+            node.index_memory_bytes,
+            1_000 * (offset as u64 + 1) * partitions_held(*worker),
+            "a node's index memory is the sum over every partition it holds, \
+             replicas included, since those are resident too"
+        );
+    }
+}
+
+#[test]
+fn describe_reports_partition_size_and_index_memory_from_the_owner() {
+    let cluster = Cluster::start(4);
+    let partition = cluster.only_partition();
+    let owner = cluster.owner_of(partition).expect("an owner");
+    cluster.set_index_bytes(owner, 4_096);
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+    let described = view
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("the partition is described");
+
+    assert_eq!(
+        described.index_bytes, 4_096,
+        "the owner's report is what a partition's index costs, because the \
+         owner is the node that has to fit it"
+    );
+}
+
+#[test]
+fn describe_reports_a_replicas_durable_position_beside_what_it_applied() {
+    let cluster = Cluster::start(5);
+    let partition = cluster.only_partition();
+    for worker in WORKERS {
+        cluster.set_progress(worker, 42);
+    }
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+    let described = view
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("the partition is described");
+
+    assert!(
+        !described.replica_progress.is_empty(),
+        "a bootstrapped partition has replicas"
+    );
+    for replica in &described.replica_progress {
+        assert_eq!(
+            replica.durable_lamport,
+            Lamport(42),
+            "WAL lag is measured from the durable position, so it has to be \
+             reported and not inferred from what was applied"
+        );
+        assert_eq!(replica.applied_lamport, Lamport(42));
+    }
 }
 
 #[test]

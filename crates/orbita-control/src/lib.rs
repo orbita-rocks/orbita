@@ -115,7 +115,7 @@ pub use config::ControlConfig;
 pub use consensus::{ConsensusLog, LogEntry, LogIndex, SingleNodeLog};
 pub use controller::{
     BootstrapSpec, ClusterView, Controller, FinalizedUpgrade, NodeView, PartitionView,
-    RegistrationOutcome,
+    RegistrationOutcome, ReplicaProgressView,
 };
 pub use membership::{NodeHealth, NodeRole, NodeStatus, PartitionProgress};
 pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
@@ -128,4 +128,5 @@ pub use version::{
 pub use wire::{
     METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
     METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
+    METHOD_REPORT_STATUS_V4,
 };

@@ -37,6 +37,11 @@ pub const METHOD_FETCH_COMMIT_INDEX: u16 = 5;
 pub const METHOD_REPORT_STATUS_V3: u16 = 6;
 /// A worker asks the control leader to hand off every partition it owns.
 pub const METHOD_DRAIN_NODE: u16 = 7;
+/// Status reporting that carries what each partition's index costs in memory.
+/// A separate method rather than a wider V3 payload because the progress list
+/// is fixed-width per entry: a leader decoding the old shape would read the
+/// new field as the next partition id.
+pub const METHOD_REPORT_STATUS_V4: u16 = 8;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -89,6 +94,21 @@ impl ReportStatusRequest {
         let mut r = Reader::new(buf);
         let node = NodeId(r.u64()?);
         let status = NodeStatus::decode(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
+    pub(crate) fn encode_v3(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v3(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v3(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v3(&mut r)?;
         r.done()?;
         Ok(Self { node, status })
     }
@@ -510,12 +530,51 @@ mod tests {
                     durable_lamport: Lamport(10),
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
+                    index_bytes: 256,
                 }],
             },
         };
         assert_eq!(
             ReportStatusRequest::decode(&request.encode()),
             Ok(request.clone())
+        );
+    }
+
+    #[test]
+    fn a_status_report_carries_index_memory_only_on_the_newest_method() {
+        // The progress list is fixed width per entry, so a leader decoding
+        // the older shape would read index memory as the next partition id.
+        // The two methods exist to keep that from being possible.
+        let request = ReportStatusRequest {
+            node: NodeId(7),
+            status: NodeStatus {
+                role: NodeRole::Worker,
+                address: "10.0.0.7:7000".into(),
+                map_version: MapVersion(3),
+                speaks: crate::version::binary_speaks(),
+                ready: true,
+                draining: false,
+                partitions: vec![PartitionProgress {
+                    partition: PartitionId(1),
+                    durable_lamport: Lamport(10),
+                    applied_lamport: Lamport(9),
+                    size_bytes: 1024,
+                    index_bytes: 256,
+                }],
+            },
+        };
+
+        assert_ne!(request.encode(), request.encode_v3());
+        let through_v3 = ReportStatusRequest::decode_v3(&request.encode_v3()).unwrap();
+        assert_eq!(through_v3.status.partitions[0].index_bytes, 0);
+        assert_eq!(through_v3.status.partitions[0].size_bytes, 1024);
+        assert_eq!(
+            ReportStatusRequest::decode(&request.encode())
+                .unwrap()
+                .status
+                .partitions[0]
+                .index_bytes,
+            256
         );
     }
 
@@ -538,6 +597,7 @@ mod tests {
                     durable_lamport: Lamport(10),
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
+                    index_bytes: 0,
                 }],
             },
         };
