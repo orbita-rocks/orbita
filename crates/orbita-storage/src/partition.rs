@@ -283,22 +283,7 @@ impl<R: Runtime> Partition<R> {
             .await
             .map_err(format_error)?
         {
-            state.index = snapshot
-                .locations()
-                .map(|(key, at)| {
-                    (
-                        key.clone(),
-                        Loc {
-                            segment: at.segment,
-                            offset: at.offset,
-                            record_length: at.record_length,
-                        },
-                    )
-                })
-                .collect();
-            state.flushed = snapshot.committed_lamport();
-            state.committed = state.flushed;
-            state.segments = snapshot.manifest().segments.clone();
+            adopt(&mut state, &snapshot);
         }
 
         Ok(Self {
@@ -655,37 +640,47 @@ impl<R: Runtime> Partition<R> {
         else {
             return Ok(());
         };
-        let horizon = snapshot.committed_lamport();
         let mut state = self.state.write().await;
-        if horizon <= state.flushed {
+        if snapshot.committed_lamport() <= state.flushed {
             return Ok(());
         }
-
-        state.index = snapshot
-            .locations()
-            .map(|(key, at)| {
-                (
-                    key.clone(),
-                    Loc {
-                        segment: at.segment,
-                        offset: at.offset,
-                        record_length: at.record_length,
-                    },
-                )
-            })
-            .collect();
-        state.segments = snapshot.manifest().segments.clone();
-        state.flushed = horizon;
-        state
-            .memtable
-            .retain(|_, entry| Lamport(entry.version.get()) > horizon);
-        state.memtable_bytes = state
-            .memtable
-            .iter()
-            .map(|(key, entry)| entry_cost(key, entry))
-            .sum();
-        state.reclaim_attempted_at_bytes = state.memtable_bytes;
+        adopt(&mut state, &snapshot);
         Ok(())
+    }
+
+    /// Rebuilds this partition from whatever manifest the bucket currently
+    /// publishes, and reports the horizon it is now current through.
+    ///
+    /// This is the payoff ADR 0006 promised: a worker that has to take on a
+    /// partition it holds nothing for downloads the index rather than taxing a
+    /// healthy peer for a copy. Building the index reads footers and key
+    /// indexes only, so the cost is proportional to key count rather than to
+    /// bytes, and the caller then replays its log above the returned horizon to
+    /// pick up the tail the manifest does not cover.
+    ///
+    /// Hydrating is idempotent and safe to abandon half way. Nothing here
+    /// mutates the partition until the whole snapshot has been read, so a
+    /// download that fails leaves the previous state intact and the next
+    /// attempt starts over; a manifest that is not ahead of what this
+    /// partition already holds is a no-op rather than a rebuild. Writes that
+    /// arrived above the horizon while the download ran stay in the mutable
+    /// table, because the horizon is exactly the line the segments cover.
+    ///
+    /// Returns `Lamport::ZERO` for a partition that has never flushed, which is
+    /// a partition with nothing to download rather than a missing one.
+    pub async fn hydrate(&self) -> Result<Lamport> {
+        let Some(snapshot) = Snapshot::open(Arc::clone(&self.store), self.path.clone())
+            .await
+            .map_err(format_error)?
+        else {
+            return Ok(self.state.read().await.flushed);
+        };
+        let mut state = self.state.write().await;
+        if snapshot.committed_lamport() <= state.flushed {
+            return Ok(state.flushed);
+        }
+        adopt(&mut state, &snapshot);
+        Ok(state.flushed)
     }
 
     /// Merges every segment into one, which is what physically reclaims
@@ -1040,6 +1035,52 @@ fn check_lamport(state: &State, lamport: Lamport) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Adopts a published manifest as this partition's flushed state.
+///
+/// One function rather than three copies because opening a partition,
+/// reclaiming a replica's memtable, and hydrating from a bucket are the same
+/// operation seen from different distances, and the invariant they share is
+/// easy to break independently: the index, the segment list, and the horizon
+/// have to move together, or a location will name a segment the partition no
+/// longer lists.
+///
+/// The committed Lamport only ever rises. A partition holding acknowledged
+/// writes above the horizon must not forget them by adopting an older
+/// manifest's idea of where the sequence is, because the next write would
+/// reuse a version that has already been handed out.
+fn adopt<S: ObjectStore + ?Sized>(state: &mut State, snapshot: &Snapshot<S>) {
+    let horizon = snapshot.committed_lamport();
+    state.index = snapshot
+        .locations()
+        .map(|(key, at)| {
+            (
+                key.clone(),
+                Loc {
+                    segment: at.segment,
+                    offset: at.offset,
+                    record_length: at.record_length,
+                },
+            )
+        })
+        .collect();
+    state.segments = snapshot.manifest().segments.clone();
+    state.flushed = horizon;
+    if state.committed < horizon {
+        state.committed = horizon;
+    }
+    // Everything at or below the horizon is in a segment now, so holding it in
+    // memory a second time buys nothing.
+    state
+        .memtable
+        .retain(|_, entry| Lamport(entry.version.get()) > horizon);
+    state.memtable_bytes = state
+        .memtable
+        .iter()
+        .map(|(key, entry)| entry_cost(key, entry))
+        .sum();
+    state.reclaim_attempted_at_bytes = state.memtable_bytes;
 }
 
 /// What one entry charges against the flush trigger.
@@ -2395,6 +2436,117 @@ mod tests {
                 .version,
             Version(33),
             "an entry above the manifest horizon remains in the memtable"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrating_builds_the_whole_partition_from_the_published_manifest() {
+        // The replacement-worker case: a partition that holds nothing takes on
+        // one that has been flushed, and gets it from the bucket rather than
+        // from a peer.
+        let (owner, fresh, _clock) = partition_pair_with_clock().await;
+        for lamport in 1..=4 {
+            owner
+                .apply(&Mutation::put(
+                    Lamport(lamport),
+                    bytes(&format!("k{lamport}")),
+                    bytes("value"),
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+        owner.flush().await.unwrap();
+
+        assert_eq!(fresh.get(b"k1").await.unwrap(), None, "nothing yet");
+        assert_eq!(fresh.hydrate().await.unwrap(), Lamport(4));
+
+        for lamport in 1..=4 {
+            let key = format!("k{lamport}");
+            assert_eq!(
+                fresh.get(key.as_bytes()).await.unwrap().unwrap().version,
+                Version(lamport),
+                "every key the manifest names is readable after hydration"
+            );
+        }
+        assert_eq!(fresh.committed_lamport().await.unwrap(), Lamport(4));
+        assert_eq!(fresh.flushed_lamport().await.unwrap(), Lamport(4));
+    }
+
+    #[tokio::test]
+    async fn hydrating_twice_changes_nothing_the_second_time() {
+        // Idempotence is what makes hydration safe to retry after a failure,
+        // and safe to call on a path that cannot tell whether it is needed.
+        let (owner, fresh, _clock) = partition_pair_with_clock().await;
+        owner
+            .apply(&Mutation::put(Lamport(7), bytes("k"), bytes("v"), None))
+            .await
+            .unwrap();
+        owner.flush().await.unwrap();
+
+        assert_eq!(fresh.hydrate().await.unwrap(), Lamport(7));
+        assert_eq!(fresh.hydrate().await.unwrap(), Lamport(7));
+        assert_eq!(fresh.get(b"k").await.unwrap().unwrap().version, Version(7));
+        assert_eq!(fresh.segment_count().await, 1, "no second copy was adopted");
+    }
+
+    #[tokio::test]
+    async fn hydrating_a_partition_that_was_never_flushed_reports_nothing_to_download() {
+        let (fresh, _clock) = partition_with_clock().await;
+        assert_eq!(fresh.hydrate().await.unwrap(), Lamport::ZERO);
+    }
+
+    #[tokio::test]
+    async fn hydrating_keeps_writes_that_arrived_above_the_manifest_horizon() {
+        // The horizon is exactly the line the segments cover, so a write above
+        // it is the caller's to keep. Dropping it would lose an acknowledged
+        // write, which is the one thing this system promises never to do.
+        let (owner, replica, _clock) = partition_pair_with_clock().await;
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("old"), bytes("v"), None))
+            .await
+            .unwrap();
+        owner.flush().await.unwrap();
+
+        replica
+            .apply(&Mutation::put(Lamport(9), bytes("new"), bytes("v"), None))
+            .await
+            .unwrap();
+        assert_eq!(replica.hydrate().await.unwrap(), Lamport(1));
+
+        assert!(replica.get(b"old").await.unwrap().is_some());
+        assert_eq!(
+            replica.get(b"new").await.unwrap().unwrap().version,
+            Version(9),
+            "the write above the horizon survives the rebuild"
+        );
+        assert_eq!(
+            replica.committed_lamport().await.unwrap(),
+            Lamport(9),
+            "adopting an older manifest must not rewind the version sequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrating_against_a_manifest_that_is_behind_leaves_the_partition_alone() {
+        // A node whose own state is ahead of the bucket, which is the steady
+        // state of any owner between flushes.
+        let (owner, _replica, _clock) = partition_pair_with_clock().await;
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("a"), bytes("v"), None))
+            .await
+            .unwrap();
+        owner.flush().await.unwrap();
+        owner
+            .apply(&Mutation::put(Lamport(2), bytes("b"), bytes("v"), None))
+            .await
+            .unwrap();
+
+        assert_eq!(owner.hydrate().await.unwrap(), Lamport(1));
+        assert_eq!(owner.committed_lamport().await.unwrap(), Lamport(2));
+        assert!(
+            owner.get(b"b").await.unwrap().is_some(),
+            "the unflushed write is still there"
         );
     }
 }
