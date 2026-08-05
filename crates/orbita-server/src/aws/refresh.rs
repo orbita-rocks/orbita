@@ -31,6 +31,27 @@
 //! while the cached credential is still valid, the cached one is returned and
 //! the failure is logged. A five-minute IMDS outage is survivable; turning it
 //! into an immediate write failure is not.
+//!
+//! # Why a failure sets a deadline
+//!
+//! Serving the cached credential after a failed refresh is only half an
+//! answer. The cached credential is still inside [`REFRESH_MARGIN`], so the
+//! *next* request finds it stale by the same test, takes the lock, and calls
+//! the metadata service again — and so does the one after that. A provider
+//! outage would turn ordinary traffic into a continuous stream of IMDS or STS
+//! calls, a warning log line per request, and a fresh round-trip delay for
+//! whichever request wins the lock each time.
+//!
+//! So a failure records a deadline, and until it passes the cached credential
+//! is served without a fetch being attempted at all. The backoff doubles from
+//! [`INITIAL_RETRY_BACKOFF`] to [`MAXIMUM_RETRY_BACKOFF`] and resets on the
+//! first success. The maximum is deliberately far smaller than the refresh
+//! margin, so even a fully backed-off provider gets many more attempts before
+//! the credential it is holding actually expires.
+//!
+//! The deadline is not a stall: a caller that has nothing usable is told so
+//! immediately, carrying the error that caused the backoff, rather than
+//! queueing behind a call that is not going to be made.
 
 use super::{SessionCredentials, SessionSource};
 
@@ -57,11 +78,38 @@ pub(crate) const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 /// the floor below which serving the cached credential stops being a kindness.
 pub(crate) const MINIMUM_VALIDITY: Duration = Duration::from_secs(30);
 
+/// How long to wait after the first failed refresh before trying again.
+///
+/// Short, because most failures are a single dropped packet or a throttle that
+/// clears immediately, and the cost of one extra call is nothing.
+pub(crate) const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The ceiling the backoff doubles up to.
+///
+/// Thirty seconds against a five-minute [`REFRESH_MARGIN`] leaves at least
+/// nine attempts inside the window where the cached credential is still good,
+/// which is plenty for an outage to clear, while capping a wedged provider at
+/// two calls a minute per node instead of one per request.
+pub(crate) const MAXIMUM_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// What a failed refresh left behind.
+struct Backoff {
+    /// No fetch is attempted before this instant.
+    retry_at_millis: u64,
+    /// How long the wait was, so the next one can double it.
+    waited: Duration,
+    /// The failure that caused it, so a caller with nothing usable is told
+    /// what actually went wrong instead of "backing off".
+    error: ObjectError,
+}
+
 /// Caches one session credential and replaces it before it expires.
 pub(crate) struct RefreshingCredentials<C: Clock, S: SessionSource> {
     clock: C,
     source: S,
     cached: RwLock<Option<SessionCredentials>>,
+    /// Set by a failed fetch and cleared by a successful one.
+    backoff: RwLock<Option<Backoff>>,
     /// Held for the duration of one fetch, so a burst of requests arriving at
     /// the refresh boundary produces one call to the metadata service and not
     /// one per request.
@@ -74,8 +122,47 @@ impl<C: Clock, S: SessionSource> RefreshingCredentials<C, S> {
             clock,
             source,
             cached: RwLock::new(None),
+            backoff: RwLock::new(None),
             refreshing: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The recorded failure if the retry deadline has not passed.
+    fn backing_off(&self, now_millis: u64) -> Option<ObjectError> {
+        let backoff = self
+            .backoff
+            .read()
+            .expect("credential cache is not poisoned");
+        let backoff = backoff.as_ref()?;
+        (now_millis < backoff.retry_at_millis).then(|| backoff.error.clone())
+    }
+
+    /// Records a failure and returns how long the next attempt waits.
+    ///
+    /// Doubling from the previous wait rather than from zero, and only when
+    /// the previous wait is still the live one — a failure after a success
+    /// starts over, because it is a new outage rather than a continuing one.
+    fn record_failure(&self, now_millis: u64, error: ObjectError) -> Duration {
+        let mut backoff = self
+            .backoff
+            .write()
+            .expect("credential cache is not poisoned");
+        let waited = backoff.as_ref().map_or(INITIAL_RETRY_BACKOFF, |previous| {
+            (previous.waited * 2).min(MAXIMUM_RETRY_BACKOFF)
+        });
+        *backoff = Some(Backoff {
+            retry_at_millis: now_millis.saturating_add(waited.as_millis() as u64),
+            waited,
+            error,
+        });
+        waited
+    }
+
+    fn clear_backoff(&self) {
+        *self
+            .backoff
+            .write()
+            .expect("credential cache is not poisoned") = None;
     }
 
     /// The cached credential if it has more than `margin` of life left.
@@ -105,6 +192,24 @@ impl<C: Clock, S: SessionSource> RefreshingCredentials<C, S> {
     }
 }
 
+/// The error for a caller that has nothing signable at all.
+///
+/// The kind is carried through from the underlying failure rather than
+/// flattened to `AccessDenied`. A metadata service that timed out and a trust
+/// policy that refuses this principal are not the same problem, and only the
+/// first is worth trying again; collapsing them tells the caller the outage is
+/// permanent, which is the one thing it is not.
+fn no_usable_credential<S: SessionSource>(source: &S, error: &ObjectError) -> ObjectError {
+    let message = format!(
+        "no usable AWS credential from {}: {error}",
+        source.describe()
+    );
+    match error {
+        ObjectError::Transient(_) => ObjectError::Transient(message),
+        _ => ObjectError::AccessDenied(message),
+    }
+}
+
 #[async_trait]
 impl<C: Clock, S: SessionSource> CredentialsProvider for RefreshingCredentials<C, S> {
     async fn credentials(&self) -> ObjectResult<Credentials> {
@@ -112,6 +217,18 @@ impl<C: Clock, S: SessionSource> CredentialsProvider for RefreshingCredentials<C
         // without touching the refresh lock at all.
         if let Some(credentials) = self.cached_with(self.clock.now_millis(), REFRESH_MARGIN) {
             return Ok(credentials);
+        }
+
+        // A refresh failed recently and the deadline has not passed. Serve
+        // what is cached, or report the failure that caused the backoff, but
+        // do not call the provider: it is the same provider that just failed,
+        // and one call per request would be a self-inflicted denial of
+        // service on top of whatever is already wrong.
+        if let Some(error) = self.backing_off(self.clock.now_millis()) {
+            return match self.cached_with(self.clock.now_millis(), MINIMUM_VALIDITY) {
+                Some(credentials) => Ok(credentials),
+                None => Err(no_usable_credential(&self.source, &error)),
+            };
         }
 
         let guard = match self.refreshing.try_lock() {
@@ -129,37 +246,44 @@ impl<C: Clock, S: SessionSource> CredentialsProvider for RefreshingCredentials<C
         };
 
         // Re-check under the lock: whoever we waited for may have filled the
-        // cache, in which case there is nothing left to do.
+        // cache, or failed and set a deadline, in which case there is nothing
+        // left to do here either way.
         if let Some(credentials) = self.cached_with(self.clock.now_millis(), REFRESH_MARGIN) {
             return Ok(credentials);
+        }
+        if let Some(error) = self.backing_off(self.clock.now_millis()) {
+            return match self.cached_with(self.clock.now_millis(), MINIMUM_VALIDITY) {
+                Some(credentials) => Ok(credentials),
+                None => Err(no_usable_credential(&self.source, &error)),
+            };
         }
 
         match self.source.fetch().await {
             Ok(session) => {
                 let credentials = session.credentials.clone();
                 self.store(session);
+                self.clear_backoff();
                 drop(guard);
                 Ok(credentials)
             }
             Err(error) => {
+                let waited = self.record_failure(self.clock.now_millis(), error.clone());
                 drop(guard);
                 match self.cached_with(self.clock.now_millis(), MINIMUM_VALIDITY) {
                     Some(credentials) => {
                         // Deliberately not an error: the node can still sign,
-                        // and there is time for the next request to try again.
+                        // and there is time for the next attempt to succeed.
                         // The message names the source, never the credential.
                         tracing::warn!(
                             source = %self.source.describe(),
                             error = %error,
+                            retry_in_seconds = waited.as_secs(),
                             "refreshing AWS credentials failed; continuing with the cached \
                              credential until it expires"
                         );
                         Ok(credentials)
                     }
-                    None => Err(ObjectError::AccessDenied(format!(
-                        "no usable AWS credential from {}: {error}",
-                        self.source.describe()
-                    ))),
+                    None => Err(no_usable_credential(&self.source, &error)),
                 }
             }
         }
@@ -208,7 +332,12 @@ mod tests {
 
     /// A source that hands out numbered credentials and can be told to fail.
     struct ScriptedSource {
+        /// Successful fetches, which is what names the credential.
         fetches: AtomicU64,
+        /// Every call, successful or not. This is the one the backoff tests
+        /// care about: the defect they protect against is a *failed* call
+        /// being repeated, which `fetches` cannot see.
+        attempts: AtomicU64,
         lifetime: Duration,
         clock: TestClock,
         fail: Arc<std::sync::atomic::AtomicBool>,
@@ -218,6 +347,7 @@ mod tests {
         fn new(clock: TestClock, lifetime: Duration) -> Self {
             Self {
                 fetches: AtomicU64::new(0),
+                attempts: AtomicU64::new(0),
                 lifetime,
                 clock,
                 fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -228,6 +358,7 @@ mod tests {
     #[async_trait]
     impl SessionSource for ScriptedSource {
         async fn fetch(&self) -> ObjectResult<SessionCredentials> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err(ObjectError::Transient(
                     "metadata service is down".to_string(),
@@ -303,8 +434,162 @@ mod tests {
 
         let result = provider.credentials().await;
         assert!(
-            matches!(result, Err(ObjectError::AccessDenied(_))),
+            result.is_err(),
             "an expired credential must surface as a failure, not be signed with: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_source_failure_stays_retryable_to_the_caller() {
+        // A metadata service that timed out and a trust policy that refuses
+        // this principal are not the same problem, and flattening both to
+        // AccessDenied tells the caller a passing outage is permanent.
+        let clock = TestClock::at(1_000_000);
+        let provider = provider(clock.clone(), Duration::from_secs(3600));
+        provider.source.fail.store(true, Ordering::SeqCst);
+
+        let error = provider.credentials().await.expect_err("nothing to serve");
+        assert!(error.is_retryable(), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_is_not_retried_on_every_request() {
+        // The defect: the cached credential is still inside REFRESH_MARGIN, so
+        // without a deadline every following request takes the lock and calls
+        // the provider again. A provider outage would become one call per
+        // request for as long as it lasted.
+        let clock = TestClock::at(1_000_000);
+        let provider = provider(clock.clone(), Duration::from_secs(3600));
+        provider.credentials().await.expect("sourced");
+        clock.advance(Duration::from_secs(3600) - REFRESH_MARGIN);
+
+        provider.source.fail.store(true, Ordering::SeqCst);
+        for _ in 0..50 {
+            provider
+                .credentials()
+                .await
+                .expect("the cached credential is still good");
+        }
+
+        assert_eq!(
+            provider.source.attempts.load(Ordering::SeqCst),
+            2,
+            "one successful fetch and exactly one failed attempt; the other 49 requests must \
+             have been served from cache without touching the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_retry_deadline_lets_a_recovered_provider_back_in() {
+        let clock = TestClock::at(1_000_000);
+        let provider = provider(clock.clone(), Duration::from_secs(3600));
+        provider.credentials().await.expect("sourced");
+        clock.advance(Duration::from_secs(3600) - REFRESH_MARGIN);
+
+        provider.source.fail.store(true, Ordering::SeqCst);
+        provider.credentials().await.expect("served from cache");
+        clock.advance(INITIAL_RETRY_BACKOFF);
+
+        provider.source.fail.store(false, Ordering::SeqCst);
+        let credentials = provider.credentials().await.expect("refreshed");
+        assert_eq!(
+            credentials.access_key_id, "AKID2",
+            "backing off must not mean giving up: {credentials:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backoff_doubles_and_is_capped() {
+        let clock = TestClock::at(1_000_000);
+        let provider = provider(clock.clone(), Duration::from_secs(3600));
+        provider.credentials().await.expect("sourced");
+        clock.advance(Duration::from_secs(3600) - REFRESH_MARGIN);
+        provider.source.fail.store(true, Ordering::SeqCst);
+
+        let mut expected = INITIAL_RETRY_BACKOFF;
+        for attempt in 2..12u64 {
+            provider.credentials().await.expect("served from cache");
+            assert_eq!(
+                provider.source.attempts.load(Ordering::SeqCst),
+                attempt,
+                "an attempt should have been made once the deadline passed"
+            );
+            // One tick short of the deadline: still no call.
+            clock.advance(expected - Duration::from_millis(1));
+            provider.credentials().await.expect("served from cache");
+            assert_eq!(
+                provider.source.attempts.load(Ordering::SeqCst),
+                attempt,
+                "the deadline had not passed yet"
+            );
+            clock.advance(Duration::from_millis(1));
+            expected = (expected * 2).min(MAXIMUM_RETRY_BACKOFF);
+        }
+        assert_eq!(
+            expected, MAXIMUM_RETRY_BACKOFF,
+            "the backoff must stop growing well inside the refresh margin"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backoff_never_outlasts_the_refresh_margin() {
+        // The invariant that makes backing off safe: even fully backed off,
+        // there is time for many attempts before the credential this provider
+        // is still serving actually expires.
+        assert!(
+            MAXIMUM_RETRY_BACKOFF * 8 < REFRESH_MARGIN,
+            "a provider that backs off for longer than it has credential left is just broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_resets_the_backoff() {
+        let clock = TestClock::at(1_000_000);
+        let provider = provider(clock.clone(), Duration::from_secs(3600));
+        provider.credentials().await.expect("sourced");
+
+        // Fail once, wait out the deadline, succeed.
+        clock.advance(Duration::from_secs(3600) - REFRESH_MARGIN);
+        provider.source.fail.store(true, Ordering::SeqCst);
+        provider.credentials().await.expect("served from cache");
+        clock.advance(INITIAL_RETRY_BACKOFF);
+        provider.source.fail.store(false, Ordering::SeqCst);
+        provider.credentials().await.expect("refreshed");
+
+        // A later, unrelated outage starts its backoff over rather than
+        // resuming where the previous one left off.
+        clock.advance(Duration::from_secs(3600) - REFRESH_MARGIN);
+        provider.source.fail.store(true, Ordering::SeqCst);
+        let before = provider.source.attempts.load(Ordering::SeqCst);
+        provider.credentials().await.expect("served from cache");
+        clock.advance(INITIAL_RETRY_BACKOFF);
+        provider.credentials().await.expect("served from cache");
+        assert_eq!(
+            provider.source.attempts.load(Ordering::SeqCst),
+            before + 2,
+            "a fresh outage waits INITIAL_RETRY_BACKOFF, not whatever the last one ended on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_with_nothing_usable_is_told_why_rather_than_stalled() {
+        let clock = TestClock::at(1_000_000);
+        let provider = provider(clock.clone(), Duration::from_secs(3600));
+        provider.source.fail.store(true, Ordering::SeqCst);
+
+        provider.credentials().await.expect_err("nothing to serve");
+        let error = provider
+            .credentials()
+            .await
+            .expect_err("still nothing to serve");
+        assert!(
+            format!("{error}").contains("metadata service is down"),
+            "the backoff must carry the failure that caused it: {error}"
+        );
+        assert_eq!(
+            provider.source.attempts.load(Ordering::SeqCst),
+            1,
+            "a cold start against a dead provider must not call it once per request either"
         );
     }
 
