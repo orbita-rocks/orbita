@@ -16,6 +16,9 @@ publish = false
 [dependencies]
 orbita-core.workspace = true
 orbita-runtime.workspace = true
+# Only for the hydration hook: it is called through a trait object, and an
+# async method in one of those is not something the language does yet.
+async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

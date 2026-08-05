@@ -45,26 +45,40 @@
 //! configured. [`ServerConfig::peers`] still seeds the directory, which is
 //! what a node that starts before the control plane needs.
 //!
-//! What is not built is a snapshot. A replica that falls further behind than
-//! its owner's log still holds cannot be caught up, and says so rather than
-//! pretending; the partition runs on the copies it has.
-//!
 //! Owners periodically publish applied writes as partition-v1 segments. A WAL
 //! checkpoint follows only after the manifest compare-and-swap succeeds, so a
 //! failed or deposed writer always retains the log range recovery still needs.
-//! Until hydration lands in issue #17, a replica that misses beyond the
-//! retained WAL cannot catch up from the manifest and stays unavailable. WAL
-//! truncation is live now; snapshot recovery is deliberately not implied.
 //!
-//! That is a sharp edge rather than a quiet one. The owner names the replica,
-//! where it stopped, and the oldest entry it still holds, through
-//! [`Server::replicas_beyond_retention`], and that drives the
-//! `replicas-recoverable` readiness condition so the answer leaves the process
-//! and a rolling update stops at a partition permanently short a copy. The
-//! owner learns where each replica's log ends from the lease heartbeat, so a
-//! restarted or promoted owner reaches the same verdict without writing
-//! anything. `src/retention.rs` runs the whole cliff under the simulator and is
-//! also the tracking test for #17.
+//! A node that has to take on a partition builds it from that manifest rather
+//! than from a peer, which is the operational payoff ADR 0006 was adopted for:
+//! replacing a worker is a download, and it costs the replacement rather than
+//! taxing a healthy node. Hydration happens when a partition is opened, and
+//! again in place when a replica turns out to have fallen further behind than
+//! its owner's retained log. Either way the log takes the horizon it was built
+//! to as where its history starts, so replication resumes above it and WAL
+//! recovery replays only the tail the manifest does not cover. That horizon is
+//! re-derived from the manifest at every open rather than written into the log,
+//! which is what keeps a pre-finalization rollback free.
+//!
+//! The manifest's epoch travels with its horizon, because a manifest is
+//! published by a fenced compare-and-swap and so is evidence about ownership. A
+//! replica that hydrates on behalf of an owner the manifest outranks refuses
+//! the append rather than acknowledging a write the real owner will truncate.
+//!
+//! Hydration is what turns the retention cliff from a dead end into a slow
+//! path. A replica past the owner's retained log is still named, with where it
+//! stopped and the oldest entry the owner still holds, through
+//! [`Server::replicas_beyond_retention`], and that still drives the
+//! `replicas-recoverable` readiness condition; what changed is that the
+//! condition now clears on its own, because the replica rebuilds from the
+//! bucket and the next append it acknowledges moves it back to following.
+//! `src/retention.rs` runs the whole cliff under the simulator and asserts the
+//! recovery rather than the dead end.
+//!
+//! What remains unavailable is the narrow case where both are exhausted: a
+//! replica beyond the retained log whose partition has never been flushed, or
+//! whose manifest is itself behind the gap. That is reported rather than
+//! papered over, and the partition runs on the copies it has.
 
 #![forbid(unsafe_code)]
 
@@ -76,12 +90,16 @@ mod forwarding;
 mod frame;
 mod fs_store;
 mod host;
+#[cfg(test)]
+mod hydration;
 mod lease;
 #[cfg(test)]
 mod linearizability;
 mod map_source;
 mod node;
 mod pending;
+#[cfg(test)]
+mod placement;
 mod proxy;
 mod readiness;
 mod replication;
@@ -124,7 +142,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A running worker.
+/// A running node.
 ///
 /// Holding one means the node is serving. Dropping one without calling
 /// [`Server::shutdown`] leaves the listener running until the process exits,
@@ -372,7 +390,12 @@ impl Server {
             }
         });
 
-        tracing::info!(node = config.node_id.get(), %local_addr, %peer_addr, "orbita worker is serving");
+        let role = if config.leader_member {
+            "leader"
+        } else {
+            "worker"
+        };
+        tracing::info!(node = config.node_id.get(), role, %local_addr, %peer_addr, "node listeners are serving");
         Ok(Self {
             local_addr,
             peer_addr,
@@ -484,10 +507,12 @@ impl Server {
         interval: Duration,
         readiness: Arc<ReadinessGate>,
     ) {
+        let mut convergence_logged = false;
         loop {
             let Some(live) = node.upgrade() else {
                 return;
             };
+            let node_id = live.id();
             let version = live.map().version();
             let progress = live.progress().await;
             // Reported before the directory is read, so that this node's own
@@ -534,6 +559,37 @@ impl Server {
             directory.refresh().await;
             if let Err(error) = live.refresh_map().await {
                 tracing::debug!(%error, "could not refresh the partition map");
+            }
+            if !convergence_logged && readiness.is_ready() {
+                let map = live.map();
+                let held_partitions = map.held_by(node_id).count();
+                match &leader_controller {
+                    Some(controller) => {
+                        let leader = controller.log_leader().await.map_or(0, |id| id.get());
+                        let raft_role = if leader == node_id.get() {
+                            "leader"
+                        } else {
+                            "follower"
+                        };
+                        tracing::info!(
+                            node = node_id.get(),
+                            leader,
+                            raft_role,
+                            map_version = map.version().get(),
+                            held_partitions,
+                            "leader member converged with the group and is ready"
+                        );
+                    }
+                    None => {
+                        tracing::info!(
+                            node = node_id.get(),
+                            map_version = map.version().get(),
+                            held_partitions,
+                            "worker joined the leader group and is ready"
+                        );
+                    }
+                }
+                convergence_logged = true;
             }
             drop(live);
             tokio::time::sleep(interval).await;
@@ -646,6 +702,22 @@ impl Server {
                     .await;
             }
             loop {
+                // Refetched every pass rather than only after a handoff is
+                // committed. Draining aborted the control loop, which is the
+                // only thing that otherwise refreshes the map, so a placement
+                // the leader group committed a moment before SIGTERM would
+                // never reach this node: it would keep an empty peer list, no
+                // replica would ever catch up, and the control plane would
+                // refuse the handoff for as long as the budget allowed.
+                if let Err(error) = node.refresh_map().await {
+                    tracing::debug!(%error, "could not refresh the partition map while draining");
+                }
+                // And with write admission closed, an append is never going to
+                // carry the log to a replica that is behind, so the owner
+                // gives up the tail no client was told about and pushes what
+                // remains. This is what makes the handoff possible rather than
+                // merely permitted.
+                node.prepare_handoff().await;
                 let _ = reporter
                     .report(node.map().version(), node.progress().await, false, true)
                     .await;

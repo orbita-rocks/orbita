@@ -1,33 +1,44 @@
 //! What happens to a replica that falls past its owner's retained log.
 //!
-//! WAL truncation is live. Hydrating a partition from the segments an owner
-//! published is not, and lands in issue #17. Between those two facts sits a
-//! cliff: a replica that misses more than the owner's retained log asks for
-//! entries that no longer exist anywhere a log can produce them, and there is
-//! no path back for it in this release. Issue #16's review accepted that as an
-//! explicit merge tradeoff.
+//! WAL truncation is live, and so, since issue #17, is hydration. Between
+//! those two facts used to sit a cliff: a replica that missed more than the
+//! owner's retained log asked for entries no log could produce, and there was
+//! no path back for it. Issue #16's review accepted that as an explicit merge
+//! tradeoff, and this scenario existed to pin what the dead end looked like
+//! from outside.
 //!
-//! An accepted tradeoff that nothing exercises is a tradeoff that drifts. This
-//! runs the cliff under the deterministic simulator and pins what it looks
-//! like from outside: the owner names the failure and fails the
-//! `replicas-recoverable` readiness condition, the replica does not serve a
-//! read from its own state, and its log stops where it stopped rather than
-//! resuming above the hole.
+//! It now pins the recovery instead. The cliff is still reached — the owner
+//! checkpoints away the entries the stranded node needs, and this asserts that
+//! before healing the link, because a scenario that cannot tell "recovered
+//! from the cliff" from "never fell off it" proves nothing. What changed is
+//! what happens next: the stranded node rebuilds the partition from the
+//! segments the owner published, the first append it then acknowledges moves
+//! it back to following, the owner has nothing left to report, and the
+//! `replicas-recoverable` readiness condition clears on its own.
 //!
-//! It also pins the two ways that answer could quietly become useless. An
-//! owner that restarts and writes nothing has to reach the same verdict, or a
-//! promotion turns a stranded partition back into a healthy-looking one; and
+//! It also still pins the two ways that answer could quietly become useless.
+//! An owner that restarts and writes nothing has to reach the same verdict, or
+//! a promotion turns the partition's health into an accident of timing; and
 //! the verdict has to leave the process, or it is the log line this replaced.
 //!
-//! # Deleting the old expectation is required rather than optional
+//! # The bucket is the cluster's, not the node's
 //!
-//! [`PAST_THE_HORIZON`] says which of two outcomes the cluster produces. It is
-//! [`PastTheHorizon::FailsLoudly`] today. When issue #17 lands it becomes
-//! [`PastTheHorizon::Recovers`], and the arm below it spells out what
-//! hydration has to make true. Hydration that ships without moving it fails
-//! this test, because a replica that recovers does not satisfy the assertions
-//! that say it cannot, so the flip cannot be forgotten and then discovered by
-//! an operator.
+//! Every worker is configured with one object store and `PartitionPath`
+//! carries no node component, so a partition's segments and manifest live at
+//! one place every node can read. That is the premise of ADR 0006 and the
+//! reason replacing a worker is a download. This scenario models it that way;
+//! a store per node would make hydration impossible by construction and would
+//! leave this test passing for a reason that has nothing to do with what it
+//! claims.
+//!
+//! # The old expectation is kept as a contrast, not as the answer
+//!
+//! [`PAST_THE_HORIZON`] says which of two outcomes the cluster produces, and
+//! issue #17 moved it from [`PastTheHorizon::FailsLoudly`] to
+//! [`PastTheHorizon::Recovers`]. The losing arm stays because it is still what
+//! the cluster does whenever hydration has nothing to offer — a partition that
+//! has never been flushed, or a manifest that is itself behind the gap — and
+//! because a flip with the other side deleted is a flip nobody can read.
 
 use crate::map_source::{BoxedMapSource, StaticMapSource};
 use crate::node::{DataLayout, Node};
@@ -49,22 +60,24 @@ use std::time::Duration;
 /// retained write-ahead log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PastTheHorizon {
-    /// Today. The owner records the replica as unrecoverable and says so, the
-    /// replica leaves the read set, and nothing invents the entries it is
-    /// missing.
-    FailsLoudly,
-    /// Issue #17. The owner's published segments are turned back into a
-    /// caught-up replica, and the cliff becomes a slow path rather than a
-    /// dead end.
+    /// Before issue #17. The owner records the replica as unrecoverable and
+    /// says so, the replica leaves the read set, and nothing invents the
+    /// entries it is missing.
     ///
-    /// Never constructed until then, which is exactly what makes it the thing
-    /// hydration has to change. The allow goes when the constant does.
+    /// Kept as the contrast rather than deleted: it is the outcome this
+    /// scenario pinned before hydration existed, and it is what the cluster
+    /// still does whenever hydration has nothing to offer — a partition that
+    /// has never been flushed, or a manifest that is itself behind the gap.
     #[allow(dead_code)]
+    FailsLoudly,
+    /// Today, since issue #17. The owner's published segments are turned back
+    /// into a caught-up replica, and the cliff is a slow path rather than a
+    /// dead end.
     Recovers,
 }
 
-/// The outcome this build produces. See the module docs: issue #17 moves this.
-const PAST_THE_HORIZON: PastTheHorizon = PastTheHorizon::FailsLoudly;
+/// The outcome this build produces. Moved by issue #17; see the module docs.
+const PAST_THE_HORIZON: PastTheHorizon = PastTheHorizon::Recovers;
 
 const KEYSPACE: &str = "default";
 const PARTITION: PartitionId = PartitionId(1);
@@ -132,12 +145,18 @@ fn cluster_map() -> PartitionMap {
 
 /// Where one node persists.
 ///
-/// An in-memory store per node, the way each node owns its own bucket prefix
-/// or data directory in production. Held by the scenario rather than made
-/// inside `start_node`, because a restart has to come back to the same objects.
-fn layout() -> DataLayout {
+/// The object store is the cluster's, not the node's. Every worker is
+/// configured with one bucket and `PartitionPath` carries no node component,
+/// so a partition's segments and manifest live at one place that every node
+/// can read. That is the whole premise of ADR 0006 and of hydration: replacing
+/// a worker is a download because the objects are already somewhere the
+/// replacement can reach.
+///
+/// The write-ahead log is the node's own, and stays so — each node has its own
+/// simulated disk under `wal_root`.
+fn layout(store: &Arc<MemoryStore>) -> DataLayout {
     DataLayout {
-        store: Arc::new(MemoryStore::new()),
+        store: Arc::clone(store) as Arc<dyn orbita_objectstore::ObjectStore>,
         wal_root: "wal".to_string(),
         wal_segment_bytes: WAL_SEGMENT_BYTES,
     }
@@ -260,7 +279,8 @@ fn scenario(seed: u64) -> Result<(), Failure> {
     // Shorter than the production default so a run covers many heartbeats in a
     // few hundred milliseconds of virtual time.
     let lease = Duration::from_millis(150);
-    let owner_layout = layout();
+    let bucket = Arc::new(MemoryStore::new());
+    let owner_layout = layout(&bucket);
     let mut owning = start_node(
         &sim,
         sim.add_node(OWNER),
@@ -268,8 +288,15 @@ fn scenario(seed: u64) -> Result<(), Failure> {
         lease,
         owner_layout.clone(),
     );
-    let healthy = start_node(&sim, sim.add_node(HEALTHY), HEALTHY, lease, layout()).node;
-    let stranded = start_node(&sim, sim.add_node(STRANDED), STRANDED, lease, layout()).node;
+    let healthy = start_node(&sim, sim.add_node(HEALTHY), HEALTHY, lease, layout(&bucket)).node;
+    let stranded = start_node(
+        &sim,
+        sim.add_node(STRANDED),
+        STRANDED,
+        lease,
+        layout(&bucket),
+    )
+    .node;
     let clock = sim.runtime(OWNER).clock().clone();
 
     // The owner's lease heartbeat, which is what puts a replica in the read
@@ -343,6 +370,27 @@ fn scenario(seed: u64) -> Result<(), Failure> {
     {
         let flushing = Arc::clone(&owner);
         sim.block_on(async move { flushing.flush_owned().await });
+    }
+
+    // The cliff, established rather than assumed. Under `Recovers` the
+    // stranded node ends up caught up either way, so without this the scenario
+    // could not tell "hydration rescued a replica that had fallen past the
+    // log" from "the checkpoint never dropped what it needed and an ordinary
+    // catch-up would have carried it". That distinction is the entire subject.
+    let retained_from = {
+        let owner = Arc::clone(&owner);
+        sim.block_on(async move { owner.retained_from(PARTITION).await })
+    };
+    match retained_from {
+        Some(oldest) if oldest > stopped_at.next() => {}
+        other => {
+            return Err(sim.failure(format!(
+                "the owner's oldest retained entry is {other:?}, which is not above the {} the \
+                 stranded node needs next, so it never fell past the horizon and this seed \
+                 proves nothing about recovering from it",
+                stopped_at.next()
+            )))
+        }
     }
 
     sim.heal(OWNER, STRANDED);

@@ -961,6 +961,7 @@ dependencies = [
 name = "orbita-wal"
 version = "0.1.0-dev"
 dependencies = [
+ "async-trait",
  "bytes",
  "crc32fast",
  "orbita-core",

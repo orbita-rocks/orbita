@@ -106,6 +106,12 @@ struct Inner<R: Runtime> {
     durable: Lamport,
     applied_through: Lamport,
     epoch: Epoch,
+    /// The manifest horizon this node's storage was built from, if it was.
+    ///
+    /// Deliberately not persisted here. See [`PartitionLog::hydrate`] for why
+    /// the log is the wrong place to write this down, and where the fact comes
+    /// from after a restart instead.
+    hydrated_through: Lamport,
     /// The oldest Lamport still on disk. See
     /// [`PartitionLog::retained_from`]; kept here so it moves under the same
     /// lock as the segment list it describes.
@@ -184,6 +190,7 @@ impl<R: Runtime> PartitionLog<R> {
                 durable: recovery.durable_lamport,
                 applied_through: recovery.applied_through,
                 epoch: recovery.epoch,
+                hydrated_through: Lamport::ZERO,
                 retained_from: scan.retained_from,
             }),
             recovery,
@@ -296,9 +303,19 @@ impl<R: Runtime> PartitionLog<R> {
         }
         write_record(&mut inner, &LogRecord::Checkpoint { applied_through }).await?;
         inner.applied_through = applied_through;
+        self.drop_applied_segments(&mut inner, applied_through)
+            .await
+    }
 
-        // Only a prefix of segments can go: entries are ordered, so the first
-        // segment holding an unapplied entry stops the sweep.
+    /// Removes the segments holding nothing above `applied_through`.
+    ///
+    /// Only a prefix of segments can go: entries are ordered, so the first
+    /// segment holding an unapplied entry stops the sweep.
+    async fn drop_applied_segments(
+        &self,
+        inner: &mut Inner<R>,
+        applied_through: Lamport,
+    ) -> Result<()> {
         let current_seq = inner.segments.last().map_or(0, |s| s.seq);
         let mut removable = Vec::new();
         for segment in &inner.segments {
@@ -327,6 +344,82 @@ impl<R: Runtime> PartitionLog<R> {
             inner.retained_from = inner.retained_from.max(dropped.next());
         }
         Ok(())
+    }
+
+    /// The horizon this log was last hydrated to from object storage.
+    ///
+    /// Exposed so a caller can tell "this node holds nothing below here
+    /// locally" from "this node has logged nothing", which look identical from
+    /// [`PartitionLog::durable_lamport`] alone.
+    pub async fn hydrated_through(&self) -> Lamport {
+        self.inner.lock().await.hydrated_through
+    }
+
+    /// Adopts a manifest horizon as where this log's history starts, so it
+    /// resumes there instead of at the beginning.
+    ///
+    /// This is the log's half of hydration under
+    /// [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md).
+    /// Rebuilding the index from a manifest makes a node current as of the
+    /// manifest's horizon, but replication is a conversation about log
+    /// positions: a node that rebuilt its data and still reported position zero
+    /// would ask its owner to resend writes the owner checkpointed away, be
+    /// told they are gone, and stay unavailable forever. Worse, it would start
+    /// its own sequence at one and hand out versions the segments already
+    /// contain. Adopting the horizon is what turns replacing a worker into a
+    /// download.
+    ///
+    /// Claiming durability for entries this file never held is sound because
+    /// the manifest is a stronger durability claim than the log: it is only
+    /// published by the epoch-fenced owner, and only for writes that were
+    /// already acknowledged and applied. It also marks them applied, since the
+    /// segments are exactly where an apply would have put them.
+    ///
+    /// **In memory only, and that is the whole design.** The obvious
+    /// implementation writes a new record kind into the log, and it cannot be
+    /// had at this format version: a reader that predates the kind treats it
+    /// as malformed, stops there, and truncates everything after it, so a
+    /// rollback inside the pre-finalization window would leave a node whose
+    /// log reopens at zero while its storage sits at the horizon. It would
+    /// then reissue Lamports the segments already hold, acknowledge them, and
+    /// have them silently dropped on apply. `docs/UPGRADES.md` promises that
+    /// window costs nothing, and a persisted marker cannot keep that promise
+    /// without a cluster-version gate that would leave the feature dark until
+    /// an operator finalized.
+    ///
+    /// Nothing is lost by not persisting it, because the fact is not this
+    /// log's to remember. The manifest is read by `Partition::open` before
+    /// this log is opened at all, on both the owner and replica paths, so the
+    /// horizon is re-derived from its source on every start. Writing it here
+    /// would be caching a value that is already free.
+    ///
+    /// Idempotent, and a no-op when the log is already at or ahead of
+    /// `through`. Returns whether the position moved.
+    pub async fn hydrate(&self, through: Lamport) -> bool {
+        let mut inner = self.inner.lock().await;
+        if through <= inner.durable {
+            return false;
+        }
+        inner.hydrated_through = inner.hydrated_through.max(through);
+        inner.durable = through;
+        inner.applied_through = inner.applied_through.max(through);
+        if let Some(last) = inner.segments.last_mut() {
+            last.max_lamport = last.max_lamport.max(through);
+        }
+        // History in this file now starts above the horizon, and saying so is
+        // not bookkeeping. This branch is reached because the horizon is above
+        // everything the file holds, so every entry in it is one the manifest
+        // already covers and none of them can be handed to anybody. A node
+        // promoted after hydrating would otherwise offer a lagging replica a
+        // backfill from the beginning of time and then fail to produce it,
+        // which is exactly the unrecoverable-failure-that-reads-as-transient
+        // that [`CatchUp::BeyondRetention`] exists to prevent.
+        inner.retained_from = inner.retained_from.max(through.next());
+        // Segments are left alone. Reclaiming them is the checkpoint's job and
+        // it happens on the next flush anyway, and a hydration that deleted
+        // them would be destroying the only bytes that let a previous binary
+        // recover this log correctly after a rollback.
+        true
     }
 
     /// Reads back entries above `after`, for retransmitting to a replica that
@@ -416,17 +509,34 @@ impl<R: Runtime> PartitionLog<R> {
 
         inner.current = file;
         inner.current_size = offset;
-        inner.durable = lamport;
+        // A hydrated horizon is not this file's to give up. Those writes are in
+        // the partition's objects, published by a fenced owner for records that
+        // were already acknowledged, so a newer owner naming a lower end of
+        // history is describing where the log stops rather than where the data
+        // does. Letting the cut lower this would make the node ask to be sent
+        // writes it already holds and can no longer be sent.
+        //
+        // This floor never fights a quiesce, which is the other caller. The
+        // committed prefix is at or above the manifest horizon by construction:
+        // a manifest only ever covers writes that were applied, and an apply
+        // only ever happens after the acknowledgement that moves the prefix.
+        inner.durable = lamport.max(inner.hydrated_through);
+        let durable = inner.durable;
         // Cutting a tail can leave the retained run empty, and an empty log's
-        // history starts at whatever it would write next.
-        inner.retained_from = inner.retained_from.min(lamport.next());
+        // history starts at whatever it would write next. Measured from the
+        // durable position rather than from the cut, so a log floored at a
+        // hydrated horizon does not claim it can serve entries below the
+        // horizon that it does not hold.
+        inner.retained_from = inner.retained_from.min(durable.next());
         if let Some(last) = inner.segments.last_mut() {
-            last.max_lamport = lamport;
+            last.max_lamport = durable;
         }
 
         // Cutting the tail can take the fence and checkpoint records with it,
         // since they sit wherever they were written. Writing them again keeps
-        // a restart from forgetting which owner this node accepted.
+        // a restart from forgetting which owner this node accepted. The
+        // hydrated horizon needs no such rescue: it is re-derived from the
+        // manifest at every open rather than stored here.
         let epoch = inner.epoch;
         let applied_through = inner.applied_through;
         if epoch > Epoch::ZERO {

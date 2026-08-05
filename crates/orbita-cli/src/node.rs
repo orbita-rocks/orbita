@@ -121,21 +121,31 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
     let joining =
         config.node.role == Role::Worker && !options.dev && !config.cluster.leader_peers.is_empty();
     let mut backoff = JoinBackoff::new(&config.cluster);
+    let mut join_attempts = 0u64;
 
     let mut server = loop {
         match Server::start(server_config(config, options, listen, peer_listen)?).await {
             Ok(server) => break server,
             Err(error) if joining => {
+                join_attempts += 1;
                 let Some(delay) = backoff.next_delay() else {
                     return Err(anyhow::anyhow!("{error}"))
                         .context(join_give_up_message(&config.cluster));
                 };
-                tracing::warn!(
-                    error = %error,
-                    leader_peers = %config.cluster.leader_peers.join(","),
-                    retry_in_millis = delay.as_millis() as u64,
-                    "cannot join the leader group yet, retrying"
-                );
+                if join_attempts == 1 {
+                    tracing::info!(
+                        leader_peers = %config.cluster.leader_peers.join(","),
+                        retry_in_millis = delay.as_millis() as u64,
+                        "waiting for the leader group to become available"
+                    );
+                } else {
+                    tracing::debug!(
+                        %error,
+                        join_attempts,
+                        retry_in_millis = delay.as_millis() as u64,
+                        "leader group is not available yet"
+                    );
+                }
                 tokio::time::sleep(delay).await;
             }
             Err(error) => {
@@ -146,7 +156,7 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
 
     // Startup notes go to stderr so that anything a later command pipes stays
     // clean.
-    eprintln!("orbita: serving on {}", server.local_addr());
+    eprintln!("orbita: listening on {}", server.local_addr());
 
     // Ctrl-C is the ordinary way a foreground node stops, and a container stop
     // sends the same signal. Draining rather than dropping means in-flight

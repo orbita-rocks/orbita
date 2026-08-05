@@ -25,7 +25,7 @@ use crate::host::PartitionHost;
 
 use orbita_core::{Lamport, PartitionId};
 use orbita_runtime::Runtime;
-use orbita_wal::{ReplicaObserver, WalEntry};
+use orbita_wal::{Hydration, PartitionHydrator, ReplicaObserver, WalEntry};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -176,6 +176,38 @@ impl<R: Runtime> ReplicaObserver for ReplicaBridge<R> {
         // out before it accepts a write. Waiting behind a queue of applies
         // would give away that ordering.
         host.truncated(above);
+    }
+}
+
+/// The bridge doubles as the hydrator because it is the one thing the
+/// `WalService` already holds that can find a partition's host, and finding the
+/// host is the whole job: the host owns the storage engine that knows how to
+/// read a manifest.
+#[async_trait::async_trait]
+impl<R: Runtime> PartitionHydrator for ReplicaBridge<R> {
+    async fn hydrate(&self, partition: PartitionId) -> Hydration {
+        let Some(host) = self.host(partition) else {
+            // The partition moved out from under us, so there is nothing here
+            // to rebuild and the owner is told the gap stands.
+            return Hydration::default();
+        };
+        match host.hydrate().await {
+            Ok(found) => found,
+            Err(error) => {
+                // Reported rather than propagated: a failed download leaves the
+                // partition exactly as it was, and the owner retries the append
+                // on its next batch. Reporting no epoch as well as no horizon
+                // is the conservative direction: a download that failed proved
+                // nothing about who owns the partition, so it must not be able
+                // to fence anybody.
+                tracing::warn!(
+                    partition = partition.get(),
+                    %error,
+                    "could not rebuild a partition from object storage"
+                );
+                Hydration::default()
+            }
+        }
     }
 }
 
