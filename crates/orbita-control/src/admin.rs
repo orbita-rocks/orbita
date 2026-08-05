@@ -401,7 +401,10 @@ fn partition_message(info: &PartitionInfo) -> pb::Partition {
             })
             .collect(),
         size_bytes: 0,
-        index_bytes: 0,
+        // Nothing was observed on this path, so nothing is claimed. A split
+        // result that reported an empty index would be inventing a
+        // measurement out of the absence of one.
+        index_bytes: None,
     }
 }
 

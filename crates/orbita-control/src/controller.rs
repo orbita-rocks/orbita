@@ -83,7 +83,12 @@ pub struct NodeView {
     /// Summed here rather than in the CLI because the leader group holds the
     /// per-partition reports, including for partitions the node holds as a
     /// replica, which never appear against it in the partition table.
-    pub index_memory_bytes: u64,
+    ///
+    /// `None` when any part of the answer is missing: a node this leader has
+    /// never heard from, or one whose report predates index measurement. A
+    /// partial sum is worse than no sum, because it looks like a small
+    /// number rather than like a missing one.
+    pub index_memory_bytes: Option<u64>,
 }
 
 /// A partition as an operator sees it, with the observations the map does not
@@ -99,7 +104,12 @@ pub struct PartitionView {
     /// What the owner's index for this partition costs in memory. A single
     /// partition's index has to fit on its owner, so this is read against one
     /// machine rather than against the cluster.
-    pub index_bytes: u64,
+    ///
+    /// `None` when nobody has said: an unowned partition, an owner that has
+    /// not reported yet, or an owner running a binary that does not measure
+    /// it. Distinct from `Some(0)`, which is a partition whose index really
+    /// is empty.
+    pub index_bytes: Option<u64>,
     /// Each replica's applied and durable positions. Both are here because
     /// the gap between them is log a replica holds and has not applied, and
     /// the gap from the owner is how far behind it would be if promoted.
@@ -958,9 +968,15 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     .get(&record.id)
                     .map(|obs| (now.saturating_sub(obs.heard_at_nanos)) / 1_000_000),
                 is_control_leader: control_leader == Some(record.id),
-                index_memory_bytes: inner.observations.get(&record.id).map_or(0, |obs| {
-                    obs.status.partitions.iter().map(|p| p.index_bytes).sum()
-                }),
+                // `sum` over an iterator of Options is None if any element
+                // is, which is exactly the wanted arithmetic: one silent
+                // partition makes the node's total unknown rather than low.
+                // A node with no partitions sums to Some(0), which is a real
+                // answer and what every leader-group member looks like.
+                index_memory_bytes: inner
+                    .observations
+                    .get(&record.id)
+                    .and_then(|obs| obs.status.partitions.iter().map(|p| p.index_bytes).sum()),
             })
             .collect();
 
@@ -981,7 +997,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                         .unwrap_or(PartitionPhase::Unowned),
                     committed_lamport: owner_progress.map_or(Lamport::ZERO, |p| p.durable_lamport),
                     size_bytes: owner_progress.map_or(0, |p| p.size_bytes),
-                    index_bytes: owner_progress.map_or(0, |p| p.index_bytes),
+                    index_bytes: owner_progress.and_then(|p| p.index_bytes),
                     replica_progress: info
                         .replicas
                         .iter()

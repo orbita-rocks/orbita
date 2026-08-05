@@ -509,7 +509,7 @@ mod tests {
                 durable_lamport: 5,
             }],
             size_bytes: 7,
-            index_bytes: 8,
+            index_bytes: Some(8),
         });
         assert!(view.end_key.is_none());
         assert_eq!(view.start_key, Blob::new(b"a"));
@@ -526,7 +526,7 @@ mod tests {
             is_raft_leader: false,
             speaks_min: None,
             speaks_max: None,
-            index_memory_bytes: 0,
+            index_memory_bytes: None,
         });
         assert_eq!(view.role, "unknown");
         assert_eq!(view.health, "unknown");

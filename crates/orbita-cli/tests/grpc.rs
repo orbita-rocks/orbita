@@ -54,6 +54,10 @@ struct Fake {
     key_exists: bool,
     /// Whether Set should report the condition as met.
     condition_holds: bool,
+    /// Whether DescribeCluster reports index memory at all. False is what a
+    /// leader group running a binary from before the measurement looks like
+    /// on the wire: the field is simply absent.
+    reports_index_memory: bool,
     /// The storage quota DescribeCluster reports for its keyspace. `Some(0)`
     /// is a real cap that allows nothing, not the absence of a cap.
     quota_bytes: Option<u64>,
@@ -162,7 +166,7 @@ impl Admin for Fake {
                 is_raft_leader: true,
                 speaks_min: Some(ClusterVersion { major: 0, minor: 1 }),
                 speaks_max: Some(ClusterVersion { major: 0, minor: 2 }),
-                index_memory_bytes: 2 * 1024 * 1024,
+                index_memory_bytes: self.reports_index_memory.then_some(2 * 1024 * 1024),
             }],
             partitions: vec![Partition {
                 id: 10,
@@ -178,7 +182,7 @@ impl Admin for Fake {
                     durable_lamport: 495,
                 }],
                 size_bytes: 1_048_576,
-                index_bytes: 65_536,
+                index_bytes: self.reports_index_memory.then_some(65_536),
             }],
             cluster_version: Some(ClusterVersion { major: 0, minor: 2 }),
             keyspaces: vec![Keyspace {
@@ -319,6 +323,7 @@ fn fake() -> Fake {
         seen: Arc::new(Mutex::new(Seen::default())),
         key_exists: true,
         condition_holds: true,
+        reports_index_memory: true,
         quota_bytes: None,
     }
 }
@@ -492,6 +497,67 @@ async fn the_describe_json_carries_every_consumption_signal_for_a_script() {
         serde_json::Value::Null,
         "a keyspace with no quota reports none rather than a number"
     );
+}
+
+#[tokio::test]
+async fn a_cluster_that_does_not_report_index_memory_describes_it_as_unknown() {
+    // The mixed-version case, end to end: an older leader group leaves the
+    // field unset, and every hop from decode to render has to keep saying
+    // "nobody measured this" rather than "this index is empty". Zero would
+    // tell an operator they have memory headroom during exactly the window
+    // where they are most likely to be checking.
+    let (config, _) = start(Fake {
+        reports_index_memory: false,
+        ..fake()
+    })
+    .await;
+
+    let text = admin::cluster(
+        &config,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    assert!(text.contains("unknown"), "{text}");
+    assert!(
+        text.contains("index memory unknown"),
+        "the total says it is missing rather than summing to nothing: {text}"
+    );
+    assert!(
+        text.contains("not reporting"),
+        "and says how much of it is missing: {text}"
+    );
+    assert!(
+        !text.contains("0 B"),
+        "no unmeasured index may be rendered as an empty one: {text}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(
+        &admin::cluster(
+            &config,
+            Format::Json,
+            ClusterCommand::Describe { keyspace: None },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        json["nodes"][0]["index_memory_bytes"],
+        serde_json::Value::Null,
+        "a script reading this must not see a number that is not there"
+    );
+    assert_eq!(
+        json["partitions"][0]["index_bytes"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["summary"]["index_memory_bytes"],
+        serde_json::Value::Null,
+        "and the total is absent rather than a partial sum wearing its name"
+    );
+    assert_eq!(json["summary"]["nodes_without_index_memory"], 1);
 }
 
 #[tokio::test]

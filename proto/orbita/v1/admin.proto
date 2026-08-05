@@ -146,7 +146,14 @@ message Node {
   // The memory this node's partition indexes hold, summed over every
   // partition it reported. Since ADR 0006 made the index memory-resident,
   // this is the resource a worker runs out of first.
-  uint64 index_memory_bytes = 8;
+  //
+  // Explicitly optional because unset and zero are different answers and the
+  // difference matters most exactly when it is easiest to get wrong: a node
+  // running a binary from before this field existed reports nothing, and
+  // rendering that as an empty index tells an operator they have room they do
+  // not have. Unset means nobody measured it. Zero means nobody is holding
+  // one. A node the leader has never heard from is unset too.
+  optional uint64 index_memory_bytes = 8;
 }
 
 message Replica {
@@ -179,7 +186,11 @@ message Partition {
   // ADR 0006 the index is resident whether or not the values are, and a
   // single partition's index has to fit on its owner, so this is a number an
   // operator sizes machines against rather than an implementation detail.
-  uint64 index_bytes = 10;
+  //
+  // Optional for the same reason index_memory_bytes is: an unowned partition,
+  // and one whose owner runs a binary that does not measure this, have no
+  // answer rather than an answer of zero.
+  optional uint64 index_bytes = 10;
 }
 
 message DescribeClusterResponse {

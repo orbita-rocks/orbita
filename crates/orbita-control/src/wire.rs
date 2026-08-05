@@ -530,7 +530,7 @@ mod tests {
                     durable_lamport: Lamport(10),
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
-                    index_bytes: 256,
+                    index_bytes: Some(256),
                 }],
             },
         };
@@ -559,14 +559,17 @@ mod tests {
                     durable_lamport: Lamport(10),
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
-                    index_bytes: 256,
+                    index_bytes: Some(256),
                 }],
             },
         };
 
         assert_ne!(request.encode(), request.encode_v3());
         let through_v3 = ReportStatusRequest::decode_v3(&request.encode_v3()).unwrap();
-        assert_eq!(through_v3.status.partitions[0].index_bytes, 0);
+        assert_eq!(
+            through_v3.status.partitions[0].index_bytes, None,
+            "a report that could not carry the measurement did not carry a zero either"
+        );
         assert_eq!(through_v3.status.partitions[0].size_bytes, 1024);
         assert_eq!(
             ReportStatusRequest::decode(&request.encode())
@@ -574,7 +577,7 @@ mod tests {
                 .status
                 .partitions[0]
                 .index_bytes,
-            256
+            Some(256)
         );
     }
 
@@ -597,7 +600,10 @@ mod tests {
                     durable_lamport: Lamport(10),
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
-                    index_bytes: 0,
+                    // A v0.0.1 report cannot carry this, so the only value
+                    // that round trips through the legacy shape is the one
+                    // meaning nobody said.
+                    index_bytes: None,
                 }],
             },
         };

@@ -171,6 +171,17 @@ def test_describe_reports_storage_against_the_quota_each_keyspace_was_given(
         assert keyspaces["quotad"].stored_bytes == sum(
             p.size_bytes for p in mine
         ), described
+
+        # Index memory carries proto field presence, which is what lets a
+        # mixed-version rollout say "nobody measured this" rather than
+        # reporting a real index as empty. HasField raises on a field without
+        # presence, so calling it at all is the assertion: if these ever go
+        # back to plain scalars, a client loses the ability to tell an
+        # unreported index from an empty one and this test says so.
+        for node in described.nodes:
+            node.HasField("index_memory_bytes")
+        for partition in described.partitions:
+            partition.HasField("index_bytes")
     finally:
         for channel in channels:
             channel.close()

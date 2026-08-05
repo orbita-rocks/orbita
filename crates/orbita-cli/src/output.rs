@@ -225,6 +225,18 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Formats a byte count that may not have been measured.
+///
+/// "unknown" rather than "0 B", and the distance between those two words is
+/// the whole point: a node running a binary from before the measurement
+/// existed reports nothing, and printing that as an empty index tells an
+/// operator they have headroom they do not have. Zero stays available for the
+/// nodes that really are holding no index.
+#[must_use]
+pub fn format_bytes_or_unknown(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "unknown".to_owned(), format_bytes)
+}
+
 /// The per-keyspace limits and defaults, as the admin API reports them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct KeyspaceConfigView {
@@ -341,10 +353,14 @@ pub struct NodeView {
     /// The cluster versions this node's binary can speak, such as "0.1..0.2",
     /// or "unknown" from a server that predates version reporting.
     pub speaks: String,
-    /// What the partition indexes this node holds cost in memory. Zero from a
-    /// node that has not reported one, which is what a leader looks like and
-    /// what any node looks like mid-rollout.
-    pub index_memory_bytes: u64,
+    /// What the partition indexes this node holds cost in memory.
+    ///
+    /// Absent when the node has not reported a measurement, which is what a
+    /// node running an older binary looks like for the length of a rolling
+    /// upgrade, and what a node the leader group has never heard from looks
+    /// like always. Not the same as zero, which is a node genuinely holding
+    /// no index and is what every leader-group member looks like.
+    pub index_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,7 +385,9 @@ pub struct PartitionView {
     pub committed_lamport: u64,
     pub size_bytes: u64,
     /// What the owner's memory-resident index for this partition costs.
-    pub index_bytes: u64,
+    /// Absent when nobody measured it rather than zero, for the same reason
+    /// as [`NodeView::index_memory_bytes`].
+    pub index_bytes: Option<u64>,
     pub replicas: Vec<ReplicaView>,
 }
 
@@ -475,7 +493,7 @@ fn partition_row(p: &PartitionView, health: Option<&BTreeMap<u64, String>>) -> V
         p.epoch.to_string(),
         p.committed_lamport.to_string(),
         format_bytes(p.size_bytes),
-        format_bytes(p.index_bytes),
+        format_bytes_or_unknown(p.index_bytes),
         p.max_replica_lag().to_string(),
         p.max_wal_lag().to_string(),
         p.replica_summary(),
@@ -501,14 +519,25 @@ pub struct ClusterSummaryView {
     pub partitions_with_an_unhealthy_owner: usize,
     pub max_replica_lag: u64,
     pub max_wal_lag: u64,
+    /// What every node's partition indexes cost, added up. ADR 0006 makes
+    /// this the resource a cluster exhausts first, and a total is what an
+    /// operator compares against the memory they bought.
+    ///
+    /// Absent when any node did not report a measurement. A sum that quietly
+    /// skipped the nodes it could not see would be a total that reads low
+    /// precisely during a rolling upgrade, which is when an operator is most
+    /// likely to be watching memory and least able to afford a number that
+    /// says there is room.
+    pub index_memory_bytes: Option<u64>,
+    /// What the nodes that did report add up to. Equal to
+    /// [`Self::index_memory_bytes`] when every node reported, and offered
+    /// beside the count below so a partial answer is still readable as one.
+    pub reported_index_memory_bytes: u64,
+    pub nodes_without_index_memory: usize,
     /// Keyspaces whose stored bytes have reached or passed their quota.
     /// Counted, not judged: it does not feed [`Self::healthy`], because the
     /// quota is a tenant's limit and not the cluster's health.
     pub keyspaces_over_quota: usize,
-    /// What every node's partition indexes cost, added up. ADR 0006 makes
-    /// this the resource a cluster exhausts first, and a total is what an
-    /// operator compares against the memory they bought.
-    pub index_memory_bytes: u64,
 }
 
 impl ClusterSummaryView {
@@ -656,7 +685,16 @@ impl ClusterView {
                 .map(PartitionView::max_wal_lag)
                 .max()
                 .unwrap_or(0),
+            // Summing Options gives None the moment one contributor is
+            // unknown, which is the answer that does not under-report. The
+            // partial sum is kept beside it so a mid-rollout describe still
+            // shows what is known instead of nothing.
             index_memory_bytes: nodes.iter().map(|n| n.index_memory_bytes).sum(),
+            reported_index_memory_bytes: nodes.iter().filter_map(|n| n.index_memory_bytes).sum(),
+            nodes_without_index_memory: nodes
+                .iter()
+                .filter(|n| n.index_memory_bytes.is_none())
+                .count(),
             keyspaces_over_quota: 0,
         };
 
@@ -723,7 +761,28 @@ impl Render for ClusterView {
             "  worst lag    {} applied, {} wal",
             s.max_replica_lag, s.max_wal_lag
         );
-        let _ = writeln!(out, "  index memory {}", format_bytes(s.index_memory_bytes));
+        // A total that silently dropped the nodes it could not measure would
+        // read low exactly when an operator is mid-rollout and watching
+        // memory, so an incomplete total says how incomplete it is.
+        let reporting = s.node_count - s.nodes_without_index_memory;
+        let _ = match s.index_memory_bytes {
+            Some(total) => writeln!(out, "  index memory {}", format_bytes(total)),
+            // Nothing was measured anywhere, which is what a whole cluster
+            // one version behind looks like. A partial sum of nothing is
+            // "0 B", and that is the reading this is here to prevent.
+            None if reporting == 0 => writeln!(
+                out,
+                "  index memory unknown, {} nodes not reporting it",
+                s.nodes_without_index_memory
+            ),
+            None => writeln!(
+                out,
+                "  index memory {} across {reporting} of {} nodes, {} not reporting",
+                format_bytes(s.reported_index_memory_bytes),
+                s.node_count,
+                s.nodes_without_index_memory
+            ),
+        };
         if s.keyspaces_over_quota > 0 {
             let _ = writeln!(
                 out,
@@ -751,7 +810,7 @@ impl Render for ClusterView {
                         n.health.clone(),
                         if n.raft_leader { "yes" } else { "no" }.to_owned(),
                         n.speaks.clone(),
-                        format_bytes(n.index_memory_bytes),
+                        format_bytes_or_unknown(n.index_memory_bytes),
                     ]
                 })
                 .collect();
@@ -1237,7 +1296,7 @@ mod tests {
             epoch: 2,
             committed_lamport: 100,
             size_bytes: 2048,
-            index_bytes: 4096,
+            index_bytes: Some(4096),
             replicas: vec![
                 ReplicaView {
                     node_id: 4,
@@ -1281,13 +1340,68 @@ mod tests {
             ],
             vec![partition(1)],
         );
-        assert_eq!(view.summary.index_memory_bytes, 1024 + 3072);
+        assert_eq!(view.summary.index_memory_bytes, Some(1024 + 3072));
         let text = render(Format::Human, &view).unwrap();
         assert!(text.contains("index memory"), "{text}");
         assert!(
             text.contains("4.0 KiB"),
             "the partition's index is a column: {text}"
         );
+    }
+
+    #[test]
+    fn an_unreported_index_renders_as_unknown_rather_than_as_an_empty_one() {
+        // The mixed-version case, at the surface an operator actually reads.
+        // A node running an older binary reports no measurement, and printing
+        // "0 B" would tell them a full index is empty, at the exact moment
+        // during a rolling upgrade when they are watching memory.
+        let mut unreported = node(3, "worker", "healthy", false);
+        unreported.index_memory_bytes = None;
+        let mut partition = partition(1);
+        partition.index_bytes = None;
+
+        let view = ClusterView::new(
+            vec![node(1, "leader", "healthy", true), unreported],
+            vec![partition],
+        );
+
+        assert_eq!(
+            view.summary.index_memory_bytes, None,
+            "one silent node means the cluster has no honest total"
+        );
+        assert_eq!(view.summary.reported_index_memory_bytes, 1024);
+        assert_eq!(view.summary.nodes_without_index_memory, 1);
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(
+            text.contains("unknown"),
+            "the node and partition rows say unknown: {text}"
+        );
+        assert!(
+            text.contains("1 not reporting"),
+            "and the total says how much of it is missing: {text}"
+        );
+        assert!(
+            !text.contains("0 B"),
+            "nothing here may be rendered as an empty index: {text}"
+        );
+    }
+
+    #[test]
+    fn an_index_measured_at_zero_still_renders_as_zero() {
+        // The other side of the same distinction. A node that has measured
+        // its index and found nothing there is a real answer, and it must not
+        // be swept into "unknown" by the fix for the case above.
+        let mut measured = node(3, "worker", "healthy", false);
+        measured.index_memory_bytes = Some(0);
+        let view = ClusterView::new(vec![measured], Vec::new());
+
+        assert_eq!(view.summary.index_memory_bytes, Some(0));
+        assert_eq!(view.summary.nodes_without_index_memory, 0);
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("0 B"), "{text}");
+        assert!(!text.contains("unknown"), "{text}");
     }
 
     #[test]
@@ -1434,7 +1548,7 @@ mod tests {
             health: health.to_owned(),
             raft_leader,
             speaks: "0.1..0.2".to_owned(),
-            index_memory_bytes: 1024 * id,
+            index_memory_bytes: Some(1024 * id),
         }
     }
 

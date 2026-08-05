@@ -48,13 +48,22 @@ pub struct PartitionProgress {
     /// 0006 makes memory the resource a worker runs out of first, and a node
     /// is the only place that number exists, so it rides the heartbeat that
     /// already reports everything else about the partition.
-    pub index_bytes: u64,
+    ///
+    /// `None` means the node did not measure it, which is what a binary from
+    /// before this field looks like for the length of a rolling upgrade. It
+    /// is deliberately not zero: an operator watching the resource that runs
+    /// out first must not be shown an empty index where there is a full one.
+    pub index_bytes: Option<u64>,
 }
 
 impl PartitionProgress {
     pub(crate) fn encode(&self, w: &mut Writer) {
         self.encode_v3(w);
-        w.u64(self.index_bytes);
+        // Optional on the wire rather than a bare u64 so that "did not
+        // measure" survives the hop. A node whose storage layer refuses to
+        // answer is in the same position as an old binary, and flattening
+        // either into zero is the failure this shape exists to prevent.
+        w.opt_u64(self.index_bytes);
     }
 
     /// The encoding without index memory, which is what every report shape up
@@ -68,20 +77,23 @@ impl PartitionProgress {
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> CodecResult<Self> {
         let mut progress = Self::decode_v3(r)?;
-        progress.index_bytes = r.u64()?;
+        progress.index_bytes = r.opt_u64()?;
         Ok(progress)
     }
 
-    /// Decodes a report from a node that does not measure index memory. Zero
-    /// is the honest answer there: the node did not say, and a describe that
-    /// invented a number would be worse than one showing nothing.
+    /// Decodes a report from a node that does not measure index memory.
+    ///
+    /// Unknown rather than zero. The node did not say, and the whole reason
+    /// this number is reported is to warn an operator before a worker runs
+    /// out of memory, so guessing low is guessing in the one direction that
+    /// costs them the warning.
     pub(crate) fn decode_v3(r: &mut Reader<'_>) -> CodecResult<Self> {
         Ok(Self {
             partition: PartitionId(r.u64()?),
             durable_lamport: Lamport(r.u64()?),
             applied_lamport: Lamport(r.u64()?),
             size_bytes: r.u64()?,
-            index_bytes: 0,
+            index_bytes: None,
         })
     }
 }
@@ -281,7 +293,7 @@ mod tests {
                 durable_lamport: Lamport(90),
                 applied_lamport: Lamport(88),
                 size_bytes: 4096,
-                index_bytes: 512,
+                index_bytes: Some(512),
             }],
         };
 
@@ -311,7 +323,7 @@ mod tests {
                 durable_lamport: Lamport(90),
                 applied_lamport: Lamport(88),
                 size_bytes: 4096,
-                index_bytes: 512,
+                index_bytes: Some(512),
             }],
         };
 
@@ -326,9 +338,51 @@ mod tests {
         assert_eq!(decoded.draining, status.draining);
         assert_eq!(decoded.partitions[0].size_bytes, 4096);
         assert_eq!(
-            decoded.partitions[0].index_bytes, 0,
-            "a node that did not report index memory reports zero, not a guess"
+            decoded.partitions[0].index_bytes, None,
+            "a node that did not report index memory is unknown, not empty"
         );
+    }
+
+    #[test]
+    fn an_index_of_no_bytes_is_reported_as_a_measurement_and_not_as_silence() {
+        // The two states this whole Option exists to keep apart. A partition
+        // whose index really is empty has to survive the wire as a zero, or
+        // the fix for the mixed-version case would have replaced one wrong
+        // answer with another.
+        let status = NodeStatus {
+            role: NodeRole::Worker,
+            address: "10.0.0.4:7000".into(),
+            map_version: MapVersion(12),
+            speaks: crate::version::binary_speaks(),
+            ready: true,
+            draining: false,
+            partitions: vec![
+                PartitionProgress {
+                    partition: PartitionId(3),
+                    durable_lamport: Lamport(90),
+                    applied_lamport: Lamport(88),
+                    size_bytes: 4096,
+                    index_bytes: Some(0),
+                },
+                PartitionProgress {
+                    partition: PartitionId(4),
+                    durable_lamport: Lamport(90),
+                    applied_lamport: Lamport(88),
+                    size_bytes: 4096,
+                    index_bytes: None,
+                },
+            ],
+        };
+
+        let mut w = Writer::new();
+        status.encode(&mut w);
+        let encoded = w.finish();
+
+        let mut r = Reader::new(&encoded);
+        let decoded = NodeStatus::decode(&mut r).unwrap();
+        assert_eq!(r.done(), Ok(()));
+        assert_eq!(decoded.partitions[0].index_bytes, Some(0));
+        assert_eq!(decoded.partitions[1].index_bytes, None);
     }
 
     #[test]

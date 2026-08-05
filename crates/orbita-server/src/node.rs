@@ -700,7 +700,11 @@ impl<R: Runtime> Node<R> {
                 durable_lamport: host.durable_lamport().await,
                 applied_lamport: host.committed_lamport().await.unwrap_or_default(),
                 size_bytes: host.size_bytes().await.unwrap_or_default(),
-                index_bytes: host.index_bytes().await.unwrap_or_default(),
+                // A storage layer that will not answer has not measured
+                // anything, so nothing is claimed. Reporting zero would tell
+                // the leader group this partition holds no index, which is
+                // the one answer that is certainly wrong.
+                index_bytes: host.index_bytes().await.ok(),
             });
         }
         // Sorted so that two reports of the same state are the same bytes,

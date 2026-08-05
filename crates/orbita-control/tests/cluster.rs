@@ -47,7 +47,11 @@ struct Cluster {
     /// What each worker claims its index costs, per partition it holds. Set
     /// by the tests so that the describe surface can be checked against a
     /// known answer rather than against whatever the storage layer produced.
-    index_bytes: Arc<Mutex<HashMap<NodeId, u64>>>,
+    ///
+    /// `None` is what a worker looks like when its report came through a
+    /// status method that cannot carry the measurement, which is every worker
+    /// running an older binary for the length of a rolling upgrade.
+    index_bytes: Arc<Mutex<HashMap<NodeId, Option<u64>>>>,
 }
 
 impl Cluster {
@@ -144,7 +148,7 @@ impl Cluster {
                     .lock()
                     .expect("index bytes lock poisoned")
                     .get(&node)
-                    .unwrap_or(&0);
+                    .unwrap_or(&Some(0));
                 let partitions: Vec<PartitionProgress> = map
                     .held_by(node)
                     .map(|info| PartitionProgress {
@@ -189,7 +193,16 @@ impl Cluster {
         self.index_bytes
             .lock()
             .expect("index bytes lock poisoned")
-            .insert(node, bytes);
+            .insert(node, Some(bytes));
+    }
+
+    /// Makes a worker report the way one whose heartbeat went through a
+    /// status method without an index field does.
+    fn set_index_unreported(&self, node: NodeId) {
+        self.index_bytes
+            .lock()
+            .expect("index bytes lock poisoned")
+            .insert(node, None);
     }
 
     fn set_ready(&self, node: NodeId, ready: bool) {
@@ -339,11 +352,101 @@ fn describe_reports_the_index_memory_each_node_holds() {
             .expect("every worker is in the description");
         assert_eq!(
             node.index_memory_bytes,
-            1_000 * (offset as u64 + 1) * partitions_held(*worker),
+            Some(1_000 * (offset as u64 + 1) * partitions_held(*worker)),
             "a node's index memory is the sum over every partition it holds, \
              replicas included, since those are resident too"
         );
     }
+}
+
+#[test]
+fn a_worker_that_never_reported_index_memory_stays_unknown_rather_than_empty() {
+    // The mixed-version case. A worker whose heartbeat arrived through a
+    // status method without the field said nothing about its index, and the
+    // description has to keep saying nothing. Reporting zero would tell an
+    // operator watching for memory exhaustion that a full index is empty,
+    // which is the one direction of error this number cannot afford.
+    let cluster = Cluster::start(11);
+    let silent = WORKERS[0];
+    cluster.set_index_unreported(silent);
+    for worker in &WORKERS[1..] {
+        cluster.set_index_bytes(*worker, 1_024);
+    }
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+
+    let node = view
+        .nodes
+        .iter()
+        .find(|n| n.record.id == silent)
+        .expect("the worker is still in the description");
+    assert_eq!(
+        node.index_memory_bytes, None,
+        "a node that did not measure its index has no total, not a zero one"
+    );
+
+    for worker in &WORKERS[1..] {
+        let node = view
+            .nodes
+            .iter()
+            .find(|n| n.record.id == *worker)
+            .expect("every worker is in the description");
+        assert!(
+            node.index_memory_bytes.is_some(),
+            "one silent node does not make its neighbours unknown"
+        );
+    }
+
+    // Every partition the silent worker owns is unknown too, and every
+    // partition owned by a reporting worker still has its number.
+    for partition in &view.partitions {
+        match partition.info.owner {
+            Some(owner) if owner == silent => assert_eq!(partition.index_bytes, None),
+            Some(_) => assert!(partition.index_bytes.is_some()),
+            None => assert_eq!(
+                partition.index_bytes, None,
+                "an unowned partition has nobody to have measured it"
+            ),
+        }
+    }
+}
+
+#[test]
+fn one_unmeasured_partition_makes_a_nodes_whole_index_total_unknown() {
+    // A partial sum is the failure mode a plain zero substitution turns into
+    // once it is added up: it looks like a small number rather than a
+    // missing one, and small is the answer that says there is headroom.
+    let cluster = Cluster::start(12);
+    let worker = WORKERS[0];
+    cluster.set_index_bytes(worker, 4_096);
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let before = cluster
+        .sim
+        .block_on(async move { controller.view().await })
+        .nodes
+        .iter()
+        .find(|n| n.record.id == worker)
+        .expect("the worker is described")
+        .index_memory_bytes;
+    assert!(before.is_some(), "a reporting worker has a total");
+
+    cluster.set_index_unreported(worker);
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let after = cluster
+        .sim
+        .block_on(async move { controller.view().await })
+        .nodes
+        .iter()
+        .find(|n| n.record.id == worker)
+        .expect("the worker is described")
+        .index_memory_bytes;
+    assert_eq!(after, None);
 }
 
 #[test]
@@ -363,10 +466,33 @@ fn describe_reports_partition_size_and_index_memory_from_the_owner() {
         .expect("the partition is described");
 
     assert_eq!(
-        described.index_bytes, 4_096,
+        described.index_bytes,
+        Some(4_096),
         "the owner's report is what a partition's index costs, because the \
          owner is the node that has to fit it"
     );
+}
+
+#[test]
+fn an_empty_index_is_described_as_zero_and_not_as_a_missing_measurement() {
+    // The other half of keeping unknown and empty apart. A worker that has
+    // measured its index and found it empty is a real answer, and folding it
+    // into "unknown" would trade one wrong reading for another.
+    let cluster = Cluster::start(13);
+    let partition = cluster.only_partition();
+    let owner = cluster.owner_of(partition).expect("an owner");
+    cluster.set_index_bytes(owner, 0);
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+    let described = view
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("the partition is described");
+
+    assert_eq!(described.index_bytes, Some(0));
 }
 
 #[test]
