@@ -119,6 +119,138 @@ moon has plugins that would own the virtualenv and the install too, which would
 delete the `setup` task. They are not usable yet, and
 [.moon/toolchains.yml](../.moon/toolchains.yml) says why.
 
+## Live object store verification
+
+`moon run orbita-objectstore:test-live-s3` runs the two tests in
+`crates/orbita-objectstore/tests/minio.rs` against whatever S3-compatible
+endpoint the environment points at. The second of them is the one that matters:
+it proves a deposed writer holding a stale ETag loses the manifest swap to the
+writer that replaced it, which is the entire fencing story for the object store.
+
+This cannot be proved against a mock. The failure it guards against is a server
+that accepts `If-Match` and ignores it, and such a server passes every mocked
+test in the crate while losing the race in production. So the tests take their
+endpoint from the environment and get pointed at three real servers:
+
+| Backend | Where | When |
+| --- | --- | --- |
+| MinIO | the `check` job in `ci.yml` | every pull request |
+| AWS S3 | `live-object-store.yml` | Mondays, 08:00 UTC, and on demand |
+| Cloudflare R2 | `live-object-store.yml` | Mondays, 08:00 UTC, and on demand |
+
+GCS is out of scope on purpose. Its XML interoperability layer ignores these
+headers and wants `x-goog-if-generation-match` instead, so supporting it means
+a second `ObjectStore` rather than this one with a different endpoint.
+
+### Configuration an operator has to create
+
+These live on the repository. Everything that identifies an account or
+authenticates to one is a secret. The region is a variable, because GitHub
+masks secret values wherever they appear in a log, and masking a string as
+short and as common as `us-east-1` would redact unrelated output and make a
+failure harder to read rather than easier.
+
+| Name | Kind | Holds |
+| --- | --- | --- |
+| `LIVE_S3_REGION` | variable | The region the AWS test bucket lives in. The endpoint is derived from it. |
+| `LIVE_S3_BUCKET` | secret | The AWS test bucket name. It must already exist. |
+| `LIVE_S3_ACCESS_KEY_ID` | secret | Access key id for the IAM principal below. |
+| `LIVE_S3_SECRET_ACCESS_KEY` | secret | Its secret access key. |
+| `LIVE_R2_ACCOUNT_ID` | secret | Cloudflare account id. It is in the R2 endpoint hostname, which is why it is not a variable. |
+| `LIVE_R2_BUCKET` | secret | The R2 test bucket name. It must already exist. |
+| `LIVE_R2_ACCESS_KEY_ID` | secret | R2 API token access key id, scoped to Object Read and Write on that one bucket. |
+| `LIVE_R2_SECRET_ACCESS_KEY` | secret | Its secret access key. |
+
+Both buckets should be dedicated to this and nothing else, and both want a
+lifecycle rule expiring objects under `orbita-it/` after a day. The tests clean
+up after themselves on the happy path, but the run that fails is the run that
+leaves an object behind, and that is also the run you least want to be doing
+bucket housekeeping during.
+
+The AWS key needs nothing beyond the prefix the tests write to. Every key is
+created under `orbita-it/`, so:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListOnlyTheTestPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::REPLACE-WITH-BUCKET",
+      "Condition": { "StringLike": { "s3:prefix": "orbita-it/*" } }
+    },
+    {
+      "Sid": "ObjectsUnderTheTestPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::REPLACE-WITH-BUCKET/orbita-it/*"
+    }
+  ]
+}
+```
+
+`s3:GetObject` covers `HeadObject` and ranged reads as well as whole-object
+reads, and conditional PUT needs no permission of its own beyond
+`s3:PutObject`. There is no `s3:*` here and there should not be: this key sits
+in a CI secret store, and the blast radius of it leaking should be one prefix
+in one bucket.
+
+Long-lived keys are the easy path, not the good one. The tests already read an
+optional `ORBITA_S3_TEST_SESSION_TOKEN`, so the AWS half can move to GitHub's
+OIDC provider and a role with the policy above without anyone touching Rust.
+That is worth doing and is not done yet.
+
+### When the configuration is absent
+
+The workflow does not run in a fork at all. A fork has no buckets and no
+credentials and never will, so the only thing a scheduled run there produces is
+a failure notification for somebody who cannot act on it.
+
+Inside this repository it fails, loudly, naming the missing secret. That looks
+like it contradicts the rule the MinIO step in `ci.yml` is built on, that a
+durability test which skips itself is worse than no test, but it is the same
+rule applied to a different situation. On the pull request path the credentials
+are a container we start ourselves, so they cannot go missing, and the right
+answer is to never allow a skip. Here they are supplied by a human out of band,
+so they can go missing, and a skip would produce exactly the outcome the rule
+exists to prevent: a green run standing in for evidence nobody collected.
+
+The practical consequence is that the first Monday after this lands is red until
+the secrets exist. That is the alarm doing its job, not a defect.
+
+### Who finds out when it breaks
+
+A scheduled workflow that fails emails whoever last edited the cron line, which
+is an accident of git history rather than a decision. So a failure opens an
+issue instead, assigned to the code owner of `/crates/orbita-objectstore/`, and
+a second consecutive failure comments on the same issue rather than opening
+another. If `.github/CODEOWNERS` changes, change the assignee in the workflow
+with it.
+
+It is not a page. A failure here does not mean anything is down. It means a
+claim we make about a backend may have stopped being true, and answering that
+means reproducing it by hand, working out whether the vendor changed or we did,
+and then either fixing the store or withdrawing the claim. None of that goes
+faster for having woken somebody up.
+
+### What it does not prove
+
+The tests exercise the conditional write semantics. They do not systematically
+exercise what a backend does to the TCP connection afterwards, and that has
+already bitten us once: MinIO answers a losing conditional PUT with `412` and
+then closes the socket without saying `Connection: close`, so hyper pooled a
+dead connection and the next unrelated request failed. The transport now drops
+the connection on any `409` or `412`, which covers the AWS and R2 versions of
+that same event for free.
+
+What is not covered is a backend that hangs up after some other status, a `404`
+or a `416` or a `200`, which we still pool. That was measured against MinIO and
+assumed of the others. It is a race, so these two tests would catch it only by
+luck. If a live run ever fails with `client error (SendRequest)`, that is the
+first thing to suspect.
+
 ## Denying warnings
 
 `-D warnings` is an argument to the clippy task rather than a `RUSTFLAGS` set

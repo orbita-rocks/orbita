@@ -1,0 +1,287 @@
+name: Live object store
+
+# Runs the live conditional-write tests against a real AWS S3 bucket and a real
+# Cloudflare R2 bucket.
+#
+# The store claims three backends. MinIO is proved on every pull request by the
+# `check` job in ci.yml, because it is a container we can start. AWS S3 and R2
+# were, until this workflow, verified by reading their documentation, which is
+# not evidence. The specific failure this exists to catch is a backend that
+# accepts `If-Match` and ignores it: that backend passes every mocked test in
+# orbita-objectstore, and then loses the deposed-writer race in production,
+# where a stale writer overwrites the manifest a newer writer just committed.
+# Nothing short of a real socket to a real bucket tells us it did not happen.
+#
+# GCS is deliberately out of scope. Its XML interoperability layer ignores
+# these headers and wants `x-goog-if-generation-match` instead, so it needs a
+# different `ObjectStore`, not this one with a different endpoint. The module
+# docs in crates/orbita-objectstore/src/s3/mod.rs say the same thing.
+#
+# Setting this up for the first time, including the secrets and the minimum IAM
+# policy, is documented in docs/BUILD.md under "Live object store verification".
+
+on:
+  schedule:
+    # Weekly, Mondays at 08:00 UTC, an hour after the nightly in ci.yml so the
+    # two are not competing for the same runners.
+    #
+    # Weekly rather than nightly, which is the cadence sim-long uses, because
+    # this job is not watching our code. It is watching two vendors, and vendor
+    # behaviour does not change on our commit cadence. Against that, every run
+    # spends real credentials on real buckets and carries a real chance of a
+    # network blip, and a job that cries wolf on a Tuesday gets ignored by
+    # Friday. The signal here is worth more than the latency: if AWS quietly
+    # regressed conditional PUT, our remedy is to stop claiming support or to
+    # work around it, and neither of those lands inside a week anyway.
+    - cron: "0 8 * * 1"
+
+  # On demand, which is how the first run after an operator creates the secrets
+  # should happen, and how to check a backend before cutting a release or after
+  # a meaningful change to the signing or conditional-write paths.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: conditional writes against ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+
+    # Never run in a fork. A fork has no buckets and no credentials, and it
+    # never will, so the only thing a scheduled run there produces is a failure
+    # notification for somebody who cannot act on it.
+    #
+    # This is not the same call as the MinIO step in ci.yml, which deliberately
+    # has no `if:` because "a durability test that skips itself is worse than no
+    # test". That rule is about the pull request path, where the credentials are
+    # a container we start ourselves and so cannot be missing. Here they are
+    # supplied by a human out of band. The rule still holds inside this
+    # repository, which is why the guard below is a hard failure and not a skip.
+    if: github.repository == 'orbita-rocks/orbita'
+
+    strategy:
+      # One backend failing says nothing about the other, and finding out that
+      # both broke in the same week is worth more than saving a runner minute.
+      fail-fast: false
+      matrix:
+        include:
+          # The endpoints are not here, because the `secrets` context is not
+          # readable from a matrix and R2's hostname contains the account id.
+          # They are built in the first step instead, from the region and the
+          # account id, so there is no second stored value that has to agree
+          # with the first one.
+          - backend: AWS S3
+            region: ${{ vars.LIVE_S3_REGION }}
+            # AWS addresses buckets as `bucket.s3.<region>.amazonaws.com` and
+            # has path style on a deprecation path, so this is the one backend
+            # that turns the store's path-style default off. That also means it
+            # is the only live coverage of the virtual-host branch of the
+            # request builder.
+            path_style: "false"
+            bucket_secret: LIVE_S3_BUCKET
+            access_key_secret: LIVE_S3_ACCESS_KEY_ID
+            secret_key_secret: LIVE_S3_SECRET_ACCESS_KEY
+
+          - backend: Cloudflare R2
+            # Not a choice. R2 has no regions and rejects a SigV4 signature
+            # scoped to anything else.
+            region: auto
+            # R2 serves both addressing styles, so it stays on the default and
+            # exercises the same path-style branch MinIO does.
+            path_style: "true"
+            bucket_secret: LIVE_R2_BUCKET
+            access_key_secret: LIVE_R2_ACCESS_KEY_ID
+            secret_key_secret: LIVE_R2_SECRET_ACCESS_KEY
+
+    steps:
+      # This runs before checkout so a missing secret costs a second rather
+      # than a full toolchain install.
+      #
+      # It fails rather than skipping. Inside this repository an absent secret
+      # is our misconfiguration, and the cost of getting it wrong is precisely
+      # the thing this workflow was built to stop: a green check that stands in
+      # for evidence nobody collected. The first Monday after this merges will
+      # be red until somebody creates the secrets, and that is the alarm working.
+      - name: Resolve the endpoint and check the credentials are configured
+        env:
+          BACKEND: ${{ matrix.backend }}
+          REGION: ${{ matrix.region }}
+          BUCKET: ${{ secrets[matrix.bucket_secret] }}
+          ACCESS_KEY: ${{ secrets[matrix.access_key_secret] }}
+          SECRET_KEY: ${{ secrets[matrix.secret_key_secret] }}
+          # Read unconditionally and used only by the R2 row, because a step
+          # env block cannot be conditional and an unused empty string costs
+          # nothing.
+          R2_ACCOUNT_ID: ${{ secrets.LIVE_R2_ACCOUNT_ID }}
+        run: |
+          missing=""
+          note() { missing="$missing $1"; }
+
+          if [ -z "$REGION" ]; then
+            note "vars.LIVE_S3_REGION"
+          fi
+          if [ -z "$BUCKET" ]; then
+            note "secrets.${{ matrix.bucket_secret }}"
+          fi
+          if [ -z "$ACCESS_KEY" ]; then
+            note "secrets.${{ matrix.access_key_secret }}"
+          fi
+          if [ -z "$SECRET_KEY" ]; then
+            note "secrets.${{ matrix.secret_key_secret }}"
+          fi
+
+          case "$BACKEND" in
+            "AWS S3")
+              endpoint="https://s3.$REGION.amazonaws.com"
+              ;;
+            "Cloudflare R2")
+              if [ -z "$R2_ACCOUNT_ID" ]; then
+                note "secrets.LIVE_R2_ACCOUNT_ID"
+              fi
+              endpoint="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+              ;;
+            *)
+              echo "::error::no endpoint rule for $BACKEND"
+              exit 1
+              ;;
+          esac
+
+          if [ -n "$missing" ]; then
+            echo "::error::$BACKEND is not configured. Missing:$missing"
+            echo "docs/BUILD.md, under 'Live object store verification', says what each one holds and what IAM policy the AWS key needs."
+            exit 1
+          fi
+
+          # Handed to the test step through the environment rather than a step
+          # output, so the R2 account id inside it stays in the same masked
+          # channel the secret it came from does.
+          echo "ORBITA_S3_TEST_ENDPOINT=$endpoint" >> "$GITHUB_ENV"
+          echo "$BACKEND is configured"
+
+      - uses: actions/checkout@v4
+        with:
+          # moon reads the base revision to work out what a change affects.
+          # Nothing here uses --affected, but moon is happier with real history
+          # than with a single grafted commit.
+          fetch-depth: 0
+
+      # No protoc step, unlike the jobs in ci.yml. orbita-objectstore depends on
+      # no other crate in this workspace and nothing here compiles a proto, so
+      # installing one would be a minute spent on nothing.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # ci.yml writes the moon version out again in its own `env` block, and
+      # .prototools says the two are kept in step by hand. A third hand-synced
+      # copy is worse here than there: this workflow runs once a week, so a
+      # stale pin would show up seven days late on the one job whose red is
+      # meant to mean a vendor changed. Reading the pin is cheap.
+      - id: moon
+        name: Read the pinned moon version
+        run: |
+          version="$(sed -n 's/^moon = "\(.*\)"$/\1/p' .prototools)"
+          if [ -z "$version" ]; then
+            echo "::error::could not find a moon pin in .prototools"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: moonrepo/setup-toolchain@v0
+        with:
+          # Keep auto-install off. It runs `proto install`, and proto reads
+          # rust-toolchain.toml as a version file, so it takes the Rust install
+          # away from rustup and leaves a toolchain with no cargo in it.
+          auto-install: false
+          # The action installs `latest` unless told otherwise, and it does
+          # not read .prototools, so the version has to be passed in.
+          moon-version: ${{ steps.moon.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Share nothing with the pull request cache. This job builds one crate
+          # and runs weekly, so a shared key would mostly serve to evict entries
+          # the merge gate depends on.
+          shared-key: live-object-store
+
+      # The same moon task the MinIO step in ci.yml runs, pointed somewhere
+      # else. One definition, three backends: if it drifts, it drifts for all of
+      # them at once instead of quietly covering only the cheap one.
+      #
+      # The task refuses to pass when the test binary turns out to contain no
+      # tests, which is the failure a `cargo test` alone reports as success.
+      - name: Live conditional-write tests
+        env:
+          # ORBITA_S3_TEST_ENDPOINT comes from the step above, through
+          # GITHUB_ENV.
+          ORBITA_S3_TEST_REGION: ${{ matrix.region }}
+          ORBITA_S3_TEST_FORCE_PATH_STYLE: ${{ matrix.path_style }}
+          ORBITA_S3_TEST_BUCKET: ${{ secrets[matrix.bucket_secret] }}
+          ORBITA_S3_TEST_ACCESS_KEY: ${{ secrets[matrix.access_key_secret] }}
+          ORBITA_S3_TEST_SECRET_KEY: ${{ secrets[matrix.secret_key_secret] }}
+        run: moon run orbita-objectstore:test-live-s3
+
+  # Who finds out when this breaks.
+  #
+  # Left alone, GitHub emails whoever last touched the cron line, which is an
+  # accident of git history rather than a decision. So the failure becomes an
+  # issue instead: it is durable, it is visible to everyone, it survives an
+  # unread inbox, and it needs no webhook secret or third-party account.
+  #
+  # It is deliberately not a page. A failure here does not mean anything is
+  # down. It means a claim we make about a backend may have stopped being true,
+  # and the response is to reproduce it by hand, work out whether the vendor
+  # changed or we did, and either fix the store or stop claiming the backend.
+  # That is days of work, not minutes, and waking someone up buys none of it.
+  notify:
+    name: file the failure
+    runs-on: ubuntu-latest
+    needs: [live]
+    # Only for the scheduled run. A `workflow_dispatch` failure already has
+    # somebody watching it, and filing an issue at them is noise.
+    if: failure() && github.event_name == 'schedule'
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job never checks out, so gh has no git remote to infer the
+          # repository from and would fail before it filed anything.
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Live object store verification is failing"
+
+          # A heredoc rather than a shell string, because a multi-line string
+          # written inline here carries this file's indentation into the issue,
+          # and markdown reads four leading spaces as a code block.
+          {
+            echo "The weekly live object store run failed: $RUN_URL"
+            echo
+            cat <<'EOF'
+          This job checks that AWS S3 and Cloudflare R2 still enforce the conditional writes the partition manifest swap depends on. A backend that stopped enforcing them would let a deposed writer overwrite the manifest a newer writer had just committed, and nothing else in this repository would notice.
+
+          Work out first whether the failure is the backend or the network. A connection or signing error is usually ours or transient. A conditional write that was supposed to lose and won is the finding this job exists to report, and it means the support claim in `crates/orbita-objectstore/src/s3/mod.rs` is no longer true.
+
+          Reproduce it by hand against a bucket of your own using the environment variables documented in `crates/orbita-objectstore/tests/minio.rs`.
+          EOF
+          } > /tmp/live-object-store-body.md
+
+          # One issue, updated by comment, rather than one per week. A pile of
+          # identical issues is how a real finding gets lost.
+          number="$(gh issue list --state open --search "$title in:title" \
+            --json number,title \
+            --jq "[.[] | select(.title == \"$title\")] | .[0].number // empty")"
+
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file /tmp/live-object-store-body.md
+          else
+            # Assigned to the code owner of /crates/orbita-objectstore/. If
+            # .github/CODEOWNERS changes, change this with it, or the alarm ends
+            # up on somebody who has stopped reading it.
+            gh issue create \
+              --title "$title" \
+              --label maintenance \
+              --assignee bradhe \
+              --body-file /tmp/live-object-store-body.md
+          fi
