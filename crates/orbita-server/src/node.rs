@@ -65,6 +65,10 @@ use std::time::Duration;
 pub(crate) struct DataLayout {
     pub store: Arc<dyn ObjectStore>,
     pub wal_root: String,
+    /// How large a log segment grows before it is rolled, which is the unit a
+    /// checkpoint removes and therefore how far a replica may fall behind and
+    /// still be caught up from the owner's log.
+    pub wal_segment_bytes: u64,
 }
 
 impl DataLayout {
@@ -73,6 +77,7 @@ impl DataLayout {
             store: Arc::clone(&self.store),
             path: PartitionPath::new("", keyspace, partition),
             wal_dir: format!("{}/p{}", self.wal_root, partition.get()),
+            wal_segment_bytes: self.wal_segment_bytes,
         }
     }
 }
@@ -177,6 +182,10 @@ impl<R: Runtime> Node<R> {
             writes: tokio::sync::RwLock::new(()),
         });
         node.reconcile_hosts().await?;
+        // Nothing is known to be stranded before a single heartbeat has gone
+        // out, and a node held unready for a verdict it has not reached would
+        // never start. The heartbeat corrects this within one interval.
+        node.readiness.mark(ReadinessCondition::ReplicasRecoverable);
         // Opening a partition replays its write-ahead log to the trusted end,
         // so the initial reconcile succeeding means every log this node holds
         // is recovered. Marked here rather than inside `reconcile` because a
@@ -769,13 +778,17 @@ impl<R: Runtime> Node<R> {
     /// Answering `false` is not a failure: it is a replica saying it is not
     /// caught up enough to serve reads, which the owner needs to know because
     /// it decides what to wait for from the same answer.
-    async fn accept_lease(&self, grant: &proxy::LeaseGrant) -> Result<bool> {
+    async fn accept_lease(&self, grant: &proxy::LeaseGrant) -> Result<proxy::LeaseReply> {
         let host = self.hosts.read().await.get(&grant.partition).cloned();
         match host {
             Some(host) => Ok(host.accept_lease(grant).await),
             // A partition this node does not hold cannot serve a read from it
-            // either, so refusing is the whole answer.
-            None => Ok(false),
+            // either, so refusing is the whole answer, and it has no log
+            // position to report for one it is not holding.
+            None => Ok(proxy::LeaseReply {
+                accepted: false,
+                durable: None,
+            }),
         }
     }
 
@@ -787,6 +800,28 @@ impl<R: Runtime> Node<R> {
     /// answer as a locally served one, only slower.
     pub(crate) fn replica_reads(&self) -> u64 {
         self.replica_reads.load(Ordering::Relaxed)
+    }
+
+    /// Every replica of a partition this node owns that has fallen past what
+    /// this node's log still holds.
+    ///
+    /// Sorted by partition and then node, so a repeated report of an unchanged
+    /// state is the same bytes. Empty is the healthy answer; anything else is
+    /// a replica that cannot be recovered until hydration exists (issue #17).
+    pub(crate) async fn replicas_beyond_retention(
+        &self,
+    ) -> Vec<(PartitionId, orbita_wal::BeyondRetention)> {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self.hosts.read().await.values().cloned().collect();
+        let mut fallen: Vec<(PartitionId, orbita_wal::BeyondRetention)> = hosts
+            .iter()
+            .flat_map(|host| {
+                host.replicas_beyond_retention()
+                    .into_iter()
+                    .map(move |one| (host.id(), one))
+            })
+            .collect();
+        fallen.sort_unstable_by_key(|(partition, one)| (partition.get(), one.node.get()));
+        fallen
     }
 
     /// How far this node has got on every partition it holds.
@@ -906,6 +941,30 @@ impl<R: Runtime> Node<R> {
         for host in hosts {
             host.renew_leases().await;
         }
+        // The heartbeat is also how an owner learns where each replica's log
+        // ends, so this is the moment its verdict can have changed.
+        self.report_replica_recoverability().await;
+    }
+
+    /// Moves the durability half of readiness to match what the owners here
+    /// have established about their replicas.
+    ///
+    /// Called from the lease heartbeat rather than a timer of its own, because
+    /// that heartbeat is what produces the evidence and running the two on
+    /// different clocks would only add a window where the gate disagreed with
+    /// the thing it reports.
+    async fn report_replica_recoverability(&self) {
+        let fallen = self.replicas_beyond_retention().await;
+        if fallen.is_empty() {
+            self.readiness.mark(ReadinessCondition::ReplicasRecoverable);
+            return;
+        }
+        self.readiness
+            .clear(ReadinessCondition::ReplicasRecoverable);
+        tracing::warn!(
+            stranded = fallen.len(),
+            "this node owns a partition whose replica cannot be caught up from its log"
+        );
     }
 
     /// Flushes every partition this node currently owns once.
@@ -968,7 +1027,7 @@ async fn dispatch<R: Runtime>(node: &Node<R>, call: PeerCall) -> Bytes {
     match call.method {
         proxy::METHOD_LEASE => match proxy::LeaseGrant::decode(&call.payload) {
             Ok(grant) => match node.accept_lease(&grant).await {
-                Ok(accepted) => proxy::encode_lease_reply(accepted),
+                Ok(reply) => proxy::encode_lease_reply(reply),
                 Err(error) => proxy::encode_error(&error),
             },
             Err(error) => proxy::encode_error(&error),
@@ -1057,19 +1116,36 @@ impl Cursor {
     }
 }
 
-/// One partition's catch-up pass, reporting whether every advertised replica
-/// reached the committed prefix.
+/// One partition's catch-up pass, reporting whether it still has work to
+/// retry.
 ///
 /// A free function so several of these can be in flight at once: one
 /// unreachable peer should cost one timeout, not one per partition it holds.
+///
+/// A replica that has fallen past the owner's retained log is not counted as
+/// outstanding work, however far short of the horizon it is. No number of
+/// passes produces entries the log no longer holds, so counting it would leave
+/// this node reconciling on every poll forever and would bury the reason under
+/// a retry. It is reported instead, through the `replicas-recoverable`
+/// readiness condition that the lease heartbeat drives from the same
+/// per-replica record this pass reads.
 async fn catch_up_one<R: Runtime>(host: &Arc<PartitionHost<R>>) -> bool {
     match host.catch_up_replicas().await {
-        Ok(caught_up) if caught_up.is_complete() => true,
-        Ok(caught_up) => {
+        Ok(pass) => {
+            if !pass.stranded.is_empty() {
+                tracing::debug!(
+                    partition = host.id().get(),
+                    stranded = ?pass.stranded,
+                    "a replica is beyond this owner's retained log, so a catch-up cannot help it"
+                );
+            }
+            if pass.is_complete() {
+                return true;
+            }
             tracing::warn!(
                 partition = host.id().get(),
-                behind = ?caught_up.behind,
-                horizon = caught_up.horizon.get(),
+                behind = ?pass.behind,
+                horizon = pass.horizon.get(),
                 "an advertised replica is still short of the committed prefix"
             );
             false
@@ -1236,6 +1312,7 @@ mod tests {
         let layout = DataLayout {
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
         };
 
         let source = StaticMapSource::new(one_partition_map());

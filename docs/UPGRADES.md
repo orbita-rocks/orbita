@@ -26,6 +26,15 @@ holds, and it turns unready again if a map change hands it a partition it
 cannot open. A leader voter also has to apply through the commit index reported
 by the current Raft leader. Seeing a leader is not enough.
 
+A worker also reports `replicas-recoverable` as unmet when it owns a partition
+whose replica has fallen further behind than its write-ahead log still reaches.
+WAL truncation is live and hydration from object storage is not, so that
+replica cannot be recovered and the partition is permanently short a copy. The
+rollout stops there on purpose: continuing would take out another copy of a
+partition that has already lost one. Replace the replica, or wait for issue
+\#17. `orbita cluster describe` shows how far each replica has applied, and the
+owner logs which one it is and the two Lamports that bracket the gap.
+
 Stage a rollout with the `partition` field and check the cluster between steps
 when the blast radius warrants it. After finalization, a worker drains its
 partitions on SIGTERM; before finalization it exits through ordinary failover so

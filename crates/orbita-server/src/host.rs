@@ -32,7 +32,7 @@
 
 use crate::lease::{LeaseTable, ReplicaReadState, DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 use crate::pending::{self, PendingRecord, PendingSet};
-use crate::proxy::{self, LeaseGrant};
+use crate::proxy::{self, LeaseGrant, LeaseReply};
 
 use bytes::Bytes;
 use orbita_core::{
@@ -42,7 +42,7 @@ use orbita_format::PartitionPath;
 use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_storage::{Mutation, Partition, ScanPage, TOMBSTONE_RETENTION_MILLIS};
-use orbita_wal::{CatchUp, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
+use orbita_wal::{CatchUpPass, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -153,6 +153,11 @@ pub(crate) struct PartitionPaths {
     pub store: Arc<dyn ObjectStore>,
     pub path: PartitionPath,
     pub wal_dir: String,
+    /// The size a log segment reaches before it is rolled. It belongs with the
+    /// paths because it is the shape of the log on disk rather than a policy:
+    /// a checkpoint drops whole segments, so this is what decides how much
+    /// history an owner keeps after one.
+    pub wal_segment_bytes: u64,
 }
 
 pub(crate) struct PartitionHost<R: Runtime> {
@@ -217,8 +222,9 @@ impl<R: Runtime> PartitionHost<R> {
             )
             .await?,
         );
-        let config =
+        let mut config =
             WalConfig::new(id, paths.wal_dir.clone(), epoch).with_replicas(replicas.clone());
+        config.segment_target_bytes = paths.wal_segment_bytes;
         let wal = Wal::open(runtime.clone(), config).await?;
 
         // A restart finds entries that were durable and never applied, because
@@ -274,7 +280,7 @@ impl<R: Runtime> PartitionHost<R> {
             runtime.clone(),
             paths.wal_dir.clone(),
             id,
-            orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES,
+            paths.wal_segment_bytes,
         )
         .await?;
         for entry in &log.recovery().entries {
@@ -420,24 +426,25 @@ impl<R: Runtime> PartitionHost<R> {
     ///
     /// The horizon is deliberately the committed prefix rather than this
     /// node's durable position; see [`orbita_wal::Wal::catch_up_replicas`].
-    pub(crate) async fn catch_up_replicas(&self) -> Result<CatchUp> {
+    pub(crate) async fn catch_up_replicas(&self) -> Result<CatchUpPass> {
         match self.wal.as_ref() {
             Some(wal) => wal.catch_up_replicas().await,
-            None => Ok(CatchUp {
+            None => Ok(CatchUpPass {
                 horizon: Lamport::ZERO,
                 caught_up: Vec::new(),
                 behind: Vec::new(),
+                stranded: Vec::new(),
             }),
         }
     }
 
-    /// The advertised replicas that have not confirmed they hold the committed
-    /// prefix.
+    /// The advertised replicas a catch-up still owes a pass.
     ///
-    /// This is what keeps a failed catch-up pending. It is answered from the
-    /// per-replica acknowledgements the append path already records, so it
-    /// stays true without a second source of truth to drift from: a healthy
-    /// partition under load reports nothing behind without anyone asking.
+    /// This is what keeps a failed catch-up pending. It reads the same
+    /// per-replica record that [`PartitionHost::replicas_beyond_retention`]
+    /// reads, so the two cannot disagree about a node: one names the work a
+    /// retry can still do and the other names the work it cannot. See
+    /// [`orbita_wal::Wal::replicas_behind`].
     pub(crate) fn replicas_behind(&self) -> Vec<NodeId> {
         self.wal
             .as_ref()
@@ -560,6 +567,19 @@ impl<R: Runtime> PartitionHost<R> {
     /// this is what bounds the writes the cluster has promised.
     pub(crate) async fn durable_lamport(&self) -> Lamport {
         self.log.durable_lamport().await
+    }
+
+    /// Replicas of this partition that have fallen past what this owner's log
+    /// still holds.
+    ///
+    /// Empty on a replica and on a healthy owner. A non-empty answer names a
+    /// node that is out of the read set and out of the durability quorum and
+    /// that no retry will recover, which is a state rather than a log line
+    /// precisely so that something can be asked about it.
+    pub(crate) fn replicas_beyond_retention(&self) -> Vec<orbita_wal::BeyondRetention> {
+        self.wal
+            .as_ref()
+            .map_or_else(Vec::new, |wal| wal.beyond_retention())
     }
 
     /// How much disk this partition is using, which is what the control plane
@@ -760,8 +780,18 @@ impl<R: Runtime> PartitionHost<R> {
             .map_err(|e| Error::Unavailable(e.to_string()))
             .and_then(|reply| proxy::decode_lease_reply(&reply));
 
+        // Where the replica said its log ends, whatever it decided about the
+        // lease. This is the heartbeat's second job and the reason an owner
+        // that has replicated nothing since it opened still knows which of its
+        // replicas it can catch up. See `Wal::note_replica_position`.
+        if let (Ok(reply), Some(wal)) = (&answered, self.wal.as_ref()) {
+            if let Some(durable) = reply.durable {
+                wal.note_replica_position(node, durable).await;
+            }
+        }
+
         match answered {
-            Ok(true) if granting => {}
+            Ok(reply) if reply.accepted && granting => {}
             Ok(_) => {
                 // Either the replica refused the lease, or this was a probe
                 // and it has confirmed it holds none. Both mean nothing there
@@ -862,14 +892,22 @@ impl<R: Runtime> PartitionHost<R> {
     ///
     /// The same message carries how far the owner has acknowledged, which is
     /// what releases entries this node is holding back.
-    pub(crate) async fn accept_lease(&self, grant: &LeaseGrant) -> bool {
+    pub(crate) async fn accept_lease(&self, grant: &LeaseGrant) -> LeaseReply {
+        // Answered even when the grant is refused, because where this node's
+        // log ends is what the owner needs most from a replica it cannot
+        // grant to.
+        let durable = Some(self.log.durable_lamport().await);
         if self.is_owner() || grant.epoch < self.epoch {
-            return false;
+            return LeaseReply {
+                accepted: false,
+                durable,
+            };
         }
         self.commit_through(grant.committed).await;
 
         let now = self.runtime.clock().monotonic_nanos();
-        self.read_state
+        let accepted = self
+            .read_state
             .lock()
             .expect("read state poisoned")
             .accept_grant(
@@ -877,7 +915,8 @@ impl<R: Runtime> PartitionHost<R> {
                 grant.through,
                 Duration::from_millis(grant.duration_millis),
                 self.lease.margin,
-            )
+            );
+        LeaseReply { accepted, durable }
     }
 
     /// Releases everything the owner has acknowledged to a client.
@@ -1332,6 +1371,7 @@ mod tests {
             store,
             path: partition_path(),
             wal_dir: "wal/p1".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
         };
         sim.block_on(async move {
             PartitionHost::open_owner(
@@ -1359,6 +1399,7 @@ mod tests {
             store,
             path: partition_path(),
             wal_dir: "wal/replica-p1".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
         };
         sim.block_on(async move {
             PartitionHost::open_replica(

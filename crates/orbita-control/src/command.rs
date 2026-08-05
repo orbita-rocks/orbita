@@ -52,6 +52,7 @@ const TAG_REGISTER_NODE_V2: u8 = 14;
 // only so an upgraded control member can replay either predecessor.
 const TAG_REGISTER_NODE_V3: u8 = 15;
 const TAG_TRANSFER_OWNERSHIP: u8 = 16;
+const TAG_COMPLETE_FENCE_DRAIN: u8 = 17;
 
 /// One decision, committed once and applied everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +133,13 @@ pub enum ControlCommand {
     /// epoch check instead of bumping again and stranding the promotion that
     /// was already in flight.
     FencePartition {
+        partition: PartitionId,
+        expect_epoch: Epoch,
+    },
+
+    /// Records that the leader waited out every lease from the fenced owner.
+    /// Once committed, a later leader need not repeat that completed wait.
+    CompleteFenceDrain {
         partition: PartitionId,
         expect_epoch: Epoch,
     },
@@ -261,6 +269,14 @@ impl ControlCommand {
                     .u64(partition.get())
                     .u64(expect_epoch.get());
             }
+            ControlCommand::CompleteFenceDrain {
+                partition,
+                expect_epoch,
+            } => {
+                w.u8(TAG_COMPLETE_FENCE_DRAIN)
+                    .u64(partition.get())
+                    .u64(expect_epoch.get());
+            }
             ControlCommand::AssignOwner {
                 partition,
                 owner,
@@ -377,6 +393,10 @@ impl ControlCommand {
             },
             TAG_REVOKE_CREDENTIAL => ControlCommand::RevokeCredential { id: r.string()? },
             TAG_FENCE_PARTITION => ControlCommand::FencePartition {
+                partition: PartitionId(r.u64()?),
+                expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_COMPLETE_FENCE_DRAIN => ControlCommand::CompleteFenceDrain {
                 partition: PartitionId(r.u64()?),
                 expect_epoch: Epoch(r.u64()?),
             },
@@ -527,6 +547,10 @@ mod tests {
             ControlCommand::FencePartition {
                 partition: PartitionId(1),
                 expect_epoch: Epoch(3),
+            },
+            ControlCommand::CompleteFenceDrain {
+                partition: PartitionId(1),
+                expect_epoch: Epoch(4),
             },
             ControlCommand::AssignOwner {
                 partition: PartitionId(1),

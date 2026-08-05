@@ -20,9 +20,9 @@ artifacts come from. `main` only ever contains released code, and a tag on
 |                | `develop`                | `main`                       |
 | -------------- | ------------------------ | ---------------------------- |
 | Version        | `0.2.0-dev`              | `0.1.0`                      |
-| Built on       | every push               | a pushed tag                 |
+| Built on       | nightly or by hand        | a pushed tag                 |
 | Image tags     | `develop`, `sha-abc1234` | `0.1.0`, `0.1`, `latest`     |
-| Binaries       | workflow artifacts, 30d  | attached to the release      |
+| Binaries       | workflow artifacts, 7d   | attached to the release      |
 | Chart          | not published            | pushed to GHCR as OCI        |
 | GitHub release | none                     | yes                          |
 
@@ -32,6 +32,13 @@ identified by the sha in the image tag and by the sha baked into the binary,
 which is why `orbita --version` prints `0.2.0-dev (abc1234)`. Bumping the
 version on every merge would produce a version number nobody could reason
 about and a lockfile churning on every commit.
+
+The nightly cadence is deliberate. A multi-architecture image compiles ARM
+under emulation and costs far more than the merge gate, while prerelease users
+need a recent build rather than one artifact per commit. The workflow can be
+dispatched when a particular commit is needed sooner. SHA-only image versions
+expire after 30 days; release tags and the moving `develop` tag are never
+selected by that cleanup.
 
 ## Cutting a release
 
@@ -102,7 +109,8 @@ direction; cut a minor release rather than arguing with it.
 - `scripts/tag-release.sh` checks that a commit is releasable, then tags it.
 - `.github/workflows/release-pr.yml` opens the release pull request.
 - `.github/workflows/release.yml` is everything a tag does.
-- `.github/workflows/prerelease.yml` is everything a push to `develop` does.
+- `.github/workflows/prerelease.yml` publishes the nightly or manually requested
+  build of `develop`.
 - `.github/workflows/post-release.yml` back-merges and opens the next cycle.
 - `cliff.toml` decides which commit types reach the changelog. It follows the
   visible and hidden split in the conventional commit skill, with anything
