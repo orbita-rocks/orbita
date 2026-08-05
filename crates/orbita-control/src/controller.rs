@@ -77,6 +77,13 @@ pub struct NodeView {
     /// How long since the leader last heard from it, in milliseconds. `None`
     /// when this leader has never heard from it at all.
     pub silent_for_millis: Option<u64>,
+    /// The map version this node last said it was routing on. `None` when this
+    /// leader has never heard from it.
+    ///
+    /// This is the leader's own evidence that a decision it published actually
+    /// landed, which is what makes "the cluster has caught up" answerable
+    /// rather than a matter of waiting long enough and assuming.
+    pub reported_map_version: Option<MapVersion>,
     pub is_control_leader: bool,
 }
 
@@ -86,8 +93,16 @@ pub struct NodeView {
 pub struct PartitionView {
     pub info: PartitionInfo,
     pub phase: PartitionPhase,
-    /// The owner's reported durable Lamport, which is the partition's
-    /// committed position.
+    /// The owner's reported durable Lamport: what reached the owner's own
+    /// disk, which is what a worker fills in from
+    /// `orbita_wal::PartitionLog::durable_lamport`.
+    ///
+    /// Not the same thing as `orbita_wal::Wal::committed_lamport`, which is
+    /// the quorum-replicated prefix and which #79 keeps deliberately separate,
+    /// because an entry on one disk whose `commit` returned `Unavailable` sits
+    /// between them. The name predates that distinction and overstates this
+    /// number; the leader group has no way to ask for the other one yet, which
+    /// is issue #87.
     pub committed_lamport: Lamport,
     pub size_bytes: u64,
     pub replica_progress: Vec<(NodeId, Lamport)>,
@@ -867,6 +882,10 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     .observations
                     .get(&record.id)
                     .map(|obs| (now.saturating_sub(obs.heard_at_nanos)) / 1_000_000),
+                reported_map_version: inner
+                    .observations
+                    .get(&record.id)
+                    .map(|obs| obs.status.map_version),
                 is_control_leader: control_leader == Some(record.id),
             })
             .collect();

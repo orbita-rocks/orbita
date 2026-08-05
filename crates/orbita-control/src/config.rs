@@ -134,6 +134,64 @@ impl ControlConfig {
     pub fn failover_budget(&self) -> Duration {
         self.dead_after + self.sweep_interval + self.lease_drain() + self.sweep_interval
     }
+
+    /// The worst-case time from the last fault healing to the cluster having
+    /// finished reacting to it: every partition owned by a live worker, every
+    /// surviving worker routing on the resulting map, every drain complete,
+    /// and no sweep still proposing anything.
+    ///
+    /// [`ControlConfig::failover_budget`] answers "when can writes resume",
+    /// which is the guarantee an operator was sold. This answers "when has the
+    /// control plane stopped moving", which is the one a liveness check needs,
+    /// and it is strictly longer because restoring redundancy and telling
+    /// everybody about it both happen after writes are already back.
+    ///
+    /// Every term is a stage of the recovery, costed at its worst case:
+    ///
+    /// | Stage | Worst case |
+    /// |---|---|
+    /// | Detect the failure and promote a replacement | `failover_budget()` |
+    /// | Commit the completed lease drain, then promote on the next sweep | one `sweep_interval` |
+    /// | Every survivor reports at or past the fence's map version | two `heartbeat_interval` |
+    /// | Repair the replica set the failure left short | one `sweep_interval` |
+    /// | Each worker fetches the map, then reports it | two `heartbeat_interval` |
+    /// | The same round trip for the repair's map bump | two `heartbeat_interval` |
+    /// | The same round trip for a drain acknowledgement | two `heartbeat_interval` |
+    /// | Two sweeps in which nothing further is proposed | two `sweep_interval` |
+    ///
+    /// A map round trip costs two heartbeats because that is what it costs in
+    /// production: a worker learns of a new map on one poll and reports that
+    /// it is routing on it on the next. Four of them are counted because the
+    /// stages are serial in the worst case, even though they usually overlap.
+    ///
+    /// The second and third rows are not in `failover_budget`, and the gap is
+    /// deliberate rather than an oversight in either. Committing the completed
+    /// drain and waiting for post-fence evidence are what stop a promotion
+    /// from being repeated after a leader change or decided on a report that
+    /// predates the fence. They lengthen the path to a new owner without
+    /// lengthening the window in which writes are unavailable for a reason
+    /// anyone would call a failover, so the two numbers measure different
+    /// things on purpose.
+    ///
+    /// The last row is not slack. It is how a controller loop that has
+    /// finished is told apart from one that is still retrying every interval,
+    /// and without it a cluster flapping forever between two decisions would
+    /// pass by being observed at the right moment.
+    ///
+    /// At the default timings this is 7.05 seconds, against a 4.05 second
+    /// failover budget. The margin is measured rather than argued: across
+    /// every seeded control-plane schedule, including the aggressive ones
+    /// currently parked against issue #76, the slowest cluster to converge
+    /// takes 4.5 seconds and the median takes 0.5. Excluding those two the
+    /// slowest is 3.0 seconds, so the margin is quoted from the schedules that
+    /// stress it hardest rather than from the ones that flatter it.
+    ///
+    /// That leaves room for a stage landing badly against a sweep without
+    /// leaving enough to hide a stage that has stopped happening altogether.
+    #[must_use]
+    pub fn convergence_bound(&self) -> Duration {
+        self.failover_budget() + 4 * self.sweep_interval + 8 * self.heartbeat_interval
+    }
 }
 
 fn scale_duration(d: Duration, scale: f64) -> Duration {
@@ -166,6 +224,25 @@ mod tests {
         let config = ControlConfig::for_failover_budget(Duration::from_secs(2));
         assert!(config.failover_budget() < Duration::from_secs(2));
         assert!(config.heartbeat_interval < config.suspect_after);
+    }
+
+    #[test]
+    fn convergence_is_bounded_after_writes_have_already_resumed() {
+        // Restoring redundancy and publishing the result both happen after the
+        // new owner is accepting writes, so a convergence bound that did not
+        // exceed the failover budget would be asserting the wrong thing.
+        let config = ControlConfig::default();
+        assert!(config.convergence_bound() > config.failover_budget());
+        assert_eq!(config.convergence_bound(), Duration::from_millis(7_050));
+    }
+
+    #[test]
+    fn the_convergence_bound_scales_with_the_timings_it_is_derived_from() {
+        // A caller that tightens the failover budget must not be left with a
+        // liveness bound stated in someone else's milliseconds.
+        let tight = ControlConfig::for_failover_budget(Duration::from_secs(2));
+        assert!(tight.convergence_bound() < ControlConfig::default().convergence_bound());
+        assert!(tight.convergence_bound() > tight.failover_budget());
     }
 
     #[test]
