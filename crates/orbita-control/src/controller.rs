@@ -1350,6 +1350,17 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 /// a pre-fence map, is an unknown upper bound rather than evidence that the
 /// replica is behind. Ties break on node id so the choice is reproducible from
 /// a seed.
+///
+/// The candidate list includes the node the fence deposed, because
+/// `fence_partition` demotes it into `replicas` rather than dropping it. That
+/// is what makes the sentence above true rather than nearly true: an owner is
+/// a member of every durability quorum it counted, so it holds the whole
+/// committed prefix, and excluding it left a promotion able to pick a
+/// survivor that is genuinely behind an acknowledged write whenever the
+/// replica set had already shrunk. Nothing here treats it as special; it is
+/// judged on the position it reports, so a deposed owner that came back with
+/// a shorter log loses to a replica that did not. See
+/// [ADR 0008](../../../docs/adr/0008-a-fenced-owner-stays-a-replica.md).
 fn best_candidate(
     inner: &Inner,
     info: &PartitionInfo,
