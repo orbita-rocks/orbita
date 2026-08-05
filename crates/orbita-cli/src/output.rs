@@ -501,6 +501,10 @@ pub struct ClusterSummaryView {
     pub partitions_with_an_unhealthy_owner: usize,
     pub max_replica_lag: u64,
     pub max_wal_lag: u64,
+    /// Keyspaces whose stored bytes have reached or passed their quota.
+    /// Counted, not judged: it does not feed [`Self::healthy`], because the
+    /// quota is a tenant's limit and not the cluster's health.
+    pub keyspaces_over_quota: usize,
     /// What every node's partition indexes cost, added up. ADR 0006 makes
     /// this the resource a cluster exhausts first, and a total is what an
     /// operator compares against the memory they bought.
@@ -550,14 +554,47 @@ pub struct KeyspaceUsageView {
     pub max_storage_bytes: Option<u64>,
 }
 
+/// Where a keyspace's storage sits against the quota it was given.
+///
+/// An enum rather than an `Option<f64>` because a quota of zero is a real,
+/// configurable state that no fraction can express, and folding it into
+/// "no measurement" is how a keyspace that is entirely over its limit ends up
+/// looking like one that has no limit at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuotaUse {
+    /// No quota configured, so there is nothing to be a fraction of.
+    Unlimited,
+    /// A quota of exactly zero bytes: the keyspace is allowed to hold
+    /// nothing. `over` is true once it holds something, which happens the
+    /// moment a nonempty keyspace is moved to this cap.
+    Closed { over: bool },
+    /// Stored bytes as a fraction of the quota. Can exceed one, because a
+    /// quota is enforced on admission and existing bytes predate it.
+    Fraction(f64),
+}
+
 impl KeyspaceUsageView {
-    /// Stored bytes as a fraction of the quota, or `None` when there is no
-    /// quota to be a fraction of.
+    /// Where this keyspace sits against its quota.
     #[must_use]
-    pub fn saturation(&self) -> Option<f64> {
+    pub fn quota_use(&self) -> QuotaUse {
         match self.max_storage_bytes {
-            Some(0) | None => None,
-            Some(limit) => Some(self.stored_bytes as f64 / limit as f64),
+            None => QuotaUse::Unlimited,
+            Some(0) => QuotaUse::Closed {
+                over: self.stored_bytes > 0,
+            },
+            Some(limit) => QuotaUse::Fraction(self.stored_bytes as f64 / limit as f64),
+        }
+    }
+
+    /// Whether this keyspace has reached or passed the quota it was given.
+    #[must_use]
+    pub fn is_over_quota(&self) -> bool {
+        match self.quota_use() {
+            QuotaUse::Unlimited => false,
+            // A zero quota is reached at zero bytes: there is no room left,
+            // whether or not anything is stored yet.
+            QuotaUse::Closed { .. } => true,
+            QuotaUse::Fraction(fraction) => fraction >= 1.0,
         }
     }
 
@@ -567,10 +604,14 @@ impl KeyspaceUsageView {
     }
 
     fn saturation_text(&self) -> String {
-        self.saturation().map_or_else(
-            || "-".to_owned(),
-            |fraction| format!("{:.1}%", fraction * 100.0),
-        )
+        match self.quota_use() {
+            QuotaUse::Unlimited => "-".to_owned(),
+            // Not a percentage, because the percentage is either zero over
+            // zero or infinite, and both would be read as a mistake.
+            QuotaUse::Closed { over: false } => "full".to_owned(),
+            QuotaUse::Closed { over: true } => "over".to_owned(),
+            QuotaUse::Fraction(fraction) => format!("{:.1}%", fraction * 100.0),
+        }
     }
 }
 
@@ -616,6 +657,7 @@ impl ClusterView {
                 .max()
                 .unwrap_or(0),
             index_memory_bytes: nodes.iter().map(|n| n.index_memory_bytes).sum(),
+            keyspaces_over_quota: 0,
         };
 
         Self {
@@ -637,6 +679,7 @@ impl ClusterView {
         // Sorted here for the same reason the nodes and partitions are: two
         // describes a minute apart have to diff cleanly.
         keyspaces.sort_by(|a, b| a.name.cmp(&b.name));
+        self.summary.keyspaces_over_quota = keyspaces.iter().filter(|k| k.is_over_quota()).count();
         self.keyspaces = keyspaces;
         self
     }
@@ -681,6 +724,14 @@ impl Render for ClusterView {
             s.max_replica_lag, s.max_wal_lag
         );
         let _ = writeln!(out, "  index memory {}", format_bytes(s.index_memory_bytes));
+        if s.keyspaces_over_quota > 0 {
+            let _ = writeln!(
+                out,
+                "  quotas       {} of {} keyspaces at or over their storage quota",
+                s.keyspaces_over_quota,
+                self.keyspaces.len()
+            );
+        }
         if s.healthy() {
             out.push_str("  everything reporting is healthy\n");
         }
@@ -1260,11 +1311,15 @@ mod tests {
             ]);
 
         assert_eq!(view.keyspaces[0].name, "audit", "sorted for a clean diff");
-        assert_eq!(view.keyspaces[1].saturation(), Some(0.5));
+        assert_eq!(view.keyspaces[1].quota_use(), QuotaUse::Fraction(0.5));
         assert_eq!(
-            view.keyspaces[0].saturation(),
-            None,
+            view.keyspaces[0].quota_use(),
+            QuotaUse::Unlimited,
             "a keyspace with no quota has no saturation, rather than zero"
+        );
+        assert_eq!(
+            view.summary.keyspaces_over_quota, 0,
+            "neither of these is at its limit"
         );
 
         let text = render(Format::Human, &view).unwrap();
@@ -1277,16 +1332,77 @@ mod tests {
     }
 
     #[test]
-    fn a_quota_of_zero_reports_no_saturation_rather_than_dividing_by_it() {
-        let usage = KeyspaceUsageView {
+    fn a_nonempty_keyspace_at_a_zero_quota_reads_as_over_and_not_as_unlimited() {
+        // A zero quota is a configured cap, not the absence of one. Treating
+        // it as no measurement printed the same dash an unlimited keyspace
+        // gets, so a tenant that is entirely over its limit looked like one
+        // that has no limit, which is backwards in the worst way.
+        let over = KeyspaceUsageView {
             id: 1,
             name: "orders".to_owned(),
             partition_count: 1,
             stored_bytes: 10,
             max_storage_bytes: Some(0),
         };
-        assert_eq!(usage.saturation(), None);
-        assert_eq!(usage.saturation_text(), "-");
+        assert_eq!(over.quota_use(), QuotaUse::Closed { over: true });
+        assert_eq!(over.saturation_text(), "over");
+        assert!(over.is_over_quota());
+
+        // The same cap on an empty keyspace is not over it, but it still has
+        // no room, and it is still not "unlimited".
+        let empty = KeyspaceUsageView {
+            stored_bytes: 0,
+            ..over.clone()
+        };
+        assert_eq!(empty.quota_use(), QuotaUse::Closed { over: false });
+        assert_eq!(empty.saturation_text(), "full");
+        assert!(empty.is_over_quota());
+
+        let unlimited = KeyspaceUsageView {
+            max_storage_bytes: None,
+            ..over.clone()
+        };
+        assert_eq!(unlimited.saturation_text(), "-");
+        assert!(!unlimited.is_over_quota());
+        assert_ne!(
+            over.saturation_text(),
+            unlimited.saturation_text(),
+            "a zero quota and no quota must not print the same thing"
+        );
+    }
+
+    #[test]
+    fn a_keyspace_at_or_over_its_quota_is_counted_in_the_summary() {
+        // The renderer showing "over" in one row is not enough on its own:
+        // the summary is what an operator reads first, and a tenant that
+        // cannot accept another byte should not need a scroll to find.
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], Vec::new())
+            .with_keyspaces(vec![
+                KeyspaceUsageView {
+                    id: 1,
+                    name: "closed".to_owned(),
+                    partition_count: 1,
+                    stored_bytes: 10,
+                    max_storage_bytes: Some(0),
+                },
+                KeyspaceUsageView {
+                    id: 2,
+                    name: "roomy".to_owned(),
+                    partition_count: 1,
+                    stored_bytes: 10,
+                    max_storage_bytes: Some(1024),
+                },
+            ]);
+
+        assert_eq!(view.summary.keyspaces_over_quota, 1);
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("at or over their storage quota"), "{text}");
+        assert!(text.contains("over"), "the row says so too: {text}");
+        assert!(
+            view.summary.healthy(),
+            "a tenant's quota is not the cluster's health, and no resource \
+             number may flip that verdict"
+        );
     }
 
     #[test]

@@ -54,6 +54,9 @@ struct Fake {
     key_exists: bool,
     /// Whether Set should report the condition as met.
     condition_holds: bool,
+    /// The storage quota DescribeCluster reports for its keyspace. `Some(0)`
+    /// is a real cap that allows nothing, not the absence of a cap.
+    quota_bytes: Option<u64>,
 }
 
 impl Fake {
@@ -178,7 +181,13 @@ impl Admin for Fake {
                 index_bytes: 65_536,
             }],
             cluster_version: Some(ClusterVersion { major: 0, minor: 2 }),
-            keyspaces: vec![keyspace("orders")],
+            keyspaces: vec![Keyspace {
+                config: Some(KeyspaceConfig {
+                    max_storage_bytes: self.quota_bytes,
+                    ..keyspace("orders").config.expect("the helper sets one")
+                }),
+                ..keyspace("orders")
+            }],
         }))
     }
 
@@ -310,6 +319,7 @@ fn fake() -> Fake {
         seen: Arc::new(Mutex::new(Seen::default())),
         key_exists: true,
         condition_holds: true,
+        quota_bytes: None,
     }
 }
 
@@ -482,6 +492,44 @@ async fn the_describe_json_carries_every_consumption_signal_for_a_script() {
         serde_json::Value::Null,
         "a keyspace with no quota reports none rather than a number"
     );
+}
+
+#[tokio::test]
+async fn a_keyspace_at_a_zero_byte_quota_describes_as_over_and_not_as_unlimited() {
+    // Some(0) is a cap that allows nothing. Treated as no measurement it
+    // printed the same dash an unlimited keyspace gets, hiding a tenant that
+    // is entirely over its limit behind the rendering of one that has none.
+    let (config, _) = start(Fake {
+        quota_bytes: Some(0),
+        ..fake()
+    })
+    .await;
+
+    let text = admin::cluster(
+        &config,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    assert!(
+        text.contains("at or over their storage quota"),
+        "the summary names it: {text}"
+    );
+    assert!(text.contains("over"), "and the row does too: {text}");
+
+    let json: serde_json::Value = serde_json::from_str(
+        &admin::cluster(
+            &config,
+            Format::Json,
+            ClusterCommand::Describe { keyspace: None },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["keyspaces"][0]["max_storage_bytes"], 0);
+    assert_eq!(json["summary"]["keyspaces_over_quota"], 1);
 }
 
 #[tokio::test]
