@@ -615,6 +615,20 @@ impl<R: Runtime> PartitionHost<R> {
             .map_or_else(Vec::new, |wal| wal.beyond_retention())
     }
 
+    /// The oldest Lamport this partition's log still holds.
+    ///
+    /// The retention floor, opposite `Wal::committed_lamport`'s ceiling: a
+    /// replica can be carried from the log exactly when the entry it needs
+    /// next is at or above this. Nothing in the running server asks — an owner
+    /// reports the floor per stranded replica through
+    /// [`PartitionHost::replicas_beyond_retention`], which is the answer an
+    /// operator wants. This exists so a scenario can establish that a gap is
+    /// genuinely past the log rather than merely large.
+    #[cfg(test)]
+    pub(crate) async fn retained_from(&self) -> Lamport {
+        self.log.retained_from().await
+    }
+
     /// How much disk this partition is using, which is what the control plane
     /// compares against the split threshold.
     pub(crate) async fn size_bytes(&self) -> Result<u64> {

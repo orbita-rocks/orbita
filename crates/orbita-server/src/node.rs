@@ -825,6 +825,22 @@ impl<R: Runtime> Node<R> {
         fallen
     }
 
+    /// The oldest Lamport this node's log for `partition` still holds, or
+    /// `None` if it does not hold the partition.
+    ///
+    /// The retention floor. Asking for it is how a scenario establishes that a
+    /// gap is genuinely past the log rather than merely large, which is what
+    /// separates a replica hydration has to rescue from one an ordinary
+    /// catch-up would have reached anyway.
+    #[cfg(test)]
+    pub(crate) async fn retained_from(
+        &self,
+        partition: PartitionId,
+    ) -> Option<orbita_core::Lamport> {
+        let host = self.hosts.read().await.get(&partition).cloned()?;
+        Some(host.retained_from().await)
+    }
+
     /// How far this node has got on every partition it holds.
     ///
     /// This is what the heartbeat to the leader group carries, and it is what
