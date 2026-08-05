@@ -438,6 +438,107 @@ fn losing_two_replicas_fails_the_write_rather_than_acknowledging_it() {
 }
 
 #[test]
+fn a_catch_up_stops_at_the_committed_prefix_rather_than_the_local_tail() {
+    let base = TestRuntime::solo(112);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        // Acknowledged at two of three, so this is the committed prefix.
+        c.owner.commit(op("kept")).await.unwrap();
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+
+        // Reached this node's disk and nowhere else. The client was told
+        // `Unavailable`, and the local durable position now runs ahead of what
+        // anybody was promised.
+        c.net.isolate(PEER_A);
+        c.net.isolate(PEER_B);
+        assert!(c.owner.commit(op("ghost")).await.is_err());
+        assert_eq!(c.owner.durable_lamport(), Lamport(2));
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+
+        c.net.heal(PEER_A);
+        c.net.heal(PEER_B);
+        let caught_up = c.owner.catch_up_replicas().await.unwrap();
+        assert_eq!(caught_up.horizon, Lamport(1), "the horizon is the prefix");
+        assert!(caught_up.is_complete());
+
+        // The failed write stays on one copy. Putting it on a second is all it
+        // takes for the next promotion to replay it into storage and serve it.
+        for peer in &c.peers {
+            assert_eq!(
+                peer.durable().await,
+                Lamport(1),
+                "a catch-up carried a write whose client was told it had failed"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_catch_up_names_the_replica_that_did_not_answer_rather_than_calling_the_pass_done() {
+    let base = TestRuntime::solo(113);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        // One peer misses the write, so two of three is still met and the
+        // entry is acknowledged while one advertised copy holds nothing.
+        c.net.isolate(PEER_B);
+        c.owner.commit(op("first")).await.unwrap();
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+
+        // A pass judged on whether any call returned would call this finished,
+        // and the partition would go on advertising a copy that is empty.
+        let caught_up = c.owner.catch_up_replicas().await.unwrap();
+        assert_eq!(caught_up.caught_up, vec![PEER_A]);
+        assert_eq!(caught_up.behind, vec![PEER_B]);
+        assert!(!caught_up.is_complete());
+        assert_eq!(c.owner.replicas_behind(), vec![PEER_B]);
+
+        c.net.heal(PEER_B);
+        let caught_up = c.owner.catch_up_replicas().await.unwrap();
+        assert!(caught_up.is_complete(), "the retry finishes the job");
+        assert!(c.owner.replicas_behind().is_empty());
+        assert_eq!(c.peers[1].durable().await, Lamport(1));
+    });
+}
+
+#[test]
+fn quiescing_gives_up_the_tail_no_client_was_told_about_and_keeps_the_rest() {
+    let base = TestRuntime::solo(114);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        c.owner.commit(op("kept")).await.unwrap();
+
+        c.net.isolate(PEER_A);
+        c.net.isolate(PEER_B);
+        assert!(c.owner.commit(op("ghost")).await.is_err());
+        assert_eq!(c.owner.durable_lamport(), Lamport(2));
+
+        // A draining owner has to advertise a position a replica may be
+        // carried to, and a catch-up may not go past the committed prefix. The
+        // only honest way to meet in the middle is to give up the entries this
+        // node holds alone and already reported as failed.
+        assert_eq!(c.owner.quiesce().await.unwrap(), Lamport(1));
+        assert_eq!(c.owner.durable_lamport(), Lamport(1));
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+        assert_eq!(
+            c.owner_peer.durable().await,
+            Lamport(1),
+            "the entry is gone from the log, not merely from the watermark"
+        );
+
+        // One way. A Lamport the log has given back must never be reissued, or
+        // two writes would share a version.
+        assert!(matches!(
+            c.owner.commit(op("after")).await,
+            Err(Error::Unavailable(_))
+        ));
+
+        // And it stays a no-op afterwards, because a drain calls it on every
+        // pass rather than once.
+        assert_eq!(c.owner.quiesce().await.unwrap(), Lamport(1));
+    });
+}
+
+#[test]
 fn an_append_from_a_fenced_owner_is_rejected_however_well_formed_it_is() {
     let base = TestRuntime::solo(13);
     block_on(&base, async {

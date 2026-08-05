@@ -642,10 +642,11 @@ impl Server {
                     tracing::debug!(%error, "could not refresh the partition map while draining");
                 }
                 // And with write admission closed, an append is never going to
-                // carry the log to a replica that is behind, so it is pushed
-                // deliberately. This is what makes the handoff possible rather
-                // than merely permitted.
-                node.sync_replicas().await;
+                // carry the log to a replica that is behind, so the owner
+                // gives up the tail no client was told about and pushes what
+                // remains. This is what makes the handoff possible rather than
+                // merely permitted.
+                node.prepare_handoff().await;
                 let _ = reporter
                     .report(node.map().version(), node.progress().await, false, true)
                     .await;
