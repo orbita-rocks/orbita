@@ -40,6 +40,8 @@ x-orbita-image: &orbita-image
   build:
     context: .
     dockerfile: Dockerfile
+  # Plain `docker compose up` reuses this tag even when the Rust source changed.
+  # Use the `--build` command above whenever starting from a source checkout.
   image: orbita:local
 
 x-common-env: &common-env
@@ -64,11 +66,11 @@ x-common-env: &common-env
   # MinIO addresses buckets by path, not by subdomain.
   ORBITA_OBJECT_STORE_FORCE_PATH_STYLE: "true"
 
-# The binary is its own health check. `cluster ping` asks the client port
-# whether the node is answering, so there is nothing extra to install in the
-# image and nothing that can report healthy while the server is still opening
-# partitions. It is deliberately not `cluster describe`: a probe should say
-# whether this node is serving, not whether the whole cluster is well.
+# The binary is its own health check. `cluster ready` asks the node-local health
+# service whether this member has joined and opened its partitions, so Raft
+# followers do not fail the probe merely because they reject leader-only Admin
+# calls. It is deliberately not `cluster describe`: a probe should say whether
+# this node is serving, not whether the whole cluster is well.
 x-orbita-healthcheck: &orbita-healthcheck
   healthcheck:
     test:
@@ -77,7 +79,7 @@ x-orbita-healthcheck: &orbita-healthcheck
       - --endpoint
       - http://127.0.0.1:7100
       - cluster
-      - ping
+      - ready
     interval: 5s
     timeout: 5s
     retries: 24

@@ -211,6 +211,11 @@ impl<R: Runtime> Node<R> {
         Arc::clone(&self.map.read().expect("partition map poisoned"))
     }
 
+    #[must_use]
+    pub(crate) fn id(&self) -> NodeId {
+        self.node_id
+    }
+
     /// Asks the map source for a newer map and opens or drops hosts to match.
     ///
     /// An older map is ignored rather than applied, because updates can arrive

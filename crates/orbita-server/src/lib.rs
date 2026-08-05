@@ -141,7 +141,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A running worker.
+/// A running node.
 ///
 /// Holding one means the node is serving. Dropping one without calling
 /// [`Server::shutdown`] leaves the listener running until the process exits,
@@ -402,7 +402,12 @@ impl Server {
             }
         });
 
-        tracing::info!(node = config.node_id.get(), %local_addr, %peer_addr, "orbita worker is serving");
+        let role = if config.leader_member {
+            "leader"
+        } else {
+            "worker"
+        };
+        tracing::info!(node = config.node_id.get(), role, %local_addr, %peer_addr, "node listeners are serving");
         Ok(Self {
             local_addr,
             peer_addr,
@@ -514,10 +519,12 @@ impl Server {
         interval: Duration,
         readiness: Arc<ReadinessGate>,
     ) {
+        let mut convergence_logged = false;
         loop {
             let Some(live) = node.upgrade() else {
                 return;
             };
+            let node_id = live.id();
             let version = live.map().version();
             let progress = live.progress().await;
             // Reported before the directory is read, so that this node's own
@@ -564,6 +571,37 @@ impl Server {
             directory.refresh().await;
             if let Err(error) = live.refresh_map().await {
                 tracing::debug!(%error, "could not refresh the partition map");
+            }
+            if !convergence_logged && readiness.is_ready() {
+                let map = live.map();
+                let held_partitions = map.held_by(node_id).count();
+                match &leader_controller {
+                    Some(controller) => {
+                        let leader = controller.log_leader().await.map_or(0, |id| id.get());
+                        let raft_role = if leader == node_id.get() {
+                            "leader"
+                        } else {
+                            "follower"
+                        };
+                        tracing::info!(
+                            node = node_id.get(),
+                            leader,
+                            raft_role,
+                            map_version = map.version().get(),
+                            held_partitions,
+                            "leader member converged with the group and is ready"
+                        );
+                    }
+                    None => {
+                        tracing::info!(
+                            node = node_id.get(),
+                            map_version = map.version().get(),
+                            held_partitions,
+                            "worker joined the leader group and is ready"
+                        );
+                    }
+                }
+                convergence_logged = true;
             }
             drop(live);
             tokio::time::sleep(interval).await;
