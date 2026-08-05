@@ -35,9 +35,6 @@ orbita-server = { path = "crates/orbita-server" }
 orbita-sim = { path = "crates/orbita-sim" }
 
 async-trait = "0.1"
-aws-config = "=0.56.1"
-aws-credential-types = "=0.56.1"
-aws-types = "=0.56.1"
 base64 = "0.22"
 bytes = "1"
 # CRC32C, the Castagnoli polynomial the format specifies. This crate uses the

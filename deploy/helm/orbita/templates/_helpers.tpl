@@ -133,3 +133,133 @@ livenessProbe:
 {{- define "orbita.objectStoreSecretName" -}}
 {{- default (printf "%s-object-store" (include "orbita.fullname" .)) .Values.objectStore.existingSecret -}}
 {{- end -}}
+
+{{/*
+The credential source written into the config file.
+
+Empty in values means "follow the keys": keys mean static, and no keys means
+"default", which is what an unset object_store.credential_source means to the
+binary — resolve at startup in the AWS chain's order and log the result.
+
+Empty deliberately does NOT mean instance-profile. On EKS the instance profile
+is the node role and IRSA is the workload role, so rendering instance-profile
+for every keyless release would take existing IRSA deployments and re-point
+them at a different principal, which succeeds rather than failing wherever node
+IMDS is reachable.
+
+It is resolved here rather than left out so that the rendered ConfigMap says
+which one this release picked; an operator reading it should not have to know
+the defaulting rule.
+*/}}
+{{- define "orbita.credentialSource" -}}
+{{- if .Values.objectStore.credentialSource -}}
+{{- .Values.objectStore.credentialSource -}}
+{{- else if or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId -}}
+static
+{{- else -}}
+default
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether this release authenticates with an access key pair.
+
+One predicate, used by validation, by the Secret, and by the container
+environment alike, so those three cannot disagree about whether a key is in
+play — which is exactly how a release ends up rendering access-key environment
+variables next to a keyless credential source.
+*/}}
+{{- define "orbita.usesStaticKeys" -}}
+{{- if eq (include "orbita.credentialSource" .) "static" -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether a Secret is in play at all.
+
+Three things can put one there: a static key pair, an inline role external id,
+and an existingSecret the operator brought themselves. A keyless release with
+none of them has no Secret, mounts nothing, and sets no credential environment
+variables, which is the whole point of it.
+
+Note this is broader than orbita.usesStaticKeys on purpose: a keyless release
+that assumes a cross-account role still needs a Secret for the external id, and
+it must read *only* that key out of it.
+*/}}
+{{- define "orbita.usesObjectStoreSecret" -}}
+{{- if or (include "orbita.usesStaticKeys" .) .Values.objectStore.externalId .Values.objectStore.existingSecret -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Fails a release whose credentials cannot possibly work, at template time,
+because a rendered manifest that deploys and then 403s on every write is the
+most expensive way to learn this.
+*/}}
+{{- define "orbita.validateObjectStore" -}}
+{{- if .Values.objectStore.endpoint -}}
+{{- $source := include "orbita.credentialSource" . -}}
+{{- $known := list "default" "static" "environment" "web-identity" "container" "instance-profile" -}}
+{{- if not (has $source $known) -}}
+{{- fail (printf "objectStore.credentialSource must be one of %s, got %q" (join ", " $known) $source) -}}
+{{- end -}}
+{{- if eq $source "static" -}}
+{{- if not (or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId) -}}
+{{- fail "objectStore.credentialSource is static but neither objectStore.accessKeyId nor objectStore.existingSecret is set" -}}
+{{- end -}}
+{{- else -}}
+{{/*
+A keyless source with an inline key, or with an existingSecret that is not
+carrying an external id, is the contradiction the binary refuses at startup:
+it would render mandatory access-key environment variables from a Secret whose
+keys this release has no reason to expect. Rejecting it here turns a
+CrashLoopBackOff (or a CreateContainerConfigError, if the Secret holds only an
+external id) into a sentence at `helm template` time.
+*/}}
+{{- if .Values.objectStore.accessKeyId -}}
+{{- fail (printf "objectStore.credentialSource is %s but objectStore.accessKeyId is also set; remove one, because a node that silently ignores a credential is a node nobody can audit" $source) -}}
+{{- end -}}
+{{- if and .Values.objectStore.existingSecret (not .Values.objectStore.roleArn) -}}
+{{- fail (printf "objectStore.credentialSource is %s but objectStore.existingSecret is set with no objectStore.roleArn; nothing would read that Secret. Set credentialSource to static to use its access keys, or drop existingSecret." $source) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.objectStore.externalId (not .Values.objectStore.roleArn) -}}
+{{- fail "objectStore.externalId is set but objectStore.roleArn is not; an external id only means anything to a role being assumed" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The credential environment variables for a node container.
+
+Access keys are mounted only when the source is static. Anything else gets at
+most the role external id, and a keyless release with no role gets nothing at
+all — which is what makes the keyless path a deployment with no Secret rather
+than a deployment with an empty one.
+*/}}
+{{- define "orbita.objectStoreEnv" -}}
+{{- if include "orbita.usesStaticKeys" . }}
+- name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "orbita.objectStoreSecretName" . }}
+      key: access_key_id
+- name: ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "orbita.objectStoreSecretName" . }}
+      key: secret_access_key
+{{- end }}
+{{- if and .Values.objectStore.roleArn (include "orbita.usesObjectStoreSecret" .) }}
+- name: ORBITA_OBJECT_STORE_ROLE_EXTERNAL_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "orbita.objectStoreSecretName" . }}
+      key: external_id
+      # Optional so that a role whose trust policy does not demand an external
+      # id can share a Secret with one that does.
+      optional: true
+{{- end }}
+{{- end -}}

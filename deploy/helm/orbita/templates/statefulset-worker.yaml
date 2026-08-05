@@ -87,17 +87,8 @@ spec:
           env:
             - name: ORBITA_CONFIG
               value: /etc/orbita/orbita.toml
-            {{- if or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId }}
-            - name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "orbita.objectStoreSecretName" . }}
-                  key: access_key_id
-            - name: ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "orbita.objectStoreSecretName" . }}
-                  key: secret_access_key
+            {{- with (include "orbita.objectStoreEnv" . | trim) }}
+            {{- . | nindent 12 }}
             {{- end }}
           ports:
             - name: grpc

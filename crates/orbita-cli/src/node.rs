@@ -86,9 +86,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use orbita_core::{KeyspaceName, NodeId};
 use orbita_objectstore::s3::Credentials;
-use orbita_server::{S3StorageConfig, Server, ServerConfig};
+use orbita_server::{AssumeRoleConfig, S3CredentialSource, S3StorageConfig, Server, ServerConfig};
 
-use crate::config::{ClusterConfig, Config, Role};
+use crate::config::{ClusterConfig, Config, CredentialSource, Role};
 
 /// What a node run needs beyond the configuration.
 #[derive(Debug, Clone)]
@@ -228,25 +228,38 @@ fn server_config(
     }
 
     if let Some(endpoint) = &config.object_store.endpoint {
-        let credentials = match (
-            config.object_store.access_key_id.clone(),
-            config.object_store.secret_access_key.clone(),
-        ) {
-            (Some(access_key_id), Some(secret_access_key)) => Some(Credentials {
-                access_key_id,
-                secret_access_key,
-                session_token: None,
-            }),
-            (None, None) => None,
-            _ => bail!(
-                "object_store.access_key_id and object_store.secret_access_key must be set together"
-            ),
+        let credentials = match config.object_store.credential_source {
+            CredentialSource::Static => match (
+                config.object_store.access_key_id.clone(),
+                config.object_store.secret_access_key.clone(),
+            ) {
+                (Some(access_key_id), Some(secret_access_key)) => {
+                    S3CredentialSource::Static(Credentials {
+                        access_key_id,
+                        secret_access_key,
+                        session_token: None,
+                    })
+                }
+                _ => bail!(
+                    "object_store.access_key_id and object_store.secret_access_key must be set \
+                     together"
+                ),
+            },
+            CredentialSource::Default => S3CredentialSource::Default,
+            CredentialSource::Environment => S3CredentialSource::Environment,
+            CredentialSource::WebIdentity => S3CredentialSource::WebIdentity,
+            CredentialSource::Container => S3CredentialSource::ContainerCredentials,
+            CredentialSource::InstanceProfile => S3CredentialSource::InstanceProfile,
         };
         server_config = server_config.with_object_store(S3StorageConfig {
             endpoint: endpoint.clone(),
             bucket: config.object_store.bucket.clone(),
             region: config.object_store.region.clone(),
             credentials,
+            assume_role: assume_role_config(config)?,
+            imds_endpoint: None,
+            sts_endpoint: config.object_store.sts_endpoint.clone(),
+            session_name: Some(session_name(config)),
             force_path_style: config.object_store.force_path_style,
         });
     }
@@ -262,6 +275,39 @@ fn server_config(
         server_config = server_config.with_keyspaces(&[keyspace]);
     }
     Ok(server_config)
+}
+
+/// What this node's assumed sessions are called in CloudTrail.
+///
+/// The cluster name and node id rather than something fixed, because the
+/// session name is what tells two nodes apart in an audit log, and a log where
+/// every entry says `orbita` answers no question anybody asks it. It is used
+/// for `AssumeRole` and for the IRSA token exchange alike, so a node has one
+/// identity in CloudTrail no matter which way it authenticated.
+fn session_name(config: &Config) -> String {
+    config
+        .object_store
+        .role_session_name
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", config.cluster.name, config.node.id))
+}
+
+/// The role to assume on top of the base credentials, if one was configured.
+fn assume_role_config(config: &Config) -> Result<Option<AssumeRoleConfig>> {
+    let Some(role_arn) = &config.object_store.role_arn else {
+        if config.object_store.role_external_id.is_some() {
+            bail!(
+                "object_store.role_external_id is set but object_store.role_arn is not; an \
+                 external id only means anything to a role being assumed"
+            );
+        }
+        return Ok(None);
+    };
+    Ok(Some(AssumeRoleConfig {
+        external_id: config.object_store.role_external_id.clone(),
+        endpoint: config.object_store.sts_endpoint.clone(),
+        ..AssumeRoleConfig::new(role_arn.clone(), session_name(config))
+    }))
 }
 
 /// Turns a configured address into a socket address.
@@ -630,6 +676,7 @@ mod tests {
             access_key_id: Some("orbita".to_string()),
             secret_access_key: Some("secret".to_string()),
             force_path_style: Some(true),
+            ..ObjectStoreLayer::default()
         };
         let config = layer.resolve().unwrap();
 
@@ -644,12 +691,16 @@ mod tests {
         let object_store = server.object_store.expect("S3 was selected");
         assert_eq!(object_store.endpoint, "http://minio:9000");
         assert_eq!(object_store.bucket, "orbita");
-        assert!(object_store.credentials.is_some());
+        assert!(matches!(
+            object_store.credentials,
+            S3CredentialSource::Static(_)
+        ));
+        assert!(object_store.assume_role.is_none());
         assert!(object_store.force_path_style);
     }
 
     #[test]
-    fn an_object_store_endpoint_without_static_keys_uses_the_aws_chain() {
+    fn an_object_store_endpoint_without_static_keys_resolves_its_source_at_startup() {
         let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
         layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
         layer.object_store.force_path_style = Some(false);
@@ -663,17 +714,142 @@ mod tests {
         )
         .unwrap();
 
-        assert!(server
-            .object_store
-            .expect("S3 was selected")
-            .credentials
-            .is_none());
+        assert!(
+            matches!(
+                server.object_store.expect("S3 was selected").credentials,
+                S3CredentialSource::Default
+            ),
+            "keyless must not be pinned to IMDS here: an EKS pod configured this way would \
+             authenticate as its node rather than as its workload"
+        );
+    }
+
+    #[test]
+    fn each_named_credential_source_reaches_the_server_unchanged() {
+        for (named, expected) in [
+            (CredentialSource::Default, "default"),
+            (CredentialSource::Environment, "environment"),
+            (CredentialSource::WebIdentity, "web-identity"),
+            (CredentialSource::Container, "container"),
+            (CredentialSource::InstanceProfile, "instance-profile"),
+        ] {
+            let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+            layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+            layer.object_store.credential_source = Some(named);
+            let config = layer.resolve().unwrap();
+
+            let server = server_config(
+                &config,
+                &options(),
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+
+            let actual = match server.object_store.expect("S3 was selected").credentials {
+                S3CredentialSource::Default => "default",
+                S3CredentialSource::Static(_) => "static",
+                S3CredentialSource::Environment => "environment",
+                S3CredentialSource::WebIdentity => "web-identity",
+                S3CredentialSource::ContainerCredentials => "container",
+                S3CredentialSource::InstanceProfile => "instance-profile",
+            };
+            assert_eq!(actual, expected, "{named} was mapped to {actual}");
+        }
+    }
+
+    #[test]
+    fn a_configured_role_is_assumed_over_the_resolved_base() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+        layer.object_store.role_arn = Some("arn:aws:iam::123456789012:role/orbita".to_string());
+        layer.object_store.role_external_id = Some("shared-secret".to_string());
+        let config = layer.resolve().unwrap();
+
+        let server = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+
+        let object_store = server.object_store.expect("S3 was selected");
+        assert!(matches!(
+            object_store.credentials,
+            S3CredentialSource::Default
+        ));
+        let assume = object_store.assume_role.expect("a role was configured");
+        assert_eq!(assume.role_arn, "arn:aws:iam::123456789012:role/orbita");
+        assert_eq!(assume.external_id.as_deref(), Some("shared-secret"));
+    }
+
+    #[test]
+    fn a_configured_sts_endpoint_reaches_both_the_server_and_the_role() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.cn-north-1.amazonaws.com.cn".to_string());
+        layer.object_store.region = Some("cn-north-1".to_string());
+        layer.object_store.role_arn = Some("arn:aws-cn:iam::123456789012:role/orbita".to_string());
+        layer.object_store.sts_endpoint = Some("https://sts.internal.example.com".to_string());
+        let config = layer.resolve().unwrap();
+
+        let server = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+
+        let object_store = server.object_store.expect("S3 was selected");
+        assert_eq!(
+            object_store.sts_endpoint.as_deref(),
+            Some("https://sts.internal.example.com")
+        );
+        assert_eq!(
+            object_store
+                .assume_role
+                .expect("a role was configured")
+                .endpoint
+                .as_deref(),
+            Some("https://sts.internal.example.com")
+        );
+    }
+
+    #[test]
+    fn the_assumed_session_name_identifies_the_node_by_default() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+        layer.object_store.role_arn = Some("arn:aws:iam::123456789012:role/orbita".to_string());
+        layer.cluster.name = Some("prod".to_string());
+        layer.node.id = Some(107);
+        let config = layer.resolve().unwrap();
+
+        let assume = assume_role_config(&config)
+            .unwrap()
+            .expect("a role was configured");
+        assert_eq!(
+            assume.session_name, "prod-107",
+            "two nodes sharing a session name make an audit log useless"
+        );
+    }
+
+    #[test]
+    fn an_external_id_without_a_role_is_refused() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+        layer.object_store.role_external_id = Some("shared-secret".to_string());
+        let config = layer.resolve().unwrap();
+
+        let error = assume_role_config(&config).unwrap_err();
+        assert!(format!("{error:#}").contains("role_arn"));
     }
 
     #[test]
     fn partial_static_object_store_credentials_fail_before_startup() {
         let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
         layer.object_store.endpoint = Some("http://minio:9000".to_string());
+        layer.object_store.credential_source = Some(CredentialSource::Static);
         layer.object_store.access_key_id = Some("orbita".to_string());
         let config = layer.resolve().unwrap();
 

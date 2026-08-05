@@ -101,7 +101,11 @@ impl HttpRequest {
         }
     }
 
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+    /// Public to match [`HttpResponse::header`]: anything that builds a
+    /// request against this seam, such as a credential provider, needs to be
+    /// able to read one back.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -114,6 +118,10 @@ impl HttpRequest {
 /// token; either is enough to reissue the request within its validity window,
 /// so both are elided while everything a debugging session actually needs,
 /// the method, URL, and remaining headers, stays.
+///
+/// The IMDSv2 session token is elided for the same reason and is arguably
+/// worse to leak: it is not a credential itself, it is the capability to read
+/// one out of the instance metadata service.
 impl std::fmt::Debug for HttpRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let headers: Vec<(&str, &str)> = self
@@ -122,6 +130,7 @@ impl std::fmt::Debug for HttpRequest {
             .map(|(name, value)| {
                 if name.eq_ignore_ascii_case("authorization")
                     || name.eq_ignore_ascii_case("x-amz-security-token")
+                    || name.eq_ignore_ascii_case("x-aws-ec2-metadata-token")
                 {
                     (name.as_str(), "<redacted>")
                 } else {

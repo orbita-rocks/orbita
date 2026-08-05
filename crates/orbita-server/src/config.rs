@@ -8,6 +8,8 @@ use crate::lease::DEFAULT_LEASE_DURATION;
 use crate::map_source::{single_node_map, BoxedMapSource, StaticMapSource};
 use crate::transport::DEFAULT_PEER_CALL_TIMEOUT;
 
+use crate::aws::AssumeRoleConfig;
+
 use orbita_core::{KeyspaceName, NodeId};
 use orbita_objectstore::s3::{Credentials, S3Config};
 
@@ -39,16 +41,81 @@ pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// much lag a partition survives.
 pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES;
 
+/// Where a node's S3 credentials come from before any role is assumed.
+///
+/// Every variant but [`S3CredentialSource::Default`] is a *named* source: it
+/// is used, and no other is tried. A provider that falls through at request
+/// time to whatever is reachable is convenient on a laptop and a liability in
+/// production, because a node whose intended source is broken then authenticates
+/// as something else and the first anyone hears of it is an audit log full of
+/// the wrong principal.
+///
+/// [`S3CredentialSource::Default`] exists because "no source named" cannot mean
+/// "the instance profile" without silently re-pointing every deployment that
+/// used to rely on the AWS chain. See `crate::aws` for the full argument; the
+/// short version is that on EKS the instance profile is a different principal
+/// from the workload role, and falling through to it succeeds.
+#[derive(Debug, Clone)]
+pub enum S3CredentialSource {
+    /// Resolve at startup, in the order the AWS SDKs document, and log which
+    /// source was picked. This is what an unset configuration means.
+    Default,
+    /// A key pair from configuration. The only thing MinIO and R2 offer, and
+    /// the wrong answer on AWS unless it is a bootstrap identity that can do
+    /// nothing but assume a role.
+    Static(Credentials),
+    /// A key pair from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+    /// optionally `AWS_SESSION_TOKEN`.
+    Environment,
+    /// EKS IRSA: a projected OIDC token traded for a session through
+    /// `sts:AssumeRoleWithWebIdentity`. This is the workload role, which is
+    /// *not* the node's instance profile.
+    WebIdentity,
+    /// An ECS or Fargate task role, or the EKS Pod Identity agent.
+    ContainerCredentials,
+    /// The EC2 instance profile, read over IMDSv2. Needs no Secret at all,
+    /// which is the whole point — but on EKS it is the node role, so it is not
+    /// usually what a pod wants.
+    InstanceProfile,
+}
+
 /// One S3-compatible bucket and the credentials used to reach it.
 #[derive(Debug, Clone)]
 pub struct S3StorageConfig {
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
-    /// Static credentials keep MinIO and R2 simple. `None` selects AWS's
-    /// refreshable provider chain, including role assumption and EC2 metadata.
-    pub credentials: Option<Credentials>,
+    /// The base identity this node authenticates as.
+    pub credentials: S3CredentialSource,
+    /// A role to assume on top of the base identity. This is the preferred
+    /// AWS deployment: the base is only permitted to assume, and the role
+    /// carries the bucket policy, so storage access can be re-scoped without
+    /// touching a single instance.
+    pub assume_role: Option<AssumeRoleConfig>,
+    /// Overrides the instance metadata endpoint. Unset uses the link-local
+    /// address; a value here exists for tests and for the container runtimes
+    /// that proxy metadata somewhere else.
+    pub imds_endpoint: Option<String>,
+    /// Overrides the STS endpoint used by both `AssumeRole` and the web
+    /// identity exchange. Unset derives a regional endpoint from the region's
+    /// partition, which is right everywhere AWS publishes one; this is for
+    /// PrivateLink, for a test double, and for a partition that postdates this
+    /// release.
+    pub sts_endpoint: Option<String>,
+    /// What this node's assumed sessions are called in CloudTrail. It is not a
+    /// secret, and it is the only thing that tells two nodes apart in an audit
+    /// log, so it should carry the node identity.
+    pub session_name: Option<String>,
     pub force_path_style: bool,
+}
+
+impl S3StorageConfig {
+    /// The `host[:port]` the instance metadata service answers on.
+    pub(crate) fn imds_authority(&self) -> String {
+        self.imds_endpoint
+            .clone()
+            .unwrap_or_else(|| crate::aws::imds::IMDS_AUTHORITY.to_string())
+    }
 }
 
 impl From<S3Config> for S3StorageConfig {
@@ -57,7 +124,11 @@ impl From<S3Config> for S3StorageConfig {
             endpoint: config.endpoint,
             bucket: config.bucket,
             region: config.region,
-            credentials: Some(config.credentials),
+            credentials: S3CredentialSource::Static(config.credentials),
+            assume_role: None,
+            imds_endpoint: None,
+            sts_endpoint: None,
+            session_name: None,
             force_path_style: config.force_path_style,
         }
     }

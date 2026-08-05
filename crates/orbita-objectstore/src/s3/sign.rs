@@ -1,11 +1,18 @@
 //! AWS Signature Version 4, request signing only.
 //!
 //! This is written out by hand rather than pulled from an SDK because the
-//! store needs exactly one signing mode — headers, single-chunk payload,
-//! service `s3` — and the SDK's version of it arrives welded to its own HTTP
-//! client, retry policy, and clock, which is precisely what a deterministic
-//! simulator cannot allow. The algorithm is fixed and published, and a unit
-//! test pins this implementation to AWS's own worked example.
+//! store needs exactly one signing mode — headers, single-chunk payload — and
+//! the SDK's version of it arrives welded to its own HTTP client, retry
+//! policy, and clock, which is precisely what a deterministic simulator cannot
+//! allow. The algorithm is fixed and published, and a unit test pins this
+//! implementation to AWS's own worked example.
+//!
+//! The service name is a parameter rather than the constant `s3` it started
+//! as. Sourcing credentials by assuming a role means signing a request to
+//! `sts`, and the only thing that changes between the two is this string.
+//! Exporting one signer that takes it beats a second hand-rolled copy of the
+//! algorithm elsewhere in the workspace, because two implementations that must
+//! agree byte for byte eventually will not.
 //!
 //! Reference: "Authenticating Requests (AWS Signature Version 4)" in the
 //! Amazon S3 API documentation.
@@ -46,13 +53,16 @@ impl std::fmt::Debug for Credentials {
 /// `x-amz-content-sha256`, the session token if there is one, and the
 /// `authorization` header over all of them.
 ///
-/// `now_millis` is Unix wall time. It is a parameter rather than a call to
-/// `SystemTime::now()` so that a simulated run signs deterministically; the
-/// production constructor supplies the system clock.
-pub(crate) fn sign(
+/// `service` is the AWS service name that goes in the credential scope, `s3`
+/// for the object store and `sts` for role assumption. `now_millis` is Unix
+/// wall time; it is a parameter rather than a call to `SystemTime::now()` so
+/// that a simulated run signs deterministically, and so that a caller sourcing
+/// credentials can sign against the same injected clock the store uses.
+pub fn sign_request(
     request: &mut HttpRequest,
     credentials: &Credentials,
     region: &str,
+    service: &str,
     now_millis: u64,
 ) {
     let (date, stamp) = amz_timestamp(now_millis);
@@ -101,7 +111,7 @@ pub(crate) fn sign(
         request.canonical_query(),
     );
 
-    let scope = format!("{date}/{region}/s3/aws4_request");
+    let scope = format!("{date}/{region}/{service}/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
         hex(&Sha256::digest(canonical_request.as_bytes()))
@@ -111,7 +121,7 @@ pub(crate) fn sign(
         format!("AWS4{}", credentials.secret_access_key).as_bytes(),
         date.as_bytes(),
     );
-    for part in [region, "s3", "aws4_request"] {
+    for part in [region, service, "aws4_request"] {
         key = hmac_sha256(&key, part.as_bytes());
     }
     let signature = hex(&hmac_sha256(&key, string_to_sign.as_bytes()));
@@ -193,10 +203,11 @@ mod tests {
             headers: vec![("range".to_string(), "bytes=0-9".to_string())],
             body: Bytes::new(),
         };
-        sign(
+        sign_request(
             &mut request,
             &example_credentials(),
             "us-east-1",
+            "s3",
             1_369_353_600_000,
         );
 
@@ -223,7 +234,13 @@ mod tests {
             headers: vec![],
             body: Bytes::new(),
         };
-        sign(&mut request, &credentials, "us-east-1", 1_369_353_600_000);
+        sign_request(
+            &mut request,
+            &credentials,
+            "us-east-1",
+            "s3",
+            1_369_353_600_000,
+        );
 
         assert_eq!(request.header("x-amz-security-token"), Some("the-token"));
         let authorization = request.header("authorization").expect("signed");
@@ -246,7 +263,13 @@ mod tests {
             headers: vec![],
             body: Bytes::from_static(b"v1"),
         };
-        sign(&mut request, &credentials, "us-east-1", 1_369_353_600_000);
+        sign_request(
+            &mut request,
+            &credentials,
+            "us-east-1",
+            "s3",
+            1_369_353_600_000,
+        );
 
         let formatted = format!("{request:?}");
         assert!(
@@ -271,6 +294,32 @@ mod tests {
         assert!(
             formatted.contains("AKIAIOSFODNN7EXAMPLE"),
             "the access key id is how an operator tells credentials apart: {formatted}"
+        );
+    }
+
+    #[test]
+    fn the_service_name_reaches_the_credential_scope() {
+        let mut request = HttpRequest {
+            method: "POST",
+            scheme: Scheme::Https,
+            authority: "sts.us-east-1.amazonaws.com".to_string(),
+            path: "/".to_string(),
+            query: vec![],
+            headers: vec![],
+            body: Bytes::from_static(b"Action=AssumeRole"),
+        };
+        sign_request(
+            &mut request,
+            &example_credentials(),
+            "us-east-1",
+            "sts",
+            1_369_353_600_000,
+        );
+
+        let authorization = request.header("authorization").expect("signed");
+        assert!(
+            authorization.contains("/us-east-1/sts/aws4_request"),
+            "a request to sts must not be scoped to s3: {authorization}"
         );
     }
 
