@@ -70,6 +70,17 @@
 //! because the cluster spends the whole run recovering and never reaches the
 //! states worth checking.
 //!
+//! # Liveness, alongside safety
+//!
+//! Every check above answers "did the cluster do something wrong". A cluster
+//! that is safe and permanently stuck answers no to all of them, and the two
+//! defects of that shape found in Orbita so far were both caught by a person
+//! reading a diff rather than by this crate. [`converge_within`] closes that
+//! gap: a scenario stops breaking the world and then has to show the cluster
+//! finished reacting within a bound of virtual time. Scenarios apply it at the
+//! end of the fault schedules they already run, so a liveness check comes for
+//! free with every seed that was already being explored.
+//!
 //! # What is covered, stated honestly
 //!
 //! Every seam the system does I/O through is simulated: the clock, the
@@ -86,6 +97,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+pub mod converge;
 mod disk;
 pub mod harness;
 pub mod lin;
@@ -96,8 +108,9 @@ mod trace;
 mod world;
 
 pub use config::{DiskFaults, NetworkFaults, SimConfig};
+pub use converge::{converge_within, Unmet};
 pub use disk::{SimDisk, SimFile};
-pub use harness::{check_seeds, seeds, Failure};
+pub use harness::{check_seeds, expect_converged, seeds, Failure};
 pub use net::SimTransport;
 pub use runtime::{SimClock, SimRng, SimRuntime};
 pub use sim::{DiskPolicy, Simulation};

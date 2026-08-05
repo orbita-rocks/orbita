@@ -78,6 +78,13 @@ pub struct NodeView {
     /// How long since the leader last heard from it, in milliseconds. `None`
     /// when this leader has never heard from it at all.
     pub silent_for_millis: Option<u64>,
+    /// The map version this node last said it was routing on. `None` when this
+    /// leader has never heard from it.
+    ///
+    /// This is the leader's own evidence that a decision it published actually
+    /// landed, which is what makes "the cluster has caught up" answerable
+    /// rather than a matter of waiting long enough and assuming.
+    pub reported_map_version: Option<MapVersion>,
     pub is_control_leader: bool,
 }
 
@@ -937,6 +944,10 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     .observations
                     .get(&record.id)
                     .map(|obs| (now.saturating_sub(obs.heard_at_nanos)) / 1_000_000),
+                reported_map_version: inner
+                    .observations
+                    .get(&record.id)
+                    .map(|obs| obs.status.map_version),
                 is_control_leader: control_leader == Some(record.id),
             })
             .collect();
