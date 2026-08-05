@@ -101,7 +101,15 @@ pub struct Wal<R: Runtime> {
     runtime: R,
     log: Arc<PartitionLog<R>>,
     partition: PartitionId,
-    replicas: Vec<NodeId>,
+    /// The peers this owner replicates to, swapped rather than fixed.
+    ///
+    /// Placement is not an ownership change: the control plane can widen or
+    /// narrow a replica set without moving the epoch, and an owner that could
+    /// only learn its peers at open time would keep acknowledging writes
+    /// against the peer list it was born with. Held as an `Arc<[NodeId]>` so
+    /// a replication pass takes one cheap snapshot and never holds the lock
+    /// across an await.
+    replicas: Mutex<Arc<[NodeId]>>,
     /// Held while a batch is written and fsynced, never while it is in flight
     /// to the replicas. That is what allows pipelining.
     flush: tokio::sync::Mutex<()>,
@@ -140,7 +148,7 @@ impl<R: Runtime> Wal<R> {
             runtime,
             log,
             partition: config.partition,
-            replicas: config.replicas,
+            replicas: Mutex::new(config.replicas.into()),
             flush: tokio::sync::Mutex::new(()),
             state: Mutex::new(OwnerState {
                 epoch: config.epoch,
@@ -167,6 +175,29 @@ impl<R: Runtime> Wal<R> {
     #[must_use]
     pub fn partition(&self) -> PartitionId {
         self.partition
+    }
+
+    /// The peers this owner currently replicates to.
+    #[must_use]
+    pub fn replicas(&self) -> Arc<[NodeId]> {
+        Arc::clone(&self.replicas.lock().expect("wal replica set poisoned"))
+    }
+
+    /// Points this owner at a new replica set without reopening the log.
+    ///
+    /// The control plane places replicas after a partition is already owned
+    /// and serving, and it does that without bumping the epoch because
+    /// placement is not a change of ownership. Reopening the partition to pick
+    /// the change up would throw away in-flight writes for a reason a client
+    /// cannot distinguish from a failover, so the peer list is swapped instead.
+    /// Entries the previous list never carried are not lost: the first append
+    /// to a peer that is behind comes back as a gap and is backfilled from this
+    /// node's own log.
+    pub fn set_replicas(&self, replicas: &[NodeId]) {
+        let mut held = self.replicas.lock().expect("wal replica set poisoned");
+        if held.as_ref() != replicas {
+            *held = replicas.into();
+        }
     }
 
     /// How far this node has durably logged, for the control plane's promotion
@@ -319,7 +350,7 @@ impl<R: Runtime> Wal<R> {
             epoch,
             truncate_above: durable,
         };
-        for node in &self.replicas {
+        for node in self.replicas().iter() {
             // A peer we cannot reach is fenced by the first append it sees at
             // the new epoch, so promotion does not wait on it. A peer that
             // says we are already stale is another matter.
@@ -334,6 +365,71 @@ impl<R: Runtime> Wal<R> {
                 self.set_fatal(error.clone());
                 return Err(error);
             }
+        }
+        Ok(())
+    }
+
+    /// Brings every replica up to this owner's durable position without
+    /// waiting for a new write to carry the entries there.
+    ///
+    /// Replication is otherwise driven entirely by appends, and an append only
+    /// happens when a client writes. Two situations leave replicas behind with
+    /// nothing to fix them: a replica placed onto a partition that then goes
+    /// idle, and an owner that has closed write admission because it is
+    /// draining. The second is the dangerous one — the control plane will only
+    /// hand a partition to a replica that has caught up, so an owner that
+    /// cannot push has nothing to hand off and drains forever.
+    ///
+    /// This sends a zero-entry append at the owner's durable position. A
+    /// replica that already holds it answers plainly; one that is behind
+    /// answers with a gap, which the existing catch-up path fills from this
+    /// node's own log. Nothing new is invented on the wire.
+    pub async fn sync_replicas(&self) -> Result<()> {
+        let replicas = self.replicas();
+        if replicas.is_empty() {
+            return Ok(());
+        }
+        let (epoch, committed, durable, fatal) = {
+            let state = self.state();
+            (
+                state.epoch,
+                state.replicated,
+                state.durable_local,
+                state.fatal.clone(),
+            )
+        };
+        if let Some(fatal) = fatal {
+            return Err(fatal);
+        }
+        let request = AppendRequest {
+            partition: self.partition,
+            epoch,
+            prev_lamport: durable,
+            committed,
+            entries: Vec::new(),
+        };
+
+        let mut behind = 0usize;
+        for node in replicas.iter() {
+            match self.call_replica(*node, request.clone()).await {
+                Outcome::Acked => {}
+                Outcome::Stale(current) => {
+                    let error = Error::StaleEpoch {
+                        partition: self.partition,
+                        got: epoch,
+                        current,
+                    };
+                    self.set_fatal(error.clone());
+                    return Err(error);
+                }
+                Outcome::Failed => behind += 1,
+            }
+        }
+        if behind == replicas.len() {
+            return Err(Error::Unavailable(format!(
+                "partition {} could not reach any replica to catch it up",
+                self.partition
+            )));
         }
         Ok(())
     }
@@ -501,13 +597,13 @@ impl<R: Runtime> Wal<R> {
     /// would leave a lagging replica lagging forever, because the fast replica
     /// wins every race.
     async fn replicate(self: &Arc<Self>, request: AppendRequest) -> Result<()> {
-        let required = self.replicas.len().div_ceil(2);
+        let replicas = self.replicas();
+        let required = replicas.len().div_ceil(2);
         if required == 0 {
             return Ok(());
         }
 
-        let mut calls: Vec<Pin<Box<dyn Future<Output = Outcome> + Send>>> = self
-            .replicas
+        let mut calls: Vec<Pin<Box<dyn Future<Output = Outcome> + Send>>> = replicas
             .iter()
             .map(|node| {
                 let this = Arc::clone(self);

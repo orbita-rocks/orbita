@@ -71,6 +71,8 @@ mod linearizability;
 mod map_source;
 mod node;
 mod pending;
+#[cfg(test)]
+mod placement;
 mod proxy;
 mod readiness;
 mod replication;
@@ -629,6 +631,21 @@ impl Server {
                     .await;
             }
             loop {
+                // Refetched every pass rather than only after a handoff is
+                // committed. Draining aborted the control loop, which is the
+                // only thing that otherwise refreshes the map, so a placement
+                // the leader group committed a moment before SIGTERM would
+                // never reach this node: it would keep an empty peer list, no
+                // replica would ever catch up, and the control plane would
+                // refuse the handoff for as long as the budget allowed.
+                if let Err(error) = node.refresh_map().await {
+                    tracing::debug!(%error, "could not refresh the partition map while draining");
+                }
+                // And with write admission closed, an append is never going to
+                // carry the log to a replica that is behind, so it is pushed
+                // deliberately. This is what makes the handoff possible rather
+                // than merely permitted.
+                node.sync_replicas().await;
                 let _ = reporter
                     .report(node.map().version(), node.progress().await, false, true)
                     .await;

@@ -241,8 +241,11 @@ impl<R: Runtime> Node<R> {
         let map = self.map();
         let wanted: Vec<PartitionInfo> = map.held_by(self.node_id).cloned().collect();
 
+        let mut adopted = Vec::new();
         let mut hosts = self.hosts.write().await;
-        let outcome = self.reconcile_locked(&mut hosts, wanted).await;
+        let outcome = self
+            .reconcile_locked(&mut hosts, wanted, &mut adopted)
+            .await;
         self.unreconciled.store(outcome.is_err(), Ordering::Release);
         // Readiness follows the reconcile outcome both ways. A node holding a
         // partition it could not open is not ready, however long it has been
@@ -254,6 +257,30 @@ impl<R: Runtime> Node<R> {
                 tracing::warn!(%error, "could not open every partition this node was given");
             }
         }
+        drop(hosts);
+
+        // Outside the lock, because this talks to peers and every read of this
+        // node's routing table would queue behind it. A replica that has just
+        // been placed holds none of the history the partition already has, and
+        // nothing but an append pushes history at it, so a partition that goes
+        // idle right after placement would sit with one real copy while the
+        // map promises three. Failing here is not fatal: the peer is retried
+        // on the next reconcile, and by the drain if it comes to that.
+        for host in adopted {
+            if let Err(error) = host.sync_replicas().await {
+                tracing::warn!(
+                    partition = host.id().get(),
+                    %error,
+                    "could not catch a newly placed replica up"
+                );
+                // Only ever raised, never lowered, so a stale failure cannot
+                // erase a fresher success the way clearing it could. The cost
+                // of being wrong is one extra reconcile pass; the cost of not
+                // retrying is a partition that stays on one copy until the map
+                // happens to move again, which on an idle partition is never.
+                self.unreconciled.store(true, Ordering::Release);
+            }
+        }
         outcome
     }
 
@@ -263,6 +290,7 @@ impl<R: Runtime> Node<R> {
         &self,
         hosts: &mut HashMap<PartitionId, Arc<PartitionHost<R>>>,
         wanted: Vec<PartitionInfo>,
+        adopted: &mut Vec<Arc<PartitionHost<R>>>,
     ) -> Result<()> {
         hosts.retain(|id, _| {
             let keep = wanted.iter().any(|p| p.id == *id);
@@ -284,10 +312,27 @@ impl<R: Runtime> Node<R> {
             // a replica of a partition it now owns, and refuse every request
             // for it.
             let owned_here = info.owner == Some(self.node_id);
-            let unchanged = hosts
-                .get(&info.id)
+            let held = hosts.get(&info.id).cloned();
+            let unchanged = held
+                .as_ref()
                 .is_some_and(|held| held.epoch() == info.epoch && held.is_owner() == owned_here);
             if unchanged {
+                // The replica set is the one thing about a partition that can
+                // move without the epoch moving, because placing replicas is
+                // not a change of ownership. Adopting it here rather than
+                // treating it as a reopen is what keeps an owner that was born
+                // unreplicated from acknowledging writes to nobody for the rest
+                // of its life. See `PartitionHost::set_replicas`.
+                if let Some(held) = held {
+                    if held.set_replicas(&info.replicas) {
+                        tracing::info!(
+                            partition = info.id.get(),
+                            replicas = ?info.replicas,
+                            "adopted a replica set placed after the partition opened"
+                        );
+                        adopted.push(held);
+                    }
+                }
                 continue;
             }
             // The old incarnation is closed before the new one opens, so that
@@ -724,6 +769,33 @@ impl<R: Runtime> Node<R> {
     pub(crate) async fn begin_draining(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
         self.accepting_writes.store(false, Ordering::Release);
         self.writes.write().await
+    }
+
+    /// Pushes every owned partition's log to the replicas that are behind it.
+    ///
+    /// This is what a drain calls on each pass. By then write admission is
+    /// closed, so nothing else will ever move a replica forward, and the
+    /// control plane will not hand a partition to a replica that has not
+    /// caught up. Without this a node whose replicas were placed late has
+    /// nothing to hand off and drains until its budget runs out.
+    pub(crate) async fn sync_replicas(&self) {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner())
+            .cloned()
+            .collect();
+        for host in hosts {
+            if let Err(error) = host.sync_replicas().await {
+                tracing::warn!(
+                    partition = host.id().get(),
+                    %error,
+                    "could not catch a replica up while draining"
+                );
+            }
+        }
     }
 
     pub(crate) fn owned_partition_count(&self) -> usize {

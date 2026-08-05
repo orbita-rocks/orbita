@@ -174,7 +174,11 @@ pub(crate) struct PartitionHost<R: Runtime> {
     leases: Mutex<LeaseTable>,
     lease: LeasePolicy,
     /// The peers this node replicates to, when it owns the partition.
-    replicas: Vec<NodeId>,
+    ///
+    /// Mutable because the control plane places replicas onto a partition that
+    /// is already owned and serving, and it does so without bumping the epoch.
+    /// See [`PartitionHost::set_replicas`].
+    replicas: Mutex<Vec<NodeId>>,
     /// Replicas this owner is willing to grant a lease to. A replica drops out
     /// when a renewal fails, because an owner that keeps granting to a node it
     /// cannot reach would wait out a lease on every write forever.
@@ -332,7 +336,7 @@ impl<R: Runtime> PartitionHost<R> {
             leases: Mutex::new(LeaseTable::default()),
             lease: spec.lease,
             grantable: Mutex::new(replicas.iter().copied().collect()),
-            replicas,
+            replicas: Mutex::new(replicas),
             committed: Mutex::new(Lamport::ZERO),
             withheld: Mutex::new(VecDeque::new()),
             applying: tokio::sync::Mutex::new(()),
@@ -360,6 +364,63 @@ impl<R: Runtime> PartitionHost<R> {
     #[must_use]
     pub(crate) fn is_owner(&self) -> bool {
         self.wal.is_some()
+    }
+
+    /// Adopts a replica set the control plane placed after this host opened.
+    ///
+    /// A partition is born owned and unreplicated and gets its replicas a
+    /// moment later, and that placement moves the map version without moving
+    /// the epoch, because placement is not a change of ownership. An owner that
+    /// only learned its peers at open time would go on acknowledging writes
+    /// against an empty peer list, which
+    /// [`orbita_wal::Wal::replicate`] treats as a quorum already met — the
+    /// write is durable on one copy while the map promises three, and no
+    /// replica ever advances far enough to be promoted or to take a read lease.
+    ///
+    /// Applied in place rather than by reopening the host: a reopen throws away
+    /// in-flight writes, and a client cannot tell that apart from a failover it
+    /// did nothing to deserve.
+    ///
+    /// Returns whether anything changed, so the caller can log a real
+    /// transition rather than every poll.
+    pub(crate) fn set_replicas(&self, replicas: &[NodeId]) -> bool {
+        let Some(wal) = self.wal.as_ref() else {
+            // A replica does not replicate onwards, so it has no peer list to
+            // keep current.
+            return false;
+        };
+        let mut held = self.replicas.lock().expect("replica set poisoned");
+        if held.as_slice() == replicas {
+            return false;
+        }
+        *held = replicas.to_vec();
+        // A peer that has just been added is grantable until a renewal to it
+        // fails; one that has been removed stops being offered new leases. The
+        // lease table is deliberately left alone, so a lease already out to a
+        // removed peer is still waited out rather than forgotten: the peer can
+        // be serving reads under it, and forgetting it is how a stale read
+        // happens.
+        let mut grantable = self.grantable.lock().expect("grantable set poisoned");
+        grantable.retain(|node| replicas.contains(node));
+        grantable.extend(replicas.iter().copied());
+        drop(grantable);
+        drop(held);
+        wal.set_replicas(replicas);
+        true
+    }
+
+    /// Pushes this partition's log to any replica that is behind it.
+    ///
+    /// Called when a replica set has just changed and on every pass of a
+    /// drain. Both are moments where a replica can be behind with no write
+    /// coming to carry it forward, and where leaving it behind means the
+    /// partition has fewer real copies than the map claims. A replica does
+    /// nothing here: it has no peers of its own to feed.
+    pub(crate) async fn sync_replicas(&self) -> Result<()> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.sync_replicas().await,
+            None => Ok(()),
+        }
     }
 
     /// Whether this node might answer a read for `key` without asking the
@@ -599,7 +660,8 @@ impl<R: Runtime> PartitionHost<R> {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        if self.replicas.is_empty() {
+        let replicas = self.replicas.lock().expect("replica set poisoned").clone();
+        if replicas.is_empty() {
             return;
         }
         // Where the log stands now. A replica takes the lease only if it is
@@ -613,8 +675,7 @@ impl<R: Runtime> PartitionHost<R> {
         let committed = wal.committed_lamport();
         let epoch = self.epoch;
 
-        let renewals: Vec<_> = self
-            .replicas
+        let renewals: Vec<_> = replicas
             .iter()
             .map(|node| self.renew_one(*node, epoch, through, committed))
             .collect();
