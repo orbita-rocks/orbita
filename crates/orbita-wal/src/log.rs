@@ -63,6 +63,12 @@ pub struct RecoveryState {
     /// The highest epoch this node has ever accepted. A restarted node uses it
     /// to keep rejecting an owner it already fenced.
     pub epoch: Epoch,
+    /// The horizon this node last built from object storage, if it ever did.
+    ///
+    /// Everything at or below it is held in segments rather than in this file,
+    /// which is why `durable_lamport` can be above anything the log physically
+    /// contains.
+    pub hydrated_through: Lamport,
     pub truncated: Option<Truncation>,
 }
 
@@ -79,6 +85,7 @@ struct Inner<R: Runtime> {
     durable: Lamport,
     applied_through: Lamport,
     epoch: Epoch,
+    hydrated_through: Lamport,
 }
 
 /// The log for one partition on this node.
@@ -137,6 +144,7 @@ impl<R: Runtime> PartitionLog<R> {
             durable_lamport: scan.durable,
             applied_through: scan.applied_through,
             epoch: scan.epoch,
+            hydrated_through: scan.hydrated_through,
             truncated: scan.truncated,
         };
 
@@ -153,6 +161,7 @@ impl<R: Runtime> PartitionLog<R> {
                 durable: recovery.durable_lamport,
                 applied_through: recovery.applied_through,
                 epoch: recovery.epoch,
+                hydrated_through: recovery.hydrated_through,
             }),
             recovery,
         }))
@@ -248,9 +257,19 @@ impl<R: Runtime> PartitionLog<R> {
         }
         write_record(&mut inner, &LogRecord::Checkpoint { applied_through }).await?;
         inner.applied_through = applied_through;
+        self.drop_applied_segments(&mut inner, applied_through)
+            .await
+    }
 
-        // Only a prefix of segments can go: entries are ordered, so the first
-        // segment holding an unapplied entry stops the sweep.
+    /// Removes the segments holding nothing above `applied_through`.
+    ///
+    /// Only a prefix of segments can go: entries are ordered, so the first
+    /// segment holding an unapplied entry stops the sweep.
+    async fn drop_applied_segments(
+        &self,
+        inner: &mut Inner<R>,
+        applied_through: Lamport,
+    ) -> Result<()> {
         let current_seq = inner.segments.last().map_or(0, |s| s.seq);
         let mut removable = Vec::new();
         for segment in &inner.segments {
@@ -268,6 +287,57 @@ impl<R: Runtime> PartitionLog<R> {
         }
         inner.segments.retain(|s| !removable.contains(&s.seq));
         Ok(())
+    }
+
+    /// The horizon this log was last hydrated to from object storage.
+    ///
+    /// Exposed so a caller can tell "this node holds nothing below here
+    /// locally" from "this node has logged nothing", which look identical from
+    /// [`PartitionLog::durable_lamport`] alone.
+    pub async fn hydrated_through(&self) -> Lamport {
+        self.inner.lock().await.hydrated_through
+    }
+
+    /// Records that the partition was built from object storage through
+    /// `through`, so this log resumes there instead of at the start.
+    ///
+    /// This is the log's half of hydration under
+    /// [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md).
+    /// Rebuilding the index from a manifest makes a node current as of the
+    /// manifest's horizon, but replication is a conversation about log
+    /// positions: a node that rebuilt its data and still reported position zero
+    /// would ask its owner to resend writes the owner checkpointed away, be
+    /// told they are gone, and stay unavailable forever. Recording the horizon
+    /// is what turns replacing a worker into a download.
+    ///
+    /// Claiming durability for entries this file never held is sound because
+    /// the manifest is a stronger durability claim than the log: it is only
+    /// published by the epoch-fenced owner, and only for writes that were
+    /// already acknowledged and applied. It also marks them applied, since the
+    /// segments are exactly where an apply would have put them.
+    ///
+    /// Idempotent, and a no-op when the log is already at or ahead of
+    /// `through`. Returns whether the position moved.
+    pub async fn hydrate(&self, through: Lamport) -> Result<bool> {
+        let mut inner = self.inner.lock().await;
+        if through <= inner.durable {
+            return Ok(false);
+        }
+        write_record(&mut inner, &LogRecord::Hydrated { through }).await?;
+        inner.hydrated_through = inner.hydrated_through.max(through);
+        inner.durable = inner.durable.max(through);
+        inner.applied_through = inner.applied_through.max(through);
+        if let Some(last) = inner.segments.last_mut() {
+            last.max_lamport = last.max_lamport.max(through);
+        }
+
+        // Segments holding only superseded entries can go now, for the same
+        // reason a checkpoint drops them: the records are in the partition's
+        // objects, so replaying the file would change nothing.
+        let applied_through = inner.applied_through;
+        self.drop_applied_segments(&mut inner, applied_through)
+            .await
+            .map(|()| true)
     }
 
     /// Reads back entries above `after`, for retransmitting to a replica that
@@ -346,18 +416,36 @@ impl<R: Runtime> PartitionLog<R> {
 
         inner.current = file;
         inner.current_size = offset;
-        inner.durable = lamport;
+        // A hydrated horizon is not this file's to give up. Those writes are in
+        // the partition's objects, published by a fenced owner for records that
+        // were already acknowledged, so a newer owner naming a lower end of
+        // history is describing where the log stops rather than where the data
+        // does. Letting the cut lower this would make the node ask to be sent
+        // writes it already holds and can no longer be sent.
+        inner.durable = lamport.max(inner.hydrated_through);
+        let durable = inner.durable;
         if let Some(last) = inner.segments.last_mut() {
-            last.max_lamport = lamport;
+            last.max_lamport = durable;
         }
 
-        // Cutting the tail can take the fence and checkpoint records with it,
-        // since they sit wherever they were written. Writing them again keeps
-        // a restart from forgetting which owner this node accepted.
+        // Cutting the tail can take the fence, checkpoint, and hydration
+        // records with it, since they sit wherever they were written. Writing
+        // them again keeps a restart from forgetting which owner this node
+        // accepted, or where its data starts.
         let epoch = inner.epoch;
         let applied_through = inner.applied_through;
+        let hydrated_through = inner.hydrated_through;
         if epoch > Epoch::ZERO {
             write_record(&mut inner, &LogRecord::Fence { epoch }).await?;
+        }
+        if hydrated_through > Lamport::ZERO {
+            write_record(
+                &mut inner,
+                &LogRecord::Hydrated {
+                    through: hydrated_through,
+                },
+            )
+            .await?;
         }
         if applied_through > Lamport::ZERO {
             write_record(&mut inner, &LogRecord::Checkpoint { applied_through }).await?;
@@ -397,6 +485,7 @@ struct DirectoryScan {
     durable: Lamport,
     applied_through: Lamport,
     epoch: Epoch,
+    hydrated_through: Lamport,
     truncated: Option<Truncation>,
 }
 
@@ -423,6 +512,7 @@ async fn scan_directory<R: Runtime>(
         durable: Lamport::ZERO,
         applied_through: Lamport::ZERO,
         epoch: Epoch::ZERO,
+        hydrated_through: Lamport::ZERO,
         truncated: None,
     };
 
@@ -453,6 +543,21 @@ async fn scan_directory<R: Runtime>(
                 LogRecord::Fence { epoch } => {
                     if *epoch > scan.epoch {
                         scan.epoch = *epoch;
+                    }
+                }
+                // Hydration moves both watermarks, because a horizon built
+                // from the bucket is durable and applied by construction: the
+                // records are in segments, which is a stronger claim than
+                // being in this file.
+                LogRecord::Hydrated { through } => {
+                    if *through > scan.hydrated_through {
+                        scan.hydrated_through = *through;
+                    }
+                    if *through > scan.durable {
+                        scan.durable = *through;
+                    }
+                    if *through > scan.applied_through {
+                        scan.applied_through = *through;
                     }
                 }
             }

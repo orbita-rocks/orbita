@@ -30,6 +30,14 @@ pub struct WalConfig {
     /// The peers holding the other two copies. This node is the third.
     pub replicas: Vec<NodeId>,
     pub segment_target_bytes: u64,
+    /// The manifest horizon this node's storage was built from, if it was.
+    ///
+    /// It travels in the config rather than being applied by the caller
+    /// afterwards because the owner reads its log position exactly once, at
+    /// open, to decide where to start assigning Lamports. A hydration applied
+    /// after that would be invisible to this owner and it would hand out
+    /// versions the segments already contain.
+    pub hydrated_through: Lamport,
 }
 
 impl WalConfig {
@@ -41,12 +49,21 @@ impl WalConfig {
             epoch,
             replicas: Vec::new(),
             segment_target_bytes: DEFAULT_SEGMENT_TARGET_BYTES,
+            hydrated_through: Lamport::ZERO,
         }
     }
 
     #[must_use]
     pub fn with_replicas(mut self, replicas: Vec<NodeId>) -> Self {
         self.replicas = replicas;
+        self
+    }
+
+    /// Declares the manifest horizon the storage engine was built from, so this
+    /// owner starts its sequence above the writes the bucket already holds.
+    #[must_use]
+    pub fn with_hydration(mut self, through: Lamport) -> Self {
+        self.hydrated_through = through;
         self
     }
 }
@@ -142,6 +159,9 @@ impl<R: Runtime> Wal<R> {
             });
         }
         log.record_fence(config.epoch).await?;
+        // Before the position is read, not after: everything below depends on
+        // `durable` being where this node's history actually starts.
+        log.hydrate(config.hydrated_through).await?;
         let durable = log.durable_lamport().await;
 
         Ok(Arc::new(Self {
@@ -721,9 +741,9 @@ impl<R: Runtime> Wal<R> {
     /// Resends everything a lagging replica is missing, from this node's own
     /// log.
     ///
-    /// One attempt only. A replica that is still behind after this is behind
-    /// by more than the log holds and needs a snapshot, which is the storage
-    /// crate's job, not this one's.
+    /// One attempt only. A replica that is still behind after this is behind by
+    /// more than the log holds, and could not close the distance from object
+    /// storage either, so there is nothing this node can send it.
     async fn catch_up(&self, node: NodeId, from: Lamport, request: &AppendRequest) -> Outcome {
         let last = request.last_lamport();
         let entries = match self.log.entries_after(from).await {
@@ -732,7 +752,8 @@ impl<R: Runtime> Wal<R> {
                 tracing::warn!(
                     node = node.get(),
                     from = from.get(),
-                    "replica is behind what the log still holds and needs a snapshot"
+                    "replica is behind what the log still holds and could not \
+                     rebuild the distance from object storage"
                 );
                 return Outcome::Failed;
             }
