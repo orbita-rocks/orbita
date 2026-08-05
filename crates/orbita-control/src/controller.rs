@@ -85,6 +85,16 @@ pub struct NodeView {
     /// rather than a matter of waiting long enough and assuming.
     pub reported_map_version: Option<MapVersion>,
     pub is_control_leader: bool,
+    /// What the indexes of every partition this node reported cost in memory.
+    /// Summed here rather than in the CLI because the leader group holds the
+    /// per-partition reports, including for partitions the node holds as a
+    /// replica, which never appear against it in the partition table.
+    ///
+    /// `None` when any part of the answer is missing: a node this leader has
+    /// never heard from, or one whose report predates index measurement. A
+    /// partial sum is worse than no sum, because it looks like a small
+    /// number rather than like a missing one.
+    pub index_memory_bytes: Option<u64>,
 }
 
 /// A partition as an operator sees it, with the observations the map does not
@@ -93,19 +103,60 @@ pub struct NodeView {
 pub struct PartitionView {
     pub info: PartitionInfo,
     pub phase: PartitionPhase,
-    /// The owner's reported durable Lamport: what reached the owner's own
-    /// disk, which is what a worker fills in from
-    /// `orbita_wal::PartitionLog::durable_lamport`.
+    /// The owner's committed prefix: the highest Lamport a durability quorum
+    /// confirmed under its epoch.
     ///
-    /// Not the same thing as `orbita_wal::Wal::committed_lamport`, which is
-    /// the quorum-replicated prefix and which #79 keeps deliberately separate,
-    /// because an entry on one disk whose `commit` returned `Unavailable` sits
-    /// between them. The name predates that distinction and overstates this
-    /// number; the leader group has no way to ask for the other one yet, which
-    /// is issue #87.
-    pub committed_lamport: Lamport,
-    pub size_bytes: u64,
-    pub replica_progress: Vec<(NodeId, Lamport)>,
+    /// Read from the owner's committed prefix rather than its durable
+    /// position, because the two differ and only one of them is safe to show.
+    /// This is the field issue #87 raised: it used to be filled in from
+    /// `orbita_wal::PartitionLog::durable_lamport`, which is one disk, under
+    /// a name that promises a quorum. Between the two sit entries whose
+    /// `commit` returned `Unavailable`.
+    /// A draining owner's `quiesce` truncates the writes it holds alone —
+    /// writes whose clients were told they failed — which drops its durable
+    /// position. Sourcing this column from that number made a planned
+    /// shutdown render as a partition going backwards, which is the reading
+    /// of "lost data" and is not what happened. The committed prefix only
+    /// ever rises.
+    ///
+    /// `None` when no owner has reported: an unowned partition, or one
+    /// [`PartitionPhase::Fenced`] is holding while its replicas report past
+    /// the fence. Lamport zero is a position a partition can genuinely be at,
+    /// and a fenced partition mid-failover is not at it.
+    pub committed_lamport: Option<Lamport>,
+    /// What the owner reported this partition holds. `None` for the same
+    /// reason as [`Self::committed_lamport`]: a fenced partition full of data
+    /// has an unknown size, not an empty one, and that difference decides
+    /// whether an operator thinks losing it is cheap.
+    pub size_bytes: Option<u64>,
+    /// What the owner's index for this partition costs in memory. A single
+    /// partition's index has to fit on its owner, so this is read against one
+    /// machine rather than against the cluster.
+    ///
+    /// `None` when nobody has said: an unowned partition, an owner that has
+    /// not reported yet, or an owner running a binary that does not measure
+    /// it. Distinct from `Some(0)`, which is a partition whose index really
+    /// is empty.
+    pub index_bytes: Option<u64>,
+    /// Each replica's applied and durable positions. Both are here because
+    /// the gap between them is log a replica holds and has not applied, and
+    /// the gap from the owner is how far behind it would be if promoted.
+    pub replica_progress: Vec<ReplicaProgressView>,
+}
+
+/// One replica's position on one partition, as an operator sees it.
+///
+/// Both positions are optional because a replica the leader group has not
+/// heard from has not told anybody where it is. #79 named that state
+/// `Unestablished` on the owner's side and made the point precisely: an
+/// absent answer read as a healthy one hides a cliff, and an absent answer
+/// read as lamport zero invents a maximally-behind replica that may in fact
+/// be perfectly current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaProgressView {
+    pub node: NodeId,
+    pub applied_lamport: Option<Lamport>,
+    pub durable_lamport: Option<Lamport>,
 }
 
 /// Everything `DescribeCluster` answers with.
@@ -887,6 +938,15 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     .get(&record.id)
                     .map(|obs| obs.status.map_version),
                 is_control_leader: control_leader == Some(record.id),
+                // `sum` over an iterator of Options is None if any element
+                // is, which is exactly the wanted arithmetic: one silent
+                // partition makes the node's total unknown rather than low.
+                // A node with no partitions sums to Some(0), which is a real
+                // answer and what every leader-group member looks like.
+                index_memory_bytes: inner
+                    .observations
+                    .get(&record.id)
+                    .and_then(|obs| obs.status.partitions.iter().map(|p| p.index_bytes).sum()),
             })
             .collect();
 
@@ -905,18 +965,27 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                         .state
                         .phase(info.id)
                         .unwrap_or(PartitionPhase::Unowned),
-                    committed_lamport: owner_progress.map_or(Lamport::ZERO, |p| p.durable_lamport),
-                    size_bytes: owner_progress.map_or(0, |p| p.size_bytes),
+                    // All three follow the owner's report, so all three are
+                    // absent together when there is no owner to have made
+                    // one. #53 made that state common rather than fleeting:
+                    // a fenced partition stays unowned until every surviving
+                    // replica has reported past the fence.
+                    committed_lamport: owner_progress.and_then(|p| p.committed_lamport),
+                    size_bytes: owner_progress.map(|p| p.size_bytes),
+                    index_bytes: owner_progress.and_then(|p| p.index_bytes),
                     replica_progress: info
                         .replicas
                         .iter()
                         .map(|r| {
-                            let applied = inner
+                            let progress = inner
                                 .observations
                                 .get(r)
-                                .and_then(|obs| obs.status.progress(info.id))
-                                .map_or(Lamport::ZERO, |p| p.applied_lamport);
-                            (*r, applied)
+                                .and_then(|obs| obs.status.progress(info.id));
+                            ReplicaProgressView {
+                                node: *r,
+                                applied_lamport: progress.map(|p| p.applied_lamport),
+                                durable_lamport: progress.map(|p| p.durable_lamport),
+                            }
                         })
                         .collect(),
                 }

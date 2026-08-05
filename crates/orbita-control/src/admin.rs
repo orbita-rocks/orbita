@@ -6,13 +6,14 @@
 //! reach a state the sweep could not.
 
 use crate::consensus::ConsensusLog;
-use crate::controller::Controller;
+use crate::controller::{ClusterView, Controller};
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Keyspace, KeyspaceConfig, Permission};
 
-use orbita_core::{Error, NodeId, PartitionId, PartitionInfo};
+use orbita_core::{Error, KeyspaceId, NodeId, PartitionId, PartitionInfo};
 use orbita_proto::v1 as pb;
 use orbita_runtime::Runtime;
+use std::collections::HashMap;
 use tonic::{Request, Response, Status};
 
 /// Serves the `Admin` API for one leader group node.
@@ -43,26 +44,60 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
     async fn ready(&self) -> Result<(), Status> {
         self.controller.ensure_leader_ready().await.map_err(status)
     }
+}
 
-    async fn keyspace_message(&self, keyspace: &Keyspace) -> pb::Keyspace {
-        let map = self.controller.partition_map().await;
-        let partitions = map.partitions().filter(|p| p.keyspace == keyspace.id);
-        let view = self.controller.view().await;
-        let stored_bytes = view
-            .partitions
-            .iter()
-            .filter(|p| p.info.keyspace == keyspace.id)
-            .map(|p| p.size_bytes)
-            .sum();
+/// What one keyspace's partitions add up to in one observation.
+///
+/// `stored_bytes` is a lower bound rather than a total whenever
+/// `partitions_without_size` is nonzero, which happens while a partition is
+/// fenced and has no owner to have reported its size. A lower bound is a true
+/// statement and a silently short total is not, and the difference decides
+/// whether a keyspace over its quota can be seen to be over it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct KeyspaceTotals {
+    partition_count: u32,
+    stored_bytes: u64,
+    partitions_without_size: u32,
+}
 
-        pb::Keyspace {
-            id: keyspace.id.get(),
-            name: keyspace.name.as_str().to_string(),
-            config: Some(config_message(&keyspace.config)),
-            created_at_millis: keyspace.created_at_millis,
-            partition_count: partitions.count() as u32,
-            stored_bytes,
+/// Every keyspace's totals, in one pass over one snapshot.
+///
+/// This exists so that a keyspace message cannot be built without a view the
+/// caller already holds. Summing per keyspace on demand rescanned every
+/// partition once per keyspace, which is quadratic on the most common admin
+/// call, and worse than the cost: each row came from a snapshot taken at a
+/// different instant, so a single response could show a partition's bytes in
+/// the partition list and a different total for its keyspace beside it.
+fn keyspace_totals(view: &ClusterView) -> HashMap<KeyspaceId, KeyspaceTotals> {
+    let mut totals: HashMap<KeyspaceId, KeyspaceTotals> = HashMap::new();
+    for partition in &view.partitions {
+        let entry = totals.entry(partition.info.keyspace).or_default();
+        entry.partition_count += 1;
+        match partition.size_bytes {
+            Some(bytes) => entry.stored_bytes += bytes,
+            // Counted rather than skipped. Dropping it would make the sum
+            // read as a complete total that happens to be small, which is the
+            // reading a keyspace at its quota can least afford.
+            None => entry.partitions_without_size += 1,
         }
+    }
+    totals
+}
+
+/// Renders one keyspace against totals taken from a single observation.
+fn keyspace_message(
+    keyspace: &Keyspace,
+    totals: &HashMap<KeyspaceId, KeyspaceTotals>,
+) -> pb::Keyspace {
+    let totals = totals.get(&keyspace.id).copied().unwrap_or_default();
+    pb::Keyspace {
+        id: keyspace.id.get(),
+        name: keyspace.name.as_str().to_string(),
+        config: Some(config_message(&keyspace.config)),
+        created_at_millis: keyspace.created_at_millis,
+        partition_count: totals.partition_count,
+        stored_bytes: totals.stored_bytes,
+        partitions_without_size: totals.partitions_without_size,
     }
 }
 
@@ -79,7 +114,11 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
             .create_keyspace(&request.name, config_from(request.config.as_ref()))
             .await
             .map_err(status)?;
-        Ok(Response::new(self.keyspace_message(&keyspace).await))
+        let view = self.controller.view().await;
+        Ok(Response::new(keyspace_message(
+            &keyspace,
+            &keyspace_totals(&view),
+        )))
     }
 
     async fn update_keyspace(
@@ -93,7 +132,11 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
             .update_keyspace(&request.name, config_from(request.config.as_ref()))
             .await
             .map_err(status)?;
-        Ok(Response::new(self.keyspace_message(&keyspace).await))
+        let view = self.controller.view().await;
+        Ok(Response::new(keyspace_message(
+            &keyspace,
+            &keyspace_totals(&view),
+        )))
     }
 
     async fn delete_keyspace(
@@ -122,10 +165,17 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         _request: Request<pb::ListKeyspacesRequest>,
     ) -> Result<Response<pb::ListKeyspacesResponse>, Status> {
         self.ready().await?;
-        let mut keyspaces = Vec::new();
-        for keyspace in self.controller.list_keyspaces().await {
-            keyspaces.push(self.keyspace_message(&keyspace).await);
-        }
+        // One view for the whole list. Taking one per keyspace made this
+        // quadratic and let two rows disagree about the same cluster.
+        let view = self.controller.view().await;
+        let totals = keyspace_totals(&view);
+        let keyspaces = self
+            .controller
+            .list_keyspaces()
+            .await
+            .into_iter()
+            .map(|keyspace| keyspace_message(&keyspace, &totals))
+            .collect();
         Ok(Response::new(pb::ListKeyspacesResponse { keyspaces }))
     }
 
@@ -212,6 +262,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
                 is_raft_leader: node.is_control_leader,
                 speaks_min: Some(version_message(node.record.speaks.min)),
                 speaks_max: Some(version_message(node.record.speaks.max)),
+                index_memory_bytes: node.index_memory_bytes,
             })
             .collect();
 
@@ -228,23 +279,45 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
                 // Node ids start at one, so it cannot be confused with a node.
                 owner_node_id: p.info.owner.map_or(0, NodeId::get),
                 epoch: p.info.epoch.get(),
-                committed_lamport: p.committed_lamport.get(),
+                committed_lamport: p.committed_lamport.map(orbita_core::Lamport::get),
                 replicas: p
                     .replica_progress
                     .iter()
-                    .map(|(node, applied)| pb::Replica {
-                        node_id: node.get(),
-                        applied_lamport: applied.get(),
+                    .map(|r| pb::Replica {
+                        node_id: r.node.get(),
+                        applied_lamport: r.applied_lamport.map(orbita_core::Lamport::get),
+                        durable_lamport: r.durable_lamport.map(orbita_core::Lamport::get),
                     })
                     .collect(),
                 size_bytes: p.size_bytes,
+                index_bytes: p.index_bytes,
             })
+            .collect();
+
+        // Quota saturation needs both halves, and only the keyspace records
+        // carry the limit. Filtered the same way the partitions are, so a
+        // describe scoped to one keyspace does not leak the others' usage.
+        //
+        // Aggregated from the view this request already captured. Asking the
+        // controller per keyspace rescanned every partition once per
+        // keyspace, and made a describe answer from as many snapshots as
+        // there are tenants, so the keyspace rows and the partition rows
+        // above them could describe two different moments.
+        let totals = keyspace_totals(&view);
+        let keyspaces = self
+            .controller
+            .list_keyspaces()
+            .await
+            .into_iter()
+            .filter(|keyspace| wanted.is_none_or(|id| keyspace.id == id))
+            .map(|keyspace| keyspace_message(&keyspace, &totals))
             .collect();
 
         Ok(Response::new(pb::DescribeClusterResponse {
             nodes,
             partitions,
             cluster_version: Some(version_message(view.cluster_version)),
+            keyspaces,
         }))
     }
 
@@ -316,16 +389,23 @@ fn partition_message(info: &PartitionInfo) -> pb::Partition {
         end_key: info.range.end().unwrap_or_default().to_vec(),
         owner_node_id: info.owner.map_or(0, NodeId::get),
         epoch: info.epoch.get(),
-        committed_lamport: 0,
+        // Nothing was observed on this path, so nothing is claimed.
+        committed_lamport: None,
         replicas: info
             .replicas
             .iter()
             .map(|node| pb::Replica {
                 node_id: node.get(),
-                applied_lamport: 0,
+                // A partial view built from the map alone has heard no
+                // positions, so it claims none.
+                applied_lamport: None,
+                durable_lamport: None,
             })
             .collect(),
-        size_bytes: 0,
+        size_bytes: None,
+        // A partial view that reported an empty index would be inventing a
+        // measurement out of the absence of one.
+        index_bytes: None,
     }
 }
 

@@ -28,8 +28,9 @@ use crate::client::{authed, channel};
 use crate::config::Config;
 use crate::output::{
     render, Ack, Blob, ClusterView, CredentialView, FinalizeUpgradeView, Format,
-    KeyspaceConfigView, KeyspaceListView, KeyspaceView, NodeView, PartitionResultView,
-    PartitionView, PingView, ReadyConditionView, ReadyView, ReplicaView, SplitView,
+    KeyspaceConfigView, KeyspaceListView, KeyspaceUsageView, KeyspaceView, NodeView,
+    PartitionResultView, PartitionView, PingView, ReadyConditionView, ReadyView, ReplicaView,
+    SplitView,
 };
 
 /// Opens an admin client against the configured endpoint.
@@ -402,12 +403,14 @@ pub fn partition_view(partition: &Partition) -> PartitionView {
         epoch: partition.epoch,
         committed_lamport: partition.committed_lamport,
         size_bytes: partition.size_bytes,
+        index_bytes: partition.index_bytes,
         replicas: partition
             .replicas
             .iter()
             .map(|r| ReplicaView {
                 node_id: r.node_id,
                 applied_lamport: r.applied_lamport,
+                durable_lamport: r.durable_lamport,
             })
             .collect(),
     }
@@ -438,6 +441,7 @@ pub fn node_view(node: &Node) -> NodeView {
         health: health.to_owned(),
         raft_leader: node.is_raft_leader,
         speaks: speaks_text(node.speaks_min.as_ref(), node.speaks_max.as_ref()),
+        index_memory_bytes: node.index_memory_bytes,
     }
 }
 
@@ -454,6 +458,23 @@ pub fn cluster_view(response: &DescribeClusterResponse) -> ClusterView {
             .as_ref()
             .map(|v| version_text(Some(v))),
     )
+    .with_keyspaces(response.keyspaces.iter().map(keyspace_usage_view).collect())
+}
+
+/// Turns a `Keyspace` into the usage row `cluster describe` prints.
+///
+/// The quota is read out of the config rather than recomputed, because the
+/// server is the only thing that knows what it will actually enforce.
+#[must_use]
+pub fn keyspace_usage_view(keyspace: &Keyspace) -> KeyspaceUsageView {
+    KeyspaceUsageView {
+        id: keyspace.id,
+        name: keyspace.name.clone(),
+        partition_count: keyspace.partition_count,
+        stored_bytes: keyspace.stored_bytes,
+        partitions_without_size: keyspace.partitions_without_size,
+        max_storage_bytes: keyspace.config.and_then(|c| c.max_storage_bytes),
+    }
 }
 
 /// The wall clock, used only to turn a relative expiry into an absolute one.
@@ -482,12 +503,14 @@ mod tests {
             end_key: Vec::new(),
             owner_node_id: 3,
             epoch: 4,
-            committed_lamport: 5,
+            committed_lamport: Some(5),
             replicas: vec![Replica {
                 node_id: 6,
-                applied_lamport: 5,
+                applied_lamport: Some(5),
+                durable_lamport: Some(5),
             }],
-            size_bytes: 7,
+            size_bytes: Some(7),
+            index_bytes: Some(8),
         });
         assert!(view.end_key.is_none());
         assert_eq!(view.start_key, Blob::new(b"a"));
@@ -504,6 +527,7 @@ mod tests {
             is_raft_leader: false,
             speaks_min: None,
             speaks_max: None,
+            index_memory_bytes: None,
         });
         assert_eq!(view.role, "unknown");
         assert_eq!(view.health, "unknown");
@@ -577,6 +601,7 @@ mod tests {
             created_at_millis: 0,
             partition_count: 1,
             stored_bytes: 0,
+            partitions_without_size: 0,
         });
         assert_eq!(view.name, "demo");
         assert_eq!(view.config.default_ttl_millis, None);

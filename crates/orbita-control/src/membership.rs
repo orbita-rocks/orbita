@@ -44,10 +44,53 @@ pub struct PartitionProgress {
     pub durable_lamport: Lamport,
     pub applied_lamport: Lamport,
     pub size_bytes: u64,
+    /// What this node's memory-resident index for the partition costs. ADR
+    /// 0006 makes memory the resource a worker runs out of first, and a node
+    /// is the only place that number exists, so it rides the heartbeat that
+    /// already reports everything else about the partition.
+    ///
+    /// `None` means the node did not measure it, which is what a binary from
+    /// before this field looks like for the length of a rolling upgrade. It
+    /// is deliberately not zero: an operator watching the resource that runs
+    /// out first must not be shown an empty index where there is a full one.
+    pub index_bytes: Option<u64>,
+    /// The owner's committed prefix: the highest Lamport a durability quorum
+    /// confirmed under its epoch.
+    ///
+    /// Distinct from `durable_lamport`, and the distinction is the point.
+    /// `durable_lamport` is what one disk holds, which includes writes whose
+    /// clients were told they failed, and a draining owner's `quiesce` drops
+    /// those and so makes that number go *down*. This one only ever rises,
+    /// because it is the no-lost-write floor a promotion has to keep.
+    ///
+    /// `None` from a replica, which has no committed prefix to report, and
+    /// from any node whose report came through a status method older than
+    /// V5. Absent is not zero: a partition at lamport zero is a real state
+    /// and a planned drain must not be made to look like one.
+    pub committed_lamport: Option<Lamport>,
 }
 
 impl PartitionProgress {
     pub(crate) fn encode(&self, w: &mut Writer) {
+        self.encode_v4(w);
+        w.opt_u64(self.committed_lamport.map(Lamport::get));
+    }
+
+    /// The encoding without the committed prefix, which is what every report
+    /// shape up to and including [`super::wire::METHOD_REPORT_STATUS_V4`]
+    /// carries.
+    pub(crate) fn encode_v4(&self, w: &mut Writer) {
+        self.encode_v3(w);
+        // Optional on the wire rather than a bare u64 so that "did not
+        // measure" survives the hop. A node whose storage layer refuses to
+        // answer is in the same position as an old binary, and flattening
+        // either into zero is the failure this shape exists to prevent.
+        w.opt_u64(self.index_bytes);
+    }
+
+    /// The encoding without index memory, which is what every report shape up
+    /// to and including [`super::wire::METHOD_REPORT_STATUS_V3`] carries.
+    pub(crate) fn encode_v3(&self, w: &mut Writer) {
         w.u64(self.partition.get())
             .u64(self.durable_lamport.get())
             .u64(self.applied_lamport.get())
@@ -55,11 +98,36 @@ impl PartitionProgress {
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let mut progress = Self::decode_v4(r)?;
+        progress.committed_lamport = r.opt_u64()?.map(Lamport);
+        Ok(progress)
+    }
+
+    /// Decodes a report from a node that does not distinguish its committed
+    /// prefix from its durable position. Unknown rather than borrowing
+    /// `durable_lamport`, which would be a number that can go backwards
+    /// wearing the name of one that cannot.
+    pub(crate) fn decode_v4(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let mut progress = Self::decode_v3(r)?;
+        progress.index_bytes = r.opt_u64()?;
+        progress.committed_lamport = None;
+        Ok(progress)
+    }
+
+    /// Decodes a report from a node that does not measure index memory.
+    ///
+    /// Unknown rather than zero. The node did not say, and the whole reason
+    /// this number is reported is to warn an operator before a worker runs
+    /// out of memory, so guessing low is guessing in the one direction that
+    /// costs them the warning.
+    pub(crate) fn decode_v3(r: &mut Reader<'_>) -> CodecResult<Self> {
         Ok(Self {
             partition: PartitionId(r.u64()?),
             durable_lamport: Lamport(r.u64()?),
             applied_lamport: Lamport(r.u64()?),
             size_bytes: r.u64()?,
+            index_bytes: None,
+            committed_lamport: None,
         })
     }
 }
@@ -124,11 +192,46 @@ impl NodeStatus {
         w.seq(&self.partitions, |w, p| p.encode(w));
     }
 
+    /// The encoding that predates the committed prefix.
+    pub(crate) fn encode_v4(&self, w: &mut Writer) {
+        self.encode_head(w);
+        self.speaks.encode(w);
+        w.u8(u8::from(self.ready)).u8(u8::from(self.draining));
+        w.seq(&self.partitions, |w, p| p.encode_v4(w));
+    }
+
+    /// Decodes the encoding that predates the committed prefix.
+    pub(crate) fn decode_v4(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let (role, address, map_version) = Self::decode_head(r)?;
+        Ok(Self {
+            role,
+            address,
+            map_version,
+            speaks: VersionRange::decode(r)?,
+            ready: r.u8()? != 0,
+            draining: r.u8()? != 0,
+            partitions: r.seq(PartitionProgress::decode_v4)?,
+        })
+    }
+
+    /// The encoding that predates index memory reporting.
+    ///
+    /// Sent when the leader answering turned out to be a binary from before
+    /// the resource fields existed. The consumption numbers are worth
+    /// nothing next to a heartbeat that lands, so the fallback drops them
+    /// rather than the report.
+    pub(crate) fn encode_v3(&self, w: &mut Writer) {
+        self.encode_head(w);
+        self.speaks.encode(w);
+        w.u8(u8::from(self.ready)).u8(u8::from(self.draining));
+        w.seq(&self.partitions, |w, p| p.encode_v3(w));
+    }
+
     /// The first version-aware encoding, which predates readiness reporting.
     pub(crate) fn encode_v2(&self, w: &mut Writer) {
         self.encode_head(w);
         self.speaks.encode(w);
-        w.seq(&self.partitions, |w, p| p.encode(w));
+        w.seq(&self.partitions, |w, p| p.encode_v3(w));
     }
 
     /// The v0.0.1 encoding, which has no speakable range.
@@ -138,7 +241,7 @@ impl NodeStatus {
     /// this when the compatibility window moves past 0.0.
     pub(crate) fn encode_legacy(&self, w: &mut Writer) {
         self.encode_head(w);
-        w.seq(&self.partitions, |w, p| p.encode(w));
+        w.seq(&self.partitions, |w, p| p.encode_v3(w));
     }
 
     fn encode_head(&self, w: &mut Writer) {
@@ -163,6 +266,20 @@ impl NodeStatus {
         })
     }
 
+    /// Decodes the encoding that predates index memory reporting.
+    pub(crate) fn decode_v3(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let (role, address, map_version) = Self::decode_head(r)?;
+        Ok(Self {
+            role,
+            address,
+            map_version,
+            speaks: VersionRange::decode(r)?,
+            ready: r.u8()? != 0,
+            draining: r.u8()? != 0,
+            partitions: r.seq(PartitionProgress::decode_v3)?,
+        })
+    }
+
     /// Decodes the first version-aware encoding. Absence is not evidence of
     /// readiness, so an old node is never selected as a planned handoff target.
     pub(crate) fn decode_v2(r: &mut Reader<'_>) -> CodecResult<Self> {
@@ -174,7 +291,7 @@ impl NodeStatus {
             speaks: VersionRange::decode(r)?,
             ready: false,
             draining: false,
-            partitions: r.seq(PartitionProgress::decode)?,
+            partitions: r.seq(PartitionProgress::decode_v3)?,
         })
     }
 
@@ -192,7 +309,7 @@ impl NodeStatus {
             speaks: VersionRange::exactly(crate::version::ClusterVersion::ZERO),
             ready: false,
             draining: false,
-            partitions: r.seq(PartitionProgress::decode)?,
+            partitions: r.seq(PartitionProgress::decode_v3)?,
         })
     }
 
@@ -232,6 +349,8 @@ mod tests {
                 durable_lamport: Lamport(90),
                 applied_lamport: Lamport(88),
                 size_bytes: 4096,
+                index_bytes: Some(512),
+                committed_lamport: Some(Lamport(88)),
             }],
         };
 
@@ -242,6 +361,93 @@ mod tests {
         let mut r = Reader::new(&encoded);
         assert_eq!(NodeStatus::decode(&mut r).unwrap(), status);
         assert_eq!(r.done(), Ok(()));
+    }
+
+    #[test]
+    fn a_report_to_a_leader_without_index_memory_keeps_everything_else() {
+        // The fallback exists so a heartbeat lands mid-rollout. Losing the
+        // resource numbers for the length of a rollout is the price; losing
+        // the report would drop the node out of the failure detector.
+        let status = NodeStatus {
+            role: NodeRole::Worker,
+            address: "10.0.0.4:7000".into(),
+            map_version: MapVersion(12),
+            speaks: crate::version::binary_speaks(),
+            ready: true,
+            draining: true,
+            partitions: vec![PartitionProgress {
+                partition: PartitionId(3),
+                durable_lamport: Lamport(90),
+                applied_lamport: Lamport(88),
+                size_bytes: 4096,
+                index_bytes: Some(512),
+                committed_lamport: Some(Lamport(88)),
+            }],
+        };
+
+        let mut w = Writer::new();
+        status.encode_v3(&mut w);
+        let encoded = w.finish();
+
+        let mut r = Reader::new(&encoded);
+        let decoded = NodeStatus::decode_v3(&mut r).unwrap();
+        assert_eq!(r.done(), Ok(()));
+        assert_eq!(decoded.ready, status.ready);
+        assert_eq!(decoded.draining, status.draining);
+        assert_eq!(decoded.partitions[0].size_bytes, 4096);
+        assert_eq!(
+            decoded.partitions[0].index_bytes, None,
+            "a node that did not report index memory is unknown, not empty"
+        );
+        assert_eq!(
+            decoded.partitions[0].committed_lamport, None,
+            "and a shape with no committed prefix does not borrow the durable \
+             position, which is a number that can go backwards"
+        );
+    }
+
+    #[test]
+    fn an_index_of_no_bytes_is_reported_as_a_measurement_and_not_as_silence() {
+        // The two states this whole Option exists to keep apart. A partition
+        // whose index really is empty has to survive the wire as a zero, or
+        // the fix for the mixed-version case would have replaced one wrong
+        // answer with another.
+        let status = NodeStatus {
+            role: NodeRole::Worker,
+            address: "10.0.0.4:7000".into(),
+            map_version: MapVersion(12),
+            speaks: crate::version::binary_speaks(),
+            ready: true,
+            draining: false,
+            partitions: vec![
+                PartitionProgress {
+                    partition: PartitionId(3),
+                    durable_lamport: Lamport(90),
+                    applied_lamport: Lamport(88),
+                    size_bytes: 4096,
+                    index_bytes: Some(0),
+                    committed_lamport: Some(Lamport(0)),
+                },
+                PartitionProgress {
+                    partition: PartitionId(4),
+                    durable_lamport: Lamport(90),
+                    applied_lamport: Lamport(88),
+                    size_bytes: 4096,
+                    index_bytes: None,
+                    committed_lamport: Some(Lamport(0)),
+                },
+            ],
+        };
+
+        let mut w = Writer::new();
+        status.encode(&mut w);
+        let encoded = w.finish();
+
+        let mut r = Reader::new(&encoded);
+        let decoded = NodeStatus::decode(&mut r).unwrap();
+        assert_eq!(r.done(), Ok(()));
+        assert_eq!(decoded.partitions[0].index_bytes, Some(0));
+        assert_eq!(decoded.partitions[1].index_bytes, None);
     }
 
     #[test]

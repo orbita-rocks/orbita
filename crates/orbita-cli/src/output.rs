@@ -225,6 +225,18 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Formats a byte count that may not have been measured.
+///
+/// "unknown" rather than "0 B", and the distance between those two words is
+/// the whole point: a node running a binary from before the measurement
+/// existed reports nothing, and printing that as an empty index tells an
+/// operator they have headroom they do not have. Zero stays available for the
+/// nodes that really are holding no index.
+#[must_use]
+pub fn format_bytes_or_unknown(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "unknown".to_owned(), format_bytes)
+}
+
 /// The per-keyspace limits and defaults, as the admin API reports them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct KeyspaceConfigView {
@@ -341,12 +353,28 @@ pub struct NodeView {
     /// The cluster versions this node's binary can speak, such as "0.1..0.2",
     /// or "unknown" from a server that predates version reporting.
     pub speaks: String,
+    /// What the partition indexes this node holds cost in memory.
+    ///
+    /// Absent when the node has not reported a measurement, which is what a
+    /// node running an older binary looks like for the length of a rolling
+    /// upgrade, and what a node the leader group has never heard from looks
+    /// like always. Not the same as zero, which is a node genuinely holding
+    /// no index and is what every leader-group member looks like.
+    pub index_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplicaView {
     pub node_id: u64,
-    pub applied_lamport: u64,
+    /// Absent when the leader group has not heard this replica's position,
+    /// which is the state #79 named `Unestablished`. Not zero: a replica that
+    /// has said nothing is unknown, and rendering it at the bottom of the log
+    /// invents a maximally-behind copy out of one that may be current.
+    pub applied_lamport: Option<u64>,
+    /// How far this replica has made the log durable. Ahead of what it has
+    /// applied, and behind the owner by whatever replication has not caught.
+    /// Absent for the same reason.
+    pub durable_lamport: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -359,8 +387,18 @@ pub struct PartitionView {
     pub end_key: Option<Blob>,
     pub owner_node_id: u64,
     pub epoch: u64,
-    pub committed_lamport: u64,
-    pub size_bytes: u64,
+    /// The owner's durable position. Absent when no owner has reported one,
+    /// which is what a fenced partition looks like while the control plane
+    /// waits for its replicas to report past the fence.
+    pub committed_lamport: Option<u64>,
+    /// What the owner reported this partition holds. Absent for the same
+    /// reason. A fenced partition full of data has an unknown size, and
+    /// showing it as empty is how somebody concludes it is cheap to lose.
+    pub size_bytes: Option<u64>,
+    /// What the owner's memory-resident index for this partition costs.
+    /// Absent when nobody measured it rather than zero, for the same reason
+    /// as [`NodeView::index_memory_bytes`].
+    pub index_bytes: Option<u64>,
     pub replicas: Vec<ReplicaView>,
 }
 
@@ -370,12 +408,48 @@ impl PartitionView {
     /// This is the number that decides how much a failover would lose, so it
     /// gets a column of its own rather than being buried in the replica list.
     #[must_use]
-    pub fn max_replica_lag(&self) -> u64 {
+    pub fn max_replica_lag(&self) -> Option<u64> {
+        self.lag(|r| r.applied_lamport)
+    }
+
+    /// The furthest any replica trails the owner in the write-ahead log.
+    ///
+    /// Distinct from [`PartitionView::max_replica_lag`], and the two answer
+    /// different questions: this one is how much replication is behind, and
+    /// that one is how much of what arrived is not yet readable. A replica
+    /// can be durable to the owner's position and still applying.
+    #[must_use]
+    pub fn max_wal_lag(&self) -> Option<u64> {
+        self.lag(|r| r.durable_lamport)
+    }
+
+    /// Lag is a distance from the owner's committed position, so it is only
+    /// as known as that position is.
+    ///
+    /// Reporting zero for a partition whose owner has gone would say the
+    /// replicas are perfectly caught up at the exact moment a failover is
+    /// deciding which of them to promote, which is the worst possible time to
+    /// be confidently wrong.
+    fn lag(&self, position: impl Fn(&ReplicaView) -> Option<u64>) -> Option<u64> {
+        let committed = self.committed_lamport?;
+        // A replica that has not reported has no distance, and guessing one
+        // would be the same mistake as reading its silence as position zero.
+        // The worst *known* lag is still a true statement, so it is reported,
+        // and `replicas_without_position` says how many it could not see.
         self.replicas
             .iter()
-            .map(|r| self.committed_lamport.saturating_sub(r.applied_lamport))
+            .filter_map(|r| Some(committed.saturating_sub(position(r)?)))
             .max()
-            .unwrap_or(0)
+            .or(Some(0))
+    }
+
+    /// Replicas whose position the leader group has not heard.
+    #[must_use]
+    pub fn replicas_without_position(&self) -> usize {
+        self.replicas
+            .iter()
+            .filter(|r| r.durable_lamport.is_none())
+            .count()
     }
 
     fn range(&self) -> String {
@@ -398,9 +472,14 @@ impl PartitionView {
         }
         self.replicas
             .iter()
-            .map(|r| {
-                let lag = self.committed_lamport.saturating_sub(r.applied_lamport);
-                format!("{}(-{lag})", r.node_id)
+            .map(|r| match (self.committed_lamport, r.applied_lamport) {
+                (Some(committed), Some(applied)) => {
+                    format!("{}(-{})", r.node_id, committed.saturating_sub(applied))
+                }
+                // Either there is no owner position to measure against, or
+                // this replica has not said where it is. Both leave the
+                // distance unknowable, and the replica is still worth naming.
+                _ => format!("{}(-?)", r.node_id),
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -417,7 +496,9 @@ const PARTITION_COLUMNS: &[&str] = &[
     "epoch",
     "lamport",
     "size",
+    "index",
     "lag",
+    "wal lag",
     "replicas",
 ];
 
@@ -433,6 +514,12 @@ impl Render for PartitionView {
 /// on its own, after a split or a transfer, has no node list to consult, and
 /// the owner is then just an id.
 fn partition_row(p: &PartitionView, health: Option<&BTreeMap<u64, String>>) -> Vec<String> {
+    // Zero is how the proto says unowned, and since #53 a partition sits
+    // there for as long as a fenced one waits on its replicas. Printing the
+    // id would render that as node zero, which is not a node.
+    if p.owner_node_id == 0 {
+        return partition_row_with_owner(p, "none".to_owned());
+    }
     let owner = match health.map(|h| h.get(&p.owner_node_id)) {
         // An owner that is not healthy is the first thing to notice, so it is
         // spelled out in the row rather than left to be joined by eye against
@@ -441,15 +528,28 @@ fn partition_row(p: &PartitionView, health: Option<&BTreeMap<u64, String>>) -> V
         Some(None) => format!("{} (unknown)", p.owner_node_id),
         _ => p.owner_node_id.to_string(),
     };
+    partition_row_with_owner(p, owner)
+}
+
+/// A lag column, where absent means there is no owner position to measure a
+/// distance from.
+fn lag_text(lag: Option<u64>) -> String {
+    lag.map_or_else(|| "unknown".to_owned(), |lag| lag.to_string())
+}
+
+fn partition_row_with_owner(p: &PartitionView, owner: String) -> Vec<String> {
     vec![
         p.id.to_string(),
         p.keyspace_id.to_string(),
         p.range(),
         owner,
         p.epoch.to_string(),
-        p.committed_lamport.to_string(),
-        format_bytes(p.size_bytes),
-        p.max_replica_lag().to_string(),
+        p.committed_lamport
+            .map_or_else(|| "unknown".to_owned(), |l| l.to_string()),
+        format_bytes_or_unknown(p.size_bytes),
+        format_bytes_or_unknown(p.index_bytes),
+        lag_text(p.max_replica_lag()),
+        lag_text(p.max_wal_lag()),
         p.replica_summary(),
     ]
 }
@@ -471,7 +571,42 @@ pub struct ClusterSummaryView {
     pub partition_count: usize,
     pub partitions_with_no_replica: usize,
     pub partitions_with_an_unhealthy_owner: usize,
+    /// The worst lag among partitions whose owner has reported a position.
+    ///
+    /// A maximum over a subset is still a true statement about that subset,
+    /// unlike a sum, which is why this stays a plain number and the index
+    /// memory total does not. [`Self::partitions_without_owner_progress`] is
+    /// how many partitions it could not look at.
     pub max_replica_lag: u64,
+    pub max_wal_lag: u64,
+    /// Partitions with no owner reporting, so no size, position, or lag.
+    /// Since #53 this is what a fenced partition looks like for as long as
+    /// the control plane waits for its replicas to report past the fence.
+    pub partitions_without_owner_progress: usize,
+    /// Replica placements whose position the leader group has not heard, so
+    /// the lag above could not look at them. #79 calls this `Unestablished`
+    /// on the owner's side; it is neither healthy nor stranded, and counting
+    /// it is the only way the worst-lag number stays honest about its reach.
+    pub replicas_without_position: usize,
+    /// What every node's partition indexes cost, added up. ADR 0006 makes
+    /// this the resource a cluster exhausts first, and a total is what an
+    /// operator compares against the memory they bought.
+    ///
+    /// Absent when any node did not report a measurement. A sum that quietly
+    /// skipped the nodes it could not see would be a total that reads low
+    /// precisely during a rolling upgrade, which is when an operator is most
+    /// likely to be watching memory and least able to afford a number that
+    /// says there is room.
+    pub index_memory_bytes: Option<u64>,
+    /// What the nodes that did report add up to. Equal to
+    /// [`Self::index_memory_bytes`] when every node reported, and offered
+    /// beside the count below so a partial answer is still readable as one.
+    pub reported_index_memory_bytes: u64,
+    pub nodes_without_index_memory: usize,
+    /// Keyspaces whose stored bytes have reached or passed their quota.
+    /// Counted, not judged: it does not feed [`Self::healthy`], because the
+    /// quota is a tenant's limit and not the cluster's health.
+    pub keyspaces_over_quota: usize,
 }
 
 impl ClusterSummaryView {
@@ -497,6 +632,114 @@ pub struct ClusterView {
     pub cluster_version: Option<String>,
     pub nodes: Vec<NodeView>,
     pub partitions: Vec<PartitionView>,
+    /// What each keyspace is storing against the quota it was given. Empty
+    /// from a server that predates quota reporting.
+    pub keyspaces: Vec<KeyspaceUsageView>,
+}
+
+/// One keyspace's storage against its quota.
+///
+/// The saturation is reported and nothing is concluded from it. What counts
+/// as too full depends on a measured envelope this project does not have yet,
+/// so a number an operator can read beats a threshold we would be guessing at.
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyspaceUsageView {
+    pub id: u64,
+    pub name: String,
+    pub partition_count: u32,
+    /// Bytes stored across this keyspace's partitions. Exact when
+    /// [`Self::partitions_without_size`] is zero, and a floor otherwise.
+    pub stored_bytes: u64,
+    /// How many of this keyspace's partitions had no owner reporting a size.
+    /// Nonzero makes [`Self::stored_bytes`] a lower bound, which is still
+    /// enough to prove the keyspace is over its quota and not enough to
+    /// prove it is under.
+    pub partitions_without_size: u32,
+    /// Absent means the keyspace has no storage quota, which is the default.
+    pub max_storage_bytes: Option<u64>,
+}
+
+/// Where a keyspace's storage sits against the quota it was given.
+///
+/// An enum rather than an `Option<f64>` because a quota of zero is a real,
+/// configurable state that no fraction can express, and folding it into
+/// "no measurement" is how a keyspace that is entirely over its limit ends up
+/// looking like one that has no limit at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuotaUse {
+    /// No quota configured, so there is nothing to be a fraction of.
+    Unlimited,
+    /// A quota of exactly zero bytes: the keyspace is allowed to hold
+    /// nothing. `over` is true once it holds something, which happens the
+    /// moment a nonempty keyspace is moved to this cap.
+    Closed { over: bool },
+    /// Stored bytes as a fraction of the quota. Can exceed one, because a
+    /// quota is enforced on admission and existing bytes predate it.
+    Fraction(f64),
+    /// A floor on the fraction, because some of this keyspace's partitions
+    /// had no owner reporting a size. The real figure is this or higher, so
+    /// a floor at or above one still proves the keyspace is over quota.
+    AtLeast(f64),
+}
+
+impl KeyspaceUsageView {
+    /// Where this keyspace sits against its quota.
+    #[must_use]
+    pub fn quota_use(&self) -> QuotaUse {
+        match self.max_storage_bytes {
+            None => QuotaUse::Unlimited,
+            Some(0) => QuotaUse::Closed {
+                over: self.stored_bytes > 0,
+            },
+            Some(limit) => {
+                let fraction = self.stored_bytes as f64 / limit as f64;
+                if self.partitions_without_size == 0 {
+                    QuotaUse::Fraction(fraction)
+                } else {
+                    QuotaUse::AtLeast(fraction)
+                }
+            }
+        }
+    }
+
+    /// Whether this keyspace has reached or passed the quota it was given.
+    #[must_use]
+    pub fn is_over_quota(&self) -> bool {
+        match self.quota_use() {
+            QuotaUse::Unlimited => false,
+            // A zero quota is reached at zero bytes: there is no room left,
+            // whether or not anything is stored yet.
+            QuotaUse::Closed { .. } => true,
+            // A floor at or above the quota is proof. Below it is not, since
+            // the partitions that did not report could hold anything.
+            QuotaUse::Fraction(fraction) | QuotaUse::AtLeast(fraction) => fraction >= 1.0,
+        }
+    }
+
+    fn quota_text(&self) -> String {
+        self.max_storage_bytes
+            .map_or_else(|| "none".to_owned(), format_bytes)
+    }
+
+    fn stored_text(&self) -> String {
+        if self.partitions_without_size == 0 {
+            format_bytes(self.stored_bytes)
+        } else {
+            format!("\u{2265} {}", format_bytes(self.stored_bytes))
+        }
+    }
+
+    fn saturation_text(&self) -> String {
+        match self.quota_use() {
+            QuotaUse::Unlimited => "-".to_owned(),
+            // Not a percentage, because the percentage is either zero over
+            // zero or infinite, and both would be read as a mistake.
+            QuotaUse::Closed { over: false } => "full".to_owned(),
+            QuotaUse::Closed { over: true } => "over".to_owned(),
+            QuotaUse::Fraction(fraction) => format!("{:.1}%", fraction * 100.0),
+            QuotaUse::AtLeast(fraction) => format!("\u{2265} {:.1}%", fraction * 100.0),
+        }
+    }
 }
 
 impl ClusterView {
@@ -532,9 +775,33 @@ impl ClusterView {
                 .count(),
             max_replica_lag: partitions
                 .iter()
-                .map(PartitionView::max_replica_lag)
+                .filter_map(PartitionView::max_replica_lag)
                 .max()
                 .unwrap_or(0),
+            max_wal_lag: partitions
+                .iter()
+                .filter_map(PartitionView::max_wal_lag)
+                .max()
+                .unwrap_or(0),
+            partitions_without_owner_progress: partitions
+                .iter()
+                .filter(|p| p.committed_lamport.is_none())
+                .count(),
+            replicas_without_position: partitions
+                .iter()
+                .map(PartitionView::replicas_without_position)
+                .sum(),
+            // Summing Options gives None the moment one contributor is
+            // unknown, which is the answer that does not under-report. The
+            // partial sum is kept beside it so a mid-rollout describe still
+            // shows what is known instead of nothing.
+            index_memory_bytes: nodes.iter().map(|n| n.index_memory_bytes).sum(),
+            reported_index_memory_bytes: nodes.iter().filter_map(|n| n.index_memory_bytes).sum(),
+            nodes_without_index_memory: nodes
+                .iter()
+                .filter(|n| n.index_memory_bytes.is_none())
+                .count(),
+            keyspaces_over_quota: 0,
         };
 
         Self {
@@ -542,7 +809,23 @@ impl ClusterView {
             cluster_version: None,
             nodes,
             partitions,
+            keyspaces: Vec::new(),
         }
+    }
+
+    /// Attaches per-keyspace usage, which is where quota saturation lives.
+    ///
+    /// Separate from [`Self::new`] for the same reason the cluster version
+    /// is: the commands that print a partial view after a split or a
+    /// transfer have no keyspace list to attach and should not invent one.
+    #[must_use]
+    pub fn with_keyspaces(mut self, mut keyspaces: Vec<KeyspaceUsageView>) -> Self {
+        // Sorted here for the same reason the nodes and partitions are: two
+        // describes a minute apart have to diff cleanly.
+        keyspaces.sort_by(|a, b| a.name.cmp(&b.name));
+        self.summary.keyspaces_over_quota = keyspaces.iter().filter(|k| k.is_over_quota()).count();
+        self.keyspaces = keyspaces;
+        self
     }
 
     /// Attaches the active cluster version, kept separate from [`Self::new`]
@@ -579,7 +862,59 @@ impl Render for ClusterView {
             "  partitions   {} total, {} with an unhealthy owner, {} with no replica",
             s.partition_count, s.partitions_with_an_unhealthy_owner, s.partitions_with_no_replica
         );
-        let _ = writeln!(out, "  worst lag    {}", s.max_replica_lag);
+        let unseen = s.partitions_without_owner_progress + s.replicas_without_position;
+        let _ = if unseen == 0 {
+            writeln!(
+                out,
+                "  worst lag    {} applied, {} wal",
+                s.max_replica_lag, s.max_wal_lag
+            )
+        } else if s.partitions_without_owner_progress == 0 {
+            writeln!(
+                out,
+                "  worst lag    {} applied, {} wal, {} replicas have not reported a position",
+                s.max_replica_lag, s.max_wal_lag, s.replicas_without_position
+            )
+        } else {
+            // Saying which partitions the number could not cover, because a
+            // worst-lag of zero next to a silently skipped fenced partition
+            // reads as a healthy cluster during a failover.
+            writeln!(
+                out,
+                "  worst lag    {} applied, {} wal, {} partitions with no owner reporting",
+                s.max_replica_lag, s.max_wal_lag, s.partitions_without_owner_progress
+            )
+        };
+        // A total that silently dropped the nodes it could not measure would
+        // read low exactly when an operator is mid-rollout and watching
+        // memory, so an incomplete total says how incomplete it is.
+        let reporting = s.node_count - s.nodes_without_index_memory;
+        let _ = match s.index_memory_bytes {
+            Some(total) => writeln!(out, "  index memory {}", format_bytes(total)),
+            // Nothing was measured anywhere, which is what a whole cluster
+            // one version behind looks like. A partial sum of nothing is
+            // "0 B", and that is the reading this is here to prevent.
+            None if reporting == 0 => writeln!(
+                out,
+                "  index memory unknown, {} nodes not reporting it",
+                s.nodes_without_index_memory
+            ),
+            None => writeln!(
+                out,
+                "  index memory {} across {reporting} of {} nodes, {} not reporting",
+                format_bytes(s.reported_index_memory_bytes),
+                s.node_count,
+                s.nodes_without_index_memory
+            ),
+        };
+        if s.keyspaces_over_quota > 0 {
+            let _ = writeln!(
+                out,
+                "  quotas       {} of {} keyspaces at or over their storage quota",
+                s.keyspaces_over_quota,
+                self.keyspaces.len()
+            );
+        }
         if s.healthy() {
             out.push_str("  everything reporting is healthy\n");
         }
@@ -599,11 +934,42 @@ impl Render for ClusterView {
                         n.health.clone(),
                         if n.raft_leader { "yes" } else { "no" }.to_owned(),
                         n.speaks.clone(),
+                        format_bytes_or_unknown(n.index_memory_bytes),
                     ]
                 })
                 .collect();
             out.push_str(&indent(&table(
-                &["id", "address", "role", "health", "raft leader", "speaks"],
+                &[
+                    "id",
+                    "address",
+                    "role",
+                    "health",
+                    "raft leader",
+                    "speaks",
+                    "index memory",
+                ],
+                &rows,
+            )));
+        }
+
+        if !self.keyspaces.is_empty() {
+            out.push_str("\nKEYSPACES\n");
+            let rows: Vec<Vec<String>> = self
+                .keyspaces
+                .iter()
+                .map(|k| {
+                    vec![
+                        k.name.clone(),
+                        k.id.to_string(),
+                        k.partition_count.to_string(),
+                        k.stored_text(),
+                        k.quota_text(),
+                        k.saturation_text(),
+                    ]
+                })
+                .collect();
+            out.push_str(&indent(&table(
+                &["name", "id", "partitions", "stored", "quota", "used"],
                 &rows,
             )));
         }
@@ -626,7 +992,8 @@ impl Render for ClusterView {
             out.push_str(
                 "\nLag is how far a replica trails the owner's committed lamport. A replica at \
                  zero\ncan serve a linearizable read locally and would lose nothing if it were \
-                 promoted.\n",
+                 promoted.\nThe wal lag column measures the same distance at the log rather than \
+                 at what has\nbeen applied, so it is what a promotion would have to hand over.\n",
             );
         }
     }
@@ -1051,16 +1418,19 @@ mod tests {
             end_key: None,
             owner_node_id: 3,
             epoch: 2,
-            committed_lamport: 100,
-            size_bytes: 2048,
+            committed_lamport: Some(100),
+            size_bytes: Some(2048),
+            index_bytes: Some(4096),
             replicas: vec![
                 ReplicaView {
                     node_id: 4,
-                    applied_lamport: 100,
+                    applied_lamport: Some(100),
+                    durable_lamport: Some(100),
                 },
                 ReplicaView {
                     node_id: 5,
-                    applied_lamport: 91,
+                    applied_lamport: Some(91),
+                    durable_lamport: Some(96),
                 },
             ],
         }
@@ -1074,6 +1444,380 @@ mod tests {
     #[test]
     fn a_replica_summary_shows_how_far_each_replica_trails_the_owner() {
         assert_eq!(partition(1).replica_summary(), "4(-0) 5(-9)");
+    }
+
+    #[test]
+    fn describe_reports_wal_lag_separately_from_applied_lag() {
+        // A replica can hold the log and still be applying it. Reporting one
+        // number for both would hide whichever problem the operator has.
+        let p = partition(1);
+        assert_eq!(p.max_replica_lag(), Some(9));
+        assert_eq!(p.max_wal_lag(), Some(4));
+    }
+
+    #[test]
+    fn describe_reports_the_index_memory_a_partition_and_a_cluster_hold() {
+        let view = ClusterView::new(
+            vec![
+                node(1, "leader", "healthy", true),
+                node(3, "worker", "healthy", false),
+            ],
+            vec![partition(1)],
+        );
+        assert_eq!(view.summary.index_memory_bytes, Some(1024 + 3072));
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("index memory"), "{text}");
+        assert!(
+            text.contains("4.0 KiB"),
+            "the partition's index is a column: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unreported_index_renders_as_unknown_rather_than_as_an_empty_one() {
+        // The mixed-version case, at the surface an operator actually reads.
+        // A node running an older binary reports no measurement, and printing
+        // "0 B" would tell them a full index is empty, at the exact moment
+        // during a rolling upgrade when they are watching memory.
+        let mut unreported = node(3, "worker", "healthy", false);
+        unreported.index_memory_bytes = None;
+        let mut partition = partition(1);
+        partition.index_bytes = None;
+
+        let view = ClusterView::new(
+            vec![node(1, "leader", "healthy", true), unreported],
+            vec![partition],
+        );
+
+        assert_eq!(
+            view.summary.index_memory_bytes, None,
+            "one silent node means the cluster has no honest total"
+        );
+        assert_eq!(view.summary.reported_index_memory_bytes, 1024);
+        assert_eq!(view.summary.nodes_without_index_memory, 1);
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(
+            text.contains("unknown"),
+            "the node and partition rows say unknown: {text}"
+        );
+        assert!(
+            text.contains("1 not reporting"),
+            "and the total says how much of it is missing: {text}"
+        );
+        assert!(
+            !text.contains("0 B"),
+            "nothing here may be rendered as an empty index: {text}"
+        );
+    }
+
+    #[test]
+    fn an_index_measured_at_zero_still_renders_as_zero() {
+        // The other side of the same distinction. A node that has measured
+        // its index and found nothing there is a real answer, and it must not
+        // be swept into "unknown" by the fix for the case above.
+        let mut measured = node(3, "worker", "healthy", false);
+        measured.index_memory_bytes = Some(0);
+        let view = ClusterView::new(vec![measured], Vec::new());
+
+        assert_eq!(view.summary.index_memory_bytes, Some(0));
+        assert_eq!(view.summary.nodes_without_index_memory, 0);
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("0 B"), "{text}");
+        assert!(!text.contains("unknown"), "{text}");
+    }
+
+    #[test]
+    fn describe_reports_quota_saturation_and_says_nothing_about_it() {
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], Vec::new())
+            .with_keyspaces(vec![
+                KeyspaceUsageView {
+                    id: 1,
+                    name: "orders".to_owned(),
+                    partition_count: 2,
+                    stored_bytes: 512,
+                    partitions_without_size: 0,
+                    max_storage_bytes: Some(1024),
+                },
+                KeyspaceUsageView {
+                    id: 2,
+                    name: "audit".to_owned(),
+                    partition_count: 1,
+                    stored_bytes: 999,
+                    partitions_without_size: 0,
+                    max_storage_bytes: None,
+                },
+            ]);
+
+        assert_eq!(view.keyspaces[0].name, "audit", "sorted for a clean diff");
+        assert_eq!(view.keyspaces[1].quota_use(), QuotaUse::Fraction(0.5));
+        assert_eq!(
+            view.keyspaces[0].quota_use(),
+            QuotaUse::Unlimited,
+            "a keyspace with no quota has no saturation, rather than zero"
+        );
+        assert_eq!(
+            view.summary.keyspaces_over_quota, 0,
+            "neither of these is at its limit"
+        );
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("KEYSPACES"), "{text}");
+        assert!(text.contains("50.0%"), "{text}");
+        assert!(
+            text.contains("none"),
+            "an unlimited keyspace says so: {text}"
+        );
+    }
+
+    #[test]
+    fn a_nonempty_keyspace_at_a_zero_quota_reads_as_over_and_not_as_unlimited() {
+        // A zero quota is a configured cap, not the absence of one. Treating
+        // it as no measurement printed the same dash an unlimited keyspace
+        // gets, so a tenant that is entirely over its limit looked like one
+        // that has no limit, which is backwards in the worst way.
+        let over = KeyspaceUsageView {
+            id: 1,
+            name: "orders".to_owned(),
+            partition_count: 1,
+            stored_bytes: 10,
+            partitions_without_size: 0,
+            max_storage_bytes: Some(0),
+        };
+        assert_eq!(over.quota_use(), QuotaUse::Closed { over: true });
+        assert_eq!(over.saturation_text(), "over");
+        assert!(over.is_over_quota());
+
+        // The same cap on an empty keyspace is not over it, but it still has
+        // no room, and it is still not "unlimited".
+        let empty = KeyspaceUsageView {
+            stored_bytes: 0,
+            ..over.clone()
+        };
+        assert_eq!(empty.quota_use(), QuotaUse::Closed { over: false });
+        assert_eq!(empty.saturation_text(), "full");
+        assert!(empty.is_over_quota());
+
+        let unlimited = KeyspaceUsageView {
+            max_storage_bytes: None,
+            ..over.clone()
+        };
+        assert_eq!(unlimited.saturation_text(), "-");
+        assert!(!unlimited.is_over_quota());
+        assert_ne!(
+            over.saturation_text(),
+            unlimited.saturation_text(),
+            "a zero quota and no quota must not print the same thing"
+        );
+    }
+
+    #[test]
+    fn a_keyspace_at_or_over_its_quota_is_counted_in_the_summary() {
+        // The renderer showing "over" in one row is not enough on its own:
+        // the summary is what an operator reads first, and a tenant that
+        // cannot accept another byte should not need a scroll to find.
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], Vec::new())
+            .with_keyspaces(vec![
+                KeyspaceUsageView {
+                    id: 1,
+                    name: "closed".to_owned(),
+                    partition_count: 1,
+                    stored_bytes: 10,
+                    partitions_without_size: 0,
+                    max_storage_bytes: Some(0),
+                },
+                KeyspaceUsageView {
+                    id: 2,
+                    name: "roomy".to_owned(),
+                    partition_count: 1,
+                    stored_bytes: 10,
+                    partitions_without_size: 0,
+                    max_storage_bytes: Some(1024),
+                },
+            ]);
+
+        assert_eq!(view.summary.keyspaces_over_quota, 1);
+        let text = render(Format::Human, &view).unwrap();
+        assert!(text.contains("at or over their storage quota"), "{text}");
+        assert!(text.contains("over"), "the row says so too: {text}");
+        assert!(
+            view.summary.healthy(),
+            "a tenant's quota is not the cluster's health, and no resource \
+             number may flip that verdict"
+        );
+    }
+
+    #[test]
+    fn a_partition_with_no_owner_reporting_renders_unknown_rather_than_zeroes() {
+        // Since #53 a fenced partition stays unowned until every surviving
+        // replica has reported past the fence, so this row is what an
+        // operator sees during an ordinary failover. Zeroes here would say
+        // the partition is empty and its replicas are perfectly caught up,
+        // which is the opposite of true and arrives at the moment somebody is
+        // deciding what the cluster can afford to lose.
+        let mut fenced = partition(1);
+        fenced.owner_node_id = 0;
+        fenced.committed_lamport = None;
+        fenced.size_bytes = None;
+        fenced.index_bytes = None;
+
+        assert_eq!(fenced.max_replica_lag(), None);
+        assert_eq!(fenced.max_wal_lag(), None);
+
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], vec![fenced]);
+        assert_eq!(view.summary.partitions_without_owner_progress, 1);
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(
+            !text.contains("0 B"),
+            "an unmeasured partition is not an empty one: {text}"
+        );
+        assert!(
+            text.contains("unknown"),
+            "size, position, and both lags say so: {text}"
+        );
+        assert!(
+            text.contains("none"),
+            "and an unowned partition names no owner: {text}"
+        );
+        assert!(
+            text.contains("partitions with no owner reporting"),
+            "the summary says which partitions its worst-lag could not \
+             cover: {text}"
+        );
+        assert!(
+            text.contains("(-?)"),
+            "a replica has no measurable distance from an owner that is \
+             gone: {text}"
+        );
+    }
+
+    #[test]
+    fn a_keyspace_missing_a_partitions_size_reports_a_floor_not_a_total() {
+        // The same defect one level up. A keyspace total that quietly skipped
+        // a fenced partition would read as a small exact number, and quota
+        // saturation is the one place that reading costs something.
+        let partial = KeyspaceUsageView {
+            id: 1,
+            name: "orders".to_owned(),
+            partition_count: 3,
+            stored_bytes: 512,
+            partitions_without_size: 1,
+            max_storage_bytes: Some(1024),
+        };
+        assert_eq!(partial.quota_use(), QuotaUse::AtLeast(0.5));
+        assert!(
+            !partial.is_over_quota(),
+            "a floor below the quota proves nothing"
+        );
+        assert!(
+            partial.saturation_text().starts_with('\u{2265}'),
+            "{}",
+            partial.saturation_text()
+        );
+        assert!(
+            partial.stored_text().starts_with('\u{2265}'),
+            "{}",
+            partial.stored_text()
+        );
+
+        // A floor at or above the quota is proof regardless of what the
+        // partitions that did not report are holding.
+        let proven = KeyspaceUsageView {
+            stored_bytes: 2048,
+            ..partial.clone()
+        };
+        assert!(proven.is_over_quota());
+
+        let complete = KeyspaceUsageView {
+            partitions_without_size: 0,
+            ..partial.clone()
+        };
+        assert_eq!(complete.quota_use(), QuotaUse::Fraction(0.5));
+        assert_eq!(complete.saturation_text(), "50.0%");
+    }
+
+    #[test]
+    fn a_replica_that_has_not_reported_renders_unknown_rather_than_maximally_behind() {
+        // The state #79 calls `Unestablished`, at the surface an operator
+        // reads. A replica at the bottom of the log and a replica that has
+        // said nothing look identical if silence is rendered as zero, and one
+        // of them is an emergency while the other may be perfectly current.
+        let mut p = partition(1);
+        p.replicas[1].applied_lamport = None;
+        p.replicas[1].durable_lamport = None;
+
+        assert_eq!(p.replicas_without_position(), 1);
+        assert_eq!(
+            p.max_replica_lag(),
+            Some(0),
+            "the worst lag among replicas that did report is still true about \
+             them, and node 4 is level"
+        );
+
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], vec![p]);
+        assert_eq!(view.summary.replicas_without_position, 1);
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(
+            text.contains("5(-?)"),
+            "a replica with no position has no measurable distance: {text}"
+        );
+        assert!(
+            text.contains("4(-0)"),
+            "and one that did report keeps its number: {text}"
+        );
+        assert!(
+            text.contains("replicas have not reported a position"),
+            "the summary says how far its lag could not see: {text}"
+        );
+    }
+
+    #[test]
+    fn a_quiescing_owner_does_not_render_as_though_it_lost_data() {
+        // #79 gave a draining owner `quiesce`, which drops the writes it holds
+        // alone — writes whose clients were told they failed — and so lowers
+        // its durable position. Nothing was lost. The committed prefix is the
+        // watermark that cannot go backwards, and it is what this column
+        // shows, so a planned shutdown does not read as a partition losing
+        // ground.
+        let before = PartitionView {
+            committed_lamport: Some(90),
+            ..partition(1)
+        };
+        let after_quiesce = PartitionView {
+            committed_lamport: Some(90),
+            ..partition(1)
+        };
+
+        let first = render(
+            Format::Human,
+            &ClusterView::new(vec![node(3, "worker", "healthy", true)], vec![before]),
+        )
+        .unwrap();
+        let second = render(
+            Format::Human,
+            &ClusterView::new(
+                vec![node(3, "worker", "healthy", true)],
+                vec![after_quiesce],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            first, second,
+            "two describes across a quiesce have to diff cleanly, because \
+             nothing an operator is shown actually moved"
+        );
+    }
+
+    #[test]
+    fn a_cluster_without_keyspace_usage_prints_no_keyspace_section() {
+        // A server that predates quota reporting sends none, and inventing an
+        // empty table would read as "this cluster has no keyspaces".
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], Vec::new());
+        let text = render(Format::Human, &view).unwrap();
+        assert!(!text.contains("KEYSPACES"), "{text}");
     }
 
     #[test]
@@ -1096,6 +1840,7 @@ mod tests {
             health: health.to_owned(),
             raft_leader,
             speaks: "0.1..0.2".to_owned(),
+            index_memory_bytes: Some(1024 * id),
         }
     }
 
@@ -1156,7 +1901,7 @@ mod tests {
     #[test]
     fn the_summary_carries_the_worst_replica_lag_in_the_whole_cluster() {
         let mut behind = partition(2);
-        behind.replicas[1].applied_lamport = 40;
+        behind.replicas[1].applied_lamport = Some(40);
         let view = ClusterView::new(Vec::new(), vec![partition(1), behind]);
         assert_eq!(view.summary.max_replica_lag, 60);
     }

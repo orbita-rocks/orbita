@@ -593,6 +593,19 @@ impl<R: Runtime> PartitionHost<R> {
         self.storage.committed_lamport().await
     }
 
+    /// The committed prefix this owner has established: the highest Lamport a
+    /// durability quorum confirmed under its epoch.
+    ///
+    /// `None` on a replica, which has no quorum of its own to have confirmed
+    /// anything. Reported beside the durable position rather than instead of
+    /// it because they answer different questions: the durable position is
+    /// the promotion input, and this is the watermark the no-lost-write
+    /// promise is stated against. Only this one is safe to show an operator
+    /// as the partition's position, because `quiesce` lowers the other.
+    pub(crate) fn committed_prefix(&self) -> Option<Lamport> {
+        self.wal.as_ref().map(|wal| wal.committed_lamport())
+    }
+
     /// The highest Lamport this node has on stable storage for this partition.
     ///
     /// This is the promotion input rather than the applied Lamport, because an
@@ -633,6 +646,15 @@ impl<R: Runtime> PartitionHost<R> {
     /// compares against the split threshold.
     pub(crate) async fn size_bytes(&self) -> Result<u64> {
         self.storage.size_bytes().await
+    }
+
+    /// What this partition's memory-resident index costs on this node.
+    ///
+    /// Reported to the leader group because the node is the only place the
+    /// number exists, and because ADR 0006 makes it the resource that runs
+    /// out before disk does.
+    pub(crate) async fn index_bytes(&self) -> Result<u64> {
+        self.storage.index_bytes().await
     }
 
     /// Rebuilds this partition's storage from the manifest in the bucket and
