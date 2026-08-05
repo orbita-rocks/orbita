@@ -42,7 +42,7 @@ use orbita_format::PartitionPath;
 use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_storage::{Mutation, Partition, ScanPage, TOMBSTONE_RETENTION_MILLIS};
-use orbita_wal::{PartitionLog, Wal, WalConfig, WalEntry, WalOp};
+use orbita_wal::{CatchUpPass, Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -179,7 +179,11 @@ pub(crate) struct PartitionHost<R: Runtime> {
     leases: Mutex<LeaseTable>,
     lease: LeasePolicy,
     /// The peers this node replicates to, when it owns the partition.
-    replicas: Vec<NodeId>,
+    ///
+    /// Mutable because the control plane places replicas onto a partition that
+    /// is already owned and serving, and it does so without bumping the epoch.
+    /// See [`PartitionHost::set_replicas`].
+    replicas: Mutex<Vec<NodeId>>,
     /// Replicas this owner is willing to grant a lease to. A replica drops out
     /// when a renewal fails, because an owner that keeps granting to a node it
     /// cannot reach would wait out a lease on every write forever.
@@ -218,16 +222,34 @@ impl<R: Runtime> PartitionHost<R> {
             )
             .await?,
         );
-        let mut config =
-            WalConfig::new(id, paths.wal_dir.clone(), epoch).with_replicas(replicas.clone());
+        // What opening the storage engine built out of the bucket. On a node
+        // that has held this partition all along it is the last manifest it
+        // published; on a replacement it is the whole partition, downloaded
+        // rather than copied from a peer. Either way it is where this node's
+        // log has to think it starts, and its epoch is the second opinion on
+        // whether the grant that brought us here is still current.
+        let hydrated = hydration_of(&storage).await;
+        let mut config = WalConfig::new(id, paths.wal_dir.clone(), epoch)
+            .with_replicas(replicas.clone())
+            .with_hydration(hydrated);
         config.segment_target_bytes = paths.wal_segment_bytes;
         let wal = Wal::open(runtime.clone(), config).await?;
 
         // A restart finds entries that were durable and never applied, because
         // the acknowledgement to the client came before the apply. Replaying
-        // them is what makes that ordering safe.
+        // them is what makes that ordering safe. Hydration and this compose
+        // rather than compete: the manifest covers everything up to its
+        // horizon, and the log carries the tail above it.
         let recovery = wal.recover();
-        for entry in &recovery.entries {
+        // Entries the manifest already covers are skipped rather than applied.
+        // `Partition::apply` ignores them anyway, but reading a value out of a
+        // log to have it thrown away is work proportional to the retained log
+        // rather than to the tail that matters.
+        for entry in recovery
+            .entries
+            .iter()
+            .filter(|e| e.lamport > hydrated.through)
+        {
             storage.apply(&mutation_of(entry)).await?;
         }
         if let Some(truncation) = recovery.truncated {
@@ -272,6 +294,7 @@ impl<R: Runtime> PartitionHost<R> {
             )
             .await?,
         );
+        let hydrated = hydration_of(&storage).await;
         let log = PartitionLog::open(
             runtime.clone(),
             paths.wal_dir.clone(),
@@ -279,7 +302,21 @@ impl<R: Runtime> PartitionHost<R> {
             paths.wal_segment_bytes,
         )
         .await?;
-        for entry in &log.recovery().entries {
+        // Adopted before anything is replayed, so this node reports the
+        // position its data is actually at. A replica that hydrated from the
+        // bucket and still claimed position zero would ask its owner to resend
+        // writes the owner has checkpointed away, and would never catch up.
+        log.hydrate(hydrated.through).await;
+        // Entries the manifest already covers are skipped rather than applied.
+        // `Partition::apply` would discard them anyway, but reading a value out
+        // of a log to have it thrown away is work proportional to the retained
+        // log rather than to the tail that matters.
+        for entry in log
+            .recovery()
+            .entries
+            .iter()
+            .filter(|e| e.lamport > hydrated.through)
+        {
             storage.apply(&mutation_of(entry)).await?;
         }
 
@@ -338,7 +375,7 @@ impl<R: Runtime> PartitionHost<R> {
             leases: Mutex::new(LeaseTable::default()),
             lease: spec.lease,
             grantable: Mutex::new(replicas.iter().copied().collect()),
-            replicas,
+            replicas: Mutex::new(replicas),
             committed: Mutex::new(Lamport::ZERO),
             withheld: Mutex::new(VecDeque::new()),
             applying: tokio::sync::Mutex::new(()),
@@ -366,6 +403,98 @@ impl<R: Runtime> PartitionHost<R> {
     #[must_use]
     pub(crate) fn is_owner(&self) -> bool {
         self.wal.is_some()
+    }
+
+    /// Adopts a replica set the control plane placed after this host opened.
+    ///
+    /// A partition is born owned and unreplicated and gets its replicas a
+    /// moment later, and that placement moves the map version without moving
+    /// the epoch, because placement is not a change of ownership. An owner that
+    /// only learned its peers at open time would go on acknowledging writes
+    /// against an empty peer list, which
+    /// [`orbita_wal::Wal::replicate`] treats as a quorum already met — the
+    /// write is durable on one copy while the map promises three, and no
+    /// replica ever advances far enough to be promoted or to take a read lease.
+    ///
+    /// Applied in place rather than by reopening the host: a reopen throws away
+    /// in-flight writes, and a client cannot tell that apart from a failover it
+    /// did nothing to deserve.
+    ///
+    /// Returns whether anything changed, so the caller can log a real
+    /// transition rather than every poll.
+    pub(crate) fn set_replicas(&self, replicas: &[NodeId]) -> bool {
+        let Some(wal) = self.wal.as_ref() else {
+            // A replica does not replicate onwards, so it has no peer list to
+            // keep current.
+            return false;
+        };
+        let mut held = self.replicas.lock().expect("replica set poisoned");
+        if held.as_slice() == replicas {
+            return false;
+        }
+        *held = replicas.to_vec();
+        // A peer that has just been added is grantable until a renewal to it
+        // fails; one that has been removed stops being offered new leases. The
+        // lease table is deliberately left alone, so a lease already out to a
+        // removed peer is still waited out rather than forgotten: the peer can
+        // be serving reads under it, and forgetting it is how a stale read
+        // happens.
+        let mut grantable = self.grantable.lock().expect("grantable set poisoned");
+        grantable.retain(|node| replicas.contains(node));
+        grantable.extend(replicas.iter().copied());
+        drop(grantable);
+        drop(held);
+        wal.set_replicas(replicas);
+        true
+    }
+
+    /// Carries any replica that is behind up to the committed prefix.
+    ///
+    /// Called whenever this node notices an advertised copy that has not
+    /// confirmed the prefix, and on every pass of a drain. Both are moments
+    /// where a replica can be behind with no write coming to carry it forward,
+    /// and where leaving it behind means the partition has fewer real copies
+    /// than the map claims. A replica does nothing here: it has no peers of
+    /// its own to feed.
+    ///
+    /// The horizon is deliberately the committed prefix rather than this
+    /// node's durable position; see [`orbita_wal::Wal::catch_up_replicas`].
+    pub(crate) async fn catch_up_replicas(&self) -> Result<CatchUpPass> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.catch_up_replicas().await,
+            None => Ok(CatchUpPass {
+                horizon: Lamport::ZERO,
+                caught_up: Vec::new(),
+                behind: Vec::new(),
+                stranded: Vec::new(),
+            }),
+        }
+    }
+
+    /// The advertised replicas a catch-up still owes a pass.
+    ///
+    /// This is what keeps a failed catch-up pending. It reads the same
+    /// per-replica record that [`PartitionHost::replicas_beyond_retention`]
+    /// reads, so the two cannot disagree about a node: one names the work a
+    /// retry can still do and the other names the work it cannot. See
+    /// [`orbita_wal::Wal::replicas_behind`].
+    pub(crate) fn replicas_behind(&self) -> Vec<NodeId> {
+        self.wal
+            .as_ref()
+            .map(|wal| wal.replicas_behind())
+            .unwrap_or_default()
+    }
+
+    /// Closes this partition's log and drops the tail no client was told
+    /// about, so that what it advertises is a position a replica can reach.
+    ///
+    /// See [`orbita_wal::Wal::quiesce`]. Only meaningful for an owner, and
+    /// only correct once write admission is closed.
+    pub(crate) async fn quiesce(&self) -> Result<()> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.quiesce().await.map(|_| ()),
+            None => Ok(()),
+        }
     }
 
     /// Whether this node might answer a read for `key` without asking the
@@ -486,10 +615,42 @@ impl<R: Runtime> PartitionHost<R> {
             .map_or_else(Vec::new, |wal| wal.beyond_retention())
     }
 
+    /// The oldest Lamport this partition's log still holds.
+    ///
+    /// The retention floor, opposite `Wal::committed_lamport`'s ceiling: a
+    /// replica can be carried from the log exactly when the entry it needs
+    /// next is at or above this. Nothing in the running server asks — an owner
+    /// reports the floor per stranded replica through
+    /// [`PartitionHost::replicas_beyond_retention`], which is the answer an
+    /// operator wants. This exists so a scenario can establish that a gap is
+    /// genuinely past the log rather than merely large.
+    #[cfg(test)]
+    pub(crate) async fn retained_from(&self) -> Lamport {
+        self.log.retained_from().await
+    }
+
     /// How much disk this partition is using, which is what the control plane
     /// compares against the split threshold.
     pub(crate) async fn size_bytes(&self) -> Result<u64> {
         self.storage.size_bytes().await
+    }
+
+    /// Rebuilds this partition's storage from the manifest in the bucket and
+    /// reports what that manifest says.
+    ///
+    /// This is the running-node half of hydration: opening a partition already
+    /// reads the manifest, and this is what a replica that has fallen beyond its
+    /// owner's retained log calls to catch up without a restart and without
+    /// asking a healthy peer for a copy. The epoch comes back with the horizon
+    /// because the caller is closing a gap on behalf of somebody claiming to
+    /// own this partition, and the manifest is the only thing on this path that
+    /// can contradict that claim.
+    pub(crate) async fn hydrate(&self) -> Result<Hydration> {
+        let found = self.storage.hydrate().await?;
+        Ok(Hydration {
+            epoch: found.epoch,
+            through: found.through,
+        })
     }
 
     /// Publishes every applied write and checkpoints only after the manifest
@@ -618,7 +779,8 @@ impl<R: Runtime> PartitionHost<R> {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        if self.replicas.is_empty() {
+        let replicas = self.replicas.lock().expect("replica set poisoned").clone();
+        if replicas.is_empty() {
             return;
         }
         // Where the log stands now. A replica takes the lease only if it is
@@ -632,8 +794,7 @@ impl<R: Runtime> PartitionHost<R> {
         let committed = wal.committed_lamport();
         let epoch = self.epoch;
 
-        let renewals: Vec<_> = self
-            .replicas
+        let renewals: Vec<_> = replicas
             .iter()
             .map(|node| self.renew_one(*node, epoch, through, committed))
             .collect();
@@ -1055,9 +1216,13 @@ async fn flush_and_checkpoint<R: Runtime>(
     }
 
     let flushed = storage.flushed_lamport().await?;
-    // A promoted node may open a manifest ahead of the WAL it retained. The
-    // manifest proves that every local entry is durable, but the checkpoint
-    // record cannot claim a Lamport this log has never held.
+    // A node may open a manifest ahead of the WAL it retained, which is the
+    // normal case for a replacement worker. Hydration is what reconciles the
+    // two: opening the partition records the manifest horizon in the log, so
+    // `durable_lamport` already accounts for the writes that live only in the
+    // segments. The cap stays because a log that was not hydrated, or that was
+    // hydrated to a lower horizon, must still not have a checkpoint claim a
+    // position it cannot back.
     let checkpoint = flushed.min(log.durable_lamport().await);
     if checkpoint > log.applied_through().await {
         log.checkpoint(checkpoint).await?;
@@ -1139,6 +1304,22 @@ fn pending_record_of(op: &WriteOp, lamport: Lamport, now_millis: u64) -> Pending
 
 fn mutation_of(entry: &WalEntry) -> Mutation {
     mutation_of_op(entry.lamport, key_of(&entry.op), &entry.op)
+}
+
+/// What the manifest the storage engine already adopted says, in the shape the
+/// log crate speaks.
+///
+/// The two crates each name this value for themselves rather than sharing a
+/// type, for the same reason [`mutation_of`] exists: neither depends on the
+/// other, the vocabulary crate is frozen, and this host is the one place they
+/// meet. Reading it costs nothing because [`Partition::open`] read the manifest
+/// on the way in.
+async fn hydration_of<R: Runtime>(storage: &Partition<R>) -> Hydration {
+    let found = storage.hydration().await;
+    Hydration {
+        epoch: found.epoch,
+        through: found.through,
+    }
 }
 
 fn key_of(op: &WalOp) -> &Bytes {
@@ -1343,6 +1524,21 @@ mod tests {
         store: Arc<FaultStore>,
         horizon: Lamport,
     ) {
+        publish_keys(sim, runtime, store, &[(horizon, "published")]);
+    }
+
+    /// Publishes a manifest holding these keys at these Lamports, which is what
+    /// a node hydrating this partition would find in the bucket.
+    fn publish_keys(
+        sim: &Simulation,
+        runtime: SimRuntime,
+        store: Arc<FaultStore>,
+        keys: &[(Lamport, &str)],
+    ) {
+        let keys: Vec<(Lamport, Bytes)> = keys
+            .iter()
+            .map(|(at, key)| (*at, Bytes::copy_from_slice(key.as_bytes())))
+            .collect();
         sim.block_on(async move {
             let partition = Partition::open(
                 runtime,
@@ -1353,15 +1549,12 @@ mod tests {
             )
             .await
             .unwrap();
-            partition
-                .apply(&Mutation::put(
-                    horizon,
-                    Bytes::from_static(b"published"),
-                    Bytes::from_static(b"value"),
-                    None,
-                ))
-                .await
-                .unwrap();
+            for (at, key) in keys {
+                partition
+                    .apply(&Mutation::put(at, key, Bytes::from_static(b"value"), None))
+                    .await
+                    .unwrap();
+            }
             partition.flush().await.unwrap();
         });
     }
@@ -1480,7 +1673,11 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_promoted_wal_does_not_checkpoint_beyond_the_manifest_it_opened() {
+    fn a_worker_with_no_log_of_its_own_takes_its_position_from_the_published_manifest() {
+        // The replacement-worker case ADR 0006 exists to make cheap: nothing on
+        // local disk, a partition in the bucket. Before hydration this node
+        // opened at position zero and could only be caught up by a peer
+        // resending every write since the beginning of the partition.
         let sim = Simulation::new(16);
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(FaultStore::new());
@@ -1491,18 +1688,99 @@ mod tests {
         sim.block_on(async move { flushing.flush().await.expect("an empty WAL is valid") });
 
         let host = Arc::clone(&host);
+        let (durable, checkpoint, value) = sim.block_on(async move {
+            (
+                host.log.durable_lamport().await,
+                host.log.applied_through().await,
+                host.get(b"published").await.unwrap(),
+            )
+        });
         assert_eq!(
-            sim.block_on(async move { host.log.applied_through().await }),
-            Lamport::ZERO,
-            "a checkpoint never names a Lamport the local WAL did not hold"
+            durable,
+            Lamport(9),
+            "the manifest is a stronger durability claim than the log, so the log adopts it"
+        );
+        assert_eq!(checkpoint, Lamport(9));
+        assert!(
+            value.is_some(),
+            "the partition was rebuilt from the bucket, not copied from a peer"
         );
     }
 
     #[test]
-    fn a_truncated_promoted_wal_checkpoints_only_its_local_durable_prefix() {
+    fn hydration_never_lowers_a_log_that_is_already_past_the_manifest() {
+        // A node whose own log runs ahead of the last published manifest is the
+        // steady state of a busy owner. Adopting the horizon there would rewind
+        // its position and let it reissue versions it has already handed out.
         let sim = Simulation::new(16);
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(FaultStore::new());
+        let host = start_host(&sim, runtime.clone(), Arc::clone(&store));
+        for _ in 0..3 {
+            write_one(&sim, &host);
+        }
+        let flushing = Arc::clone(&host);
+        sim.block_on(async move { flushing.flush().await.expect("the flush succeeds") });
+        drop(host);
+
+        // Reopening runs hydration against a manifest at Lamport 3 with a log
+        // that also stands at 3, which must leave both alone.
+        let reopened = start_host(&sim, runtime, store);
+        let durable = sim.block_on({
+            let reopened = Arc::clone(&reopened);
+            async move { reopened.log.durable_lamport().await }
+        });
+        assert_eq!(durable, Lamport(3));
+    }
+
+    #[test]
+    fn a_running_replica_rebuilds_from_the_bucket_without_being_reopened() {
+        // What a replica that fell beyond its owner's retained log does about
+        // it. Before hydration the only cure was restarting the node, because
+        // the manifest was read exactly once, at open.
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        let replica = start_replica(&sim, runtime.clone(), Arc::clone(&store));
+
+        publish_keys(
+            &sim,
+            runtime,
+            Arc::clone(&store),
+            &[(Lamport(1), "one"), (Lamport(2), "two")],
+        );
+
+        let replica = Arc::clone(&replica);
+        sim.block_on(async move {
+            assert_eq!(
+                replica.hydrate().await.unwrap().through,
+                Lamport(2),
+                "the horizon it reports is the one the owner may resume from"
+            );
+            assert!(replica.get(b"one").await.unwrap().is_some());
+            assert!(replica.get(b"two").await.unwrap().is_some());
+            assert_eq!(
+                replica.hydrate().await.unwrap().through,
+                Lamport(2),
+                "hydrating again is a no-op rather than a second download"
+            );
+        });
+    }
+
+    #[test]
+    fn hydration_replays_the_wal_tail_beyond_the_manifest() {
+        // The composition the issue turns on. A hydrated partition is current
+        // as of its manifest and no further, so the log above that horizon has
+        // to be replayed on top of it, and the log below it must not be: those
+        // writes are already in the segments, and replaying them would be work
+        // proportional to the retained log rather than to the tail.
+        let sim = Simulation::new(16);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+
+        // Five writes in the log, of which the bucket has published the first
+        // three under different keys, so which source answered a read is
+        // visible rather than inferred.
         let wal = sim.block_on({
             let runtime = runtime.clone();
             async move {
@@ -1511,7 +1789,7 @@ mod tests {
                     .unwrap()
             }
         });
-        for key in ["a", "b", "c"] {
+        for key in ["log1", "log2", "log3", "log4", "log5"] {
             let wal = Arc::clone(&wal);
             sim.block_on(async move {
                 wal.commit(WalOp::Put {
@@ -1524,18 +1802,40 @@ mod tests {
             });
         }
         drop(wal);
-        publish_horizon(&sim, runtime.clone(), Arc::clone(&store), Lamport(9));
+        publish_keys(
+            &sim,
+            runtime.clone(),
+            Arc::clone(&store),
+            &[
+                (Lamport(1), "seg1"),
+                (Lamport(2), "seg2"),
+                (Lamport(3), "seg3"),
+            ],
+        );
 
         let host = start_host(&sim, runtime, store);
-        let flushing = Arc::clone(&host);
-        sim.block_on(async move { flushing.flush().await.expect("the prefix is covered") });
-
         let host = Arc::clone(&host);
-        assert_eq!(
-            sim.block_on(async move { host.log.applied_through().await }),
-            Lamport(3),
-            "the checkpoint is capped at the local WAL's durable end"
-        );
+        sim.block_on(async move {
+            for key in [b"seg1".as_slice(), b"seg2", b"seg3"] {
+                assert!(
+                    host.get(key).await.unwrap().is_some(),
+                    "the manifest supplies everything at or below its horizon"
+                );
+            }
+            for key in [b"log4".as_slice(), b"log5"] {
+                assert!(
+                    host.get(key).await.unwrap().is_some(),
+                    "the log supplies the tail the manifest does not cover"
+                );
+            }
+            for key in [b"log1".as_slice(), b"log2", b"log3"] {
+                assert!(
+                    host.get(key).await.unwrap().is_none(),
+                    "entries at or below the horizon are the manifest's account, not the log's"
+                );
+            }
+            assert_eq!(host.log.durable_lamport().await, Lamport(5));
+        });
     }
 
     #[test]

@@ -21,6 +21,16 @@ pub(crate) const FRAME_HEADER_BYTES: usize = 8;
 /// bounded by what a legal entry could possibly need.
 pub(crate) const MAX_FRAME_BODY_BYTES: usize = MAX_KEY_BYTES + MAX_VALUE_BYTES + 128;
 
+/// The record kinds format version 1 defines.
+///
+/// Adding one is a format change even though the frame layout does not move,
+/// because a reader that predates it treats the record as malformed, stops
+/// there, and truncates the rest of the log. There is no "skip what you do not
+/// know" in this framing and there deliberately is not: a log is a sequence,
+/// so a record a reader cannot understand is a hole, not a curiosity. Any new
+/// kind therefore has to wait for a cluster version to gate it, and until then
+/// facts that can be re-derived belong in memory rather than here. See
+/// `PartitionLog::hydrate`.
 const KIND_ENTRY: u8 = 1;
 const KIND_CHECKPOINT: u8 = 2;
 const KIND_FENCE: u8 = 3;
@@ -90,6 +100,9 @@ pub(crate) enum LogRecord {
 }
 
 impl LogRecord {
+    /// The Lamport this record occupies in the log's sequence.
+    ///
+    /// Only an entry has one.
     pub(crate) fn lamport(&self) -> Option<Lamport> {
         match self {
             LogRecord::Entry(e) => Some(e.lamport),

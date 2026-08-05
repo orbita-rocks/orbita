@@ -605,6 +605,102 @@ async fn a_planned_shutdown_hands_off_acknowledged_writes_and_retires_the_old_ow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_planned_shutdown_completes_when_the_replicas_were_placed_after_the_last_write() {
+    // The load-sensitive version of this is
+    // `a_planned_shutdown_hands_off_acknowledged_writes_and_retires_the_old_owner`,
+    // which only reaches this state when the scheduler is busy enough that the
+    // owner's map poll loses a race with the drain. Here the ordering is built
+    // rather than waited for: one worker starts alone, so the partition is born
+    // owned and unreplicated, every write lands while that is still true, and
+    // the replicas are placed afterwards with nothing left to write.
+    //
+    // That is the shape a SIGTERM arriving shortly after a scale-up has, and it
+    // is the one where a handoff has to be made possible rather than merely
+    // permitted: the control plane will not give a partition to a replica that
+    // has not caught up, write admission is already closed, and an append is
+    // the only thing that ever moves a replica forward.
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+
+    let mut workers = vec![start_worker(WORKERS[0], &group.address, lease).await];
+    let seen = group.controller.clone();
+    let placed = Arc::new(std::sync::Mutex::new((None, Vec::new())));
+    let watch = Arc::clone(&placed);
+    tokio::spawn(async move {
+        loop {
+            *watch.lock().unwrap() = placement(&seen.partition_map().await);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    // Twice the budget the other tests give this, because they start from a
+    // cluster that is already at its final shape and this one is waiting out a
+    // cold bootstrap. The number that matters to what is under test is the
+    // drain budget below, which is the same as everywhere else.
+    const SETUP: Duration = Duration::from_secs(16);
+    until("the only worker to be given the partition", SETUP, || {
+        let held = placed.lock().unwrap();
+        held.0 == Some(WORKERS[0]) && held.1.is_empty()
+    })
+    .await;
+
+    // Acknowledged while the map honestly promises a single copy.
+    let mut acknowledged = Vec::new();
+    let deadline = Instant::now() + SETUP;
+    while acknowledged.len() < 10 {
+        let key = format!("early-{}", acknowledged.len());
+        let value = acknowledged.len().to_string();
+        match workers[0].client.set(set(&key, &value)).await {
+            Ok(response) if response.get_ref().applied => acknowledged.push((key, value)),
+            _ => assert!(
+                Instant::now() < deadline,
+                "the single-node cluster never became writable"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The scale-up. Nothing writes from here on, so the only thing that can
+    // put these entries on a second node is the owner deciding to send them.
+    for id in &WORKERS[1..] {
+        workers.push(start_worker(*id, &group.address, lease).await);
+    }
+    until("the scaled-up partition to be replicated", SETUP, || {
+        placed.lock().unwrap().1.len() == 2
+    })
+    .await;
+
+    workers[0]
+        .drain(BUDGET * 6)
+        .await
+        .expect("the planned handoff completes");
+
+    let (new_owner, _) = placement(&group.controller.partition_map().await);
+    let new_owner = new_owner.expect("the partition remains owned");
+    assert_ne!(new_owner, WORKERS[0], "the drained node is still the owner");
+    let new_index = workers
+        .iter()
+        .position(|worker| worker.id == new_owner)
+        .unwrap();
+    for (key, value) in acknowledged {
+        let response = workers[new_index]
+            .client
+            .get(get(&key))
+            .await
+            .expect("an acknowledged write is readable from the new owner")
+            .into_inner();
+        assert!(response.found, "{key} did not survive the handoff");
+        assert_eq!(String::from_utf8_lossy(&response.value), value);
+    }
+
+    for worker in &mut workers {
+        if worker.server.is_some() {
+            worker.kill().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_drain_timeout_is_reported_as_failure() {
     let control = ControlConfig::for_failover_budget(BUDGET);
     let lease = control.lease_duration;
