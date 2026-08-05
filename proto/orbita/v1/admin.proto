@@ -143,6 +143,10 @@ message Node {
   // ends. This is what finalize-upgrade checks before it advances.
   ClusterVersion speaks_min = 6;
   ClusterVersion speaks_max = 7;
+  // The memory this node's partition indexes hold, summed over every
+  // partition it reported. Since ADR 0006 made the index memory-resident,
+  // this is the resource a worker runs out of first.
+  uint64 index_memory_bytes = 8;
 }
 
 message Replica {
@@ -151,6 +155,11 @@ message Replica {
   // lamport. The gap is what decides whether it can serve a read locally and
   // how far behind it would be if promoted.
   uint64 applied_lamport = 2;
+  // How far this replica has made durable in its write-ahead log. Two
+  // different lags fall out of this and they mean different things: the gap
+  // to the owner's committed lamport is replication lag, and the gap down to
+  // applied_lamport is log this replica holds but has not applied yet.
+  uint64 durable_lamport = 3;
 }
 
 message Partition {
@@ -166,6 +175,11 @@ message Partition {
   uint64 committed_lamport = 7;
   repeated Replica replicas = 8;
   uint64 size_bytes = 9;
+  // What the owner's memory-resident index costs for this partition. Per
+  // ADR 0006 the index is resident whether or not the values are, and a
+  // single partition's index has to fit on its owner, so this is a number an
+  // operator sizes machines against rather than an implementation detail.
+  uint64 index_bytes = 10;
 }
 
 message DescribeClusterResponse {
@@ -173,6 +187,10 @@ message DescribeClusterResponse {
   repeated Partition partitions = 2;
   // The active cluster version every node has agreed to speak.
   ClusterVersion cluster_version = 3;
+  // Every keyspace the description covers, carried so that stored_bytes can
+  // be read against the storage quota in its config. A partition list says
+  // nothing about how close a tenant is to being refused writes.
+  repeated Keyspace keyspaces = 4;
 }
 
 message SplitPartitionRequest {

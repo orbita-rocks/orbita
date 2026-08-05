@@ -89,6 +89,14 @@ const COMPACT_TRIGGER_TIMER_FLUSHES: usize = 120;
 /// key and value bytes. An estimate is all a trigger needs.
 const ENTRY_OVERHEAD_BYTES: u64 = 64;
 
+/// What one index entry costs beyond its key bytes: the key handle, the
+/// location record, and this entry's share of the B-tree node holding them.
+///
+/// An estimate rather than a measurement, because the only exact answer comes
+/// from allocator internals and the number exists so an operator can watch a
+/// resource, not so anything can be reconciled against it.
+const INDEX_ENTRY_OVERHEAD_BYTES: u64 = 64;
+
 /// What a conditional write did.
 ///
 /// A failed condition is not an error at this layer. The caller needs the
@@ -221,6 +229,11 @@ struct State {
     segments: Vec<SegmentEntry>,
     /// Every flushed key and where its winning record lives.
     index: BTreeMap<Bytes, Loc>,
+    /// What [`State::index`] is estimated to cost in memory, maintained
+    /// alongside it rather than walked on demand. Every caller asking is a
+    /// heartbeat, and a per-key walk once a second is a bill that grows with
+    /// the partition for a number nobody needs to the byte.
+    index_bytes: u64,
     /// Timer flushes can be tiny, so only full memtables pay toward a rewrite.
     full_flushes_since_compaction: usize,
     /// Timer passes since the last merge of a non-empty partition.
@@ -275,6 +288,7 @@ impl<R: Runtime> Partition<R> {
             flushed: Lamport::ZERO,
             segments: Vec::new(),
             index: BTreeMap::new(),
+            index_bytes: 0,
             full_flushes_since_compaction: 0,
             timer_flushes_since_compaction: 0,
             reclaim_attempted_at_bytes: 0,
@@ -296,6 +310,7 @@ impl<R: Runtime> Partition<R> {
                     )
                 })
                 .collect();
+            state.index_bytes = index_cost(&state.index);
             state.flushed = snapshot.committed_lamport();
             state.committed = state.flushed;
             state.segments = snapshot.manifest().segments.clone();
@@ -601,6 +616,17 @@ impl<R: Runtime> Partition<R> {
         Ok(state.memtable_bytes + state.segments.iter().map(|s| s.bytes).sum::<u64>())
     }
 
+    /// What this partition's memory-resident index is estimated to cost.
+    ///
+    /// ADR 0006 keeps the index resident whether or not the values are, which
+    /// makes memory the resource a worker exhausts first and makes this the
+    /// number an operator watches. It excludes the mutable table, whose cost
+    /// is already charged to [`Partition::size_bytes`], so adding the two
+    /// double counts nothing.
+    pub async fn index_bytes(&self) -> Result<u64> {
+        Ok(self.state.read().await.index_bytes)
+    }
+
     /// Flushes the mutable table into a segment and publishes it.
     ///
     /// A no-op when the table is empty. This is the explicit trigger ADR 0006
@@ -674,6 +700,7 @@ impl<R: Runtime> Partition<R> {
                 )
             })
             .collect();
+        state.index_bytes = index_cost(&state.index);
         state.segments = snapshot.manifest().segments.clone();
         state.flushed = horizon;
         state
@@ -865,7 +892,7 @@ impl<R: Runtime> Partition<R> {
         // because every record here carries a Lamport above the old horizon.
         let position = manifest.segments.len() - 1;
         for entry in built.index.entries() {
-            state.index.insert(
+            let replaced = state.index.insert(
                 entry.key.clone(),
                 Loc {
                     segment: position,
@@ -873,6 +900,11 @@ impl<R: Runtime> Partition<R> {
                     record_length: entry.record_length,
                 },
             );
+            // A key already in the index moved to a newer segment rather than
+            // arriving, and the entry costs the same either way.
+            if replaced.is_none() {
+                state.index_bytes += index_entry_cost(&entry.key);
+            }
         }
         state.segments = manifest.segments;
         state.memtable.clear();
@@ -977,6 +1009,7 @@ impl<R: Runtime> Partition<R> {
             .map_err(format_error)?;
         state.segments = manifest.segments;
         state.index = index;
+        state.index_bytes = index_cost(&state.index);
         state.full_flushes_since_compaction = 0;
         state.timer_flushes_since_compaction = 0;
 
@@ -1040,6 +1073,17 @@ fn check_lamport(state: &State, lamport: Lamport) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// What one index entry is estimated to hold in memory.
+fn index_entry_cost(key: &Bytes) -> u64 {
+    key.len() as u64 + INDEX_ENTRY_OVERHEAD_BYTES
+}
+
+/// The whole index's estimated cost, for the paths that replace it wholesale
+/// and are already walking every entry.
+fn index_cost(index: &BTreeMap<Bytes, Loc>) -> u64 {
+    index.keys().map(index_entry_cost).sum()
 }
 
 /// What one entry charges against the flush trigger.
@@ -2161,6 +2205,63 @@ mod tests {
             p.size_bytes().await.unwrap() > empty + 100 * 1024,
             "the leader splits on this number, so it has to move"
         );
+    }
+
+    #[tokio::test]
+    async fn index_memory_grows_with_the_keys_flushed_and_survives_a_reopen() {
+        // ADR 0006 makes the index resident whether or not the values are, so
+        // this is what a worker runs out of first. An operator watching it
+        // needs it to move with the key count and to be the same number after
+        // a restart, since a restart rebuilds the index from the manifest.
+        let (p, _clock) = partition_with_clock().await;
+        assert_eq!(p.index_bytes().await.unwrap(), 0);
+
+        for i in 0..200u32 {
+            p.apply(&Mutation::put(
+                Lamport(u64::from(i) + 1),
+                Bytes::from(format!("k{i:04}")),
+                bytes("v"),
+                None,
+            ))
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            p.index_bytes().await.unwrap(),
+            0,
+            "an unflushed write is in the mutable table, not the index"
+        );
+
+        p.flush().await.unwrap();
+        let flushed = p.index_bytes().await.unwrap();
+        assert!(flushed >= 200 * 5, "200 five-byte keys at least: {flushed}");
+
+        let p = reopened(p).await;
+        assert_eq!(
+            p.index_bytes().await.unwrap(),
+            flushed,
+            "a rebuilt index costs what the one it replaced did"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_memory_does_not_double_count_a_key_written_twice() {
+        // Every flush inserts into the index, and a key that moves to a newer
+        // segment is one entry rather than two. Counting it twice would grow
+        // the number without bound under an overwrite workload.
+        let (p, _clock) = partition_with_clock().await;
+        p.apply(&Mutation::put(Lamport(1), bytes("k"), bytes("v"), None))
+            .await
+            .unwrap();
+        p.flush().await.unwrap();
+        let once = p.index_bytes().await.unwrap();
+
+        p.apply(&Mutation::put(Lamport(2), bytes("k"), bytes("v2"), None))
+            .await
+            .unwrap();
+        p.flush().await.unwrap();
+
+        assert_eq!(p.index_bytes().await.unwrap(), once);
     }
 
     #[tokio::test]
