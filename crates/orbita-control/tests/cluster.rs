@@ -724,21 +724,40 @@ impl Cluster {
         // promoted. A node the leader has given up on is excluded, since a
         // dead replica is not evidence of anything and never catches up.
         //
-        // This is a liveness claim about replicas that have a catch-up path,
-        // and #75 pinned the case where one does not: a replica that falls
-        // past the owner's retained log is `Stranded` and cannot recover until
-        // hydration lands, which is a sharp edge rather than slowness. The two
-        // do not contradict because `Replication` has no retention horizon, so
-        // every lagging replica here is #75's `Following` case by
-        // construction.
+        // This asserts that a replica behind its owner catches up, and it used
+        // to carry a caveat: #75 pinned a replica that falls past the owner's
+        // retained log as `Stranded`, with no catch-up path at all, which
+        // would have made this condition false rather than slow. #82 closed
+        // that. Hydration rebuilds such a replica from the bucket, and
+        // `retention::PAST_THE_HORIZON` moved from `FailsLoudly` to
+        // `Recovers` to say so. The state that could have contradicted this
+        // condition now recovers, so the caveat is gone rather than merely
+        // unreachable.
         //
-        // Its verdict would be the better authority for this condition, and it
-        // is not reachable from where this runs. #75 says why: the controller
-        // has every number it needs except the owner's retention horizon, and
-        // carrying that wants a new worker-to-leader status method that
-        // belongs with #36. When that lands, this should exempt replicas the
-        // owner has declared stranded rather than keep asserting they catch
-        // up, or the two will start disagreeing about the same cluster.
+        // What remains is a boundary rather than a disagreement. `Stranded` is
+        // still terminal for WAL catch-up, per the table on
+        // `orbita_wal::ReplicaCatchUp`: a retry cannot help, and the rescue
+        // comes from the object store one layer up. This condition is
+        // indifferent to which route was taken, because it reads positions
+        // rather than mechanisms, and both routes end with the replica at the
+        // owner's committed position.
+        //
+        // The owner's own verdict is still the better authority and is still
+        // not reachable from here, for the reason #75 gave: the controller has
+        // every number it needs except the retention horizon, and carrying it
+        // wants a worker-to-leader status method belonging with #36.
+        //
+        // One thing to be careful about after #79, which made the word load
+        // bearing: `PartitionView::committed_lamport` is the owner's reported
+        // durable position, which a real worker fills in from
+        // `PartitionLog::durable_lamport`, its own disk. That is not
+        // `Wal::committed_lamport`, the quorum-replicated prefix #79 calls the
+        // normative horizon and deliberately keeps separate from
+        // `durable_local`. The two coincide here because `Replication` models
+        // no entry that reached one disk and no other, so there is nothing for
+        // them to disagree about. Against a real cluster they can differ, and
+        // this condition would then be asking replicas to reach entries a
+        // catch-up is not allowed to ship them. Filed as #87.
         for partition in &view.partitions {
             for (replica, position) in &partition.replica_progress {
                 let surviving = state

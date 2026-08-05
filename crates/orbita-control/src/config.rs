@@ -179,11 +179,15 @@ impl ControlConfig {
     /// pass by being observed at the right moment.
     ///
     /// At the default timings this is 7.05 seconds, against a 4.05 second
-    /// failover budget. The margin is measured rather than argued: across the
-    /// seeded control-plane batches the slowest cluster to converge takes 4.5
-    /// seconds, and the median takes 0.5. That leaves room for a stage landing
-    /// badly against a sweep without leaving enough to hide a stage that has
-    /// stopped happening altogether.
+    /// failover budget. The margin is measured rather than argued: across
+    /// every seeded control-plane schedule, including the aggressive ones
+    /// currently parked against issue #76, the slowest cluster to converge
+    /// takes 4.5 seconds and the median takes 0.5. Excluding those two the
+    /// slowest is 3.0 seconds, so the margin is quoted from the schedules that
+    /// stress it hardest rather than from the ones that flatter it.
+    ///
+    /// That leaves room for a stage landing badly against a sweep without
+    /// leaving enough to hide a stage that has stopped happening altogether.
     #[must_use]
     pub fn convergence_bound(&self) -> Duration {
         self.failover_budget() + 4 * self.sweep_interval + 8 * self.heartbeat_interval

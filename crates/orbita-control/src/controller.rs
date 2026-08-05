@@ -93,8 +93,16 @@ pub struct NodeView {
 pub struct PartitionView {
     pub info: PartitionInfo,
     pub phase: PartitionPhase,
-    /// The owner's reported durable Lamport, which is the partition's
-    /// committed position.
+    /// The owner's reported durable Lamport: what reached the owner's own
+    /// disk, which is what a worker fills in from
+    /// `orbita_wal::PartitionLog::durable_lamport`.
+    ///
+    /// Not the same thing as `orbita_wal::Wal::committed_lamport`, which is
+    /// the quorum-replicated prefix and which #79 keeps deliberately separate,
+    /// because an entry on one disk whose `commit` returned `Unavailable` sits
+    /// between them. The name predates that distinction and overstates this
+    /// number; the leader group has no way to ask for the other one yet, which
+    /// is issue #87.
     pub committed_lamport: Lamport,
     pub size_bytes: u64,
     pub replica_progress: Vec<(NodeId, Lamport)>,
