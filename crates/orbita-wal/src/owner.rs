@@ -11,7 +11,7 @@ use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId, Result};
 use orbita_runtime::{PeerCall, Runtime, ServiceId, Transport};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
-use crate::log::{PartitionLog, RecoveryState, DEFAULT_SEGMENT_TARGET_BYTES};
+use crate::log::{CatchUp, PartitionLog, RecoveryState, DEFAULT_SEGMENT_TARGET_BYTES};
 use crate::wire::{
     AppendRequest, FenceRequest, StatusRequest, WalResponse, METHOD_APPEND, METHOD_FENCE,
     METHOD_STATUS,
@@ -51,6 +51,29 @@ impl WalConfig {
     }
 }
 
+/// A replica this owner has proven it cannot catch up from its own log.
+///
+/// The owner is the only node that can tell this: the replica knows it is
+/// missing entries, and only the owner knows whether it still holds them. So
+/// the owner records it rather than logging it and moving on, because a
+/// warning line is not a state anything can be asked about, and a failure mode
+/// nothing can be asked about is one an operator discovers first.
+///
+/// Until hydration from object storage lands (issue #17) there is no path back
+/// for such a replica: the entries are cluster-durable in the published
+/// manifest, and nothing turns those objects into a caught-up replica. It
+/// stays out of the read set and has to be replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeyondRetention {
+    pub node: NodeId,
+    /// How far the replica said it had logged when it fell off.
+    pub replica_durable: Lamport,
+    /// The oldest Lamport this owner still retains, which is the other half of
+    /// the diagnosis: the gap is everything between the two. `None` when the
+    /// owner's log retains no entries at all.
+    pub retained_from: Option<Lamport>,
+}
+
 struct Pending {
     entry: WalEntry,
     frame: Bytes,
@@ -87,6 +110,10 @@ struct OwnerState {
     /// the invalidation, and that is a question about named nodes rather than
     /// about how many answered.
     acked: HashMap<NodeId, Lamport>,
+    /// Replicas that asked for entries this log no longer holds. Cleared for a
+    /// node the moment it acknowledges anything, so recovering by any means
+    /// takes it off the list rather than needing a second code path to.
+    beyond_retention: HashMap<NodeId, BeyondRetention>,
     /// Set when this node must stop being an owner: it was fenced, or its own
     /// disk stopped telling the truth.
     fatal: Option<Error>,
@@ -151,6 +178,7 @@ impl<R: Runtime> Wal<R> {
                 replicated: durable,
                 failed_through: Lamport::ZERO,
                 acked: HashMap::new(),
+                beyond_retention: HashMap::new(),
                 fatal: None,
             }),
             progress: tokio::sync::Notify::new(),
@@ -232,6 +260,55 @@ impl<R: Runtime> Wal<R> {
         }
     }
 
+    /// Replicas this owner has proven it cannot catch up from its own log.
+    ///
+    /// Empty is the healthy answer. A non-empty one names a replica that is
+    /// out of the read set and out of the durability quorum until something
+    /// outside this crate restores it, and it is the surface a node reports
+    /// rather than a log line nobody is watching.
+    ///
+    /// Sorted by node so that two reports of the same state are the same
+    /// bytes, which keeps a repeated report from looking like a change.
+    #[must_use]
+    pub fn beyond_retention(&self) -> Vec<BeyondRetention> {
+        let mut fallen: Vec<BeyondRetention> =
+            self.state().beyond_retention.values().copied().collect();
+        fallen.sort_unstable_by_key(|fallen| fallen.node.get());
+        fallen
+    }
+
+    /// Records that a replica asked for entries this log has already dropped.
+    ///
+    /// Logged only when the diagnosis changes, because catch-up is attempted
+    /// on every batch and a line per write would bury the one that matters.
+    fn record_beyond_retention(
+        &self,
+        node: NodeId,
+        replica_durable: Lamport,
+        retained_from: Option<Lamport>,
+    ) {
+        let fallen = BeyondRetention {
+            node,
+            replica_durable,
+            retained_from,
+        };
+        let changed = {
+            let mut state = self.state();
+            state.beyond_retention.insert(node, fallen) != Some(fallen)
+        };
+        if changed {
+            tracing::error!(
+                partition = self.partition.get(),
+                node = node.get(),
+                replica_durable = replica_durable.get(),
+                retained_from = retained_from.map(Lamport::get),
+                "replica has fallen past this owner's retained log and cannot be caught up from \
+                 it; it is out of the read set and the durability quorum until it is hydrated \
+                 from object storage or replaced"
+            );
+        }
+    }
+
     /// Records how far a replica has confirmed. An acknowledgement covers
     /// everything below it, because the protocol refuses a batch that would
     /// leave a hole.
@@ -242,6 +319,11 @@ impl<R: Runtime> Wal<R> {
             if through > *slot {
                 *slot = through;
             }
+            // A replica that acknowledges anything is back in the protocol,
+            // whatever put it there. Clearing here rather than at the one
+            // place that could fix it today is what lets hydration land
+            // without a second bookkeeping path.
+            state.beyond_retention.remove(&node);
         }
         self.progress.notify_waiters();
     }
@@ -631,12 +713,24 @@ impl<R: Runtime> Wal<R> {
     async fn catch_up(&self, node: NodeId, from: Lamport, request: &AppendRequest) -> Outcome {
         let last = request.last_lamport();
         let entries = match self.log.entries_after(from).await {
-            Ok(Some(entries)) => entries,
-            Ok(None) | Err(_) => {
+            Ok(CatchUp::Entries(entries)) => entries,
+            Ok(CatchUp::BeyondRetention { retained_from }) => {
+                self.record_beyond_retention(node, from, retained_from);
+                return Outcome::Failed;
+            }
+            // The replica reported a gap and this log has nothing above it,
+            // which means the batch this is answering has already been
+            // superseded. Nothing to send and nothing wrong.
+            Ok(CatchUp::UpToDate) => return Outcome::Failed,
+            Err(error) => {
+                // Reading this node's own log failed, which says nothing about
+                // the replica. Kept distinct from the cliff above so that a bad
+                // disk here is not diagnosed as a lost replica there.
                 tracing::warn!(
                     node = node.get(),
                     from = from.get(),
-                    "replica is behind what the log still holds and needs a snapshot"
+                    %error,
+                    "reading the log to catch a replica up failed"
                 );
                 return Outcome::Failed;
             }

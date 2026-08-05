@@ -83,6 +83,20 @@ those objects back into a caught-up replica. Until #17 lands, operators must
 repair or replace such a replica after hydration exists; there is no safe
 fallback to an incomplete WAL.
 
+The cliff is a state rather than a log line. The owner records the replica, the
+Lamport it stopped at, and the oldest Lamport the owner still retains, and
+reports all three through `Server::replicas_beyond_retention`. Empty is the
+healthy answer. `crates/orbita-server/src/retention.rs` drives the whole thing
+under the simulator and pins what it looks like from outside: the owner names
+it, the replica leaves the read set rather than serving from its own state, and
+its log stops where it stopped instead of resuming above the hole. That
+scenario is also the tracking test for #17: it asserts one of two named
+outcomes, and hydration has to move which one.
+
+How far a replica may lag before it falls off is the write-ahead log's segment
+size, since a checkpoint drops whole segments. That is `wal_segment_bytes` on
+`ServerConfig`, defaulting to 64 MiB.
+
 ## Decisions to make and write down
 
 - **Proxy hop cost.** Does a forwarded request open a new stream per call, or

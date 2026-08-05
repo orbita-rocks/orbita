@@ -65,6 +65,10 @@ use std::time::Duration;
 pub(crate) struct DataLayout {
     pub store: Arc<dyn ObjectStore>,
     pub wal_root: String,
+    /// How large a log segment grows before it is rolled, which is the unit a
+    /// checkpoint removes and therefore how far a replica may fall behind and
+    /// still be caught up from the owner's log.
+    pub wal_segment_bytes: u64,
 }
 
 impl DataLayout {
@@ -73,6 +77,7 @@ impl DataLayout {
             store: Arc::clone(&self.store),
             path: PartitionPath::new("", keyspace, partition),
             wal_dir: format!("{}/p{}", self.wal_root, partition.get()),
+            wal_segment_bytes: self.wal_segment_bytes,
         }
     }
 }
@@ -687,6 +692,28 @@ impl<R: Runtime> Node<R> {
         self.replica_reads.load(Ordering::Relaxed)
     }
 
+    /// Every replica of a partition this node owns that has fallen past what
+    /// this node's log still holds.
+    ///
+    /// Sorted by partition and then node, so a repeated report of an unchanged
+    /// state is the same bytes. Empty is the healthy answer; anything else is
+    /// a replica that cannot be recovered until hydration exists (issue #17).
+    pub(crate) async fn replicas_beyond_retention(
+        &self,
+    ) -> Vec<(PartitionId, orbita_wal::BeyondRetention)> {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self.hosts.read().await.values().cloned().collect();
+        let mut fallen: Vec<(PartitionId, orbita_wal::BeyondRetention)> = hosts
+            .iter()
+            .flat_map(|host| {
+                host.replicas_beyond_retention()
+                    .into_iter()
+                    .map(move |one| (host.id(), one))
+            })
+            .collect();
+        fallen.sort_unstable_by_key(|(partition, one)| (partition.get(), one.node.get()));
+        fallen
+    }
+
     /// How far this node has got on every partition it holds.
     ///
     /// This is what the heartbeat to the leader group carries, and it is what
@@ -1062,6 +1089,7 @@ mod tests {
         let layout = DataLayout {
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
         };
 
         let source = StaticMapSource::new(one_partition_map());

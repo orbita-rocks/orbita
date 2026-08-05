@@ -53,6 +53,7 @@ fn partition_paths() -> PartitionPaths {
         store: Arc::new(MemoryStore::new()),
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
         wal_dir: "wal/p1".to_string(),
+        wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
     }
 }
 
@@ -279,6 +280,7 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
     let layout = DataLayout {
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
+        wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
     };
     let source = BoxedMapSource::new(StaticMapSource::new(owner_and_replica_map()));
     sim.block_on(async move {

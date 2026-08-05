@@ -153,6 +153,11 @@ pub(crate) struct PartitionPaths {
     pub store: Arc<dyn ObjectStore>,
     pub path: PartitionPath,
     pub wal_dir: String,
+    /// The size a log segment reaches before it is rolled. It belongs with the
+    /// paths because it is the shape of the log on disk rather than a policy:
+    /// a checkpoint drops whole segments, so this is what decides how much
+    /// history an owner keeps after one.
+    pub wal_segment_bytes: u64,
 }
 
 pub(crate) struct PartitionHost<R: Runtime> {
@@ -213,8 +218,9 @@ impl<R: Runtime> PartitionHost<R> {
             )
             .await?,
         );
-        let config =
+        let mut config =
             WalConfig::new(id, paths.wal_dir.clone(), epoch).with_replicas(replicas.clone());
+        config.segment_target_bytes = paths.wal_segment_bytes;
         let wal = Wal::open(runtime.clone(), config).await?;
 
         // A restart finds entries that were durable and never applied, because
@@ -270,7 +276,7 @@ impl<R: Runtime> PartitionHost<R> {
             runtime.clone(),
             paths.wal_dir.clone(),
             id,
-            orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES,
+            paths.wal_segment_bytes,
         )
         .await?;
         for entry in &log.recovery().entries {
@@ -465,6 +471,19 @@ impl<R: Runtime> PartitionHost<R> {
     /// this is what bounds the writes the cluster has promised.
     pub(crate) async fn durable_lamport(&self) -> Lamport {
         self.log.durable_lamport().await
+    }
+
+    /// Replicas of this partition that have fallen past what this owner's log
+    /// still holds.
+    ///
+    /// Empty on a replica and on a healthy owner. A non-empty answer names a
+    /// node that is out of the read set and out of the durability quorum and
+    /// that no retry will recover, which is a state rather than a log line
+    /// precisely so that something can be asked about it.
+    pub(crate) fn replicas_beyond_retention(&self) -> Vec<orbita_wal::BeyondRetention> {
+        self.wal
+            .as_ref()
+            .map_or_else(Vec::new, |wal| wal.beyond_retention())
     }
 
     /// How much disk this partition is using, which is what the control plane
@@ -1237,6 +1256,7 @@ mod tests {
             store,
             path: partition_path(),
             wal_dir: "wal/p1".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
         };
         sim.block_on(async move {
             PartitionHost::open_owner(
@@ -1264,6 +1284,7 @@ mod tests {
             store,
             path: partition_path(),
             wal_dir: "wal/replica-p1".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
         };
         sim.block_on(async move {
             PartitionHost::open_replica(

@@ -47,7 +47,7 @@
 //!
 //! What is not built is a snapshot. A replica that falls further behind than
 //! its owner's log still holds cannot be caught up, and says so rather than
-//! pretending; the owner logs it and the partition runs on the copies it has.
+//! pretending; the partition runs on the copies it has.
 //!
 //! Owners periodically publish applied writes as partition-v1 segments. A WAL
 //! checkpoint follows only after the manifest compare-and-swap succeeds, so a
@@ -55,6 +55,12 @@
 //! Until hydration lands in issue #17, a replica that misses beyond the
 //! retained WAL cannot catch up from the manifest and stays unavailable. WAL
 //! truncation is live now; snapshot recovery is deliberately not implied.
+//!
+//! That is a sharp edge rather than a quiet one, and
+//! [`Server::replicas_beyond_retention`] is where it surfaces: the owner names
+//! the replica, where it stopped, and the oldest entry the owner still holds.
+//! `src/retention.rs` runs the whole cliff under the simulator and is also the
+//! tracking test for #17.
 
 #![forbid(unsafe_code)]
 
@@ -74,6 +80,8 @@ mod pending;
 mod proxy;
 mod readiness;
 mod replication;
+#[cfg(test)]
+mod retention;
 mod runtime;
 mod s3_store;
 mod service;
@@ -83,7 +91,7 @@ mod validate;
 
 pub use config::{
     S3StorageConfig, ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL, DEFAULT_FLUSH_INTERVAL,
-    DEFAULT_KEYSPACE,
+    DEFAULT_KEYSPACE, DEFAULT_WAL_SEGMENT_BYTES,
 };
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
@@ -230,6 +238,7 @@ impl Server {
         let layout = DataLayout {
             store,
             wal_root: "wal".to_string(),
+            wal_segment_bytes: config.wal_segment_bytes,
         };
 
         // A node in a real cluster takes its map from the leader group, and
@@ -556,6 +565,22 @@ impl Server {
     #[must_use]
     pub fn replica_reads(&self) -> u64 {
         self.node.replica_reads()
+    }
+
+    /// Replicas of this node's partitions that have fallen further behind than
+    /// its log still reaches.
+    ///
+    /// Empty is healthy. Anything else names a replica that is out of the read
+    /// set and out of the durability quorum and that will not come back on its
+    /// own: WAL truncation is live and hydration from object storage is not
+    /// (issue #17), so the entries it needs exist only as segments nothing can
+    /// yet turn back into a caught-up replica. This is the answer an operator
+    /// asks for rather than greps for.
+    #[must_use]
+    pub async fn replicas_beyond_retention(
+        &self,
+    ) -> Vec<(orbita_core::PartitionId, orbita_wal::BeyondRetention)> {
+        self.node.replicas_beyond_retention().await
     }
 
     /// The readiness gate this node reports from.

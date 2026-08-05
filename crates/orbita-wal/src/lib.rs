@@ -100,8 +100,9 @@ mod tests;
 
 pub use format::{WalEntry, WalOp};
 pub use log::{
-    PartitionLog, RecoveryState, Truncation, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES,
+    CatchUp, PartitionLog, RecoveryState, Truncation, TruncationReason,
+    DEFAULT_SEGMENT_TARGET_BYTES,
 };
-pub use owner::{Wal, WalConfig};
+pub use owner::{BeyondRetention, Wal, WalConfig};
 pub use replica::{ReplicaObserver, WalService};
 pub use wire::{METHOD_APPEND, METHOD_FENCE, METHOD_STATUS};

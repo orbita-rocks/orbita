@@ -7,7 +7,7 @@ use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId, Result};
 use orbita_runtime::{Rng, Runtime, ServiceId, Transport};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
-use crate::log::{PartitionLog, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES};
+use crate::log::{CatchUp, PartitionLog, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES};
 use crate::owner::{Wal, WalConfig};
 use crate::replica::WalService;
 use crate::testkit::{block_on, yield_now, Faults, MemDisk, MemNetwork, TestRuntime};
@@ -244,6 +244,51 @@ fn segments_roll_over_and_a_checkpoint_removes_the_ones_fully_applied() {
             vec![Lamport(7), Lamport(8)],
             "only unapplied entries need replaying"
         );
+    });
+}
+
+#[test]
+fn a_catch_up_beyond_the_checkpoint_is_reported_apart_from_being_already_caught_up() {
+    // These two used to be one answer, and conflating them is how an
+    // unrecoverable replica reads like a healthy one. Only the first needs
+    // hydration; the second needs nothing at all. See issue #63.
+    let base = TestRuntime::solo(6);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, 64)
+            .await
+            .expect("open");
+        for i in 1..=8 {
+            let entry = put(i, 1, &format!("key-{i}"));
+            let frame = format::encode(&LogRecord::Entry(entry.clone()));
+            log.append_frames(&[frame], entry.lamport).await.unwrap();
+        }
+        log.checkpoint(Lamport(6)).await.expect("checkpoint");
+
+        let retained = match log.entries_after(Lamport::ZERO).await.expect("scan") {
+            CatchUp::BeyondRetention { retained_from } => {
+                retained_from.expect("segments survive the checkpoint")
+            }
+            other => panic!("a replica holding nothing must not be told it is fine: {other:?}"),
+        };
+        assert!(
+            retained > Lamport(1),
+            "the reported horizon has to be above where the replica is or it diagnoses nothing"
+        );
+
+        assert_eq!(
+            log.entries_after(Lamport(8)).await.expect("scan"),
+            CatchUp::UpToDate,
+            "a replica level with the owner is not a replica that fell off a cliff"
+        );
+
+        let CatchUp::Entries(entries) = log
+            .entries_after(Lamport(retained.get() - 1))
+            .await
+            .expect("scan")
+        else {
+            panic!("the retained range is still servable");
+        };
+        assert_eq!(entries.first().map(|e| e.lamport), Some(retained));
     });
 }
 
