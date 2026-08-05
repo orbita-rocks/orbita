@@ -155,6 +155,7 @@ impl<R: Runtime> Node<R> {
         // Registered before anything is opened, so the first batch a replica
         // receives cannot land without having been invalidated for.
         wal_service.observe(Arc::clone(&bridge) as Arc<dyn orbita_wal::ReplicaObserver>);
+        wal_service.hydrate_with(Arc::clone(&bridge) as Arc<dyn orbita_wal::PartitionHydrator>);
 
         let node = Arc::new(Self {
             runtime: runtime.clone(),

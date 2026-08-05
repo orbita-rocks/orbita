@@ -45,16 +45,23 @@
 //! configured. [`ServerConfig::peers`] still seeds the directory, which is
 //! what a node that starts before the control plane needs.
 //!
-//! What is not built is a snapshot. A replica that falls further behind than
-//! its owner's log still holds cannot be caught up, and says so rather than
-//! pretending; the owner logs it and the partition runs on the copies it has.
-//!
 //! Owners periodically publish applied writes as partition-v1 segments. A WAL
 //! checkpoint follows only after the manifest compare-and-swap succeeds, so a
 //! failed or deposed writer always retains the log range recovery still needs.
-//! Until hydration lands in issue #17, a replica that misses beyond the
-//! retained WAL cannot catch up from the manifest and stays unavailable. WAL
-//! truncation is live now; snapshot recovery is deliberately not implied.
+//!
+//! A node that has to take on a partition builds it from that manifest rather
+//! than from a peer, which is the operational payoff ADR 0006 was adopted for:
+//! replacing a worker is a download, and it costs the replacement rather than
+//! taxing a healthy node. Hydration happens when a partition is opened, and
+//! again in place when a replica turns out to have fallen further behind than
+//! its owner's retained log. Either way the log records the horizon it was
+//! built to, so replication resumes above it and WAL recovery replays only the
+//! tail the manifest does not cover.
+//!
+//! What remains unavailable is the narrow case where both are exhausted: a
+//! replica beyond the retained log whose partition has never been flushed, or
+//! whose manifest is itself behind the gap. That is reported rather than
+//! papered over, and the partition runs on the copies it has.
 
 #![forbid(unsafe_code)]
 
