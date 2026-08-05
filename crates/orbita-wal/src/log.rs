@@ -63,12 +63,6 @@ pub struct RecoveryState {
     /// The highest epoch this node has ever accepted. A restarted node uses it
     /// to keep rejecting an owner it already fenced.
     pub epoch: Epoch,
-    /// The horizon this node last built from object storage, if it ever did.
-    ///
-    /// Everything at or below it is held in segments rather than in this file,
-    /// which is why `durable_lamport` can be above anything the log physically
-    /// contains.
-    pub hydrated_through: Lamport,
     pub truncated: Option<Truncation>,
 }
 
@@ -85,6 +79,11 @@ struct Inner<R: Runtime> {
     durable: Lamport,
     applied_through: Lamport,
     epoch: Epoch,
+    /// The manifest horizon this node's storage was built from, if it was.
+    ///
+    /// Deliberately not persisted here. See [`PartitionLog::hydrate`] for why
+    /// the log is the wrong place to write this down, and where the fact comes
+    /// from after a restart instead.
     hydrated_through: Lamport,
 }
 
@@ -144,7 +143,6 @@ impl<R: Runtime> PartitionLog<R> {
             durable_lamport: scan.durable,
             applied_through: scan.applied_through,
             epoch: scan.epoch,
-            hydrated_through: scan.hydrated_through,
             truncated: scan.truncated,
         };
 
@@ -161,7 +159,7 @@ impl<R: Runtime> PartitionLog<R> {
                 durable: recovery.durable_lamport,
                 applied_through: recovery.applied_through,
                 epoch: recovery.epoch,
-                hydrated_through: recovery.hydrated_through,
+                hydrated_through: Lamport::ZERO,
             }),
             recovery,
         }))
@@ -298,8 +296,8 @@ impl<R: Runtime> PartitionLog<R> {
         self.inner.lock().await.hydrated_through
     }
 
-    /// Records that the partition was built from object storage through
-    /// `through`, so this log resumes there instead of at the start.
+    /// Adopts a manifest horizon as where this log's history starts, so it
+    /// resumes there instead of at the beginning.
     ///
     /// This is the log's half of hydration under
     /// [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md).
@@ -307,8 +305,10 @@ impl<R: Runtime> PartitionLog<R> {
     /// manifest's horizon, but replication is a conversation about log
     /// positions: a node that rebuilt its data and still reported position zero
     /// would ask its owner to resend writes the owner checkpointed away, be
-    /// told they are gone, and stay unavailable forever. Recording the horizon
-    /// is what turns replacing a worker into a download.
+    /// told they are gone, and stay unavailable forever. Worse, it would start
+    /// its own sequence at one and hand out versions the segments already
+    /// contain. Adopting the horizon is what turns replacing a worker into a
+    /// download.
     ///
     /// Claiming durability for entries this file never held is sound because
     /// the manifest is a stronger durability claim than the log: it is only
@@ -316,28 +316,42 @@ impl<R: Runtime> PartitionLog<R> {
     /// already acknowledged and applied. It also marks them applied, since the
     /// segments are exactly where an apply would have put them.
     ///
+    /// **In memory only, and that is the whole design.** The obvious
+    /// implementation writes a new record kind into the log, and it cannot be
+    /// had at this format version: a reader that predates the kind treats it
+    /// as malformed, stops there, and truncates everything after it, so a
+    /// rollback inside the pre-finalization window would leave a node whose
+    /// log reopens at zero while its storage sits at the horizon. It would
+    /// then reissue Lamports the segments already hold, acknowledge them, and
+    /// have them silently dropped on apply. `docs/UPGRADES.md` promises that
+    /// window costs nothing, and a persisted marker cannot keep that promise
+    /// without a cluster-version gate that would leave the feature dark until
+    /// an operator finalized.
+    ///
+    /// Nothing is lost by not persisting it, because the fact is not this
+    /// log's to remember. The manifest is read by `Partition::open` before
+    /// this log is opened at all, on both the owner and replica paths, so the
+    /// horizon is re-derived from its source on every start. Writing it here
+    /// would be caching a value that is already free.
+    ///
     /// Idempotent, and a no-op when the log is already at or ahead of
     /// `through`. Returns whether the position moved.
-    pub async fn hydrate(&self, through: Lamport) -> Result<bool> {
+    pub async fn hydrate(&self, through: Lamport) -> bool {
         let mut inner = self.inner.lock().await;
         if through <= inner.durable {
-            return Ok(false);
+            return false;
         }
-        write_record(&mut inner, &LogRecord::Hydrated { through }).await?;
         inner.hydrated_through = inner.hydrated_through.max(through);
-        inner.durable = inner.durable.max(through);
+        inner.durable = through;
         inner.applied_through = inner.applied_through.max(through);
         if let Some(last) = inner.segments.last_mut() {
             last.max_lamport = last.max_lamport.max(through);
         }
-
-        // Segments holding only superseded entries can go now, for the same
-        // reason a checkpoint drops them: the records are in the partition's
-        // objects, so replaying the file would change nothing.
-        let applied_through = inner.applied_through;
-        self.drop_applied_segments(&mut inner, applied_through)
-            .await
-            .map(|()| true)
+        // Segments are left alone. Reclaiming them is the checkpoint's job and
+        // it happens on the next flush anyway, and a hydration that deleted
+        // them would be destroying the only bytes that let a previous binary
+        // recover this log correctly after a rollback.
+        true
     }
 
     /// Reads back entries above `after`, for retransmitting to a replica that
@@ -428,24 +442,15 @@ impl<R: Runtime> PartitionLog<R> {
             last.max_lamport = durable;
         }
 
-        // Cutting the tail can take the fence, checkpoint, and hydration
-        // records with it, since they sit wherever they were written. Writing
-        // them again keeps a restart from forgetting which owner this node
-        // accepted, or where its data starts.
+        // Cutting the tail can take the fence and checkpoint records with it,
+        // since they sit wherever they were written. Writing them again keeps
+        // a restart from forgetting which owner this node accepted. The
+        // hydrated horizon needs no such rescue: it is re-derived from the
+        // manifest at every open rather than stored here.
         let epoch = inner.epoch;
         let applied_through = inner.applied_through;
-        let hydrated_through = inner.hydrated_through;
         if epoch > Epoch::ZERO {
             write_record(&mut inner, &LogRecord::Fence { epoch }).await?;
-        }
-        if hydrated_through > Lamport::ZERO {
-            write_record(
-                &mut inner,
-                &LogRecord::Hydrated {
-                    through: hydrated_through,
-                },
-            )
-            .await?;
         }
         if applied_through > Lamport::ZERO {
             write_record(&mut inner, &LogRecord::Checkpoint { applied_through }).await?;
@@ -485,7 +490,6 @@ struct DirectoryScan {
     durable: Lamport,
     applied_through: Lamport,
     epoch: Epoch,
-    hydrated_through: Lamport,
     truncated: Option<Truncation>,
 }
 
@@ -512,7 +516,6 @@ async fn scan_directory<R: Runtime>(
         durable: Lamport::ZERO,
         applied_through: Lamport::ZERO,
         epoch: Epoch::ZERO,
-        hydrated_through: Lamport::ZERO,
         truncated: None,
     };
 
@@ -543,21 +546,6 @@ async fn scan_directory<R: Runtime>(
                 LogRecord::Fence { epoch } => {
                     if *epoch > scan.epoch {
                         scan.epoch = *epoch;
-                    }
-                }
-                // Hydration moves both watermarks, because a horizon built
-                // from the bucket is durable and applied by construction: the
-                // records are in segments, which is a stronger claim than
-                // being in this file.
-                LogRecord::Hydrated { through } => {
-                    if *through > scan.hydrated_through {
-                        scan.hydrated_through = *through;
-                    }
-                    if *through > scan.durable {
-                        scan.durable = *through;
-                    }
-                    if *through > scan.applied_through {
-                        scan.applied_through = *through;
                     }
                 }
             }

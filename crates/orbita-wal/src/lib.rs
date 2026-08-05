@@ -103,5 +103,5 @@ pub use log::{
     PartitionLog, RecoveryState, Truncation, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES,
 };
 pub use owner::{Wal, WalConfig};
-pub use replica::{PartitionHydrator, ReplicaObserver, WalService};
+pub use replica::{Hydration, PartitionHydrator, ReplicaObserver, WalService};
 pub use wire::{METHOD_APPEND, METHOD_FENCE, METHOD_STATUS};

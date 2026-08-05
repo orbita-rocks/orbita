@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::format::WalEntry;
 use bytes::Bytes;
-use orbita_core::{Lamport, NodeId, PartitionId};
+use orbita_core::{Epoch, Lamport, NodeId, PartitionId};
 use orbita_runtime::{PeerCall, PeerHandler, Runtime, TransportError};
 
 use crate::log::PartitionLog;
@@ -67,6 +67,22 @@ pub trait ReplicaObserver: Send + Sync + 'static {
     fn truncated(&self, partition: PartitionId, above: Lamport);
 }
 
+/// What a published manifest says: where the partition's data ends, and who
+/// the cluster last agreed owns it.
+///
+/// Both halves matter and they are one value so that a caller cannot take the
+/// first and drop the second. A manifest reaches the bucket only through the
+/// epoch-fenced owner's compare-and-swap, so a manifest at epoch `e` is proof
+/// that anybody claiming to own this partition below `e` has been deposed.
+/// That proof is free at exactly the moment a replica is most likely to be
+/// working on behalf of a stale owner, and throwing it away is how a deposed
+/// owner collects an acknowledgement it must never get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Hydration {
+    pub epoch: Epoch,
+    pub through: Lamport,
+}
+
 /// Rebuilds a partition from object storage when its log cannot be caught up.
 ///
 /// This is the other end of hydration under
@@ -84,13 +100,22 @@ pub trait ReplicaObserver: Send + Sync + 'static {
 #[async_trait::async_trait]
 pub trait PartitionHydrator: Send + Sync + 'static {
     /// Builds the partition from the manifest currently in the bucket and
-    /// reports the Lamport it is now current through.
+    /// reports what that manifest says.
     ///
     /// Must be idempotent and must report a horizon it has actually reached,
-    /// because the log records that number as durable. Reporting
+    /// because the log takes that number as durable. Reporting
     /// `Lamport::ZERO`, which is also what a partition that has never been
     /// flushed reports, leaves the gap where it was.
-    async fn hydrate(&self, partition: PartitionId) -> Lamport;
+    async fn hydrate(&self, partition: PartitionId) -> Hydration;
+}
+
+/// What came of trying to close a replication gap from object storage.
+enum Closed {
+    /// The log now stands here, which may be exactly where it started.
+    To(Lamport),
+    /// The manifest was published at an epoch above the sender's, so the
+    /// sender has been deposed and gets nothing.
+    SenderIsDeposed { by: Epoch },
 }
 
 /// Serves inbound WAL traffic for every partition this node holds.
@@ -283,18 +308,37 @@ impl<R: Runtime> WalService<R> {
         }
 
         let mut durable = log.durable_lamport().await;
-        let epoch = log.epoch().await;
         if request.prev_lamport > durable {
             // The batch would leave a hole, and a log with a hole cannot be
             // replayed. Before saying so, try the cheaper answer: the writes
             // under the hole are very likely in the bucket already, and
             // downloading them costs this node alone rather than taxing the
             // owner for a retransmission it may no longer be able to make.
-            match self.close_gap(&log, request.partition, durable).await {
-                Ok(reached) => durable = reached,
+            match self
+                .close_gap(&log, request.partition, request.epoch, durable)
+                .await
+            {
+                Ok(Closed::To(reached)) => durable = reached,
+                Ok(Closed::SenderIsDeposed { by }) => {
+                    // The manifest was published by a compare-and-swap at an
+                    // epoch above this sender's, so this sender is not the
+                    // owner however contiguous its batch looks and however far
+                    // behind its own fence record this node is.
+                    tracing::warn!(
+                        partition = request.partition.get(),
+                        got = request.epoch.get(),
+                        published = by.get(),
+                        "rejecting an append from an owner the published manifest proves is deposed"
+                    );
+                    return WalResponse::StaleEpoch { current: by };
+                }
                 Err(e) => return WalResponse::Error(e.to_string()),
             }
         }
+        // Read after the gap is closed, because closing it can adopt a fence
+        // out of the manifest and the answer has to name the epoch this node
+        // now holds rather than the one it held a moment ago.
+        let epoch = log.epoch().await;
         if request.prev_lamport > durable {
             return WalResponse::Gap {
                 durable_lamport: durable,
@@ -373,24 +417,47 @@ impl<R: Runtime> WalService<R> {
         &self,
         log: &Arc<PartitionLog<R>>,
         partition: PartitionId,
+        sender: Epoch,
         durable: Lamport,
-    ) -> orbita_core::Result<Lamport> {
+    ) -> orbita_core::Result<Closed> {
         let Some(hydrator) = self.hydrator() else {
-            return Ok(durable);
+            return Ok(Closed::To(durable));
         };
-        let through = hydrator.hydrate(partition).await;
-        if through <= durable {
-            return Ok(durable);
+        let found = hydrator.hydrate(partition).await;
+        // The download is kept whatever the answer turns out to be. Adopting a
+        // manifest is correct no matter who asked for it, and undoing it would
+        // throw away a rebuild this node paid for.
+        if found.through > durable {
+            log.hydrate(found.through).await;
+            // And the fence the manifest implies is written down, which is the
+            // difference between a refusal and an invariant. A refusal that
+            // lived only in this call would hold for one batch: the rebuild
+            // removes the very gap that sent this node to the bucket, so the
+            // deposed owner's next attempt would find a contiguous log, never
+            // consult the manifest again, and be acknowledged.
+            //
+            // Recording it is sound here and only here. The branch is reached
+            // because the horizon is above everything this log holds, so there
+            // is no tail above the horizon for a newer owner to cut away, which
+            // is the one thing adopting an epoch out of band could cost. When
+            // the horizon does not move, the fence is not recorded and the
+            // refusal stands on its own: the gap is still there, so the next
+            // attempt reads the manifest again and is refused again.
+            log.record_fence(found.epoch).await?;
+            tracing::info!(
+                partition = partition.get(),
+                from = durable.get(),
+                to = found.through.get(),
+                published = found.epoch.get(),
+                "rebuilt a partition from object storage to close a replication gap"
+            );
         }
-        log.hydrate(through).await?;
-        let reached = log.durable_lamport().await;
-        tracing::info!(
-            partition = partition.get(),
-            from = durable.get(),
-            to = reached.get(),
-            "rebuilt a partition from object storage to close a replication gap"
-        );
-        Ok(reached)
+        // Checked after the adoption and before the answer, because it decides
+        // whether this node may acknowledge rather than what it holds.
+        if found.epoch > sender {
+            return Ok(Closed::SenderIsDeposed { by: found.epoch });
+        }
+        Ok(Closed::To(log.durable_lamport().await))
     }
 
     async fn fence(&self, request: FenceRequest) -> WalResponse {

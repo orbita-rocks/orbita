@@ -54,9 +54,16 @@
 //! replacing a worker is a download, and it costs the replacement rather than
 //! taxing a healthy node. Hydration happens when a partition is opened, and
 //! again in place when a replica turns out to have fallen further behind than
-//! its owner's retained log. Either way the log records the horizon it was
-//! built to, so replication resumes above it and WAL recovery replays only the
-//! tail the manifest does not cover.
+//! its owner's retained log. Either way the log takes the horizon it was built
+//! to as where its history starts, so replication resumes above it and WAL
+//! recovery replays only the tail the manifest does not cover. That horizon is
+//! re-derived from the manifest at every open rather than written into the log,
+//! which is what keeps a pre-finalization rollback free.
+//!
+//! The manifest's epoch travels with its horizon, because a manifest is
+//! published by a fenced compare-and-swap and so is evidence about ownership. A
+//! replica that hydrates on behalf of an owner the manifest outranks refuses
+//! the append rather than acknowledging a write the real owner will truncate.
 //!
 //! What remains unavailable is the narrow case where both are exhausted: a
 //! replica beyond the retained log whose partition has never been flushed, or
@@ -72,6 +79,8 @@ mod forwarding;
 mod frame;
 mod fs_store;
 mod host;
+#[cfg(test)]
+mod hydration;
 mod lease;
 #[cfg(test)]
 mod linearizability;

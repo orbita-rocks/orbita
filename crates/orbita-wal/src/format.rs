@@ -21,10 +21,19 @@ pub(crate) const FRAME_HEADER_BYTES: usize = 8;
 /// bounded by what a legal entry could possibly need.
 pub(crate) const MAX_FRAME_BODY_BYTES: usize = MAX_KEY_BYTES + MAX_VALUE_BYTES + 128;
 
+/// The record kinds format version 1 defines.
+///
+/// Adding one is a format change even though the frame layout does not move,
+/// because a reader that predates it treats the record as malformed, stops
+/// there, and truncates the rest of the log. There is no "skip what you do not
+/// know" in this framing and there deliberately is not: a log is a sequence,
+/// so a record a reader cannot understand is a hole, not a curiosity. Any new
+/// kind therefore has to wait for a cluster version to gate it, and until then
+/// facts that can be re-derived belong in memory rather than here. See
+/// `PartitionLog::hydrate`.
 const KIND_ENTRY: u8 = 1;
 const KIND_CHECKPOINT: u8 = 2;
 const KIND_FENCE: u8 = 3;
-const KIND_HYDRATED: u8 = 4;
 
 const OP_PUT: u8 = 1;
 const OP_DELETE: u8 = 2;
@@ -88,26 +97,12 @@ pub(crate) enum LogRecord {
     Fence {
         epoch: Epoch,
     },
-    /// This node built the partition from object storage, and therefore holds
-    /// every write at or below this Lamport whether or not its own log ever
-    /// carried them.
-    ///
-    /// Recorded rather than inferred because the manifest is not this node's
-    /// to read back at recovery time, and a restart that forgot it would ask
-    /// its owner for entries that were checkpointed away years of writes ago.
-    Hydrated {
-        through: Lamport,
-    },
 }
 
 impl LogRecord {
     /// The Lamport this record occupies in the log's sequence.
     ///
-    /// Only an entry has one. A hydration marker names a Lamport it does not
-    /// occupy: the writes below it live in object storage rather than in this
-    /// file, so treating it as a position would make the ordering check reject
-    /// the entries that legitimately follow it, and would make a divergent-tail
-    /// truncation cut away the very record that says why the log starts high.
+    /// Only an entry has one.
     pub(crate) fn lamport(&self) -> Option<Lamport> {
         match self {
             LogRecord::Entry(e) => Some(e.lamport),
@@ -212,10 +207,6 @@ pub(crate) fn encode(record: &LogRecord) -> Bytes {
             body.put_u8(KIND_FENCE);
             body.put_u64_le(epoch.get());
         }
-        LogRecord::Hydrated { through } => {
-            body.put_u8(KIND_HYDRATED);
-            body.put_u64_le(through.get());
-        }
     }
 
     let len = u32::try_from(body.len()).expect("record bodies are bounded by entry limits");
@@ -307,9 +298,6 @@ fn decode_body(body: &[u8]) -> Result<LogRecord, FrameError> {
         },
         KIND_FENCE => LogRecord::Fence {
             epoch: Epoch(r.u64()?),
-        },
-        KIND_HYDRATED => LogRecord::Hydrated {
-            through: Lamport(r.u64()?),
         },
         _ => return Err(FrameError::Malformed),
     };
@@ -417,9 +405,6 @@ mod tests {
                 applied_through: Lamport(9),
             },
             LogRecord::Fence { epoch: Epoch(4) },
-            LogRecord::Hydrated {
-                through: Lamport(4096),
-            },
         ] {
             let frame = encode(&record);
             let (decoded, used) = decode(&frame).expect("round trip");

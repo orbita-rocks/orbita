@@ -79,10 +79,24 @@ state.
 
 Hydration is the answer, and it is what makes the retention bound safe rather
 than merely cheap. A node builds the partition from the current manifest and
-records that horizon in its own log, so it resumes replication above the
-horizon instead of at the start. It happens when a partition is opened, which
-is the replacement-worker case, and in place when an inbound batch turns out to
-leave a hole, which is the fell-behind case and does not need a restart.
+takes that horizon as where its own log starts, so it resumes replication above
+the horizon instead of at the start. It happens when a partition is opened,
+which is the replacement-worker case, and in place when an inbound batch turns
+out to leave a hole, which is the fell-behind case and does not need a restart.
+
+The horizon is derived at every open rather than written into the log, and that
+is a compatibility decision rather than an implementation detail. The log's
+framing cannot skip a record it does not understand: an older reader stops at
+the first unknown kind and truncates the rest, so a marker record would make
+the pre-finalization rollback `docs/UPGRADES.md` promises lose acknowledged
+writes. Nothing is lost by deriving it, because the manifest is read before the
+log is opened on both the owner and replica paths.
+
+Hydration also carries the manifest's epoch, not only its horizon. A manifest
+reaches the bucket through the owner's fenced compare-and-swap, so it is proof
+about who owns the partition. A replica that hydrates on behalf of a sender the
+manifest outranks refuses the append instead of acknowledging it, and a worker
+whose ownership grant the manifest outranks refuses to open as owner at all.
 
 Two limits remain, and neither is a fallback to an incomplete WAL. A partition
 that has never been flushed has nothing to hydrate from, and a manifest that is

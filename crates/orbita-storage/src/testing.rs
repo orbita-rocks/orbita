@@ -177,6 +177,22 @@ pub(crate) struct TempPartition {
     range: KeyRange,
 }
 
+impl TempPartition {
+    /// Opens another incarnation over the same objects at a different epoch,
+    /// which is what a failover looks like from the object store's side.
+    pub(crate) async fn successor(&self, epoch: Epoch) -> crate::Partition<TestRuntime> {
+        crate::Partition::open(
+            self.runtime.clone(),
+            self.store.clone(),
+            partition_path(),
+            epoch,
+            self.range.clone(),
+        )
+        .await
+        .expect("opening a successor over the same store")
+    }
+}
+
 impl Deref for TempPartition {
     type Target = crate::Partition<TestRuntime>;
 
@@ -220,6 +236,18 @@ pub(crate) async fn partition_with_clock() -> (TempPartition, ManualClock) {
 /// Two incarnations over one object namespace, standing in for an owner and a
 /// replica that must observe publication without publishing itself.
 pub(crate) async fn partition_pair_with_clock() -> (TempPartition, TempPartition, ManualClock) {
+    partition_pair_at_epochs(Epoch(1), Epoch(1)).await
+}
+
+/// The same pair, opened under different ownership epochs.
+///
+/// A failover is exactly this: the same objects, a new writer, a higher epoch.
+/// Tests that care what a manifest says about ownership need to be able to
+/// build one that a lower-epoch reader will meet.
+pub(crate) async fn partition_pair_at_epochs(
+    first_epoch: Epoch,
+    second_epoch: Epoch,
+) -> (TempPartition, TempPartition, ManualClock) {
     let clock = ManualClock::default();
     let store = Arc::new(MemoryStore::new());
     let runtime = TestRuntime {
@@ -233,7 +261,7 @@ pub(crate) async fn partition_pair_with_clock() -> (TempPartition, TempPartition
         runtime.clone(),
         store.clone(),
         partition_path(),
-        Epoch(1),
+        first_epoch,
         range.clone(),
     )
     .await
@@ -242,7 +270,7 @@ pub(crate) async fn partition_pair_with_clock() -> (TempPartition, TempPartition
         runtime.clone(),
         store.clone(),
         partition_path(),
-        Epoch(1),
+        second_epoch,
         range.clone(),
     )
     .await

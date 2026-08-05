@@ -42,7 +42,7 @@ use orbita_format::PartitionPath;
 use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_storage::{Mutation, Partition, ScanPage, TOMBSTONE_RETENTION_MILLIS};
-use orbita_wal::{PartitionLog, Wal, WalConfig, WalEntry, WalOp};
+use orbita_wal::{Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -221,8 +221,9 @@ impl<R: Runtime> PartitionHost<R> {
         // that has held this partition all along it is the last manifest it
         // published; on a replacement it is the whole partition, downloaded
         // rather than copied from a peer. Either way it is where this node's
-        // log has to think it starts.
-        let hydrated = storage.flushed_lamport().await?;
+        // log has to think it starts, and its epoch is the second opinion on
+        // whether the grant that brought us here is still current.
+        let hydrated = hydration_of(&storage).await;
         let config = WalConfig::new(id, paths.wal_dir.clone(), epoch)
             .with_replicas(replicas.clone())
             .with_hydration(hydrated);
@@ -234,7 +235,15 @@ impl<R: Runtime> PartitionHost<R> {
         // rather than compete: the manifest covers everything up to its
         // horizon, and the log carries the tail above it.
         let recovery = wal.recover();
-        for entry in &recovery.entries {
+        // Entries the manifest already covers are skipped rather than applied.
+        // `Partition::apply` ignores them anyway, but reading a value out of a
+        // log to have it thrown away is work proportional to the retained log
+        // rather than to the tail that matters.
+        for entry in recovery
+            .entries
+            .iter()
+            .filter(|e| e.lamport > hydrated.through)
+        {
             storage.apply(&mutation_of(entry)).await?;
         }
         if let Some(truncation) = recovery.truncated {
@@ -279,7 +288,7 @@ impl<R: Runtime> PartitionHost<R> {
             )
             .await?,
         );
-        let hydrated = storage.flushed_lamport().await?;
+        let hydrated = hydration_of(&storage).await;
         let log = PartitionLog::open(
             runtime.clone(),
             paths.wal_dir.clone(),
@@ -287,11 +296,11 @@ impl<R: Runtime> PartitionHost<R> {
             orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES,
         )
         .await?;
-        // Recorded before anything is replayed, so this node reports the
+        // Adopted before anything is replayed, so this node reports the
         // position its data is actually at. A replica that hydrated from the
         // bucket and still claimed position zero would ask its owner to resend
         // writes the owner has checkpointed away, and would never catch up.
-        log.hydrate(hydrated).await?;
+        log.hydrate(hydrated.through).await;
         // Entries the manifest already covers are skipped rather than applied.
         // `Partition::apply` would discard them anyway, but reading a value out
         // of a log to have it thrown away is work proportional to the retained
@@ -300,7 +309,7 @@ impl<R: Runtime> PartitionHost<R> {
             .recovery()
             .entries
             .iter()
-            .filter(|e| e.lamport > hydrated)
+            .filter(|e| e.lamport > hydrated.through)
         {
             storage.apply(&mutation_of(entry)).await?;
         }
@@ -559,14 +568,21 @@ impl<R: Runtime> PartitionHost<R> {
     }
 
     /// Rebuilds this partition's storage from the manifest in the bucket and
-    /// reports the horizon it is now current through.
+    /// reports what that manifest says.
     ///
     /// This is the running-node half of hydration: opening a partition already
     /// reads the manifest, and this is what a replica that has fallen beyond its
     /// owner's retained log calls to catch up without a restart and without
-    /// asking a healthy peer for a copy.
-    pub(crate) async fn hydrate(&self) -> Result<Lamport> {
-        self.storage.hydrate().await
+    /// asking a healthy peer for a copy. The epoch comes back with the horizon
+    /// because the caller is closing a gap on behalf of somebody claiming to
+    /// own this partition, and the manifest is the only thing on this path that
+    /// can contradict that claim.
+    pub(crate) async fn hydrate(&self) -> Result<Hydration> {
+        let found = self.storage.hydrate().await?;
+        Ok(Hydration {
+            epoch: found.epoch,
+            through: found.through,
+        })
     }
 
     /// Publishes every applied write and checkpoints only after the manifest
@@ -1203,6 +1219,22 @@ fn mutation_of(entry: &WalEntry) -> Mutation {
     mutation_of_op(entry.lamport, key_of(&entry.op), &entry.op)
 }
 
+/// What the manifest the storage engine already adopted says, in the shape the
+/// log crate speaks.
+///
+/// The two crates each name this value for themselves rather than sharing a
+/// type, for the same reason [`mutation_of`] exists: neither depends on the
+/// other, the vocabulary crate is frozen, and this host is the one place they
+/// meet. Reading it costs nothing because [`Partition::open`] read the manifest
+/// on the way in.
+async fn hydration_of<R: Runtime>(storage: &Partition<R>) -> Hydration {
+    let found = storage.hydration().await;
+    Hydration {
+        epoch: found.epoch,
+        through: found.through,
+    }
+}
+
 fn key_of(op: &WalOp) -> &Bytes {
     match op {
         WalOp::Put { key, .. } | WalOp::Delete { key, .. } => key,
@@ -1632,14 +1664,14 @@ mod tests {
         let replica = Arc::clone(&replica);
         sim.block_on(async move {
             assert_eq!(
-                replica.hydrate().await.unwrap(),
+                replica.hydrate().await.unwrap().through,
                 Lamport(2),
                 "the horizon it reports is the one the owner may resume from"
             );
             assert!(replica.get(b"one").await.unwrap().is_some());
             assert!(replica.get(b"two").await.unwrap().is_some());
             assert_eq!(
-                replica.hydrate().await.unwrap(),
+                replica.hydrate().await.unwrap().through,
                 Lamport(2),
                 "hydrating again is a no-op rather than a second download"
             );
