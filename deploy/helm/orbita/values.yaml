@@ -130,10 +130,47 @@ objectStore:
   # AWS S3 wants this false. MinIO, R2, and most other S3-compatible stores
   # want it true.
   forcePathStyle: true
-  # Credentials come from a Secret. Set existingSecret to bring your own, with
-  # keys access_key_id and secret_access_key. Otherwise the chart creates one
-  # from the values below, which is fine for a test cluster and not for a real
-  # one.
+
+  # Where the node's S3 credentials come from.
+  #
+  #   instance-profile  Read from the EC2 instance metadata service over
+  #                     IMDSv2. No Secret is created and none is mounted, which
+  #                     is the deployment AWS security reviews approve. The
+  #                     nodes must run on instances with an instance profile
+  #                     attached, and IMDSv2 must be enabled (`HttpTokens` may
+  #                     be `required`; this chart never falls back to IMDSv1).
+  #   static            An access key pair, from the Secret below. This is what
+  #                     MinIO and R2 need, because they offer nothing else.
+  #
+  # Empty picks one for you: static when accessKeyId or existingSecret is set,
+  # instance-profile otherwise. Naming it explicitly is better in production,
+  # because then a missing key is a startup error rather than a node quietly
+  # authenticating as something nobody expected.
+  credentialSource: ""
+
+  # A role to assume on top of whatever credentialSource produced. This is the
+  # preferred AWS shape: the instance profile is permitted only to assume this
+  # role, and the role carries the bucket policy, so storage access can be
+  # re-scoped without touching a single instance. Leave roleArn empty to use
+  # the base credentials against S3 directly.
+  #
+  # externalId is only for cross-account access, where the role's trust policy
+  # demands it. It is delivered through the same Secret as the access keys,
+  # because it is a shared secret whatever AWS calls it.
+  roleArn: ""
+  externalId: ""
+  # What the assumed session is called in CloudTrail. Empty derives it from the
+  # cluster name and the node id, which is what makes an audit log able to tell
+  # two nodes apart.
+  sessionName: ""
+
+  # Static credentials. Set existingSecret to bring your own, with keys
+  # access_key_id and secret_access_key, and optionally external_id. Otherwise
+  # the chart creates one from the values below, which is fine for a test
+  # cluster and not for a real one: inline values end up in the Helm release,
+  # readable by anyone who can read releases.
+  #
+  # Leave all three empty to deploy with no Secret at all.
   existingSecret: ""
   accessKeyId: ""
   secretAccessKey: ""

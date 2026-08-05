@@ -51,3 +51,12 @@ Warning: no object store is configured, so compacted data stays on local disks
 and replacing a worker means rehydrating it from its replicas. Set
 objectStore.endpoint before this cluster holds anything you care about.
 {{- end }}
+{{- if and .Values.objectStore.endpoint (eq (include "orbita.credentialSource" .) "static") }}
+
+This release authenticates to object storage with a static access key. On AWS,
+prefer objectStore.credentialSource=instance-profile with objectStore.roleArn:
+the nodes then read short-lived credentials from the instance metadata service
+and assume the role that carries the bucket policy, and this release deploys no
+Secret at all. Static keys remain the right answer for MinIO and R2, which
+offer nothing else.
+{{- end }}

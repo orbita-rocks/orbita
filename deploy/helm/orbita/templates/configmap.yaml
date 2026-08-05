@@ -3,6 +3,7 @@ Everything that is not a secret and not per-pod goes in the file. Node id and
 advertise address are per-pod and come from the environment instead, which is
 exactly the split the configuration precedence was designed for.
 */}}
+{{- include "orbita.validateObjectStore" . -}}
 {{- if lt (int .Values.leader.replicas) 3 -}}
 {{- fail "leader.replicas must be at least 3; use `orbita dev` for a supported single-node cluster" -}}
 {{- end }}
@@ -37,6 +38,16 @@ data:
     {{- end }}
     bucket = {{ .Values.objectStore.bucket | quote }}
     region = {{ .Values.objectStore.region | quote }}
+    # Written out even when it was defaulted, so that a rendered ConfigMap says
+    # which identity this release authenticates as rather than leaving an
+    # operator to reconstruct the rule.
+    credential_source = {{ include "orbita.credentialSource" . | quote }}
+    {{- with .Values.objectStore.roleArn }}
+    role_arn = {{ . | quote }}
+    {{- end }}
+    {{- with .Values.objectStore.sessionName }}
+    role_session_name = {{ . | quote }}
+    {{- end }}
     force_path_style = {{ .Values.objectStore.forcePathStyle }}
 
     [telemetry]

@@ -133,3 +133,89 @@ livenessProbe:
 {{- define "orbita.objectStoreSecretName" -}}
 {{- default (printf "%s-object-store" (include "orbita.fullname" .)) .Values.objectStore.existingSecret -}}
 {{- end -}}
+
+{{/*
+Whether a Secret is in play at all.
+
+The keyless path — an instance profile, with or without a role to assume — has
+no Secret, mounts nothing, and sets no credential environment variables. This
+is the one predicate that decides that, so a StatefulSet cannot disagree with
+the Secret template about whether one exists.
+*/}}
+{{- define "orbita.usesObjectStoreSecret" -}}
+{{- if or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId .Values.objectStore.externalId -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+The credential source written into the config file.
+
+Empty in values means "follow the keys", which matches what the binary does
+with an unset object_store.credential_source. It is resolved here rather than
+left out so that the rendered ConfigMap says which one this release picked;
+an operator reading it should not have to know the defaulting rule.
+*/}}
+{{- define "orbita.credentialSource" -}}
+{{- if .Values.objectStore.credentialSource -}}
+{{- .Values.objectStore.credentialSource -}}
+{{- else if or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId -}}
+static
+{{- else -}}
+instance-profile
+{{- end -}}
+{{- end -}}
+
+{{/*
+Fails a release whose credentials cannot possibly work, at template time,
+because a rendered manifest that deploys and then 403s on every write is the
+most expensive way to learn this.
+*/}}
+{{- define "orbita.validateObjectStore" -}}
+{{- if .Values.objectStore.endpoint -}}
+{{- $source := include "orbita.credentialSource" . -}}
+{{- if and (eq $source "static") (not (or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId)) -}}
+{{- fail "objectStore.credentialSource is static but neither objectStore.accessKeyId nor objectStore.existingSecret is set" -}}
+{{- end -}}
+{{- if and (eq $source "instance-profile") .Values.objectStore.accessKeyId -}}
+{{- fail "objectStore.credentialSource is instance-profile but objectStore.accessKeyId is also set; remove one, because a node that silently ignores a credential is a node nobody can audit" -}}
+{{- end -}}
+{{- if and .Values.objectStore.externalId (not .Values.objectStore.roleArn) -}}
+{{- fail "objectStore.externalId is set but objectStore.roleArn is not; an external id only means anything to a role being assumed" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The credential environment variables for a node container.
+
+Keys come from the Secret when there is one and are simply absent when there is
+not, which is what makes the instance-profile path a deployment with no Secret
+rather than a deployment with an empty one.
+*/}}
+{{- define "orbita.objectStoreEnv" -}}
+{{- if include "orbita.usesObjectStoreSecret" . }}
+{{- if or .Values.objectStore.existingSecret .Values.objectStore.accessKeyId }}
+- name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "orbita.objectStoreSecretName" . }}
+      key: access_key_id
+- name: ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "orbita.objectStoreSecretName" . }}
+      key: secret_access_key
+{{- end }}
+{{- if .Values.objectStore.roleArn }}
+- name: ORBITA_OBJECT_STORE_ROLE_EXTERNAL_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "orbita.objectStoreSecretName" . }}
+      key: external_id
+      # Optional so that a role whose trust policy does not demand an external
+      # id can share a Secret with one that does.
+      optional: true
+{{- end }}
+{{- end }}
+{{- end -}}
