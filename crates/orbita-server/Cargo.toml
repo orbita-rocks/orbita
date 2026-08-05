@@ -28,10 +28,10 @@ orbita-proto.workspace = true
 orbita-storage.workspace = true
 orbita-wal.workspace = true
 async-trait.workspace = true
-aws-config.workspace = true
-aws-credential-types.workspace = true
-aws-types.workspace = true
+
 bytes.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
 crc32c.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

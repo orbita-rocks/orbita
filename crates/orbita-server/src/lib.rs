@@ -58,6 +58,7 @@
 
 #![forbid(unsafe_code)]
 
+mod aws;
 mod config;
 mod control;
 #[cfg(test)]
@@ -75,15 +76,15 @@ mod proxy;
 mod readiness;
 mod replication;
 mod runtime;
-mod s3_store;
 mod service;
 mod status;
 mod transport;
 mod validate;
 
+pub use aws::{AssumeRoleConfig, DEFAULT_SESSION_DURATION_SECONDS};
 pub use config::{
-    S3StorageConfig, ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL, DEFAULT_FLUSH_INTERVAL,
-    DEFAULT_KEYSPACE,
+    S3CredentialSource, S3StorageConfig, ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL,
+    DEFAULT_FLUSH_INTERVAL, DEFAULT_KEYSPACE,
 };
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
@@ -101,7 +102,7 @@ use orbita_control::{
     Controller, KeyspaceConfig, RaftLog,
 };
 use orbita_core::{Error, Result};
-use orbita_objectstore::s3::{S3Config, S3Store};
+use orbita_objectstore::s3::{HttpTransport, HyperTransport, NowMillis, S3Config, S3Store};
 use orbita_objectstore::ObjectStore;
 use orbita_proto::v1::health_server::HealthServer;
 use orbita_proto::v1::kv_server::KvServer;
@@ -201,23 +202,10 @@ impl Server {
             .await?;
         }
         let store: Arc<dyn ObjectStore> = match config.object_store {
-            Some(object_store) => match object_store.credentials.clone() {
-                Some(credentials) => Arc::new(
-                    S3Store::connect(S3Config {
-                        endpoint: object_store.endpoint,
-                        bucket: object_store.bucket,
-                        region: object_store.region,
-                        credentials,
-                        force_path_style: object_store.force_path_style,
-                    })
+            Some(object_store) => Arc::new(
+                connect_object_store(&runtime, object_store)
                     .map_err(|e| Error::Internal(format!("configuring object storage: {e}")))?,
-                ),
-                None => Arc::new(
-                    s3_store::RefreshingS3Store::connect(object_store)
-                        .await
-                        .map_err(|e| Error::Internal(format!("configuring object storage: {e}")))?,
-                ),
-            },
+            ),
             None => {
                 // The local adapter keeps `orbita dev` self-contained.
                 let storage_root = config.data_dir.join("storage");
@@ -681,6 +669,50 @@ impl Server {
             .await
             .map_err(|e| Error::Internal(format!("the client listener panicked: {e}")))
     }
+}
+
+/// Builds the S3 store this node reads and writes objects through.
+///
+/// One transport is shared by the store and by every credential provider, so a
+/// credential refresh reuses the connection pool the node already has, and one
+/// clock feeds both signing and expiry. Both come from the runtime rather than
+/// from `SystemTime` and a fresh hyper client, which is what will let a
+/// simulated run drive credential expiry and metadata-service failures.
+fn connect_object_store(
+    runtime: &ServerRuntime,
+    config: S3StorageConfig,
+) -> orbita_objectstore::ObjectResult<S3Store> {
+    let transport: Arc<dyn HttpTransport> = Arc::new(HyperTransport::new());
+    let now_millis: NowMillis = {
+        let clock = runtime.clock().clone();
+        Arc::new(move || clock.now_millis())
+    };
+    let credentials = aws::credentials_provider(
+        runtime.clock(),
+        transport.clone(),
+        now_millis.clone(),
+        &config,
+    )?;
+
+    S3Store::new(
+        S3Config {
+            endpoint: config.endpoint,
+            bucket: config.bucket,
+            region: config.region,
+            // Replaced immediately below. The store's own field is the static
+            // path, and this node always goes through a provider so that the
+            // static and refreshable cases share one code path.
+            credentials: orbita_objectstore::s3::Credentials {
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                session_token: None,
+            },
+            force_path_style: config.force_path_style,
+        },
+        transport,
+        now_millis,
+    )
+    .map(|store| store.with_credentials_provider(credentials))
 }
 
 async fn start_control_plane(
