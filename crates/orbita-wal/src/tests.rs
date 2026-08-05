@@ -8,7 +8,7 @@ use orbita_runtime::{Rng, Runtime, ServiceId, Transport};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
 use crate::log::{CatchUp, PartitionLog, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES};
-use crate::owner::{Wal, WalConfig};
+use crate::owner::{BeyondRetention, ReplicaCatchUp, Wal, WalConfig};
 use crate::replica::WalService;
 use crate::testkit::{block_on, yield_now, Faults, MemDisk, MemNetwork, TestRuntime};
 use crate::wire::{AppendRequest, WalResponse};
@@ -628,6 +628,129 @@ fn a_replica_that_missed_a_batch_is_caught_up_rather_than_left_with_a_hole() {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
         );
+    });
+}
+
+#[test]
+fn an_owner_that_has_replicated_nothing_yet_calls_its_replicas_unestablished_not_healthy() {
+    // The bug this protects against: an owner opens with an empty view of its
+    // replicas, and an empty view read as "nobody is stranded" is a healthy
+    // answer nobody earned. After a restart or a promotion, an idle partition
+    // would report that forever while a replica sat unable to serve. See the
+    // #75 review of issue #63.
+    let base = TestRuntime::solo(19);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        assert_eq!(
+            c.owner.catch_up_status(),
+            vec![
+                (PEER_A, ReplicaCatchUp::Unestablished),
+                (PEER_B, ReplicaCatchUp::Unestablished),
+            ],
+            "a replica this owner has not heard from is not a replica it has cleared"
+        );
+        assert!(c.owner.beyond_retention().is_empty());
+    });
+}
+
+#[test]
+fn a_reopened_owner_relearns_a_stranded_replica_without_replicating_anything() {
+    let base = TestRuntime::solo(20);
+    block_on(&base, async {
+        // A small segment target so a handful of commits roll several
+        // segments, which is what makes a checkpoint drop history.
+        let net = MemNetwork::new();
+        let owner_runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let mut config =
+            WalConfig::new(PARTITION, DIR, Epoch(1)).with_replicas(vec![PEER_A, PEER_B]);
+        config.segment_target_bytes = 256;
+        let owner = Wal::open(owner_runtime.clone(), config.clone())
+            .await
+            .expect("open owner");
+        let peers = vec![
+            peer(&base, &net, PEER_A).await,
+            peer(&base, &net, PEER_B).await,
+        ];
+
+        // PEER_B misses everything from here, and the owner checkpoints past
+        // what it missed.
+        net.isolate(PEER_B);
+        for i in 1..=12 {
+            owner.commit(op(&format!("k{i}"))).await.unwrap();
+        }
+        owner.checkpoint(Lamport(12)).await.expect("checkpoint");
+        let horizon = owner.log().retained_from().await;
+        assert!(
+            horizon > Lamport(1),
+            "the checkpoint has to have dropped history for this to test anything"
+        );
+        assert_eq!(peers[1].durable().await, Lamport::ZERO);
+        drop(owner);
+        net.heal(PEER_B);
+
+        // The owner restarts and writes nothing. Its own log still says where
+        // history starts, so hearing where a replica is once is enough.
+        let reopened = Wal::open(owner_runtime, config).await.expect("reopen");
+        assert_eq!(
+            reopened.catch_up_status(),
+            vec![
+                (PEER_A, ReplicaCatchUp::Unestablished),
+                (PEER_B, ReplicaCatchUp::Unestablished),
+            ]
+        );
+
+        for peer in &peers {
+            let node = peer.runtime.transport().local_node();
+            reopened
+                .note_replica_position(node, peer.durable().await)
+                .await;
+        }
+        assert_eq!(
+            reopened.beyond_retention(),
+            vec![BeyondRetention {
+                node: PEER_B,
+                replica_durable: Lamport::ZERO,
+                retained_from: Some(horizon),
+            }],
+            "a restart must not lose the fact that a replica cannot be caught up"
+        );
+        assert_eq!(
+            reopened.catch_up_status()[0],
+            (PEER_A, ReplicaCatchUp::Following),
+            "the replica that kept up is cleared by the same report"
+        );
+    });
+}
+
+#[test]
+fn the_tracked_retention_horizon_is_the_one_a_catch_up_scan_finds() {
+    // Two ways of answering "where does my history start" that must not drift:
+    // the scan is authoritative and the tracked value is what the heartbeat
+    // path can afford to ask on every renewal.
+    let base = TestRuntime::solo(21);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, 64)
+            .await
+            .expect("open");
+        assert_eq!(
+            log.retained_from().await,
+            Lamport(1),
+            "an empty log's history starts at the first Lamport nobody has written yet"
+        );
+
+        for i in 1..=8 {
+            let entry = put(i, 1, &format!("key-{i}"));
+            let frame = format::encode(&LogRecord::Entry(entry.clone()));
+            log.append_frames(&[frame], entry.lamport).await.unwrap();
+        }
+        assert_eq!(log.retained_from().await, Lamport(1));
+
+        log.checkpoint(Lamport(6)).await.expect("checkpoint");
+        let scanned = match log.entries_after(Lamport::ZERO).await.expect("scan") {
+            CatchUp::BeyondRetention { retained_from } => retained_from.expect("entries survive"),
+            other => panic!("the checkpoint dropped history: {other:?}"),
+        };
+        assert_eq!(log.retained_from().await, scanned);
     });
 }
 

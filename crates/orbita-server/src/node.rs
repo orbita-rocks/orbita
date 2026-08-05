@@ -182,6 +182,10 @@ impl<R: Runtime> Node<R> {
             writes: tokio::sync::RwLock::new(()),
         });
         node.reconcile().await?;
+        // Nothing is known to be stranded before a single heartbeat has gone
+        // out, and a node held unready for a verdict it has not reached would
+        // never start. The heartbeat corrects this within one interval.
+        node.readiness.mark(ReadinessCondition::ReplicasRecoverable);
         // Opening a partition replays its write-ahead log to the trusted end,
         // so the initial reconcile succeeding means every log this node holds
         // is recovered. Marked here rather than inside `reconcile` because a
@@ -672,13 +676,17 @@ impl<R: Runtime> Node<R> {
     /// Answering `false` is not a failure: it is a replica saying it is not
     /// caught up enough to serve reads, which the owner needs to know because
     /// it decides what to wait for from the same answer.
-    async fn accept_lease(&self, grant: &proxy::LeaseGrant) -> Result<bool> {
+    async fn accept_lease(&self, grant: &proxy::LeaseGrant) -> Result<proxy::LeaseReply> {
         let host = self.hosts.read().await.get(&grant.partition).cloned();
         match host {
             Some(host) => Ok(host.accept_lease(grant).await),
             // A partition this node does not hold cannot serve a read from it
-            // either, so refusing is the whole answer.
-            None => Ok(false),
+            // either, so refusing is the whole answer, and it has no log
+            // position to report for one it is not holding.
+            None => Ok(proxy::LeaseReply {
+                accepted: false,
+                durable: None,
+            }),
         }
     }
 
@@ -787,6 +795,30 @@ impl<R: Runtime> Node<R> {
         for host in hosts {
             host.renew_leases().await;
         }
+        // The heartbeat is also how an owner learns where each replica's log
+        // ends, so this is the moment its verdict can have changed.
+        self.report_replica_recoverability().await;
+    }
+
+    /// Moves the durability half of readiness to match what the owners here
+    /// have established about their replicas.
+    ///
+    /// Called from the lease heartbeat rather than a timer of its own, because
+    /// that heartbeat is what produces the evidence and running the two on
+    /// different clocks would only add a window where the gate disagreed with
+    /// the thing it reports.
+    async fn report_replica_recoverability(&self) {
+        let fallen = self.replicas_beyond_retention().await;
+        if fallen.is_empty() {
+            self.readiness.mark(ReadinessCondition::ReplicasRecoverable);
+            return;
+        }
+        self.readiness
+            .clear(ReadinessCondition::ReplicasRecoverable);
+        tracing::warn!(
+            stranded = fallen.len(),
+            "this node owns a partition whose replica cannot be caught up from its log"
+        );
     }
 
     /// Flushes every partition this node currently owns once.
@@ -849,7 +881,7 @@ async fn dispatch<R: Runtime>(node: &Node<R>, call: PeerCall) -> Bytes {
     match call.method {
         proxy::METHOD_LEASE => match proxy::LeaseGrant::decode(&call.payload) {
             Ok(grant) => match node.accept_lease(&grant).await {
-                Ok(accepted) => proxy::encode_lease_reply(accepted),
+                Ok(reply) => proxy::encode_lease_reply(reply),
                 Err(error) => proxy::encode_error(&error),
             },
             Err(error) => proxy::encode_error(&error),

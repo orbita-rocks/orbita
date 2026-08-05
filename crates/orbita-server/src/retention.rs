@@ -9,9 +9,15 @@
 //!
 //! An accepted tradeoff that nothing exercises is a tradeoff that drifts. This
 //! runs the cliff under the deterministic simulator and pins what it looks
-//! like from outside: the owner names the failure, the replica does not serve
-//! a read from its own state, and its log stops where it stopped rather than
+//! like from outside: the owner names the failure and fails the
+//! `replicas-recoverable` readiness condition, the replica does not serve a
+//! read from its own state, and its log stops where it stopped rather than
 //! resuming above the hole.
+//!
+//! It also pins the two ways that answer could quietly become useless. An
+//! owner that restarts and writes nothing has to reach the same verdict, or a
+//! promotion turns a stranded partition back into a healthy-looking one; and
+//! the verdict has to leave the process, or it is the log line this replaced.
 //!
 //! # Deleting the old expectation is required rather than optional
 //!
@@ -25,6 +31,7 @@
 
 use crate::map_source::{BoxedMapSource, StaticMapSource};
 use crate::node::{DataLayout, Node};
+use crate::readiness::ReadinessCondition;
 
 use orbita_core::{
     Epoch, KeyRange, KeyspaceId, KeyspaceInfo, KeyspaceName, Lamport, MapVersion, NodeId,
@@ -33,7 +40,7 @@ use orbita_core::{
 use orbita_format::testing::MemoryStore;
 use orbita_proto::v1::{GetRequest, SetRequest};
 use orbita_runtime::{Clock, Runtime};
-use orbita_sim::{harness, Failure, SimRuntime, Simulation};
+use orbita_sim::{harness, DiskPolicy, Failure, SimRuntime, Simulation};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,28 +130,50 @@ fn cluster_map() -> PartitionMap {
     map
 }
 
-fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRuntime>> {
-    let runtime = sim.add_node(node);
-    // Each node persists into its own in-memory store, the way each node owns
-    // its own bucket prefix or data directory in production.
-    let layout = DataLayout {
+/// Where one node persists.
+///
+/// An in-memory store per node, the way each node owns its own bucket prefix
+/// or data directory in production. Held by the scenario rather than made
+/// inside `start_node`, because a restart has to come back to the same objects.
+fn layout() -> DataLayout {
+    DataLayout {
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
         wal_segment_bytes: WAL_SEGMENT_BYTES,
-    };
+    }
+}
+
+/// One worker, with the readiness gate it reports through.
+///
+/// The gate is what makes this scenario able to check the operator-facing
+/// answer rather than only the in-process one: it is the same gate
+/// `Health.CheckReadiness` renders and the same one a rolling update stops on.
+struct Worker {
+    node: Arc<Node<SimRuntime>>,
+    gate: Arc<crate::ReadinessGate>,
+}
+
+fn start_node(
+    sim: &Simulation,
+    runtime: SimRuntime,
+    node: NodeId,
+    lease: Duration,
+    layout: DataLayout,
+) -> Worker {
     let source = BoxedMapSource::new(StaticMapSource::new(cluster_map()));
-    sim.block_on(async move {
-        Node::start(
-            runtime,
-            node,
-            layout,
-            source,
-            lease,
-            Arc::new(crate::ReadinessGate::new()),
-        )
-        .await
-        .expect("the node starts")
-    })
+    let gate = Arc::new(crate::ReadinessGate::new());
+    let started = {
+        let gate = Arc::clone(&gate);
+        sim.block_on(async move {
+            Node::start(runtime, node, layout, source, lease, gate)
+                .await
+                .expect("the node starts")
+        })
+    };
+    Worker {
+        node: started,
+        gate,
+    }
 }
 
 fn key(n: u64) -> String {
@@ -231,23 +260,42 @@ fn scenario(seed: u64) -> Result<(), Failure> {
     // Shorter than the production default so a run covers many heartbeats in a
     // few hundred milliseconds of virtual time.
     let lease = Duration::from_millis(150);
-    let owner = start_node(&sim, OWNER, lease);
-    let healthy = start_node(&sim, HEALTHY, lease);
-    let stranded = start_node(&sim, STRANDED, lease);
+    let owner_layout = layout();
+    let mut owning = start_node(
+        &sim,
+        sim.add_node(OWNER),
+        OWNER,
+        lease,
+        owner_layout.clone(),
+    );
+    let healthy = start_node(&sim, sim.add_node(HEALTHY), HEALTHY, lease, layout()).node;
+    let stranded = start_node(&sim, sim.add_node(STRANDED), STRANDED, lease, layout()).node;
     let clock = sim.runtime(OWNER).clock().clone();
 
     // The owner's lease heartbeat, which is what puts a replica in the read
-    // set at all. In production this is a loop the server owns.
+    // set at all, and what carries every replica's log position back. In
+    // production this is a loop the server owns. It reads the owner out of a
+    // cell so that restarting the owner below replaces what it heartbeats
+    // rather than keeping the dead incarnation alive.
+    let heartbeating: Arc<std::sync::Mutex<Option<Arc<Node<SimRuntime>>>>> =
+        Arc::new(std::sync::Mutex::new(Some(Arc::clone(&owning.node))));
     {
-        let owner = Arc::clone(&owner);
+        let heartbeating = Arc::clone(&heartbeating);
         let clock = clock.clone();
         sim.spawn(async move {
             for _ in 0..RENEWALS {
-                owner.renew_leases().await;
+                let current = heartbeating
+                    .lock()
+                    .expect("heartbeat cell poisoned")
+                    .clone();
+                if let Some(node) = current {
+                    node.renew_leases().await;
+                }
                 clock.sleep(lease / 3).await;
             }
         });
     }
+    let owner = Arc::clone(&owning.node);
 
     // A healthy replica first, so that "it stopped serving" means something.
     if write_all(&sim, &owner, 1..=BEFORE) != BEFORE {
@@ -267,6 +315,17 @@ fn scenario(seed: u64) -> Result<(), Failure> {
         return Err(sim.failure(
             "the stranded node never served a read while it was caught up, so this seed \
              proved nothing about it stopping"
+                .to_string(),
+        ));
+    }
+    if !owning
+        .gate
+        .state()
+        .is_met(ReadinessCondition::ReplicasRecoverable)
+    {
+        return Err(sim.failure(
+            "the owner reported a durability problem before there was one, so this seed cannot \
+             tell the report apart from the default"
                 .to_string(),
         ));
     }
@@ -300,6 +359,10 @@ fn scenario(seed: u64) -> Result<(), Failure> {
         let owner = Arc::clone(&owner);
         sim.block_on(async move { owner.replicas_beyond_retention().await })
     };
+    let reported_before_restart = owning
+        .gate
+        .state()
+        .is_met(ReadinessCondition::ReplicasRecoverable);
     let healthy_durable = durable(&sim, &healthy);
     let stranded_durable = durable(&sim, &stranded);
     let stranded_served = stranded.replica_reads();
@@ -424,7 +487,77 @@ fn scenario(seed: u64) -> Result<(), Failure> {
         )));
     }
 
+    // The verdict has to leave the process, or it is the log line this set out
+    // to replace with something an operator can ask for. This is the gate
+    // `Health.CheckReadiness` renders and the gate a rolling update stops on.
+    let stranded_is_a_readiness_problem =
+        PAST_THE_HORIZON == PastTheHorizon::FailsLoudly && !fallen.is_empty();
+    if reported_before_restart == stranded_is_a_readiness_problem {
+        return Err(sim.failure(format!(
+            "the owner's readiness said replicas-recoverable was {reported_before_restart} with \
+             {} replicas beyond its horizon",
+            fallen.len()
+        )));
+    }
+
+    // An owner that restarts and writes nothing must reach the same verdict.
+    // Detection used to depend on a later append being refused, so a restarted
+    // owner of an idle partition reported the healthy answer indefinitely
+    // while the replica still could not serve. See the #75 review of #63.
     drop(owner);
+    *heartbeating.lock().expect("heartbeat cell poisoned") = None;
+    drop(owning.node);
+    sim.crash(OWNER);
+    owning = start_node(
+        &sim,
+        sim.restart(OWNER, DiskPolicy::Intact),
+        OWNER,
+        lease,
+        owner_layout,
+    );
+    *heartbeating.lock().expect("heartbeat cell poisoned") = Some(Arc::clone(&owning.node));
+    // Heartbeats only. Nothing is written, which is the whole point.
+    sim.run_for(lease * 8);
+
+    let after_restart = {
+        let owner = Arc::clone(&owning.node);
+        sim.block_on(async move { owner.replicas_beyond_retention().await })
+    };
+    let ready_after_restart = owning
+        .gate
+        .state()
+        .is_met(ReadinessCondition::ReplicasRecoverable);
+    let outcome = match PAST_THE_HORIZON {
+        PastTheHorizon::FailsLoudly => {
+            if after_restart != fallen {
+                return Err(sim.failure(format!(
+                    "before the restart the owner reported {fallen:?} and after it, having \
+                     written nothing, it reported {after_restart:?}"
+                )));
+            }
+            if ready_after_restart {
+                return Err(sim.failure(
+                    "a restarted owner called itself recoverable while it reported a replica it \
+                     cannot catch up"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+        PastTheHorizon::Recovers => {
+            // Issue #17: hydration has run by now, so a restart finds nothing
+            // to report and nothing holding readiness down.
+            if !after_restart.is_empty() || !ready_after_restart {
+                return Err(sim.failure(format!(
+                    "hydration is available and a restarted owner still reports {after_restart:?}"
+                )));
+            }
+            Ok(())
+        }
+    };
+    outcome?;
+
+    drop(owning.node);
     drop(healthy);
     drop(stranded);
     Ok(())

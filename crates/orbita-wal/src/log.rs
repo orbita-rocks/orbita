@@ -106,6 +106,10 @@ struct Inner<R: Runtime> {
     durable: Lamport,
     applied_through: Lamport,
     epoch: Epoch,
+    /// The oldest Lamport still on disk. See
+    /// [`PartitionLog::retained_from`]; kept here so it moves under the same
+    /// lock as the segment list it describes.
+    retained_from: Lamport,
 }
 
 /// The log for one partition on this node.
@@ -180,9 +184,26 @@ impl<R: Runtime> PartitionLog<R> {
                 durable: recovery.durable_lamport,
                 applied_through: recovery.applied_through,
                 epoch: recovery.epoch,
+                retained_from: scan.retained_from,
             }),
             recovery,
         }))
+    }
+
+    /// The oldest Lamport this log still holds.
+    ///
+    /// A log holds one contiguous run of Lamports, so this one number says
+    /// where its history starts: a replica holding through `after` can be
+    /// caught up from here exactly when `after.next() >= retained_from`. An
+    /// empty log reports the Lamport it would write next, which makes the same
+    /// comparison come out true for a replica holding nothing.
+    ///
+    /// This is the cheap half of [`PartitionLog::entries_after`], and the two
+    /// have to agree. That is what an owner's heartbeat asks on every renewal,
+    /// and rescanning the directory for it would put a full read of the log on
+    /// a timer. Recomputed only where segments are added or removed.
+    pub async fn retained_from(&self) -> Lamport {
+        self.inner.lock().await.retained_from
     }
 
     /// Which partition this log holds, so a registry can key on it without
@@ -286,6 +307,12 @@ impl<R: Runtime> PartitionLog<R> {
             }
             removable.push(segment.seq);
         }
+        let dropped = inner
+            .segments
+            .iter()
+            .filter(|s| removable.contains(&s.seq))
+            .map(|s| s.max_lamport)
+            .max();
         for seq in &removable {
             self.runtime
                 .disk()
@@ -294,6 +321,11 @@ impl<R: Runtime> PartitionLog<R> {
                 .map_err(disk_err)?;
         }
         inner.segments.retain(|s| !removable.contains(&s.seq));
+        // Segments hold a contiguous run, so history now starts one past the
+        // last Lamport the removed ones held.
+        if let Some(dropped) = dropped {
+            inner.retained_from = inner.retained_from.max(dropped.next());
+        }
         Ok(())
     }
 
@@ -385,6 +417,9 @@ impl<R: Runtime> PartitionLog<R> {
         inner.current = file;
         inner.current_size = offset;
         inner.durable = lamport;
+        // Cutting a tail can leave the retained run empty, and an empty log's
+        // history starts at whatever it would write next.
+        inner.retained_from = inner.retained_from.min(lamport.next());
         if let Some(last) = inner.segments.last_mut() {
             last.max_lamport = lamport;
         }
@@ -436,6 +471,9 @@ struct DirectoryScan {
     applied_through: Lamport,
     epoch: Epoch,
     truncated: Option<Truncation>,
+    /// The oldest Lamport the segments on disk still hold, or the Lamport the
+    /// log would write next when they hold none.
+    retained_from: Lamport,
 }
 
 /// Reads every segment in order, stopping at the first byte it cannot trust.
@@ -462,6 +500,7 @@ async fn scan_directory<R: Runtime>(
         applied_through: Lamport::ZERO,
         epoch: Epoch::ZERO,
         truncated: None,
+        retained_from: Lamport::ZERO,
     };
 
     let mut stopped_at: Option<usize> = None;
@@ -540,6 +579,10 @@ async fn scan_directory<R: Runtime>(
         }
     }
 
+    scan.retained_from = scan
+        .all_entries
+        .first()
+        .map_or_else(|| scan.durable.next(), |first| first.lamport);
     scan.entries = scan
         .all_entries
         .iter()

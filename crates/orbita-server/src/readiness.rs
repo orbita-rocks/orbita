@@ -40,6 +40,23 @@ pub enum ReadinessCondition {
     /// partition it cannot open, because a node refusing requests for a
     /// partition it was given is not ready no matter how it got there.
     PartitionsCaughtUp,
+    /// No replica of a partition this node owns has fallen past what this
+    /// node's write-ahead log still holds.
+    ///
+    /// WAL truncation is live and hydration from object storage is not (issue
+    /// #17), so a replica that lags past the retained prefix cannot be
+    /// recovered: it is out of the read set and out of the durability quorum
+    /// until an operator replaces it. That is a partition permanently short a
+    /// copy, and a rolling update that walked past it would take out another
+    /// one. Holding the rollout here is the same reasoning
+    /// [`Self::PartitionsCaughtUp`] uses, and it is why this is a readiness
+    /// condition rather than a log line.
+    ///
+    /// Only a replica the owner has proven stranded clears this. A replica it
+    /// has not heard from is unreachable, which is a different problem with
+    /// its own signal, and treating silence as a durability failure would make
+    /// every restart unready for as long as one peer was down.
+    ReplicasRecoverable,
     /// The node has not begun a planned shutdown. Clearing this makes the
     /// readiness probe fail before ownership starts moving away.
     AcceptingOwnership,
@@ -47,11 +64,12 @@ pub enum ReadinessCondition {
 
 impl ReadinessCondition {
     /// Every condition, in the order reports list them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ClusterVersionCompatible,
         Self::ControlPlaneJoined,
         Self::WalRecovered,
         Self::PartitionsCaughtUp,
+        Self::ReplicasRecoverable,
         Self::AcceptingOwnership,
     ];
 
@@ -64,6 +82,7 @@ impl ReadinessCondition {
             Self::ControlPlaneJoined => "control-plane-joined",
             Self::WalRecovered => "wal-recovered",
             Self::PartitionsCaughtUp => "partitions-caught-up",
+            Self::ReplicasRecoverable => "replicas-recoverable",
             Self::AcceptingOwnership => "accepting-ownership",
         }
     }
@@ -85,6 +104,7 @@ pub struct ReadinessState {
     joined: bool,
     recovered: bool,
     caught_up: bool,
+    replicas_recoverable: bool,
     accepting_ownership: bool,
 }
 
@@ -96,6 +116,7 @@ impl ReadinessState {
             && self.joined
             && self.recovered
             && self.caught_up
+            && self.replicas_recoverable
             && self.accepting_ownership
     }
 
@@ -107,6 +128,7 @@ impl ReadinessState {
             ReadinessCondition::ControlPlaneJoined => self.joined,
             ReadinessCondition::WalRecovered => self.recovered,
             ReadinessCondition::PartitionsCaughtUp => self.caught_up,
+            ReadinessCondition::ReplicasRecoverable => self.replicas_recoverable,
             ReadinessCondition::AcceptingOwnership => self.accepting_ownership,
         }
     }
@@ -126,6 +148,7 @@ impl ReadinessState {
             ReadinessCondition::ControlPlaneJoined => self.joined = met,
             ReadinessCondition::WalRecovered => self.recovered = met,
             ReadinessCondition::PartitionsCaughtUp => self.caught_up = met,
+            ReadinessCondition::ReplicasRecoverable => self.replicas_recoverable = met,
             ReadinessCondition::AcceptingOwnership => self.accepting_ownership = met,
         }
     }

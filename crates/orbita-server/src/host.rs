@@ -32,7 +32,7 @@
 
 use crate::lease::{LeaseTable, ReplicaReadState, DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 use crate::pending::{self, PendingRecord, PendingSet};
-use crate::proxy::{self, LeaseGrant};
+use crate::proxy::{self, LeaseGrant, LeaseReply};
 
 use bytes::Bytes;
 use orbita_core::{
@@ -684,8 +684,18 @@ impl<R: Runtime> PartitionHost<R> {
             .map_err(|e| Error::Unavailable(e.to_string()))
             .and_then(|reply| proxy::decode_lease_reply(&reply));
 
+        // Where the replica said its log ends, whatever it decided about the
+        // lease. This is the heartbeat's second job and the reason an owner
+        // that has replicated nothing since it opened still knows which of its
+        // replicas it can catch up. See `Wal::note_replica_position`.
+        if let (Ok(reply), Some(wal)) = (&answered, self.wal.as_ref()) {
+            if let Some(durable) = reply.durable {
+                wal.note_replica_position(node, durable).await;
+            }
+        }
+
         match answered {
-            Ok(true) if granting => {}
+            Ok(reply) if reply.accepted && granting => {}
             Ok(_) => {
                 // Either the replica refused the lease, or this was a probe
                 // and it has confirmed it holds none. Both mean nothing there
@@ -786,14 +796,22 @@ impl<R: Runtime> PartitionHost<R> {
     ///
     /// The same message carries how far the owner has acknowledged, which is
     /// what releases entries this node is holding back.
-    pub(crate) async fn accept_lease(&self, grant: &LeaseGrant) -> bool {
+    pub(crate) async fn accept_lease(&self, grant: &LeaseGrant) -> LeaseReply {
+        // Answered even when the grant is refused, because where this node's
+        // log ends is what the owner needs most from a replica it cannot
+        // grant to.
+        let durable = Some(self.log.durable_lamport().await);
         if self.is_owner() || grant.epoch < self.epoch {
-            return false;
+            return LeaseReply {
+                accepted: false,
+                durable,
+            };
         }
         self.commit_through(grant.committed).await;
 
         let now = self.runtime.clock().monotonic_nanos();
-        self.read_state
+        let accepted = self
+            .read_state
             .lock()
             .expect("read state poisoned")
             .accept_grant(
@@ -801,7 +819,8 @@ impl<R: Runtime> PartitionHost<R> {
                 grant.through,
                 Duration::from_millis(grant.duration_millis),
                 self.lease.margin,
-            )
+            );
+        LeaseReply { accepted, durable }
     }
 
     /// Releases everything the owner has acknowledged to a client.

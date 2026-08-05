@@ -56,11 +56,15 @@
 //! retained WAL cannot catch up from the manifest and stays unavailable. WAL
 //! truncation is live now; snapshot recovery is deliberately not implied.
 //!
-//! That is a sharp edge rather than a quiet one, and
-//! [`Server::replicas_beyond_retention`] is where it surfaces: the owner names
-//! the replica, where it stopped, and the oldest entry the owner still holds.
-//! `src/retention.rs` runs the whole cliff under the simulator and is also the
-//! tracking test for #17.
+//! That is a sharp edge rather than a quiet one. The owner names the replica,
+//! where it stopped, and the oldest entry it still holds, through
+//! [`Server::replicas_beyond_retention`], and that drives the
+//! `replicas-recoverable` readiness condition so the answer leaves the process
+//! and a rolling update stops at a partition permanently short a copy. The
+//! owner learns where each replica's log ends from the lease heartbeat, so a
+//! restarted or promoted owner reaches the same verdict without writing
+//! anything. `src/retention.rs` runs the whole cliff under the simulator and is
+//! also the tracking test for #17.
 
 #![forbid(unsafe_code)]
 
@@ -782,11 +786,16 @@ mod leader_readiness_tests {
 
     #[test]
     fn an_accepted_leader_report_does_not_make_a_lagging_voter_ready() {
+        // Everything this function does not touch already holds, so that what
+        // is left unmet is what it decided. Written as "all but one" rather
+        // than a list, because a list goes stale the next time a condition is
+        // added and fails a test about something else.
         let readiness = ReadinessGate::new();
-        readiness.mark(ReadinessCondition::ClusterVersionCompatible);
-        readiness.mark(ReadinessCondition::WalRecovered);
-        readiness.mark(ReadinessCondition::PartitionsCaughtUp);
-        readiness.mark(ReadinessCondition::AcceptingOwnership);
+        for condition in ReadinessCondition::ALL {
+            if condition != ReadinessCondition::ControlPlaneJoined {
+                readiness.mark(condition);
+            }
+        }
 
         update_control_readiness(&readiness, true, Some(false));
 
@@ -798,11 +807,16 @@ mod leader_readiness_tests {
 
     #[test]
     fn a_voter_becomes_ready_after_applying_through_the_leader_authority() {
+        // Everything this function does not touch already holds, so that what
+        // is left unmet is what it decided. Written as "all but one" rather
+        // than a list, because a list goes stale the next time a condition is
+        // added and fails a test about something else.
         let readiness = ReadinessGate::new();
-        readiness.mark(ReadinessCondition::ClusterVersionCompatible);
-        readiness.mark(ReadinessCondition::WalRecovered);
-        readiness.mark(ReadinessCondition::PartitionsCaughtUp);
-        readiness.mark(ReadinessCondition::AcceptingOwnership);
+        for condition in ReadinessCondition::ALL {
+            if condition != ReadinessCondition::ControlPlaneJoined {
+                readiness.mark(condition);
+            }
+        }
 
         update_control_readiness(&readiness, true, Some(true));
 
