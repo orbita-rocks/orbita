@@ -11,7 +11,7 @@ use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId, Result};
 use orbita_runtime::{PeerCall, Runtime, ServiceId, Transport};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
-use crate::log::{PartitionLog, RecoveryState, DEFAULT_SEGMENT_TARGET_BYTES};
+use crate::log::{CatchUp, PartitionLog, RecoveryState, DEFAULT_SEGMENT_TARGET_BYTES};
 use crate::replica::Hydration;
 use crate::wire::{
     AppendRequest, FenceRequest, StatusRequest, WalResponse, METHOD_APPEND, METHOD_FENCE,
@@ -73,6 +73,85 @@ impl WalConfig {
     }
 }
 
+/// A replica this owner has proven it cannot catch up from its own log.
+///
+/// The owner is the only node that can tell this: the replica knows it is
+/// missing entries, and only the owner knows whether it still holds them. So
+/// the owner records it rather than logging it and moving on, because a
+/// warning line is not a state anything can be asked about, and a failure mode
+/// nothing can be asked about is one an operator discovers first.
+///
+/// Until hydration from object storage lands (issue #17) there is no path back
+/// for such a replica: the entries are cluster-durable in the published
+/// manifest, and nothing turns those objects into a caught-up replica. It
+/// stays out of the read set and has to be replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeyondRetention {
+    pub node: NodeId,
+    /// How far the replica said it had logged when it fell off.
+    pub replica_durable: Lamport,
+    /// The oldest Lamport this owner still retains, which is the other half of
+    /// the diagnosis: the gap is everything between the two. `None` when the
+    /// owner's log retains no entries at all.
+    pub retained_from: Option<Lamport>,
+}
+
+/// What an owner has established about one replica: where its log ends, and
+/// whether this log can still extend it.
+///
+/// The three states exist because two of them are not the same thing, and
+/// collapsing them is how a cliff hides. An owner that has just opened its log
+/// has replicated nothing and heard nothing, so it knows nothing, and an
+/// absent answer read as a healthy one is the bug the #75 review of issue #63
+/// found: a restarted owner of an idle partition would report every replica
+/// fine while one of them could not serve at all.
+///
+/// This is the only per-replica record in the crate, and both questions asked
+/// about a replica's health are read off it. Whether a catch-up still has work
+/// to do for a node is [`Wal::replicas_behind`]; whether no catch-up ever can
+/// is [`Wal::beyond_retention`]. They partition the same three states, so they
+/// cannot contradict each other about one node:
+///
+/// | State | `replicas_behind` | `beyond_retention` |
+/// |---|---|---|
+/// | `Unestablished` | yes, if there is history to give | no |
+/// | `Following` below the committed prefix | yes | no |
+/// | `Following` at or above it | no | no |
+/// | `Stranded` | no — a retry cannot help | yes |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaCatchUp {
+    /// Neither replicated to nor heard from since this log opened. Not
+    /// healthy, not stranded, not an answer to give an operator.
+    Unestablished,
+    /// Holds a prefix this log can still extend, ending at `through`.
+    ///
+    /// The position is carried rather than left implicit because "can be
+    /// extended" and "has been extended" are different facts and a caller
+    /// needs both. Without it, deciding whether a catch-up still owes this
+    /// replica a pass would need a second map keyed by the same nodes, and two
+    /// maps describing one replica are two answers waiting to disagree.
+    Following { through: Lamport },
+    /// Needs entries this log no longer holds.
+    Stranded(BeyondRetention),
+}
+
+impl ReplicaCatchUp {
+    /// Whether this is the same kind of answer as `other`, ignoring how far
+    /// the replica has got.
+    ///
+    /// Used to decide whether a conclusion is worth logging. A replica
+    /// following along moves its position on every append, and a line per
+    /// append would bury the one transition an operator needs to see.
+    fn same_kind(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Unestablished, Self::Unestablished)
+                | (Self::Following { .. }, Self::Following { .. })
+                | (Self::Stranded(_), Self::Stranded(_))
+        )
+    }
+}
+
 struct Pending {
     entry: WalEntry,
     frame: Bytes,
@@ -92,20 +171,41 @@ struct Batch {
 /// advertises a copy that does not hold the history. A caller that treated
 /// "somebody answered" as success would clear the work and never look again,
 /// and on an idle partition nothing else ever raises the question.
+///
+/// Named for the pass rather than the state, because the state is
+/// [`ReplicaCatchUp`] and the log's answer to a backfill request is
+/// [`crate::CatchUp`]. This is neither: it is what one round of
+/// [`Wal::catch_up_replicas`] achieved, read back off the per-replica record
+/// once the calls have landed.
 #[derive(Debug, Clone)]
-pub struct CatchUp {
+pub struct CatchUpPass {
     /// The committed prefix every replica was carried to. See
     /// [`Wal::committed_lamport`] for why the horizon is that watermark and
     /// not the local durable one.
     pub horizon: Lamport,
-    /// Replicas that have confirmed, in a reply, that they hold `horizon`.
+    /// Replicas now known to hold `horizon`.
     pub caught_up: Vec<NodeId>,
-    /// Replicas that have not, whatever the reason.
+    /// Replicas short of it that another pass could still carry: unreachable,
+    /// or reached and still catching up.
     pub behind: Vec<NodeId>,
+    /// Replicas short of it that no pass can carry, because the entries they
+    /// need are older than this owner's retained log.
+    ///
+    /// Kept apart from `behind` because the two need opposite handling. One is
+    /// work to retry; the other is a fault to report, and retrying it forever
+    /// would pin a node in a permanent retry loop while hiding the reason. It
+    /// leaves the crate through [`Wal::beyond_retention`] instead.
+    pub stranded: Vec<NodeId>,
 }
 
-impl CatchUp {
-    /// Whether every advertised copy now really exists.
+impl CatchUpPass {
+    /// Whether every advertised copy a catch-up could still help now holds the
+    /// horizon.
+    ///
+    /// Deliberately blind to `stranded`. A stranded replica is not incomplete
+    /// work, it is finished work with a bad answer, and a caller that kept
+    /// retrying on account of it would never settle. Its own signal is the
+    /// `replicas-recoverable` readiness condition.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.behind.is_empty()
@@ -145,6 +245,21 @@ struct OwnerState {
     /// Set when this owner has given up its uncommitted tail and will never
     /// assign another Lamport. See [`Wal::quiesce`].
     quiesced: bool,
+    /// What this owner has established about each replica: where its log ends,
+    /// and whether this log can still extend it. Seeded `Unestablished` for
+    /// every configured replica when the log opens, so that having heard
+    /// nothing yet is never mistaken for having heard something good.
+    ///
+    /// This is the single per-replica record. Both questions anyone asks about
+    /// a replica's health are read off it — [`Wal::replicas_behind`], the work
+    /// a catch-up can still do, and [`Wal::beyond_retention`], the work it
+    /// cannot — so the two can never disagree about the same node.
+    ///
+    /// `acked` above is not a second copy of this. It answers a different
+    /// question: whether one named node confirmed one named Lamport, which is
+    /// what the ADR 0001 coherence quorum waits on. This one answers where a
+    /// replica stands relative to the log as a whole.
+    catch_up: HashMap<NodeId, ReplicaCatchUp>,
     /// Set when this node must stop being an owner: it was fenced, or its own
     /// disk stopped telling the truth.
     fatal: Option<Error>,
@@ -210,6 +325,11 @@ impl<R: Runtime> Wal<R> {
         // `durable` being where this node's history actually starts.
         log.hydrate(config.hydrated.through).await;
         let durable = log.durable_lamport().await;
+        let catch_up = config
+            .replicas
+            .iter()
+            .map(|node| (*node, ReplicaCatchUp::Unestablished))
+            .collect();
 
         Ok(Arc::new(Self {
             runtime,
@@ -227,6 +347,7 @@ impl<R: Runtime> Wal<R> {
                 failed_through: Lamport::ZERO,
                 acked: HashMap::new(),
                 quiesced: false,
+                catch_up,
                 fatal: None,
             }),
             progress: tokio::sync::Notify::new(),
@@ -307,30 +428,48 @@ impl<R: Runtime> Wal<R> {
         self.state().replicated
     }
 
-    /// The advertised replicas that are not known to hold the committed
-    /// prefix.
+    /// The advertised replicas a catch-up still owes a pass, meaning those not
+    /// known to hold the committed prefix and not proven unreachable from this
+    /// log.
     ///
-    /// Answered from the per-replica acknowledgements the append path already
-    /// records, so a replica counts as caught up only because it said so in a
-    /// reply, never because a call to somebody else succeeded.
+    /// Read off [`Wal::catch_up_status`], which is the crate's only
+    /// per-replica record, so this cannot disagree with
+    /// [`Wal::beyond_retention`] about a node. The three states divide cleanly:
     ///
-    /// The evidence is remembered rather than re-established, which bounds
-    /// what this can notice: a replica that acknowledged the prefix and then
-    /// lost its disk reports as current until something moves the prefix and
-    /// the next append finds the gap. That is the same hole recovery has
-    /// always had for a replica whose storage is replaced under it, and
-    /// closing it is a question about detecting silent data loss rather than
-    /// about placement.
+    /// - `Unestablished` counts as behind, but only when there is history to
+    ///   hand over. Nothing has been heard from the replica, and a pass is
+    ///   exactly what establishes something; an empty log has nothing to
+    ///   establish and the first write will do it. This is stronger than
+    ///   trusting an acknowledgement map, because a promoted or restarted
+    ///   owner starts here rather than starting from a number that predates
+    ///   its epoch.
+    /// - `Following` counts as behind while its position is short of the
+    ///   committed prefix. Under load the append path keeps the position
+    ///   current, so a healthy partition answers empty without anyone asking.
+    /// - `Stranded` never counts. A retry cannot produce entries the log no
+    ///   longer holds, and treating it as pending would pin the owner in a
+    ///   permanent retry loop instead of reporting the fault. It leaves
+    ///   through [`Wal::beyond_retention`] and the `replicas-recoverable`
+    ///   readiness condition.
+    ///
+    /// One limit is inherited rather than fixed here: a position only ever
+    /// rises, so a replica that confirmed the prefix and then lost its disk
+    /// reads as current until an append finds the gap and turns it into
+    /// `Stranded`. Lowering on a heartbeat report would close that and open a
+    /// worse one, since a reply that raced an append is stale by exactly the
+    /// same shape and would put a healthy cluster into a permanent catch-up
+    /// loop.
     #[must_use]
     pub fn replicas_behind(&self) -> Vec<NodeId> {
-        let replicas = self.replicas();
-        let state = self.state();
-        replicas
-            .iter()
-            .copied()
-            .filter(|node| {
-                state.acked.get(node).copied().unwrap_or(Lamport::ZERO) < state.replicated
+        let committed = self.committed_lamport();
+        self.catch_up_status()
+            .into_iter()
+            .filter(|(_, status)| match status {
+                ReplicaCatchUp::Unestablished => committed > Lamport::ZERO,
+                ReplicaCatchUp::Following { through } => *through < committed,
+                ReplicaCatchUp::Stranded(_) => false,
             })
+            .map(|(node, _)| node)
             .collect()
     }
 
@@ -383,6 +522,148 @@ impl<R: Runtime> Wal<R> {
         }
     }
 
+    /// What this owner has established about each of its replicas, in node
+    /// order so that two reports of an unchanged state are the same bytes.
+    ///
+    /// Every configured replica appears, including the ones nothing is known
+    /// about. That is the whole point: a caller that only sees failures cannot
+    /// tell "checked and fine" from "never checked".
+    ///
+    /// The current peer list is what this iterates, not the recorded one, so a
+    /// replica placed onto the partition after the log opened has no entry yet
+    /// and reads as `Unestablished`. That is the honest answer and it is what
+    /// makes a catch-up owe the new peer a pass; a replica removed from the
+    /// set stops being reported without its record having to be hunted down.
+    #[must_use]
+    pub fn catch_up_status(&self) -> Vec<(NodeId, ReplicaCatchUp)> {
+        let replicas = self.replicas();
+        let state = self.state();
+        let mut status: Vec<(NodeId, ReplicaCatchUp)> = replicas
+            .iter()
+            .map(|node| {
+                let known = state
+                    .catch_up
+                    .get(node)
+                    .copied()
+                    .unwrap_or(ReplicaCatchUp::Unestablished);
+                (*node, known)
+            })
+            .collect();
+        drop(state);
+        status.sort_unstable_by_key(|(node, _)| node.get());
+        status
+    }
+
+    /// The replicas this owner has proven it cannot catch up from its own log.
+    ///
+    /// Empty means no replica is known to be stranded, which is not the same
+    /// as every replica being fine; ask [`Wal::catch_up_status`] for that
+    /// distinction. A non-empty answer names a copy that is out of the read
+    /// set and out of the durability quorum until something outside this crate
+    /// restores it.
+    #[must_use]
+    pub fn beyond_retention(&self) -> Vec<BeyondRetention> {
+        self.catch_up_status()
+            .into_iter()
+            .filter_map(|(_, status)| match status {
+                ReplicaCatchUp::Stranded(fallen) => Some(fallen),
+                ReplicaCatchUp::Unestablished | ReplicaCatchUp::Following { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Folds in a report of where a replica's log ends.
+    ///
+    /// Any report will do, and that is what makes an owner that has just
+    /// opened its log able to reconstruct the truth without replicating
+    /// anything: the lease heartbeat reaches every replica whether or not
+    /// there are writes, and one number back is enough when the owner already
+    /// knows where its own history starts.
+    ///
+    /// Cheap enough for a heartbeat. It reads the retention horizon the log
+    /// tracks rather than scanning the directory for it, which is why
+    /// [`crate::PartitionLog::retained_from`] exists.
+    ///
+    /// This is also what lets [`Wal::replicas_behind`] work on an owner that
+    /// has replicated nothing since it opened. Without it the only evidence a
+    /// fresh owner had was an acknowledgement, which needs a write, and an
+    /// idle partition never produces one.
+    pub async fn note_replica_position(&self, node: NodeId, replica_durable: Lamport) {
+        let retained_from = self.log.retained_from().await;
+        // The log holds one contiguous run, so a replica can be extended from
+        // here exactly when the entry it needs next has not been dropped.
+        let status = if replica_durable.next() >= retained_from {
+            ReplicaCatchUp::Following {
+                through: replica_durable,
+            }
+        } else {
+            ReplicaCatchUp::Stranded(BeyondRetention {
+                node,
+                replica_durable,
+                // A log that has dropped everything reports no horizon rather
+                // than a Lamport it does not hold.
+                retained_from: (self.log.durable_lamport().await >= retained_from)
+                    .then_some(retained_from),
+            })
+        };
+        self.record_catch_up(node, status);
+    }
+
+    /// Records a conclusion about a replica, logging only when the kind of
+    /// conclusion changes.
+    ///
+    /// Catch-up is judged on every append and every heartbeat, so a line per
+    /// judgement would bury the one that matters under thousands that do not.
+    /// A following replica moves its position constantly and none of those
+    /// moves is news; only becoming stranded, or stopping being stranded, is.
+    ///
+    /// A `Following` position only ever rises. A heartbeat reply and an append
+    /// acknowledgement are two samples of the same number taken at different
+    /// moments, and the reply can easily be the older one; letting it win
+    /// would make a busy partition look permanently behind and put it in a
+    /// catch-up loop it does not need. The cost is the inherited limit
+    /// documented on [`Wal::replicas_behind`], and the case that actually
+    /// matters — a replica that lost entries — is caught by the append path
+    /// as `Stranded` rather than by a lowered watermark.
+    fn record_catch_up(&self, node: NodeId, status: ReplicaCatchUp) {
+        let (changed, status) = {
+            let mut state = self.state();
+            let held = state.catch_up.get(&node).copied();
+            let status = match (held, status) {
+                (
+                    Some(ReplicaCatchUp::Following { through: held }),
+                    ReplicaCatchUp::Following { through },
+                ) => ReplicaCatchUp::Following {
+                    through: through.max(held),
+                },
+                (_, status) => status,
+            };
+            state.catch_up.insert(node, status);
+            (!held.is_some_and(|held| held.same_kind(status)), status)
+        };
+        if !changed {
+            return;
+        }
+        match status {
+            ReplicaCatchUp::Stranded(fallen) => tracing::error!(
+                partition = self.partition.get(),
+                node = node.get(),
+                replica_durable = fallen.replica_durable.get(),
+                retained_from = fallen.retained_from.map(Lamport::get),
+                "replica has fallen past this owner's retained log and cannot be caught up from \
+                 it; it is out of the read set and the durability quorum until it is hydrated \
+                 from object storage or replaced"
+            ),
+            ReplicaCatchUp::Following { through } => tracing::info!(
+                partition = self.partition.get(),
+                node = node.get(),
+                through = through.get(),
+                "replica is following this owner's log again"
+            ),
+            ReplicaCatchUp::Unestablished => {}
+        }
+    }
+
     /// Records how far a replica has confirmed. An acknowledgement covers
     /// everything below it, because the protocol refuses a batch that would
     /// leave a hole.
@@ -394,6 +675,12 @@ impl<R: Runtime> Wal<R> {
                 *slot = through;
             }
         }
+        // A replica that took a batch holds a prefix this log can extend,
+        // whatever put it there, so this is also how a hydrated replica clears
+        // itself without hydration needing a second bookkeeping path. The
+        // position it confirmed goes in with it, which is what a catch-up
+        // reads back to decide whether it still owes this node a pass.
+        self.record_catch_up(node, ReplicaCatchUp::Following { through });
         self.progress.notify_waiters();
     }
 
@@ -468,6 +755,9 @@ impl<R: Runtime> Wal<R> {
             // history ends, so what they confirmed under the old owner says
             // nothing about where they are now.
             state.acked.clear();
+            for status in state.catch_up.values_mut() {
+                *status = ReplicaCatchUp::Unestablished;
+            }
             state.fatal = None;
         }
 
@@ -523,8 +813,10 @@ impl<R: Runtime> Wal<R> {
     ///
     /// Errors only when this owner has been fenced, which is not a retryable
     /// condition. A replica that could not be reached comes back in
-    /// [`CatchUp::behind`] so the caller keeps the work pending.
-    pub async fn catch_up_replicas(&self) -> Result<CatchUp> {
+    /// [`CatchUpPass::behind`] so the caller keeps the work pending, and one
+    /// the log can no longer reach comes back in [`CatchUpPass::stranded`] so
+    /// the caller stops trying and reports it instead.
+    pub async fn catch_up_replicas(&self) -> Result<CatchUpPass> {
         let replicas = self.replicas();
         let (epoch, horizon, fatal) = {
             let state = self.state();
@@ -533,10 +825,11 @@ impl<R: Runtime> Wal<R> {
         if let Some(fatal) = fatal {
             return Err(fatal);
         }
-        let mut result = CatchUp {
+        let mut result = CatchUpPass {
             horizon,
             caught_up: Vec::new(),
             behind: Vec::new(),
+            stranded: Vec::new(),
         };
         if replicas.is_empty() {
             return Ok(result);
@@ -560,14 +853,24 @@ impl<R: Runtime> Wal<R> {
                 self.set_fatal(error.clone());
                 return Err(error);
             }
-            // Judged on what the replica said about itself rather than on
-            // whether the call returned, because those differ: a reply can
-            // arrive from a replica that is still short of the horizon, and a
-            // node that answered nothing has proved nothing.
-            if self.acked_through(*node) >= horizon {
-                result.caught_up.push(*node);
-            } else {
-                result.behind.push(*node);
+        }
+
+        // Read back off the per-replica record rather than from the outcomes,
+        // because the call returning and the replica having arrived are
+        // different facts: a reply can come from a node that is still short of
+        // the horizon, a node that answered nothing has proved nothing, and a
+        // backfill that hit the retention cliff answers the same way as a lost
+        // packet while meaning something a retry cannot fix. The record knows
+        // the difference; the outcomes do not.
+        for (node, status) in self.catch_up_status() {
+            match status {
+                ReplicaCatchUp::Following { through } if through >= horizon => {
+                    result.caught_up.push(node);
+                }
+                ReplicaCatchUp::Stranded(_) => result.stranded.push(node),
+                ReplicaCatchUp::Following { .. } | ReplicaCatchUp::Unestablished => {
+                    result.behind.push(node);
+                }
             }
         }
         Ok(result)
@@ -591,6 +894,16 @@ impl<R: Runtime> Wal<R> {
     ///
     /// Returns the durable position afterwards, which is now the committed
     /// prefix.
+    ///
+    /// It cannot strand a replica, which is worth stating because this is the
+    /// one operation in the crate that makes a log shorter. A replica is
+    /// stranded when the entry it needs next is older than
+    /// [`crate::PartitionLog::retained_from`], and cutting a tail can only
+    /// lower that horizon, never raise it — the entries being dropped are the
+    /// newest ones, not the oldest. So a replica judged `Following` before a
+    /// quiesce is still `Following` after it, and a draining owner cannot
+    /// clear the `replicas-recoverable` readiness condition by giving up its
+    /// own tail.
     ///
     /// [ADR 0002]: https://github.com/orbita-rocks/orbita/blob/develop/docs/adr/0002-key-versions-are-partition-lamports.md
     pub async fn quiesce(&self) -> Result<Lamport> {
@@ -923,13 +1236,31 @@ impl<R: Runtime> Wal<R> {
     async fn catch_up(&self, node: NodeId, from: Lamport, request: &AppendRequest) -> Outcome {
         let last = request.last_lamport();
         let entries = match self.log.entries_after(from).await {
-            Ok(Some(entries)) => entries,
-            Ok(None) | Err(_) => {
+            Ok(CatchUp::Entries(entries)) => entries,
+            Ok(CatchUp::BeyondRetention { retained_from }) => {
+                self.record_catch_up(
+                    node,
+                    ReplicaCatchUp::Stranded(BeyondRetention {
+                        node,
+                        replica_durable: from,
+                        retained_from,
+                    }),
+                );
+                return Outcome::Failed;
+            }
+            // The replica reported a gap and this log has nothing above it,
+            // which means the batch this is answering has already been
+            // superseded. Nothing to send and nothing wrong.
+            Ok(CatchUp::UpToDate) => return Outcome::Failed,
+            Err(error) => {
+                // Reading this node's own log failed, which says nothing about
+                // the replica. Kept distinct from the cliff above so that a bad
+                // disk here is not diagnosed as a lost replica there.
                 tracing::warn!(
                     node = node.get(),
                     from = from.get(),
-                    "replica is behind what the log still holds and could not \
-                     rebuild the distance from object storage"
+                    %error,
+                    "reading the log to catch a replica up failed"
                 );
                 return Outcome::Failed;
             }

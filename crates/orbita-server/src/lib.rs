@@ -65,6 +65,16 @@
 //! replica that hydrates on behalf of an owner the manifest outranks refuses
 //! the append rather than acknowledging a write the real owner will truncate.
 //!
+//! Hydration is what turns the retention cliff from a dead end into a slow
+//! path. A replica past the owner's retained log is still named, with where it
+//! stopped and the oldest entry the owner still holds, through
+//! [`Server::replicas_beyond_retention`], and that still drives the
+//! `replicas-recoverable` readiness condition; what changed is that the
+//! condition now clears on its own, because the replica rebuilds from the
+//! bucket and the next append it acknowledges moves it back to following.
+//! `src/retention.rs` runs the whole cliff under the simulator and asserts the
+//! recovery rather than the dead end.
+//!
 //! What remains unavailable is the narrow case where both are exhausted: a
 //! replica beyond the retained log whose partition has never been flushed, or
 //! whose manifest is itself behind the gap. That is reported rather than
@@ -92,6 +102,8 @@ mod placement;
 mod proxy;
 mod readiness;
 mod replication;
+#[cfg(test)]
+mod retention;
 mod runtime;
 mod s3_store;
 mod service;
@@ -101,7 +113,7 @@ mod validate;
 
 pub use config::{
     S3StorageConfig, ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL, DEFAULT_FLUSH_INTERVAL,
-    DEFAULT_KEYSPACE,
+    DEFAULT_KEYSPACE, DEFAULT_WAL_SEGMENT_BYTES,
 };
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
@@ -248,6 +260,7 @@ impl Server {
         let layout = DataLayout {
             store,
             wal_root: "wal".to_string(),
+            wal_segment_bytes: config.wal_segment_bytes,
         };
 
         // A node in a real cluster takes its map from the leader group, and
@@ -576,6 +589,22 @@ impl Server {
         self.node.replica_reads()
     }
 
+    /// Replicas of this node's partitions that have fallen further behind than
+    /// its log still reaches.
+    ///
+    /// Empty is healthy. Anything else names a replica that is out of the read
+    /// set and out of the durability quorum and that will not come back on its
+    /// own: WAL truncation is live and hydration from object storage is not
+    /// (issue #17), so the entries it needs exist only as segments nothing can
+    /// yet turn back into a caught-up replica. This is the answer an operator
+    /// asks for rather than greps for.
+    #[must_use]
+    pub async fn replicas_beyond_retention(
+        &self,
+    ) -> Vec<(orbita_core::PartitionId, orbita_wal::BeyondRetention)> {
+        self.node.replicas_beyond_retention().await
+    }
+
     /// The readiness gate this node reports from.
     ///
     /// Shared rather than snapshotted so a caller can subscribe and await a
@@ -791,11 +820,16 @@ mod leader_readiness_tests {
 
     #[test]
     fn an_accepted_leader_report_does_not_make_a_lagging_voter_ready() {
+        // Everything this function does not touch already holds, so that what
+        // is left unmet is what it decided. Written as "all but one" rather
+        // than a list, because a list goes stale the next time a condition is
+        // added and fails a test about something else.
         let readiness = ReadinessGate::new();
-        readiness.mark(ReadinessCondition::ClusterVersionCompatible);
-        readiness.mark(ReadinessCondition::WalRecovered);
-        readiness.mark(ReadinessCondition::PartitionsCaughtUp);
-        readiness.mark(ReadinessCondition::AcceptingOwnership);
+        for condition in ReadinessCondition::ALL {
+            if condition != ReadinessCondition::ControlPlaneJoined {
+                readiness.mark(condition);
+            }
+        }
 
         update_control_readiness(&readiness, true, Some(false));
 
@@ -807,11 +841,16 @@ mod leader_readiness_tests {
 
     #[test]
     fn a_voter_becomes_ready_after_applying_through_the_leader_authority() {
+        // Everything this function does not touch already holds, so that what
+        // is left unmet is what it decided. Written as "all but one" rather
+        // than a list, because a list goes stale the next time a condition is
+        // added and fails a test about something else.
         let readiness = ReadinessGate::new();
-        readiness.mark(ReadinessCondition::ClusterVersionCompatible);
-        readiness.mark(ReadinessCondition::WalRecovered);
-        readiness.mark(ReadinessCondition::PartitionsCaughtUp);
-        readiness.mark(ReadinessCondition::AcceptingOwnership);
+        for condition in ReadinessCondition::ALL {
+            if condition != ReadinessCondition::ControlPlaneJoined {
+                readiness.mark(condition);
+            }
+        }
 
         update_control_readiness(&readiness, true, Some(true));
 

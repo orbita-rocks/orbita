@@ -94,12 +94,29 @@ fn map_with(
 }
 
 fn start_node(sim: &Simulation, node: NodeId, source: &StaticMapSource) -> Arc<Node<SimRuntime>> {
+    start_node_reporting(sim, node, source, &Arc::new(crate::ReadinessGate::new()))
+}
+
+/// The same, with the readiness gate the node reports through handed in, so a
+/// scenario can check the operator-facing answer rather than only the
+/// in-process one.
+fn start_node_reporting(
+    sim: &Simulation,
+    node: NodeId,
+    source: &StaticMapSource,
+    gate: &Arc<crate::ReadinessGate>,
+) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
+        // The default, so nothing here rolls a segment: these scenarios are
+        // about what a catch-up may carry, and the retention cliff is
+        // `retention.rs`'s subject.
+        wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
     };
     let source = BoxedMapSource::new(source.clone());
+    let gate = Arc::clone(gate);
     sim.block_on(async move {
         Node::start(
             runtime,
@@ -107,7 +124,7 @@ fn start_node(sim: &Simulation, node: NodeId, source: &StaticMapSource) -> Arc<N
             layout,
             source,
             Duration::from_millis(150),
-            Arc::new(crate::ReadinessGate::new()),
+            gate,
         )
         .await
         .expect("the node starts")
@@ -657,6 +674,86 @@ fn a_quiesced_owner_advertises_only_what_a_replica_can_be_carried_to() {
                      {first_at:?} and {second_at:?}, so the control plane can never find a \
                      caught-up handoff target",
                 )));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_drain_does_not_report_a_durability_problem_it_created_itself() {
+    harness::check_seeds(
+        "placement::a_drain_does_not_report_a_durability_problem_it_created_itself",
+        20,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let source = StaticMapSource::new(placed_on_both());
+            let gate = Arc::new(crate::ReadinessGate::new());
+            let owner = start_node_reporting(&sim, OWNER, &source, &gate);
+            let first = start_node(&sim, FIRST, &source);
+            let second = start_node(&sim, SECOND, &source);
+            poll_maps(&sim, &[&owner, &first, &second], 1);
+
+            let wrote = write_keys(&sim, &owner, "kept", WRITES);
+            sim.run_until_idle();
+            if wrote.iter().any(|applied| !applied) {
+                return Err(sim.failure("a healthy three-copy partition refused a write"));
+            }
+
+            // A tail that reached this disk and nowhere else. Giving it up is
+            // what a drain does, and it is the only thing in the system that
+            // makes an owner's log shorter.
+            sim.partition(OWNER, FIRST);
+            sim.partition(OWNER, SECOND);
+            let ghosts = write_keys(&sim, &owner, "ghost", 2);
+            sim.run_until_idle();
+            if ghosts.iter().any(|applied| *applied) {
+                return Err(sim.failure(
+                    "a write with no second copy was acknowledged, so this proves nothing",
+                ));
+            }
+            sim.heal_all();
+
+            let healthy_before = gate
+                .state()
+                .is_met(crate::readiness::ReadinessCondition::ReplicasRecoverable);
+            if !healthy_before {
+                return Err(sim.failure(
+                    "the owner reported a durability problem before draining, so this seed \
+                     cannot tell the drain's effect apart from the starting state",
+                ));
+            }
+
+            let draining = Arc::clone(&owner);
+            sim.block_on(async move { draining.prepare_handoff().await });
+            sim.run_until_idle();
+            // The heartbeat is what publishes the verdict, and a real drain has
+            // already stopped it. Driving it anyway is the stronger check: even
+            // if it did run, the answer has to be that nothing is stranded.
+            let reporting = Arc::clone(&owner);
+            sim.block_on(async move { reporting.renew_leases().await });
+            sim.run_until_idle();
+
+            let healthy_after = gate
+                .state()
+                .is_met(crate::readiness::ReadinessCondition::ReplicasRecoverable);
+            let reporting = Arc::clone(&owner);
+            let stranded = sim.block_on(async move { reporting.replicas_beyond_retention().await });
+            drop(owner);
+            drop(first);
+            drop(second);
+
+            if !stranded.is_empty() {
+                return Err(sim.failure(format!(
+                    "giving up the uncommitted tail stranded a replica that was following: \
+                     {stranded:?}",
+                )));
+            }
+            if !healthy_after {
+                return Err(sim.failure(
+                    "a drain cleared the replicas-recoverable condition, so a planned shutdown \
+                     raises a durability alarm about a replica it did not harm",
+                ));
             }
             Ok(())
         },

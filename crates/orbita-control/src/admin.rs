@@ -10,7 +10,6 @@ use crate::controller::Controller;
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Keyspace, KeyspaceConfig, Permission};
 
-use bytes::Bytes;
 use orbita_core::{Error, NodeId, PartitionId, PartitionInfo};
 use orbita_proto::v1 as pb;
 use orbita_runtime::Runtime;
@@ -263,26 +262,12 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn split_partition(
         &self,
-        request: Request<pb::SplitPartitionRequest>,
+        _request: Request<pb::SplitPartitionRequest>,
     ) -> Result<Response<pb::SplitPartitionResponse>, Status> {
         self.ready().await?;
-        let request = request.into_inner();
-        let at = if request.split_key.is_empty() {
-            None
-        } else {
-            Some(Bytes::from(request.split_key))
-        };
-        let (lower, upper) = self
-            .controller
-            .split_partition(PartitionId(request.partition_id), at)
-            .await
-            .map_err(status)?;
-
-        let map = self.controller.partition_map().await;
-        Ok(Response::new(pb::SplitPartitionResponse {
-            lower: map.partition(lower).map(partition_message),
-            upper: map.partition(upper).map(partition_message),
-        }))
+        Err(Status::unimplemented(
+            "partition split is disabled until child storage preparation is implemented",
+        ))
     }
 
     async fn merge_partitions(

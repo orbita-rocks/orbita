@@ -89,6 +89,15 @@
 //! owner, which gives that tail up entirely rather than advertise a position
 //! no replica may be carried to.
 //!
+//! The committed prefix is the ceiling; retention is the floor. A replica
+//! below the oldest entry the log still holds cannot be carried at all, and
+//! the two limits meet in one per-replica record, [`ReplicaCatchUp`]. Reading
+//! that record two ways is what keeps the owner's answers consistent:
+//! `Wal::replicas_behind` is the work a catch-up can still do and something
+//! retries it, `Wal::beyond_retention` is the work it cannot and something
+//! reports it. A replica belongs to exactly one of them, so an owner can never
+//! be simultaneously retrying a node and declaring it unreachable.
+//!
 //! # Failure stance
 //!
 //! An owner that is fenced, or whose own disk fails a write or an fsync, stops
@@ -121,8 +130,9 @@ mod tests;
 
 pub use format::{WalEntry, WalOp};
 pub use log::{
-    PartitionLog, RecoveryState, Truncation, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES,
+    CatchUp, PartitionLog, RecoveryState, Truncation, TruncationReason,
+    DEFAULT_SEGMENT_TARGET_BYTES,
 };
-pub use owner::{CatchUp, Wal, WalConfig};
+pub use owner::{BeyondRetention, CatchUpPass, ReplicaCatchUp, Wal, WalConfig};
 pub use replica::{Hydration, PartitionHydrator, ReplicaObserver, WalService};
 pub use wire::{METHOD_APPEND, METHOD_FENCE, METHOD_STATUS};

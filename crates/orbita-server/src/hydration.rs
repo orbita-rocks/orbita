@@ -105,6 +105,7 @@ fn start_replica(
         store,
         path: path(),
         wal_dir: "wal/replica".to_string(),
+        wal_segment_bytes: orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES,
     };
     sim.block_on(async move {
         let (bridge, applies) = ReplicaBridge::start(&runtime);
@@ -415,6 +416,7 @@ fn a_hydrated_node_leaves_a_log_the_previous_binary_still_recovers() {
                 store: Arc::clone(&store) as Arc<dyn orbita_objectstore::ObjectStore>,
                 path: path(),
                 wal_dir: "wal/worker".to_string(),
+                wal_segment_bytes: orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES,
             };
             let host = sim.block_on({
                 let runtime = runtime.clone();

@@ -93,22 +93,53 @@ impl LeaseGrant {
     }
 }
 
-/// Encodes whether the replica took the lease, in the same envelope as every
-/// other reply so that a refusal and a failure stay distinguishable.
-pub(crate) fn encode_lease_reply(accepted: bool) -> Bytes {
-    let mut out = BytesMut::with_capacity(2);
+/// What a replica said when its owner offered it a lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeaseReply {
+    pub accepted: bool,
+    /// How far the replica's own log reaches, when it said.
+    ///
+    /// This rides on the heartbeat rather than earning a call of its own
+    /// because the owner needs it on exactly the cadence the heartbeat already
+    /// runs at, and for exactly the nodes it already reaches. It is what lets
+    /// an owner that has just opened its log work out which replicas it can
+    /// still catch up without replicating anything first. `None` from a peer
+    /// too old to send it, which the owner treats as not knowing rather than
+    /// as good news.
+    pub durable: Option<Lamport>,
+}
+
+/// Encodes what the replica said, in the same envelope as every other reply so
+/// that a refusal and a failure stay distinguishable.
+///
+/// The Lamport is appended after the acceptance bit, so a peer that stops
+/// reading where the old reply ended is unaffected and a peer that never sends
+/// it is read as having said nothing. See [`decode_lease_reply`].
+pub(crate) fn encode_lease_reply(reply: LeaseReply) -> Bytes {
+    let mut out = BytesMut::with_capacity(10);
     out.put_u8(TAG_OK);
-    out.put_u8(u8::from(accepted));
+    out.put_u8(u8::from(reply.accepted));
+    if let Some(durable) = reply.durable {
+        out.put_u64(durable.get());
+    }
     out.freeze()
 }
 
-pub(crate) fn decode_lease_reply(raw: &[u8]) -> Result<bool> {
+pub(crate) fn decode_lease_reply(raw: &[u8]) -> Result<LeaseReply> {
     let mut buf = raw;
     if buf.remaining() < 1 {
         return Err(Error::Internal("empty lease reply".to_string()));
     }
     match buf.get_u8() {
-        TAG_OK if buf.remaining() >= 1 => Ok(buf.get_u8() != 0),
+        TAG_OK if buf.remaining() >= 1 => {
+            let accepted = buf.get_u8() != 0;
+            // Absent from a peer running the release before this field
+            // existed. Tolerated here rather than versioned because the two
+            // shapes cannot be confused: one ends, the other carries eight
+            // more bytes.
+            let durable = (buf.remaining() >= 8).then(|| Lamport(buf.get_u64()));
+            Ok(LeaseReply { accepted, durable })
+        }
         TAG_OK => Err(Error::Internal("truncated lease reply".to_string())),
         TAG_ERROR => Err(decode_error(buf)?),
         other => Err(Error::Internal(format!("unknown proxy tag {other}"))),
@@ -338,9 +369,45 @@ mod tests {
     fn a_refused_lease_is_distinguishable_from_a_failed_one() {
         // The owner acts on the difference: a refusal means nothing there can
         // serve a stale read, and a failure means it has to assume otherwise.
-        assert!(!decode_lease_reply(&encode_lease_reply(false)).unwrap());
-        assert!(decode_lease_reply(&encode_lease_reply(true)).unwrap());
+        for accepted in [false, true] {
+            let reply = LeaseReply {
+                accepted,
+                durable: Some(Lamport(41)),
+            };
+            assert_eq!(
+                decode_lease_reply(&encode_lease_reply(reply)).unwrap(),
+                reply
+            );
+        }
         assert!(decode_lease_reply(&encode_error(&Error::NotFound)).is_err());
+    }
+
+    #[test]
+    fn a_lease_reply_without_a_log_position_is_read_as_saying_nothing_about_one() {
+        // What a peer running the release before the position existed sends.
+        // Reading its silence as a position would have the owner conclude
+        // something about a replica that told it nothing.
+        let older = encode_lease_reply(LeaseReply {
+            accepted: true,
+            durable: None,
+        });
+        assert_eq!(
+            decode_lease_reply(&older).unwrap(),
+            LeaseReply {
+                accepted: true,
+                durable: None
+            }
+        );
+        assert_eq!(older.len(), 2, "the older shape is the one that used to go");
+
+        // And the other direction, which is the one a rolling update needs:
+        // a peer running the older release reads the first two bytes and
+        // stops, so the position it does not know about cannot confuse it.
+        let newer = encode_lease_reply(LeaseReply {
+            accepted: true,
+            durable: Some(Lamport(41)),
+        });
+        assert_eq!(newer[..2], older[..], "the reply still starts where it did");
     }
 
     #[test]
