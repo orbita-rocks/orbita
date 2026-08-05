@@ -9,7 +9,7 @@ use orbita_runtime::{Rng, Runtime, ServiceId, Transport};
 use crate::format::{self, LogRecord, WalEntry, WalOp};
 use crate::log::{CatchUp, PartitionLog, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES};
 use crate::owner::{BeyondRetention, ReplicaCatchUp, Wal, WalConfig};
-use crate::replica::WalService;
+use crate::replica::{Hydration, WalService};
 use crate::testkit::{block_on, yield_now, Faults, MemDisk, MemNetwork, TestRuntime};
 use crate::wire::{AppendRequest, WalResponse};
 
@@ -318,6 +318,604 @@ fn a_log_written_by_two_owners_at_once_is_cut_where_the_lamports_go_backwards() 
         log.recovery().truncated.map(|t| t.reason),
         Some(TruncationReason::LamportOutOfOrder)
     );
+}
+
+// -------------------------------------------------------------------------
+// Hydration: a log whose history starts at a manifest horizon.
+// -------------------------------------------------------------------------
+
+#[test]
+fn a_hydrated_log_resumes_at_the_manifest_horizon_rather_than_at_the_start() {
+    // The claim ADR 0006 makes operationally: a node that downloaded the
+    // partition holds every write below the horizon, so its log resumes there
+    // and the next entry follows the horizon rather than the empty file.
+    let base = TestRuntime::solo(40);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        assert_eq!(log.durable_lamport().await, Lamport::ZERO);
+
+        assert!(log.hydrate(Lamport(500)).await);
+        assert_eq!(log.durable_lamport().await, Lamport(500));
+        assert_eq!(log.applied_through().await, Lamport(500));
+        assert_eq!(log.hydrated_through().await, Lamport(500));
+
+        let entry = put(501, 1, "after");
+        log.append_frames(
+            &[format::encode(&LogRecord::Entry(entry.clone()))],
+            entry.lamport,
+        )
+        .await
+        .expect("append");
+        assert_eq!(log.durable_lamport().await, Lamport(501));
+    });
+}
+
+#[test]
+fn a_hydrated_horizon_is_re_derived_at_every_open_rather_than_written_down() {
+    // The rollback promise in `docs/UPGRADES.md` is why this is not a record.
+    // Reopening the log finds a file that knows nothing about the horizon, and
+    // the caller supplies it again from the manifest it has already read. The
+    // tail written above the horizon survives untouched, which is the part a
+    // persisted marker got wrong.
+    let base = TestRuntime::solo(40);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        log.hydrate(Lamport(500)).await;
+        let entry = put(501, 1, "after");
+        log.append_frames(
+            &[format::encode(&LogRecord::Entry(entry.clone()))],
+            entry.lamport,
+        )
+        .await
+        .expect("append");
+
+        let reopened =
+            PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+                .await
+                .expect("reopen");
+        assert_eq!(
+            reopened
+                .recovery()
+                .entries
+                .iter()
+                .map(|e| e.lamport)
+                .collect::<Vec<_>>(),
+            vec![Lamport(501)],
+            "the tail above the horizon is in the file and is recovered from it"
+        );
+
+        assert!(
+            !reopened.hydrate(Lamport(500)).await,
+            "the file already stands above the horizon, so re-supplying it changes nothing"
+        );
+        assert_eq!(reopened.durable_lamport().await, Lamport(501));
+    });
+}
+
+#[test]
+fn a_previous_binary_reads_back_every_log_a_hydrated_node_writes() {
+    // The rollback promise, checked rather than argued about. Before
+    // finalization an operator may roll a worker back to the binary it was
+    // upgraded from, and `docs/UPGRADES.md` says that costs nothing because
+    // nothing has written a new format. This framing has no way to skip a
+    // record it does not know: an older reader stops at the first unknown kind
+    // and truncates everything after it, so a hydration marker at the head of
+    // the log would take the whole tail with it and reopen the node at
+    // position zero while its storage sat at the manifest horizon. It would
+    // then reissue Lamports the segments already hold and have them dropped on
+    // apply, which is an acknowledged write lost during a supported rollback.
+    let base = TestRuntime::solo(91);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        log.hydrate(Lamport(100)).await;
+        log.record_fence(Epoch(2)).await.expect("fence");
+        for i in 101..=103 {
+            let entry = put(i, 2, &format!("key-{i}"));
+            log.append_frames(
+                &[format::encode(&LogRecord::Entry(entry.clone()))],
+                entry.lamport,
+            )
+            .await
+            .unwrap();
+        }
+        log.checkpoint(Lamport(102)).await.expect("checkpoint");
+
+        let bytes = base.mem_disk().contents(&segment(1)).expect("segment");
+        let read = previous_binary_scan(&bytes);
+        assert!(
+            read.whole_file,
+            "a previous binary must reach the end of every log this one writes"
+        );
+        assert_eq!(
+            read.durable,
+            Lamport(103),
+            "and must recover the tail written above the horizon"
+        );
+    });
+}
+
+/// What the format-version-1 reader does with a segment: parse the header,
+/// decode frames, and stop dead at the first record kind it does not know.
+///
+/// This is the previous binary's recovery, reduced to the part that matters
+/// for a rollback. It is written out by hand rather than reusing `scan_segment`
+/// so that adding a record kind cannot quietly teach it to accept one.
+struct PreviousBinary {
+    durable: Lamport,
+    whole_file: bool,
+}
+
+fn previous_binary_scan(bytes: &[u8]) -> PreviousBinary {
+    const KINDS_IT_KNOWS: u8 = 3;
+    let mut read = PreviousBinary {
+        durable: Lamport::ZERO,
+        whole_file: false,
+    };
+    if format::parse_segment_header(bytes).is_err() {
+        return read;
+    }
+    let mut pos = format::SEGMENT_HEADER_BYTES;
+    while pos < bytes.len() {
+        // Length and checksum first, then the body, whose first byte names the
+        // record kind.
+        if bytes[pos + format::FRAME_HEADER_BYTES] > KINDS_IT_KNOWS {
+            return read;
+        }
+        match format::decode(&bytes[pos..]) {
+            Ok((record, used)) => {
+                if let Some(lamport) = record.lamport() {
+                    read.durable = lamport;
+                }
+                pos += used;
+            }
+            Err(_) => return read,
+        }
+    }
+    read.whole_file = true;
+    read
+}
+
+#[test]
+fn hydrating_below_where_the_log_already_stands_is_a_no_op() {
+    let base = TestRuntime::solo(41);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        for i in 1..=4 {
+            let entry = put(i, 1, &format!("key-{i}"));
+            log.append_frames(
+                &[format::encode(&LogRecord::Entry(entry.clone()))],
+                entry.lamport,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(!log.hydrate(Lamport(2)).await);
+        assert_eq!(log.durable_lamport().await, Lamport(4));
+        assert_eq!(
+            log.applied_through().await,
+            Lamport::ZERO,
+            "a stale horizon must not mark unapplied entries applied"
+        );
+    });
+}
+
+#[test]
+fn a_cut_below_the_hydrated_horizon_cannot_disown_the_downloaded_partition() {
+    // A fence names where the log's history ends. It cannot name where the
+    // partition's data ends, because the segments below the horizon were
+    // published by a fenced owner for writes that were already acknowledged.
+    let base = TestRuntime::solo(43);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        log.hydrate(Lamport(100)).await;
+        let entry = put(101, 1, "tail");
+        log.append_frames(
+            &[format::encode(&LogRecord::Entry(entry.clone()))],
+            entry.lamport,
+        )
+        .await
+        .unwrap();
+
+        log.truncate_above(Lamport(50)).await.expect("truncate");
+        assert_eq!(
+            log.durable_lamport().await,
+            Lamport(100),
+            "the log gives up its tail, never the horizon its data was built from"
+        );
+    });
+}
+
+/// A hydrator standing in for a partition whose manifest the bucket holds.
+struct PublishedManifest {
+    found: Hydration,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl PublishedManifest {
+    fn at(epoch: u64, through: u64) -> Self {
+        Self {
+            found: Hydration {
+                epoch: Epoch(epoch),
+                through: Lamport(through),
+            },
+            calls: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::replica::PartitionHydrator for PublishedManifest {
+    async fn hydrate(&self, _partition: PartitionId) -> Hydration {
+        *self.calls.lock().expect("call count poisoned") += 1;
+        self.found
+    }
+}
+
+/// An append that would leave a hole, from a replica's point of view.
+fn append_from(prev: Lamport, lamport: u64) -> AppendRequest {
+    append_at(Epoch(1), prev, lamport)
+}
+
+fn append_at(epoch: Epoch, prev: Lamport, lamport: u64) -> AppendRequest {
+    let entry = WalEntry {
+        epoch,
+        ..put(lamport, 1, "beyond")
+    };
+    let frame = format::encode(&LogRecord::Entry(entry.clone()));
+    AppendRequest {
+        partition: PARTITION,
+        epoch,
+        prev_lamport: prev,
+        committed: prev,
+        entries: vec![(entry, frame)],
+    }
+}
+
+#[test]
+fn a_replica_beyond_the_retained_log_reports_a_gap_when_it_cannot_hydrate() {
+    // The behaviour before this change, kept as the contrast: with nothing in
+    // the bucket to build from, the honest answer is still "I have a hole".
+    let base = TestRuntime::solo(44);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        let response = block_on_append(&peer, append_from(Lamport(10), 11)).await;
+        assert_eq!(
+            response,
+            WalResponse::Gap {
+                durable_lamport: Lamport::ZERO,
+                epoch: Epoch(1),
+            }
+        );
+    });
+}
+
+#[test]
+fn a_replica_beyond_the_retained_log_hydrates_instead_of_reporting_a_gap() {
+    // The payoff: the writes under the hole are in the bucket, so the replica
+    // downloads them and takes the batch, instead of asking the owner for a
+    // retransmission the owner may have checkpointed away.
+    let base = TestRuntime::solo(45);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        let manifest = Arc::new(PublishedManifest::at(1, 10));
+        let calls = Arc::clone(&manifest.calls);
+        peer.service.hydrate_with(manifest);
+
+        let response = block_on_append(&peer, append_from(Lamport(10), 11)).await;
+        assert_eq!(
+            response,
+            WalResponse::Ok {
+                durable_lamport: Lamport(11),
+                epoch: Epoch(1),
+            },
+            "the gap closed from object storage and the batch was accepted"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(peer.durable().await, Lamport(11));
+
+        // A batch that follows contiguously does not ask again, because the
+        // download only happens when the log cannot take the entries as they
+        // are.
+        let next = block_on_append(&peer, append_from(Lamport(11), 12)).await;
+        assert!(matches!(next, WalResponse::Ok { .. }));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    });
+}
+
+#[test]
+fn a_hydration_that_does_not_reach_the_batch_still_reports_the_gap_it_closed() {
+    // Honesty under a partial answer: the bucket was behind the batch, so the
+    // owner is told where this replica now stands rather than being left to
+    // assume the append landed.
+    let base = TestRuntime::solo(46);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        peer.service
+            .hydrate_with(Arc::new(PublishedManifest::at(1, 5)));
+
+        let response = block_on_append(&peer, append_from(Lamport(10), 11)).await;
+        assert_eq!(
+            response,
+            WalResponse::Gap {
+                durable_lamport: Lamport(5),
+                epoch: Epoch(1),
+            }
+        );
+    });
+}
+
+#[test]
+fn an_owner_the_manifest_proves_is_deposed_gets_no_acknowledgement() {
+    // The replica never saw the epoch-2 fence, so its own log cannot refuse
+    // this batch. Hydration reads a manifest only an epoch-2 owner could have
+    // published, and that is proof enough: acknowledging here would let a
+    // deposed owner reach quorum for a write the real owner later truncates,
+    // which loses an acknowledged write.
+    let base = TestRuntime::solo(90);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        peer.service
+            .hydrate_with(Arc::new(PublishedManifest::at(2, 10)));
+
+        let response = block_on_append(&peer, append_at(Epoch(1), Lamport(10), 11)).await;
+        assert_eq!(
+            response,
+            WalResponse::StaleEpoch { current: Epoch(2) },
+            "the manifest's epoch is what answers, because the log has no fence to answer with"
+        );
+        assert_eq!(
+            peer.durable().await,
+            Lamport(10),
+            "the rebuild is kept; only the acknowledgement is refused"
+        );
+        assert_eq!(
+            peer.epoch().await,
+            Epoch(2),
+            "the refusal is written down, or it would hold for exactly one batch: the rebuild \
+             closes the gap that sent this node to the bucket, so the next attempt would find a \
+             contiguous log and never look again"
+        );
+    });
+}
+
+#[test]
+fn a_deposed_owner_refused_once_stays_refused_on_every_retry() {
+    // The failure the first version of this fix had, and the reason the fence
+    // is recorded rather than merely acted on. Hydration removes the gap, so a
+    // refusal that lived only in the call that read the manifest would let the
+    // deposed owner's very next batch through.
+    let base = TestRuntime::solo(90);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        peer.service
+            .hydrate_with(Arc::new(PublishedManifest::at(2, 10)));
+
+        for attempt in 0..3 {
+            assert_eq!(
+                block_on_append(&peer, append_at(Epoch(1), Lamport(10), 11)).await,
+                WalResponse::StaleEpoch { current: Epoch(2) },
+                "attempt {attempt} was answered as if the sender were still the owner"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_hydration_that_moves_nothing_does_not_adopt_a_fence_out_of_band() {
+    // The fence is only sound where it is recorded: the horizon was above
+    // everything this log held, so there was no tail for a newer owner to cut
+    // away. Where the horizon does not move, that guarantee is gone, and the
+    // refusal has to stand on its own rather than take the epoch with it. The
+    // gap is still there in that case, so the next attempt reads the manifest
+    // again and is refused again.
+    let base = TestRuntime::solo(94);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        peer.service
+            .hydrate_with(Arc::new(PublishedManifest::at(2, 0)));
+
+        assert_eq!(
+            block_on_append(&peer, append_at(Epoch(1), Lamport(10), 11)).await,
+            WalResponse::StaleEpoch { current: Epoch(2) },
+        );
+        assert_eq!(
+            peer.epoch().await,
+            Epoch(1),
+            "no rebuild happened, so nothing here proves this log has no divergent tail"
+        );
+        assert_eq!(
+            block_on_append(&peer, append_at(Epoch(1), Lamport(10), 11)).await,
+            WalResponse::StaleEpoch { current: Epoch(2) },
+            "and the gap is still there, so the manifest is consulted again"
+        );
+    });
+}
+
+#[test]
+fn the_owner_the_manifest_names_is_served_after_the_deposed_one_is_refused() {
+    // The other half of the same rule. A manifest at epoch 2 refuses epoch 1
+    // and says nothing against epoch 2, so the real owner closes the same gap
+    // and is acknowledged.
+    let base = TestRuntime::solo(90);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        peer.service
+            .hydrate_with(Arc::new(PublishedManifest::at(2, 10)));
+
+        assert!(matches!(
+            block_on_append(&peer, append_at(Epoch(1), Lamport(10), 11)).await,
+            WalResponse::StaleEpoch { .. }
+        ));
+        assert_eq!(
+            block_on_append(&peer, append_at(Epoch(2), Lamport(10), 11)).await,
+            WalResponse::Ok {
+                durable_lamport: Lamport(11),
+                epoch: Epoch(2),
+            }
+        );
+    });
+}
+
+#[test]
+fn a_manifest_behind_the_sender_does_not_fence_the_sender() {
+    // An owner at epoch 3 whose predecessor published the last manifest is the
+    // ordinary case, and reading that manifest must not turn a live owner into
+    // a deposed one.
+    let base = TestRuntime::solo(90);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        peer.service
+            .hydrate_with(Arc::new(PublishedManifest::at(2, 10)));
+
+        assert_eq!(
+            block_on_append(&peer, append_at(Epoch(3), Lamport(10), 11)).await,
+            WalResponse::Ok {
+                durable_lamport: Lamport(11),
+                epoch: Epoch(3),
+            }
+        );
+    });
+}
+
+#[test]
+fn quiescing_a_hydrated_owner_gives_up_its_tail_without_giving_up_its_horizon() {
+    // Where hydration meets the drain path. Quiescing drops the writes that
+    // reached this node's disk alone, and it does that by cutting the log,
+    // which is the one operation that lowers a durable position. Hydration
+    // puts a floor under that cut at the manifest horizon.
+    //
+    // The two cannot disagree, and the reason is worth stating rather than
+    // trusting: a manifest only ever covers writes that were applied, an apply
+    // only ever happens after the acknowledgement, so the horizon is at or
+    // below the committed prefix by construction. The floor is therefore never
+    // the thing that stops a quiesce, and the tail above the prefix still
+    // goes.
+    let base = TestRuntime::solo(95);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        // A replica that is registered but never reachable, so every write
+        // this owner takes reaches its own disk and no second copy.
+        let wal = Wal::open(
+            runtime,
+            WalConfig::new(PARTITION, DIR, Epoch(2))
+                .with_replicas(vec![PEER_A])
+                .with_hydration(Hydration {
+                    epoch: Epoch(2),
+                    through: Lamport(10),
+                }),
+        )
+        .await
+        .expect("open");
+        assert_eq!(wal.durable_lamport(), Lamport(10));
+        assert_eq!(wal.committed_lamport(), Lamport(10));
+
+        for i in 0..3 {
+            let _unavailable = wal.commit(op(&format!("one copy {i}"))).await;
+        }
+        assert!(
+            wal.durable_lamport() > Lamport(10),
+            "the writes reached this node's own log"
+        );
+
+        let after = wal.quiesce().await.expect("quiesce");
+        assert_eq!(
+            after,
+            Lamport(10),
+            "the tail no client was told about goes, down to the committed prefix, which \
+             here is exactly the horizon this owner was built to"
+        );
+        assert_eq!(wal.log().hydrated_through().await, Lamport(10));
+    });
+}
+
+#[test]
+fn a_worker_granted_a_superseded_epoch_refuses_to_open_as_owner() {
+    // The same evidence at the other end of its life. A replacement worker has
+    // no fence record of its own, so without the manifest a stale grant would
+    // be indistinguishable from a fresh one and this node would start writing
+    // under a dead epoch.
+    let base = TestRuntime::solo(92);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let opened = Wal::open(
+            runtime,
+            WalConfig::new(PARTITION, DIR, Epoch(1)).with_hydration(Hydration {
+                epoch: Epoch(2),
+                through: Lamport(10),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                opened.err(),
+                Some(Error::StaleEpoch {
+                    got: Epoch(1),
+                    current: Epoch(2),
+                    ..
+                })
+            ),
+            "a grant the bucket disproves is refused rather than taken"
+        );
+    });
+}
+
+#[test]
+fn an_owner_at_the_epoch_that_published_the_manifest_opens_above_its_horizon() {
+    let base = TestRuntime::solo(93);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let wal = Wal::open(
+            runtime,
+            WalConfig::new(PARTITION, DIR, Epoch(2)).with_hydration(Hydration {
+                epoch: Epoch(2),
+                through: Lamport(10),
+            }),
+        )
+        .await
+        .expect("the grant matches the manifest");
+        assert_eq!(
+            wal.durable_lamport(),
+            Lamport(10),
+            "the sequence resumes above the versions the segments already hold"
+        );
+    });
+}
+
+async fn block_on_append(peer: &Peer, request: AppendRequest) -> WalResponse {
+    let bytes = orbita_runtime::PeerHandler::handle(
+        &peer.service,
+        OWNER,
+        orbita_runtime::PeerCall {
+            service: ServiceId::Wal,
+            method: crate::wire::METHOD_APPEND,
+            payload: request.encode(),
+        },
+    )
+    .await
+    .expect("the service always answers");
+    WalResponse::decode(&bytes).expect("decodable")
 }
 
 // -------------------------------------------------------------------------
@@ -944,6 +1542,68 @@ fn a_stranded_replica_is_reported_rather_than_retried_forever() {
             owner.beyond_retention().first().map(|one| one.node),
             Some(PEER_B),
             "the fault has to leave through the retention report"
+        );
+    });
+}
+
+#[test]
+fn a_stranded_replica_that_hydrates_clears_itself_by_taking_the_next_batch() {
+    // Hydration is the thing that turns `Stranded` back into `Following`, and
+    // it does so through the record that already exists rather than through a
+    // second one. Nothing on the hydration path touches `catch_up`, `acked` or
+    // `replicas_behind`: the replica rebuilds from the bucket, the next batch
+    // stops leaving a hole, and the acknowledgement it sends is what moves it.
+    //
+    // That is worth pinning here rather than only end to end, because the
+    // failure it guards against is silent. A hydration path that kept its own
+    // notion of who is caught up would contradict this one, and the owner would
+    // report a replica unrecoverable through `replicas-recoverable` while the
+    // replica was serving reads.
+    let base = TestRuntime::solo(23);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let owner_runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let mut config =
+            WalConfig::new(PARTITION, DIR, Epoch(1)).with_replicas(vec![PEER_A, PEER_B]);
+        config.segment_target_bytes = 256;
+        let owner = Wal::open(owner_runtime, config).await.expect("open owner");
+        let peers = [
+            peer(&base, &net, PEER_A).await,
+            peer(&base, &net, PEER_B).await,
+        ];
+
+        net.isolate(PEER_B);
+        for i in 1..=12 {
+            owner.commit(op(&format!("k{i}"))).await.unwrap();
+        }
+        owner.checkpoint(Lamport(12)).await.expect("checkpoint");
+        net.heal(PEER_B);
+
+        // The cliff, reached first and with no hydrator wired, or the rest of
+        // this proves nothing about coming back from it.
+        let pass = owner.catch_up_replicas().await.unwrap();
+        assert_eq!(pass.stranded, vec![PEER_B]);
+        assert_eq!(
+            owner.beyond_retention().first().map(|one| one.node),
+            Some(PEER_B)
+        );
+
+        // The bucket has what the log gave up. This is what the replica's
+        // storage engine finds when the next batch turns out to leave a hole.
+        peers[1]
+            .service
+            .hydrate_with(Arc::new(PublishedManifest::at(1, 12)));
+
+        owner.commit(op("k13")).await.expect("the next write");
+
+        assert_eq!(peers[1].durable().await, Lamport(13));
+        assert!(
+            owner.beyond_retention().is_empty(),
+            "the owner has nothing left to report, so `replicas-recoverable` clears on its own"
+        );
+        assert!(
+            owner.replicas_behind().is_empty(),
+            "and it is not outstanding work either: the replica confirmed the prefix itself"
         );
     });
 }

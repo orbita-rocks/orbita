@@ -134,5 +134,5 @@ pub use log::{
     DEFAULT_SEGMENT_TARGET_BYTES,
 };
 pub use owner::{BeyondRetention, CatchUpPass, ReplicaCatchUp, Wal, WalConfig};
-pub use replica::{ReplicaObserver, WalService};
+pub use replica::{Hydration, PartitionHydrator, ReplicaObserver, WalService};
 pub use wire::{METHOD_APPEND, METHOD_FENCE, METHOD_STATUS};

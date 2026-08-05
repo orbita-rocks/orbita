@@ -12,6 +12,7 @@ use orbita_runtime::{PeerCall, Runtime, ServiceId, Transport};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
 use crate::log::{CatchUp, PartitionLog, RecoveryState, DEFAULT_SEGMENT_TARGET_BYTES};
+use crate::replica::Hydration;
 use crate::wire::{
     AppendRequest, FenceRequest, StatusRequest, WalResponse, METHOD_APPEND, METHOD_FENCE,
     METHOD_STATUS,
@@ -30,6 +31,17 @@ pub struct WalConfig {
     /// The peers holding the other two copies. This node is the third.
     pub replicas: Vec<NodeId>,
     pub segment_target_bytes: u64,
+    /// What the manifest this node's storage was built from says, if there was
+    /// one.
+    ///
+    /// It travels in the config rather than being applied by the caller
+    /// afterwards because the owner reads its log position exactly once, at
+    /// open, to decide where to start assigning Lamports. A hydration applied
+    /// after that would be invisible to this owner and it would hand out
+    /// versions the segments already contain. The epoch comes with it because
+    /// a manifest published above the epoch this node was granted means the
+    /// grant is stale and this node must not open as owner at all.
+    pub hydrated: Hydration,
 }
 
 impl WalConfig {
@@ -41,12 +53,22 @@ impl WalConfig {
             epoch,
             replicas: Vec::new(),
             segment_target_bytes: DEFAULT_SEGMENT_TARGET_BYTES,
+            hydrated: Hydration::default(),
         }
     }
 
     #[must_use]
     pub fn with_replicas(mut self, replicas: Vec<NodeId>) -> Self {
         self.replicas = replicas;
+        self
+    }
+
+    /// Declares what the manifest the storage engine was built from says, so
+    /// this owner starts its sequence above the writes the bucket already
+    /// holds and refuses to open under a grant that manifest disproves.
+    #[must_use]
+    pub fn with_hydration(mut self, hydrated: Hydration) -> Self {
+        self.hydrated = hydrated;
         self
     }
 }
@@ -284,7 +306,13 @@ impl<R: Runtime> Wal<R> {
         )
         .await?;
 
-        let seen = log.epoch().await;
+        // The log's own fence and the published manifest are two independent
+        // records of who the cluster last agreed owns this partition, and a
+        // grant below either of them is stale. The manifest matters most
+        // exactly when the log cannot help: a replacement worker has no fence
+        // record at all, so without this it would take a superseded grant and
+        // start writing under a dead epoch.
+        let seen = log.epoch().await.max(config.hydrated.epoch);
         if config.epoch < seen {
             return Err(Error::StaleEpoch {
                 partition: config.partition,
@@ -293,6 +321,9 @@ impl<R: Runtime> Wal<R> {
             });
         }
         log.record_fence(config.epoch).await?;
+        // Before the position is read, not after: everything below depends on
+        // `durable` being where this node's history actually starts.
+        log.hydrate(config.hydrated.through).await;
         let durable = log.durable_lamport().await;
         let catch_up = config
             .replicas
@@ -1199,9 +1230,9 @@ impl<R: Runtime> Wal<R> {
     /// Resends everything a lagging replica is missing, from this node's own
     /// log.
     ///
-    /// One attempt only. A replica that is still behind after this is behind
-    /// by more than the log holds and needs a snapshot, which is the storage
-    /// crate's job, not this one's.
+    /// One attempt only. A replica that is still behind after this is behind by
+    /// more than the log holds, and could not close the distance from object
+    /// storage either, so there is nothing this node can send it.
     async fn catch_up(&self, node: NodeId, from: Lamport, request: &AppendRequest) -> Outcome {
         let last = request.last_lamport();
         let entries = match self.log.entries_after(from).await {
