@@ -1,11 +1,9 @@
 name: CI
 
 on:
-  # develop is the integration branch and the default, so it is what the README
-  # badge reports. main is here because releases come off it, and a release
-  # branch with no CI history is the wrong thing to cut from.
-  push:
-    branches: [develop, main]
+  # Pull requests are the merge gate. Repeating the same checks after merge
+  # spent another runner for no new evidence; the nightly below still checks
+  # the exact tip of develop, and a release calls this workflow again itself.
   pull_request:
   schedule:
     # Nightly, for the long simulation batch.
@@ -21,6 +19,13 @@ on:
         type: boolean
         required: false
         default: false
+
+# A newer commit makes an in-flight pull request run obsolete. Release calls
+# are never cancelled here: a tag is immutable, and abandoning one half way
+# through its gate would leave the release workflow with no useful result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -69,6 +74,68 @@ jobs:
       # Scoped to the Rust crates, because the end-to-end suite also has a
       # `test` task and it belongs to the job below.
       - run: moon run :fmt :lint :test --query "language=rust"
+
+      # The live object store tests, which prove that a deposed writer holding
+      # a stale ETag loses the manifest swap to the writer that replaced it.
+      # That is the fencing mechanism the live write path now depends on, and
+      # it is not provable against a mock: the failure it guards against is a
+      # real server taking `If-None-Match: *` and ignoring it.
+      #
+      # These ride in this job rather than getting their own. They need a
+      # compiled orbita-objectstore, and clippy above has already built its
+      # test targets into the same target directory, so here the marginal cost
+      # is an image pull and about a second of tests. A separate job would pay
+      # for a checkout, a toolchain, and a cold compile to run two tests. They
+      # are also last on purpose: a job that fails clippy never pulls MinIO.
+      #
+      # `docker run` rather than a `services:` block because the minio image
+      # takes `server /data` as its command, and service containers have no way
+      # to supply one.
+      #
+      # The digest is RELEASE.2025-09-07T16-13-09Z. Two things fix it there.
+      # The floor is conditional PUT, which MinIO shipped in early 2025;
+      # against a 2023 server these tests fail on the assertion rather than on
+      # a 501, because that server answers 200 and silently drops the header,
+      # which is precisely the clobber this suite exists to catch. The ceiling
+      # is that MinIO stopped publishing community images after this release,
+      # so this is the newest there is. Do not swap it for a moving tag: a
+      # floating MinIO that regresses conditional PUT would turn the durability
+      # keystone green while breaking it.
+      - name: Start MinIO
+        run: |
+          docker run -d --name orbita-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=orbita-ci \
+            -e MINIO_ROOT_PASSWORD=orbita-ci-secret \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+
+      # `mc` ships inside that image, so readiness and bucket creation need no
+      # second thing to pin. The tests assume the bucket already exists, the
+      # same assumption they make of a production deployment.
+      - name: Create the test bucket
+        run: |
+          docker exec orbita-minio mc ready local
+          docker exec orbita-minio mc alias set ci http://127.0.0.1:9000 orbita-ci orbita-ci-secret
+          docker exec orbita-minio mc mb ci/orbita-ci
+
+      # No `if:` guarding this step, and no `continue-on-error`. A durability
+      # test that skips itself is worse than no test, because the green check
+      # still reads as coverage. If MinIO is missing the tests panic on the
+      # unset endpoint; if it is too old they fail an assertion; and the task
+      # itself refuses to pass when the suite turns out to contain no tests.
+      - name: Live conditional-write tests against MinIO
+        env:
+          ORBITA_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          ORBITA_S3_TEST_BUCKET: orbita-ci
+          ORBITA_S3_TEST_ACCESS_KEY: orbita-ci
+          ORBITA_S3_TEST_SECRET_KEY: orbita-ci-secret
+        run: moon run orbita-objectstore:test-live-s3
+
+      # When the failure is "MinIO never came up" the Rust error says only that
+      # the connection was refused, which points at the wrong thing.
+      - name: MinIO logs
+        if: failure()
+        run: docker logs orbita-minio
 
   # A separate job because these fail for different reasons than the Rust
   # tests do: this one is the wire contract as seen by a client that shares no

@@ -2,8 +2,11 @@
 
 use orbita_core::NodeId;
 use orbita_proto::v1::admin_client::AdminClient;
-use orbita_proto::v1::{CreateKeyspaceRequest, ListKeyspacesRequest};
+use orbita_proto::v1::{
+    CreateKeyspaceRequest, DescribeClusterRequest, ListKeyspacesRequest, SplitPartitionRequest,
+};
 use orbita_server::{Server, ServerConfig};
+use tonic::Code;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -128,6 +131,41 @@ async fn two_of_three_configured_leaders_form_replicate_and_restart() {
     assert!(leader_keyspace_names(&[&one, &two])
         .await
         .contains(&"replicated".to_string()));
+
+    let mut split_refused = false;
+    for server in [&one, &two] {
+        let mut client = AdminClient::connect(format!("http://{}", server.local_addr()))
+            .await
+            .expect("connect to a leader voter");
+        let Ok(description) = client
+            .describe_cluster(DescribeClusterRequest {
+                keyspace: String::new(),
+            })
+            .await
+        else {
+            continue;
+        };
+        let partition = description
+            .into_inner()
+            .partitions
+            .into_iter()
+            .next()
+            .expect("the bootstrap partition");
+        let error = client
+            .split_partition(SplitPartitionRequest {
+                partition_id: partition.id,
+                split_key: b"m".to_vec(),
+            })
+            .await
+            .expect_err("partition split remains disabled at the wire");
+        assert_eq!(error.code(), Code::Unimplemented);
+        split_refused = true;
+        break;
+    }
+    assert!(
+        split_refused,
+        "the control leader must refuse partition split"
+    );
 
     two.shutdown().await.expect("the second voter stops");
     tokio::time::sleep(Duration::from_millis(100)).await;

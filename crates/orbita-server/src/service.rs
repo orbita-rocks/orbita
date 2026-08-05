@@ -162,9 +162,36 @@ mod tests {
                 "cluster-version-compatible",
                 "control-plane-joined",
                 "partitions-caught-up",
+                "replicas-recoverable",
                 "accepting-ownership"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_replica_that_cannot_be_caught_up_reaches_an_operator_over_the_wire() {
+        // The state this carries is a durability failure that no retry fixes,
+        // and it used to exist only as an error log inside the owner. This is
+        // the RPC a probe and `orbita cluster ready` call, so a stranded
+        // replica has to be visible in the answer rather than in a log nobody
+        // is tailing.
+        let gate = Arc::new(ReadinessGate::new());
+        for condition in ReadinessCondition::ALL {
+            gate.mark(condition);
+        }
+        gate.clear(ReadinessCondition::ReplicasRecoverable);
+
+        let service = HealthService::new(Arc::clone(&gate));
+        let response = service
+            .check_readiness(Request::new(CheckReadinessRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.ready, "a rolling update must stop at this node");
+        assert!(response
+            .conditions
+            .iter()
+            .any(|c| c.name == "replicas-recoverable" && !c.met));
     }
 
     #[tokio::test]
