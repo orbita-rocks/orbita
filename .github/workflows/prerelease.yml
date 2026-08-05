@@ -1,21 +1,28 @@
 name: Prerelease
 
-# What a push to develop produces.
+# What the latest develop produces each night, or when requested by hand.
 #
 # The point is that there is always something to install that is newer than the
-# last release, so a bug report can be answered with "try develop" instead of
-# "wait for 0.2.0". These artifacts are deliberately less than a release: no
-# GitHub release, no moving tags, no chart. They are for people who already
-# know what develop is.
+# last release, without paying for an emulated ARM build after every merge. A
+# bug report can still be answered with "try develop", and a build needed
+# sooner can be dispatched by hand. These artifacts are deliberately less than
+# a release: no GitHub release, no chart. They are for people who already know
+# what develop is.
 #
 # The version does not change per commit. develop sits at the next version with
 # a -dev suffix, and the commit is identified by the sha in the image tag and
 # by the sha the binary reports in --version.
 
 on:
-  push:
-    branches: [develop]
+  schedule:
+    - cron: "0 8 * * *"
   workflow_dispatch:
+
+# Both triggers publish the same moving tag. If somebody requests a build while
+# the nightly is still running, only the newer result is worth finishing.
+concurrency:
+  group: prerelease-develop
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -100,5 +107,44 @@ jobs:
         with:
           name: orbita-develop-x86_64-unknown-linux-gnu
           path: target/release/orbita
-          retention-days: 30
+          # A prerelease is a short-lived diagnostic. Releases own durable
+          # artifacts, while seven days covers the useful life of develop.
+          retention-days: 7
           if-no-files-found: error
+
+  cleanup:
+    name: expire old prerelease images
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Delete SHA-only images older than 30 days
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+            const versions = await github.paginate(
+              github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
+              {
+                org: context.repo.owner,
+                package_type: 'container',
+                package_name: 'orbita',
+                per_page: 100,
+              },
+            );
+
+            for (const version of versions) {
+              const tags = version.metadata?.container?.tags ?? [];
+              const shaOnly = tags.length > 0 && tags.every((tag) => tag.startsWith('sha-'));
+              if (!shaOnly || Date.parse(version.updated_at) >= cutoff) {
+                continue;
+              }
+              await github.rest.packages.deletePackageVersionForOrg({
+                org: context.repo.owner,
+                package_type: 'container',
+                package_name: 'orbita',
+                package_version_id: version.id,
+              });
+            }
