@@ -285,8 +285,8 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
                     .iter()
                     .map(|r| pb::Replica {
                         node_id: r.node.get(),
-                        applied_lamport: r.applied_lamport.get(),
-                        durable_lamport: r.durable_lamport.get(),
+                        applied_lamport: r.applied_lamport.map(orbita_core::Lamport::get),
+                        durable_lamport: r.durable_lamport.map(orbita_core::Lamport::get),
                     })
                     .collect(),
                 size_bytes: p.size_bytes,
@@ -396,8 +396,10 @@ fn partition_message(info: &PartitionInfo) -> pb::Partition {
             .iter()
             .map(|node| pb::Replica {
                 node_id: node.get(),
-                applied_lamport: 0,
-                durable_lamport: 0,
+                // A partial view built from the map alone has heard no
+                // positions, so it claims none.
+                applied_lamport: None,
+                durable_lamport: None,
             })
             .collect(),
         size_bytes: None,

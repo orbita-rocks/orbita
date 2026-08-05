@@ -179,8 +179,8 @@ impl Admin for Fake {
                 committed_lamport: Some(500),
                 replicas: vec![Replica {
                     node_id: 3,
-                    applied_lamport: 490,
-                    durable_lamport: 495,
+                    applied_lamport: Some(490),
+                    durable_lamport: Some(495),
                 }],
                 size_bytes: Some(1_048_576),
                 index_bytes: self.reports_index_memory.then_some(65_536),

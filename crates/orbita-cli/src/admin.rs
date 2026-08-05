@@ -506,8 +506,8 @@ mod tests {
             committed_lamport: Some(5),
             replicas: vec![Replica {
                 node_id: 6,
-                applied_lamport: 5,
-                durable_lamport: 5,
+                applied_lamport: Some(5),
+                durable_lamport: Some(5),
             }],
             size_bytes: Some(7),
             index_bytes: Some(8),

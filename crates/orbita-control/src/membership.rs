@@ -54,10 +54,32 @@ pub struct PartitionProgress {
     /// is deliberately not zero: an operator watching the resource that runs
     /// out first must not be shown an empty index where there is a full one.
     pub index_bytes: Option<u64>,
+    /// The owner's committed prefix: the highest Lamport a durability quorum
+    /// confirmed under its epoch.
+    ///
+    /// Distinct from `durable_lamport`, and the distinction is the point.
+    /// `durable_lamport` is what one disk holds, which includes writes whose
+    /// clients were told they failed, and a draining owner's `quiesce` drops
+    /// those and so makes that number go *down*. This one only ever rises,
+    /// because it is the no-lost-write floor a promotion has to keep.
+    ///
+    /// `None` from a replica, which has no committed prefix to report, and
+    /// from any node whose report came through a status method older than
+    /// V5. Absent is not zero: a partition at lamport zero is a real state
+    /// and a planned drain must not be made to look like one.
+    pub committed_lamport: Option<Lamport>,
 }
 
 impl PartitionProgress {
     pub(crate) fn encode(&self, w: &mut Writer) {
+        self.encode_v4(w);
+        w.opt_u64(self.committed_lamport.map(Lamport::get));
+    }
+
+    /// The encoding without the committed prefix, which is what every report
+    /// shape up to and including [`super::wire::METHOD_REPORT_STATUS_V4`]
+    /// carries.
+    pub(crate) fn encode_v4(&self, w: &mut Writer) {
         self.encode_v3(w);
         // Optional on the wire rather than a bare u64 so that "did not
         // measure" survives the hop. A node whose storage layer refuses to
@@ -76,8 +98,19 @@ impl PartitionProgress {
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let mut progress = Self::decode_v4(r)?;
+        progress.committed_lamport = r.opt_u64()?.map(Lamport);
+        Ok(progress)
+    }
+
+    /// Decodes a report from a node that does not distinguish its committed
+    /// prefix from its durable position. Unknown rather than borrowing
+    /// `durable_lamport`, which would be a number that can go backwards
+    /// wearing the name of one that cannot.
+    pub(crate) fn decode_v4(r: &mut Reader<'_>) -> CodecResult<Self> {
         let mut progress = Self::decode_v3(r)?;
         progress.index_bytes = r.opt_u64()?;
+        progress.committed_lamport = None;
         Ok(progress)
     }
 
@@ -94,6 +127,7 @@ impl PartitionProgress {
             applied_lamport: Lamport(r.u64()?),
             size_bytes: r.u64()?,
             index_bytes: None,
+            committed_lamport: None,
         })
     }
 }
@@ -156,6 +190,28 @@ impl NodeStatus {
         self.speaks.encode(w);
         w.u8(u8::from(self.ready)).u8(u8::from(self.draining));
         w.seq(&self.partitions, |w, p| p.encode(w));
+    }
+
+    /// The encoding that predates the committed prefix.
+    pub(crate) fn encode_v4(&self, w: &mut Writer) {
+        self.encode_head(w);
+        self.speaks.encode(w);
+        w.u8(u8::from(self.ready)).u8(u8::from(self.draining));
+        w.seq(&self.partitions, |w, p| p.encode_v4(w));
+    }
+
+    /// Decodes the encoding that predates the committed prefix.
+    pub(crate) fn decode_v4(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let (role, address, map_version) = Self::decode_head(r)?;
+        Ok(Self {
+            role,
+            address,
+            map_version,
+            speaks: VersionRange::decode(r)?,
+            ready: r.u8()? != 0,
+            draining: r.u8()? != 0,
+            partitions: r.seq(PartitionProgress::decode_v4)?,
+        })
     }
 
     /// The encoding that predates index memory reporting.
@@ -294,6 +350,7 @@ mod tests {
                 applied_lamport: Lamport(88),
                 size_bytes: 4096,
                 index_bytes: Some(512),
+                committed_lamport: Some(Lamport(88)),
             }],
         };
 
@@ -324,6 +381,7 @@ mod tests {
                 applied_lamport: Lamport(88),
                 size_bytes: 4096,
                 index_bytes: Some(512),
+                committed_lamport: Some(Lamport(88)),
             }],
         };
 
@@ -340,6 +398,11 @@ mod tests {
         assert_eq!(
             decoded.partitions[0].index_bytes, None,
             "a node that did not report index memory is unknown, not empty"
+        );
+        assert_eq!(
+            decoded.partitions[0].committed_lamport, None,
+            "and a shape with no committed prefix does not borrow the durable \
+             position, which is a number that can go backwards"
         );
     }
 
@@ -363,6 +426,7 @@ mod tests {
                     applied_lamport: Lamport(88),
                     size_bytes: 4096,
                     index_bytes: Some(0),
+                    committed_lamport: Some(Lamport(0)),
                 },
                 PartitionProgress {
                     partition: PartitionId(4),
@@ -370,6 +434,7 @@ mod tests {
                     applied_lamport: Lamport(88),
                     size_bytes: 4096,
                     index_bytes: None,
+                    committed_lamport: Some(Lamport(0)),
                 },
             ],
         };

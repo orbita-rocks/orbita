@@ -366,10 +366,15 @@ pub struct NodeView {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplicaView {
     pub node_id: u64,
-    pub applied_lamport: u64,
+    /// Absent when the leader group has not heard this replica's position,
+    /// which is the state #79 named `Unestablished`. Not zero: a replica that
+    /// has said nothing is unknown, and rendering it at the bottom of the log
+    /// invents a maximally-behind copy out of one that may be current.
+    pub applied_lamport: Option<u64>,
     /// How far this replica has made the log durable. Ahead of what it has
     /// applied, and behind the owner by whatever replication has not caught.
-    pub durable_lamport: u64,
+    /// Absent for the same reason.
+    pub durable_lamport: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -425,13 +430,26 @@ impl PartitionView {
     /// replicas are perfectly caught up at the exact moment a failover is
     /// deciding which of them to promote, which is the worst possible time to
     /// be confidently wrong.
-    fn lag(&self, position: impl Fn(&ReplicaView) -> u64) -> Option<u64> {
+    fn lag(&self, position: impl Fn(&ReplicaView) -> Option<u64>) -> Option<u64> {
         let committed = self.committed_lamport?;
+        // A replica that has not reported has no distance, and guessing one
+        // would be the same mistake as reading its silence as position zero.
+        // The worst *known* lag is still a true statement, so it is reported,
+        // and `replicas_without_position` says how many it could not see.
         self.replicas
             .iter()
-            .map(|r| committed.saturating_sub(position(r)))
+            .filter_map(|r| Some(committed.saturating_sub(position(r)?)))
             .max()
             .or(Some(0))
+    }
+
+    /// Replicas whose position the leader group has not heard.
+    #[must_use]
+    pub fn replicas_without_position(&self) -> usize {
+        self.replicas
+            .iter()
+            .filter(|r| r.durable_lamport.is_none())
+            .count()
     }
 
     fn range(&self) -> String {
@@ -454,17 +472,14 @@ impl PartitionView {
         }
         self.replicas
             .iter()
-            .map(|r| match self.committed_lamport {
-                Some(committed) => {
-                    format!(
-                        "{}(-{})",
-                        r.node_id,
-                        committed.saturating_sub(r.applied_lamport)
-                    )
+            .map(|r| match (self.committed_lamport, r.applied_lamport) {
+                (Some(committed), Some(applied)) => {
+                    format!("{}(-{})", r.node_id, committed.saturating_sub(applied))
                 }
-                // No owner position to measure against. The replica is still
-                // worth naming; the distance is not knowable.
-                None => format!("{}(-?)", r.node_id),
+                // Either there is no owner position to measure against, or
+                // this replica has not said where it is. Both leave the
+                // distance unknowable, and the replica is still worth naming.
+                _ => format!("{}(-?)", r.node_id),
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -568,6 +583,11 @@ pub struct ClusterSummaryView {
     /// Since #53 this is what a fenced partition looks like for as long as
     /// the control plane waits for its replicas to report past the fence.
     pub partitions_without_owner_progress: usize,
+    /// Replica placements whose position the leader group has not heard, so
+    /// the lag above could not look at them. #79 calls this `Unestablished`
+    /// on the owner's side; it is neither healthy nor stranded, and counting
+    /// it is the only way the worst-lag number stays honest about its reach.
+    pub replicas_without_position: usize,
     /// What every node's partition indexes cost, added up. ADR 0006 makes
     /// this the resource a cluster exhausts first, and a total is what an
     /// operator compares against the memory they bought.
@@ -767,6 +787,10 @@ impl ClusterView {
                 .iter()
                 .filter(|p| p.committed_lamport.is_none())
                 .count(),
+            replicas_without_position: partitions
+                .iter()
+                .map(PartitionView::replicas_without_position)
+                .sum(),
             // Summing Options gives None the moment one contributor is
             // unknown, which is the answer that does not under-report. The
             // partial sum is kept beside it so a mid-rollout describe still
@@ -838,11 +862,18 @@ impl Render for ClusterView {
             "  partitions   {} total, {} with an unhealthy owner, {} with no replica",
             s.partition_count, s.partitions_with_an_unhealthy_owner, s.partitions_with_no_replica
         );
-        let _ = if s.partitions_without_owner_progress == 0 {
+        let unseen = s.partitions_without_owner_progress + s.replicas_without_position;
+        let _ = if unseen == 0 {
             writeln!(
                 out,
                 "  worst lag    {} applied, {} wal",
                 s.max_replica_lag, s.max_wal_lag
+            )
+        } else if s.partitions_without_owner_progress == 0 {
+            writeln!(
+                out,
+                "  worst lag    {} applied, {} wal, {} replicas have not reported a position",
+                s.max_replica_lag, s.max_wal_lag, s.replicas_without_position
             )
         } else {
             // Saying which partitions the number could not cover, because a
@@ -1393,13 +1424,13 @@ mod tests {
             replicas: vec![
                 ReplicaView {
                     node_id: 4,
-                    applied_lamport: 100,
-                    durable_lamport: 100,
+                    applied_lamport: Some(100),
+                    durable_lamport: Some(100),
                 },
                 ReplicaView {
                     node_id: 5,
-                    applied_lamport: 91,
-                    durable_lamport: 96,
+                    applied_lamport: Some(91),
+                    durable_lamport: Some(96),
                 },
             ],
         }
@@ -1708,6 +1739,79 @@ mod tests {
     }
 
     #[test]
+    fn a_replica_that_has_not_reported_renders_unknown_rather_than_maximally_behind() {
+        // The state #79 calls `Unestablished`, at the surface an operator
+        // reads. A replica at the bottom of the log and a replica that has
+        // said nothing look identical if silence is rendered as zero, and one
+        // of them is an emergency while the other may be perfectly current.
+        let mut p = partition(1);
+        p.replicas[1].applied_lamport = None;
+        p.replicas[1].durable_lamport = None;
+
+        assert_eq!(p.replicas_without_position(), 1);
+        assert_eq!(
+            p.max_replica_lag(),
+            Some(0),
+            "the worst lag among replicas that did report is still true about \
+             them, and node 4 is level"
+        );
+
+        let view = ClusterView::new(vec![node(1, "leader", "healthy", true)], vec![p]);
+        assert_eq!(view.summary.replicas_without_position, 1);
+
+        let text = render(Format::Human, &view).unwrap();
+        assert!(
+            text.contains("5(-?)"),
+            "a replica with no position has no measurable distance: {text}"
+        );
+        assert!(
+            text.contains("4(-0)"),
+            "and one that did report keeps its number: {text}"
+        );
+        assert!(
+            text.contains("replicas have not reported a position"),
+            "the summary says how far its lag could not see: {text}"
+        );
+    }
+
+    #[test]
+    fn a_quiescing_owner_does_not_render_as_though_it_lost_data() {
+        // #79 gave a draining owner `quiesce`, which drops the writes it holds
+        // alone — writes whose clients were told they failed — and so lowers
+        // its durable position. Nothing was lost. The committed prefix is the
+        // watermark that cannot go backwards, and it is what this column
+        // shows, so a planned shutdown does not read as a partition losing
+        // ground.
+        let before = PartitionView {
+            committed_lamport: Some(90),
+            ..partition(1)
+        };
+        let after_quiesce = PartitionView {
+            committed_lamport: Some(90),
+            ..partition(1)
+        };
+
+        let first = render(
+            Format::Human,
+            &ClusterView::new(vec![node(3, "worker", "healthy", true)], vec![before]),
+        )
+        .unwrap();
+        let second = render(
+            Format::Human,
+            &ClusterView::new(
+                vec![node(3, "worker", "healthy", true)],
+                vec![after_quiesce],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            first, second,
+            "two describes across a quiesce have to diff cleanly, because \
+             nothing an operator is shown actually moved"
+        );
+    }
+
+    #[test]
     fn a_cluster_without_keyspace_usage_prints_no_keyspace_section() {
         // A server that predates quota reporting sends none, and inventing an
         // empty table would read as "this cluster has no keyspaces".
@@ -1797,7 +1901,7 @@ mod tests {
     #[test]
     fn the_summary_carries_the_worst_replica_lag_in_the_whole_cluster() {
         let mut behind = partition(2);
-        behind.replicas[1].applied_lamport = 40;
+        behind.replicas[1].applied_lamport = Some(40);
         let view = ClusterView::new(Vec::new(), vec![partition(1), behind]);
         assert_eq!(view.summary.max_replica_lag, 60);
     }

@@ -96,8 +96,17 @@ pub struct NodeView {
 pub struct PartitionView {
     pub info: PartitionInfo,
     pub phase: PartitionPhase,
-    /// The owner's reported durable Lamport, which is the partition's
-    /// committed position.
+    /// The owner's committed prefix: the highest Lamport a durability quorum
+    /// confirmed under its epoch.
+    ///
+    /// Read from the owner's committed prefix rather than its durable
+    /// position, because the two differ and only one of them is safe to show.
+    /// A draining owner's `quiesce` truncates the writes it holds alone —
+    /// writes whose clients were told they failed — which drops its durable
+    /// position. Sourcing this column from that number made a planned
+    /// shutdown render as a partition going backwards, which is the reading
+    /// of "lost data" and is not what happened. The committed prefix only
+    /// ever rises.
     ///
     /// `None` when no owner has reported: an unowned partition, or one
     /// [`PartitionPhase::Fenced`] is holding while its replicas report past
@@ -125,11 +134,18 @@ pub struct PartitionView {
 }
 
 /// One replica's position on one partition, as an operator sees it.
+///
+/// Both positions are optional because a replica the leader group has not
+/// heard from has not told anybody where it is. #79 named that state
+/// `Unestablished` on the owner's side and made the point precisely: an
+/// absent answer read as a healthy one hides a cliff, and an absent answer
+/// read as lamport zero invents a maximally-behind replica that may in fact
+/// be perfectly current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicaProgressView {
     pub node: NodeId,
-    pub applied_lamport: Lamport,
-    pub durable_lamport: Lamport,
+    pub applied_lamport: Option<Lamport>,
+    pub durable_lamport: Option<Lamport>,
 }
 
 /// Everything `DescribeCluster` answers with.
@@ -939,7 +955,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     // one. #53 made that state common rather than fleeting:
                     // a fenced partition stays unowned until every surviving
                     // replica has reported past the fence.
-                    committed_lamport: owner_progress.map(|p| p.durable_lamport),
+                    committed_lamport: owner_progress.and_then(|p| p.committed_lamport),
                     size_bytes: owner_progress.map(|p| p.size_bytes),
                     index_bytes: owner_progress.and_then(|p| p.index_bytes),
                     replica_progress: info
@@ -952,10 +968,8 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                                 .and_then(|obs| obs.status.progress(info.id));
                             ReplicaProgressView {
                                 node: *r,
-                                applied_lamport: progress
-                                    .map_or(Lamport::ZERO, |p| p.applied_lamport),
-                                durable_lamport: progress
-                                    .map_or(Lamport::ZERO, |p| p.durable_lamport),
+                                applied_lamport: progress.map(|p| p.applied_lamport),
+                                durable_lamport: progress.map(|p| p.durable_lamport),
                             }
                         })
                         .collect(),

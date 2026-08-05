@@ -188,6 +188,11 @@ def test_describe_reports_storage_against_the_quota_each_keyspace_was_given(
             node.HasField("index_memory_bytes")
         for partition in described.partitions:
             partition.HasField("index_bytes")
+            # A replica the leader group has not heard from has no position,
+            # not position zero. #79 calls that state Unestablished.
+            for replica in partition.replicas:
+                replica.HasField("applied_lamport")
+                replica.HasField("durable_lamport")
             # Size and committed position carry presence for the same reason:
             # a fenced partition has an unknown size, not a size of zero.
             partition.HasField("size_bytes")

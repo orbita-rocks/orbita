@@ -45,7 +45,7 @@ use orbita_proto::v1::{
     ListRequest, ListResponse, SetRequest, SetResponse,
 };
 use orbita_runtime::{
-    PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError, TransportResult,
+    join_all, PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError, TransportResult,
 };
 use orbita_wal::WalService;
 
@@ -160,6 +160,7 @@ impl<R: Runtime> Node<R> {
         // Registered before anything is opened, so the first batch a replica
         // receives cannot land without having been invalidated for.
         wal_service.observe(Arc::clone(&bridge) as Arc<dyn orbita_wal::ReplicaObserver>);
+        wal_service.hydrate_with(Arc::clone(&bridge) as Arc<dyn orbita_wal::PartitionHydrator>);
 
         let node = Arc::new(Self {
             runtime: runtime.clone(),
@@ -181,7 +182,7 @@ impl<R: Runtime> Node<R> {
             accepting_writes: AtomicBool::new(true),
             writes: tokio::sync::RwLock::new(()),
         });
-        node.reconcile().await?;
+        node.reconcile_hosts().await?;
         // Nothing is known to be stranded before a single heartbeat has gone
         // out, and a node held unready for a verdict it has not reached would
         // never start. The heartbeat corrects this within one interval.
@@ -208,6 +209,11 @@ impl<R: Runtime> Node<R> {
     #[must_use]
     pub(crate) fn map(&self) -> Arc<PartitionMap> {
         Arc::clone(&self.map.read().expect("partition map poisoned"))
+    }
+
+    #[must_use]
+    pub(crate) fn id(&self) -> NodeId {
+        self.node_id
     }
 
     /// Asks the map source for a newer map and opens or drops hosts to match.
@@ -247,6 +253,24 @@ impl<R: Runtime> Node<R> {
     /// there is nothing to retry, and nothing would ever re-mark it until the
     /// map version moved.
     async fn reconcile(&self) -> Result<()> {
+        self.reconcile_inner(true).await
+    }
+
+    /// The local half of a reconcile: open and close hosts to match the map,
+    /// and leave any catch-up to the next pass.
+    ///
+    /// This is what start-up uses. A node that has just recovered a log looks,
+    /// to itself, like a node whose every replica is behind, because nothing
+    /// has acknowledged anything since the process began. Doing that work here
+    /// would put a round trip to every peer of every partition in front of the
+    /// listener opening, and a peer that is down would put a timeout there
+    /// instead. Whether this node can reach its peers is not what readiness
+    /// means, and it is not worth a slow start to find out.
+    async fn reconcile_hosts(&self) -> Result<()> {
+        self.reconcile_inner(false).await
+    }
+
+    async fn reconcile_inner(&self, catch_up: bool) -> Result<()> {
         let map = self.map();
         let wanted: Vec<PartitionInfo> = map.held_by(self.node_id).cloned().collect();
 
@@ -263,7 +287,69 @@ impl<R: Runtime> Node<R> {
                 tracing::warn!(%error, "could not open every partition this node was given");
             }
         }
+        drop(hosts);
+
+        let complete = if catch_up {
+            self.catch_up_owned().await
+        } else {
+            // Deferred rather than skipped. Leaving the flag raised is what
+            // makes the very next poll do the work, instead of waiting for the
+            // map to move, which on an idle partition it never does.
+            self.owned_replicas_behind().await.is_empty()
+        };
+        if !complete {
+            // Only ever raised here, never lowered, so a stale failure cannot
+            // erase a fresher success the way clearing it could. The cost of
+            // being wrong is one extra reconcile pass; the cost of not
+            // retrying is a partition that stays on fewer copies than the map
+            // promises until the map happens to move again, which on an idle
+            // partition is never.
+            self.unreconciled.store(true, Ordering::Release);
+        }
         outcome
+    }
+
+    /// The owned partitions with at least one advertised replica that has not
+    /// confirmed the committed prefix.
+    async fn owned_replicas_behind(&self) -> Vec<Arc<PartitionHost<R>>> {
+        self.hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner() && !host.replicas_behind().is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Carries every advertised replica that is behind up to the committed
+    /// prefix, and reports whether every one of them got there.
+    ///
+    /// Run outside the `hosts` lock, because it talks to peers and every read
+    /// of this node's routing table would queue behind it.
+    ///
+    /// Which partitions get a pass is decided from the per-replica
+    /// acknowledgements the WAL already keeps rather than from having just
+    /// seen the placement change. That distinction is the whole point. A
+    /// replica set is installed before anybody is synchronized to it, so a
+    /// pass driven by "the map moved" gets exactly one attempt: if the peer is
+    /// unreachable for that attempt, the next reconcile sees an unchanged
+    /// placement, calls itself finished, and the partition advertises a copy
+    /// that holds nothing until something else moves the map. Driven by what
+    /// the replicas have actually confirmed, a failed pass simply stays
+    /// pending, and a healthy partition under load asks for nothing because
+    /// its appends keep the acknowledgements current.
+    ///
+    /// Partitions with nothing behind are skipped, because a cluster in good
+    /// health would otherwise pay a round trip per replica every time anything
+    /// moved the map. A drain does not skip; see [`Node::prepare_handoff`].
+    ///
+    /// The partitions that do need a pass are worked concurrently, so a single
+    /// unreachable peer costs one timeout rather than one per partition it
+    /// happens to hold.
+    pub(crate) async fn catch_up_owned(&self) -> bool {
+        let behind = self.owned_replicas_behind().await;
+        let passes: Vec<_> = behind.iter().map(|host| catch_up_one(host)).collect();
+        join_all(passes).await.into_iter().all(|done| done)
     }
 
     /// The body of a reconcile, run under the `hosts` write lock the caller
@@ -293,10 +379,32 @@ impl<R: Runtime> Node<R> {
             // a replica of a partition it now owns, and refuse every request
             // for it.
             let owned_here = info.owner == Some(self.node_id);
-            let unchanged = hosts
-                .get(&info.id)
+            let held = hosts.get(&info.id).cloned();
+            let unchanged = held
+                .as_ref()
                 .is_some_and(|held| held.epoch() == info.epoch && held.is_owner() == owned_here);
             if unchanged {
+                // The replica set is the one thing about a partition that can
+                // move without the epoch moving, because placing replicas is
+                // not a change of ownership. Adopting it here rather than
+                // treating it as a reopen is what keeps an owner that was born
+                // unreplicated from acknowledging writes to nobody for the rest
+                // of its life. See `PartitionHost::set_replicas`.
+                //
+                // Nothing is scheduled from this branch. Adopting the set is
+                // what makes the new peers show up as behind, and the catch-up
+                // pass after the lock works from that rather than from having
+                // witnessed the change, so a peer that could not be reached on
+                // the first attempt is still owed one on the next pass.
+                if let Some(held) = held {
+                    if held.set_replicas(&info.replicas) {
+                        tracing::info!(
+                            partition = info.id.get(),
+                            replicas = ?info.replicas,
+                            "adopted a replica set placed after the partition opened"
+                        );
+                    }
+                }
                 continue;
             }
             // The old incarnation is closed before the new one opens, so that
@@ -722,6 +830,22 @@ impl<R: Runtime> Node<R> {
         fallen
     }
 
+    /// The oldest Lamport this node's log for `partition` still holds, or
+    /// `None` if it does not hold the partition.
+    ///
+    /// The retention floor. Asking for it is how a scenario establishes that a
+    /// gap is genuinely past the log rather than merely large, which is what
+    /// separates a replica hydration has to rescue from one an ordinary
+    /// catch-up would have reached anyway.
+    #[cfg(test)]
+    pub(crate) async fn retained_from(
+        &self,
+        partition: PartitionId,
+    ) -> Option<orbita_core::Lamport> {
+        let host = self.hosts.read().await.get(&partition).cloned()?;
+        Some(host.retained_from().await)
+    }
+
     /// How far this node has got on every partition it holds.
     ///
     /// This is what the heartbeat to the leader group carries, and it is what
@@ -740,6 +864,11 @@ impl<R: Runtime> Node<R> {
                 // the leader group this partition holds no index, which is
                 // the one answer that is certainly wrong.
                 index_bytes: host.index_bytes().await.ok(),
+                // Only an owner has a committed prefix. A replica reports
+                // none rather than borrowing its own durable position, which
+                // is a different watermark and would let a describe present
+                // one replica's disk as the partition's committed state.
+                committed_lamport: host.committed_prefix(),
             });
         }
         // Sorted so that two reports of the same state are the same bytes,
@@ -764,6 +893,50 @@ impl<R: Runtime> Node<R> {
     pub(crate) async fn begin_draining(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
         self.accepting_writes.store(false, Ordering::Release);
         self.writes.write().await
+    }
+
+    /// Makes every owned partition handable: gives up the tail no client was
+    /// told about, then carries the replicas to what is left.
+    ///
+    /// This is what a drain calls on each pass, and it is two steps because
+    /// the handoff has two conditions that pull against each other. The
+    /// control plane will not give a partition to a replica short of the
+    /// owner's advertised position, and a catch-up may not carry a replica
+    /// past the committed prefix. An owner sitting on writes that reached its
+    /// disk alone satisfies neither: it advertises a number no replica is
+    /// allowed to reach.
+    ///
+    /// Quiescing settles that in the only direction that is honest. Write
+    /// admission is already closed and every admitted write has resolved, so
+    /// the gap is exactly the writes whose clients were told `Unavailable`,
+    /// and this node is the last one that still knows they failed. It drops
+    /// them, and what it then advertises is the committed prefix, which is
+    /// precisely what a catch-up can deliver.
+    ///
+    /// Called on every pass rather than once, because a partition can arrive
+    /// here between passes: quiescing an already quiesced log is free, and
+    /// catching up an already current replica is one round trip that carries
+    /// nothing.
+    pub(crate) async fn prepare_handoff(&self) {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner())
+            .cloned()
+            .collect();
+        for host in &hosts {
+            if let Err(error) = host.quiesce().await {
+                tracing::warn!(
+                    partition = host.id().get(),
+                    %error,
+                    "could not give up the uncommitted tail before handing off"
+                );
+            }
+        }
+        let passes: Vec<_> = hosts.iter().map(|host| catch_up_one(host)).collect();
+        join_all(passes).await;
     }
 
     pub(crate) fn owned_partition_count(&self) -> usize {
@@ -972,6 +1145,51 @@ impl Cursor {
             route_key: Bytes::copy_from_slice(&raw[5 + len..]),
             inner: (!inner.is_empty()).then(|| Bytes::copy_from_slice(inner)),
         })
+    }
+}
+
+/// One partition's catch-up pass, reporting whether it still has work to
+/// retry.
+///
+/// A free function so several of these can be in flight at once: one
+/// unreachable peer should cost one timeout, not one per partition it holds.
+///
+/// A replica that has fallen past the owner's retained log is not counted as
+/// outstanding work, however far short of the horizon it is. No number of
+/// passes produces entries the log no longer holds, so counting it would leave
+/// this node reconciling on every poll forever and would bury the reason under
+/// a retry. It is reported instead, through the `replicas-recoverable`
+/// readiness condition that the lease heartbeat drives from the same
+/// per-replica record this pass reads.
+async fn catch_up_one<R: Runtime>(host: &Arc<PartitionHost<R>>) -> bool {
+    match host.catch_up_replicas().await {
+        Ok(pass) => {
+            if !pass.stranded.is_empty() {
+                tracing::debug!(
+                    partition = host.id().get(),
+                    stranded = ?pass.stranded,
+                    "a replica is beyond this owner's retained log, so a catch-up cannot help it"
+                );
+            }
+            if pass.is_complete() {
+                return true;
+            }
+            tracing::warn!(
+                partition = host.id().get(),
+                behind = ?pass.behind,
+                horizon = pass.horizon.get(),
+                "an advertised replica is still short of the committed prefix"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                partition = host.id().get(),
+                %error,
+                "could not catch a replica up"
+            );
+            false
+        }
     }
 }
 

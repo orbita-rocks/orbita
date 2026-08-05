@@ -42,6 +42,16 @@ pub const METHOD_DRAIN_NODE: u16 = 7;
 /// is fixed-width per entry: a leader decoding the old shape would read the
 /// new field as the next partition id.
 pub const METHOD_REPORT_STATUS_V4: u16 = 8;
+/// Status reporting that carries the owner's committed prefix beside its
+/// durable position.
+///
+/// A separate method for the same reason V4 was: the progress list decodes a
+/// fixed sequence of fields per entry, so a V4 leader reading a sixth field
+/// would take it for the next partition's id. That is the rule for anything
+/// added per partition, and it is why a new rung is cheaper than it looks —
+/// the fallback below already knows how to lose a field and keep the
+/// heartbeat.
+pub const METHOD_REPORT_STATUS_V5: u16 = 9;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -94,6 +104,21 @@ impl ReportStatusRequest {
         let mut r = Reader::new(buf);
         let node = NodeId(r.u64()?);
         let status = NodeStatus::decode(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
+    pub(crate) fn encode_v4(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v4(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v4(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v4(&mut r)?;
         r.done()?;
         Ok(Self { node, status })
     }
@@ -531,6 +556,7 @@ mod tests {
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
                     index_bytes: Some(256),
+                    committed_lamport: Some(Lamport(9)),
                 }],
             },
         };
@@ -560,6 +586,7 @@ mod tests {
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
                     index_bytes: Some(256),
+                    committed_lamport: Some(Lamport(9)),
                 }],
             },
         };
@@ -600,10 +627,11 @@ mod tests {
                     durable_lamport: Lamport(10),
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
-                    // A v0.0.1 report cannot carry this, so the only value
-                    // that round trips through the legacy shape is the one
-                    // meaning nobody said.
+                    // A v0.0.1 report cannot carry either of these, so the
+                    // only value that round trips through the legacy shape is
+                    // the one meaning nobody said.
                     index_bytes: None,
+                    committed_lamport: None,
                 }],
             },
         };

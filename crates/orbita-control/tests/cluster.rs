@@ -53,6 +53,9 @@ struct Cluster {
     /// status method that cannot carry the measurement, which is every worker
     /// running an older binary for the length of a rolling upgrade.
     index_bytes: Arc<Mutex<HashMap<NodeId, Option<u64>>>>,
+    /// The committed prefix each worker reports, where `None` is a node whose
+    /// status method has no room for one.
+    committed: Arc<Mutex<HashMap<NodeId, Option<u64>>>>,
 }
 
 impl Cluster {
@@ -105,6 +108,7 @@ impl Cluster {
                 WORKERS.into_iter().map(|node| (node, true)).collect(),
             )),
             index_bytes: Arc::new(Mutex::new(HashMap::new())),
+            committed: Arc::new(Mutex::new(HashMap::new())),
         };
         cluster.spawn_sweep(&leader);
         for worker in WORKERS {
@@ -138,6 +142,7 @@ impl Cluster {
         let draining = Arc::clone(&self.draining);
         let reporting = Arc::clone(&self.reporting);
         let index_bytes = Arc::clone(&self.index_bytes);
+        let committed = Arc::clone(&self.committed);
 
         runtime.spawn(async move {
             loop {
@@ -168,6 +173,13 @@ impl Cluster {
                             applied_lamport: lamport,
                             size_bytes: 0,
                             index_bytes: index,
+                            committed_lamport: committed
+                                .lock()
+                                .expect("committed lock poisoned")
+                                .get(&node)
+                                .copied()
+                                .unwrap_or(Some(lamport.get()))
+                                .map(Lamport),
                         })
                         .collect();
                     let status = NodeStatus {
@@ -210,6 +222,13 @@ impl Cluster {
 
     /// Makes a worker report the way one whose heartbeat went through a
     /// status method without an index field does.
+    fn set_committed(&self, node: NodeId, lamport: Option<u64>) {
+        self.committed
+            .lock()
+            .expect("committed lock poisoned")
+            .insert(node, lamport);
+    }
+
     fn set_index_unreported(&self, node: NodeId) {
         self.index_bytes
             .lock()
@@ -538,11 +557,11 @@ fn describe_reports_a_replicas_durable_position_beside_what_it_applied() {
     for replica in &described.replica_progress {
         assert_eq!(
             replica.durable_lamport,
-            Lamport(42),
+            Some(Lamport(42)),
             "WAL lag is measured from the durable position, so it has to be \
              reported and not inferred from what was applied"
         );
-        assert_eq!(replica.applied_lamport, Lamport(42));
+        assert_eq!(replica.applied_lamport, Some(Lamport(42)));
     }
 }
 
@@ -996,6 +1015,7 @@ fn a_new_control_leader_does_not_repeat_a_completed_lease_drain() {
                             // about promotion, so the honest neutral value is
                             // a measurement, not the absence of one.
                             index_bytes: Some(0),
+                            committed_lamport: Some(Lamport(1)),
                         }],
                     },
                 )
@@ -2204,4 +2224,131 @@ fn a_fenced_partition_reports_unknown_progress_rather_than_zeroes() {
         "and an unknown committed position, not lamport zero"
     );
     assert_eq!(described.index_bytes, None);
+}
+
+#[test]
+fn a_replica_that_has_not_reported_is_unknown_rather_than_at_lamport_zero() {
+    // #79 named this state `Unestablished` and made the case for it on the
+    // owner's side: an absent answer read as a healthy one hides a cliff. The
+    // describe surface had the mirror-image bug. Reading silence as lamport
+    // zero invents a maximally-behind replica out of a node that may be
+    // perfectly current, and during a failover that is the number somebody
+    // decides a promotion against.
+    //
+    // A leader that has just taken over is the reachable version of this: the
+    // map names replicas it has never heard a word from.
+    let cluster = Cluster::start(45);
+    let partition = cluster.only_partition();
+    for worker in WORKERS {
+        cluster.set_progress(worker, 42);
+    }
+    assert!(cluster.run_until(Duration::from_secs(5), |c| {
+        c.map()
+            .partition(partition)
+            .is_some_and(|info| !info.replicas.is_empty())
+    }));
+
+    cluster.sim.crash(LEADER);
+    let restarted = cluster.sim.restart(LEADER, DiskPolicy::Intact);
+    let view = cluster.sim.block_on(async move {
+        let log = Log::open(&restarted).await?;
+        let controller = Controller::new(restarted, log, ControlConfig::default());
+        controller.recover().await?;
+        Ok::<_, Error>(controller.view().await)
+    });
+    let view = view.expect("the new leader describes the cluster");
+
+    let described = view
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("the partition is described");
+    assert!(
+        !described.replica_progress.is_empty(),
+        "the map still names replicas for the new leader to be silent about"
+    );
+    for replica in &described.replica_progress {
+        assert_eq!(
+            replica.durable_lamport, None,
+            "a replica this leader has not heard from has no position, not \
+             position zero"
+        );
+        assert_eq!(replica.applied_lamport, None);
+    }
+    assert_eq!(
+        described.committed_lamport, None,
+        "and no owner has reported a committed prefix to it either"
+    );
+}
+
+#[test]
+fn a_partitions_committed_position_comes_from_the_prefix_a_quorum_confirmed() {
+    // #79 introduced a committed prefix distinct from a node's durable
+    // position, and gave a draining owner `quiesce`, which truncates the
+    // writes it holds alone and so makes its durable position go *down*.
+    // Those writes were never acknowledged to anyone, so nothing was lost,
+    // but a describe sourcing the partition's committed column from the
+    // durable position rendered a planned shutdown as a partition moving
+    // backwards. Only the prefix is safe here, and it only ever rises.
+    let cluster = Cluster::start(43);
+    let partition = cluster.only_partition();
+    let owner = cluster.owner_of(partition).expect("an owner");
+    cluster.set_progress(owner, 100);
+    cluster.set_committed(owner, Some(90));
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+    let described = view
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("the partition is described");
+    assert_eq!(
+        described.committed_lamport,
+        Some(Lamport(90)),
+        "the committed column is the quorum-confirmed prefix, not the \
+         owner's durable position"
+    );
+
+    // Quiesce: the durable position drops to meet the prefix. The prefix
+    // does not move, so neither does what an operator is shown.
+    cluster.set_progress(owner, 90);
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+    let described = view
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("the partition is described");
+    assert_eq!(
+        described.committed_lamport,
+        Some(Lamport(90)),
+        "a quiescing owner must not render as though it lost data"
+    );
+}
+
+#[test]
+fn an_owner_that_cannot_report_a_committed_prefix_leaves_it_unknown() {
+    // What a worker one version behind looks like: its report came through a
+    // status method with no room for the prefix. Borrowing its durable
+    // position would put a number that can go backwards under a name that
+    // promises it cannot.
+    let cluster = Cluster::start(44);
+    let partition = cluster.only_partition();
+    let owner = cluster.owner_of(partition).expect("an owner");
+    cluster.set_progress(owner, 100);
+    cluster.set_committed(owner, None);
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+    let described = view
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("the partition is described");
+    assert_eq!(described.committed_lamport, None);
 }

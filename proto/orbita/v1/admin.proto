@@ -174,12 +174,20 @@ message Replica {
   // How far this replica has applied, for comparison against the owner's
   // lamport. The gap is what decides whether it can serve a read locally and
   // how far behind it would be if promoted.
-  uint64 applied_lamport = 2;
+  //
+  // Unset when the leader group has not heard this replica's position at
+  // all, which is the state #79 named Unestablished on the owner's side.
+  // Lamport zero is a real position, so it cannot also mean "nobody said":
+  // rendering silence as zero invents a maximally-behind replica out of a
+  // node that may be perfectly current.
+  optional uint64 applied_lamport = 2;
   // How far this replica has made durable in its write-ahead log. Two
   // different lags fall out of this and they mean different things: the gap
   // to the owner's committed lamport is replication lag, and the gap down to
   // applied_lamport is log this replica holds but has not applied yet.
-  uint64 durable_lamport = 3;
+  //
+  // Unset for the same reason applied_lamport is.
+  optional uint64 durable_lamport = 3;
 }
 
 message Partition {

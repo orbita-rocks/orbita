@@ -14,6 +14,7 @@ use crate::wire::{
     ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest, METHOD_DRAIN_NODE,
     METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
     METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
+    METHOD_REPORT_STATUS_V5,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
@@ -196,6 +197,37 @@ impl<R: Runtime> ControlClient<R> {
             status: status.clone(),
         }
         .encode();
+        match self.call(METHOD_REPORT_STATUS_V5, payload).await {
+            Ok(ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            }) => Ok(StatusReportResponse::Accepted {
+                map_version,
+                cluster_version,
+            }),
+            Ok(ControlResponse::Incompatible(refusal)) => {
+                Ok(StatusReportResponse::Incompatible(refusal))
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(Error::Internal(message)) if message.contains("unknown control method") => {
+                self.send_status_v4(node, status, lifecycle).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One rung down: everything but the owner's committed prefix.
+    async fn send_status_v4(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+        lifecycle: bool,
+    ) -> Result<StatusReportResponse> {
+        let payload = ReportStatusRequest {
+            node,
+            status: status.clone(),
+        }
+        .encode_v4();
         match self.call(METHOD_REPORT_STATUS_V4, payload).await {
             Ok(ControlResponse::Accepted {
                 map_version,
@@ -447,7 +479,7 @@ fn unexpected(response: &ControlResponse) -> Error {
 mod tests {
     use super::*;
     use crate::membership::{NodeRole, NodeStatus};
-    use crate::wire::{METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4};
+    use crate::wire::{METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5};
 
     use orbita_runtime::{PeerCall, PeerHandler, ServiceId, TransportResult};
     use orbita_sim::Simulation;
@@ -512,6 +544,8 @@ mod tests {
         // The resource numbers are new; heartbeats are not. A leader from
         // before this change must still be able to keep a worker out of the
         // failure detector, at the cost of the numbers for that rollout.
+        // Two rungs down from the newest method now, which is the point of
+        // the chain being a chain.
         struct V3Leader;
         impl PeerHandler for V3Leader {
             async fn handle(
@@ -560,6 +594,69 @@ mod tests {
     }
 
     #[test]
+    fn a_report_to_a_leader_without_the_committed_prefix_still_lands() {
+        // The new rung. A leader running the previous binary serves V4 and
+        // not V5, and the worker has to lose the committed prefix rather than
+        // the heartbeat. This is the fallback chain doing the job it exists
+        // for, one rung further down than last time.
+        struct V4Leader;
+        impl PeerHandler for V4Leader {
+            async fn handle(
+                &self,
+                _from: orbita_runtime::NodeId,
+                call: PeerCall,
+            ) -> TransportResult<bytes::Bytes> {
+                let response = match call.method {
+                    METHOD_REPORT_STATUS_V4 => {
+                        match ReportStatusRequest::decode_v4(&call.payload) {
+                            Ok(request) => {
+                                assert!(
+                                    request
+                                        .status
+                                        .partitions
+                                        .iter()
+                                        .all(|p| p.committed_lamport.is_none()),
+                                    "a V4 payload cannot carry a committed prefix"
+                                );
+                                ControlResponse::Accepted {
+                                    map_version: MapVersion(12),
+                                    cluster_version: Some(crate::version::binary_version()),
+                                }
+                            }
+                            Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
+                        }
+                    }
+                    other => ControlResponse::Error(format!("unknown control method {other}")),
+                };
+                Ok(response.encode())
+            }
+        }
+
+        let sim = Simulation::new(11);
+        let leader = sim.add_node(NodeId(1));
+        let worker = sim.add_node(NodeId(2));
+        orbita_runtime::Transport::register(leader.transport(), ServiceId::Control, V4Leader);
+
+        let client = ControlClient::new(worker, vec![NodeId(1)]);
+        let result = sim.block_on(async move {
+            client
+                .report_status_with_lifecycle(
+                    NodeId(2),
+                    NodeStatus::joining(NodeRole::Worker, "10.0.0.2:7000"),
+                )
+                .await
+        });
+
+        assert_eq!(
+            result,
+            Ok(StatusReportResponse::Accepted {
+                map_version: MapVersion(12),
+                cluster_version: Some(crate::version::binary_version()),
+            })
+        );
+    }
+
+    #[test]
     fn only_a_missing_method_triggers_the_fallback() {
         // A leader that serves the newest method but refuses the report must not
         // be retried on the legacy method: the refusal is an answer, and
@@ -573,7 +670,7 @@ mod tests {
                 call: PeerCall,
             ) -> TransportResult<bytes::Bytes> {
                 let response = match call.method {
-                    METHOD_REPORT_STATUS_V4 => ControlResponse::Error("no".into()),
+                    METHOD_REPORT_STATUS_V5 => ControlResponse::Error("no".into()),
                     other => panic!("an older method must not be tried, got {other}"),
                 };
                 Ok(response.encode())
