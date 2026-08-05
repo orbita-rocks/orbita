@@ -67,6 +67,32 @@ pub trait ReplicaObserver: Send + Sync + 'static {
     fn truncated(&self, partition: PartitionId, above: Lamport);
 }
 
+/// Rebuilds a partition from object storage when its log cannot be caught up.
+///
+/// This is the other end of hydration under
+/// [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md).
+/// A replica that falls further behind than its owner's retained log used to be
+/// stuck: the owner had checkpointed the entries away, so there was nothing left
+/// to send and the partition ran on the copies it had until somebody restarted
+/// the node. The manifest is a complete answer to that question, and this is the
+/// seam through which this crate asks for it without learning what a manifest
+/// is.
+///
+/// It sits here rather than on [`ReplicaObserver`] because rebuilding a
+/// partition is real work with real I/O, and that trait is on the acknowledgement
+/// path where anything slow becomes write latency for the whole partition.
+#[async_trait::async_trait]
+pub trait PartitionHydrator: Send + Sync + 'static {
+    /// Builds the partition from the manifest currently in the bucket and
+    /// reports the Lamport it is now current through.
+    ///
+    /// Must be idempotent and must report a horizon it has actually reached,
+    /// because the log records that number as durable. Reporting
+    /// `Lamport::ZERO`, which is also what a partition that has never been
+    /// flushed reports, leaves the gap where it was.
+    async fn hydrate(&self, partition: PartitionId) -> Lamport;
+}
+
 /// Serves inbound WAL traffic for every partition this node holds.
 ///
 /// Cheap to clone; all clones share one registry, so the server can hand a
@@ -74,6 +100,7 @@ pub trait ReplicaObserver: Send + Sync + 'static {
 pub struct WalService<R: Runtime> {
     logs: Arc<Mutex<HashMap<PartitionId, Arc<PartitionLog<R>>>>>,
     observer: Arc<Mutex<Option<Arc<dyn ReplicaObserver>>>>,
+    hydrator: Arc<Mutex<Option<Arc<dyn PartitionHydrator>>>>,
     /// One gate per partition, held across a whole append.
     ///
     /// An owner pipelines: it releases its flush lock before replicating, so
@@ -90,6 +117,7 @@ impl<R: Runtime> Clone for WalService<R> {
         Self {
             logs: Arc::clone(&self.logs),
             observer: Arc::clone(&self.observer),
+            hydrator: Arc::clone(&self.hydrator),
             gates: Arc::clone(&self.gates),
         }
     }
@@ -107,8 +135,26 @@ impl<R: Runtime> WalService<R> {
         Self {
             logs: Arc::new(Mutex::new(HashMap::new())),
             observer: Arc::new(Mutex::new(None)),
+            hydrator: Arc::new(Mutex::new(None)),
             gates: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Registers what rebuilds a partition from object storage when its log
+    /// cannot be caught up.
+    ///
+    /// Optional. Without one, a replica that falls beyond the owner's retained
+    /// log reports the gap and stays behind, which is what happened before
+    /// hydration existed.
+    pub fn hydrate_with(&self, hydrator: Arc<dyn PartitionHydrator>) {
+        *self.hydrator.lock().expect("wal service hydrator poisoned") = Some(hydrator);
+    }
+
+    fn hydrator(&self) -> Option<Arc<dyn PartitionHydrator>> {
+        self.hydrator
+            .lock()
+            .expect("wal service hydrator poisoned")
+            .clone()
     }
 
     /// Registers the observer that watches replicated entries.
@@ -236,11 +282,20 @@ impl<R: Runtime> WalService<R> {
             }
         }
 
-        let durable = log.durable_lamport().await;
+        let mut durable = log.durable_lamport().await;
         let epoch = log.epoch().await;
         if request.prev_lamport > durable {
-            // Writing this batch would leave a hole, and a log with a hole
-            // cannot be replayed.
+            // The batch would leave a hole, and a log with a hole cannot be
+            // replayed. Before saying so, try the cheaper answer: the writes
+            // under the hole are very likely in the bucket already, and
+            // downloading them costs this node alone rather than taxing the
+            // owner for a retransmission it may no longer be able to make.
+            match self.close_gap(&log, request.partition, durable).await {
+                Ok(reached) => durable = reached,
+                Err(e) => return WalResponse::Error(e.to_string()),
+            }
+        }
+        if request.prev_lamport > durable {
             return WalResponse::Gap {
                 durable_lamport: durable,
                 epoch,
@@ -305,6 +360,37 @@ impl<R: Runtime> WalService<R> {
             durable_lamport: log.durable_lamport().await,
             epoch,
         }
+    }
+
+    /// Rebuilds the partition from object storage and reports where the log
+    /// stands afterwards.
+    ///
+    /// Returns `durable` unchanged when there is no hydrator, when the bucket
+    /// is no further ahead than this node, or when the partition has never been
+    /// flushed. All three are "the gap is still there", which the caller
+    /// reports honestly rather than papering over.
+    async fn close_gap(
+        &self,
+        log: &Arc<PartitionLog<R>>,
+        partition: PartitionId,
+        durable: Lamport,
+    ) -> orbita_core::Result<Lamport> {
+        let Some(hydrator) = self.hydrator() else {
+            return Ok(durable);
+        };
+        let through = hydrator.hydrate(partition).await;
+        if through <= durable {
+            return Ok(durable);
+        }
+        log.hydrate(through).await?;
+        let reached = log.durable_lamport().await;
+        tracing::info!(
+            partition = partition.get(),
+            from = durable.get(),
+            to = reached.get(),
+            "rebuilt a partition from object storage to close a replication gap"
+        );
+        Ok(reached)
     }
 
     async fn fence(&self, request: FenceRequest) -> WalResponse {
