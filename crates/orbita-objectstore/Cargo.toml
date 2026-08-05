@@ -64,4 +64,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+# `net` and `io-util` are for the stub server in `hyper_transport`'s tests: the
+# connection-reuse bug it pins down is only visible to something holding the
+# socket, so the test has to be the server.
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util"] }
