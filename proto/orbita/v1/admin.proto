@@ -58,7 +58,20 @@ message Keyspace {
   uint64 created_at_millis = 4;
   // Current partition count, which grows as the keyspace splits.
   uint32 partition_count = 5;
+  // Bytes stored across this keyspace's partitions. Exact when
+  // partitions_without_size is zero, and a lower bound otherwise.
   uint64 stored_bytes = 6;
+  // How many of this keyspace's partitions had no owner reporting a size when
+  // this was measured, which is what a fenced partition looks like while the
+  // control plane waits for its replicas to report past the fence.
+  //
+  // Nonzero means stored_bytes is a floor, not a total. Reported rather than
+  // folded in, because a sum that quietly omits a contributor reads as a
+  // small number rather than an incomplete one, and quota saturation is
+  // exactly the place that reading costs something. A floor is still enough
+  // to prove a keyspace is over its quota; it is not enough to prove it is
+  // under.
+  uint32 partitions_without_size = 7;
 }
 
 message CreateKeyspaceRequest {
@@ -179,9 +192,17 @@ message Partition {
   // Bumped on every ownership change; a write carrying a stale epoch is
   // rejected, which is what fences a deposed owner.
   uint64 epoch = 6;
-  uint64 committed_lamport = 7;
+  // The owner's durable position, which is this partition's committed one.
+  // Unset when no owner has reported it: an unowned partition, or one held
+  // fenced while its replicas report past the fence. Lamport zero is a real
+  // position a partition can be at, so it cannot also mean "nobody said".
+  optional uint64 committed_lamport = 7;
   repeated Replica replicas = 8;
-  uint64 size_bytes = 9;
+  // What the owner reported this partition holds. Unset for the same reason
+  // committed_lamport is. A fenced partition holding a gigabyte has an
+  // unknown size, not a size of zero, and an operator deciding what it can
+  // afford to lose needs to be able to tell those apart.
+  optional uint64 size_bytes = 9;
   // What the owner's memory-resident index costs for this partition. Per
   // ADR 0006 the index is resident whether or not the values are, and a
   // single partition's index has to fit on its owner, so this is a number an

@@ -88,6 +88,7 @@ fn keyspace(name: &str) -> Keyspace {
         created_at_millis: 1_700_000_000_000,
         partition_count: 1,
         stored_bytes: 4096,
+        partitions_without_size: 0,
     }
 }
 
@@ -175,13 +176,13 @@ impl Admin for Fake {
                 end_key: Vec::new(),
                 owner_node_id: 2,
                 epoch: 3,
-                committed_lamport: 500,
+                committed_lamport: Some(500),
                 replicas: vec![Replica {
                     node_id: 3,
                     applied_lamport: 490,
                     durable_lamport: 495,
                 }],
-                size_bytes: 1_048_576,
+                size_bytes: Some(1_048_576),
                 index_bytes: self.reports_index_memory.then_some(65_536),
             }],
             cluster_version: Some(ClusterVersion { major: 0, minor: 2 }),

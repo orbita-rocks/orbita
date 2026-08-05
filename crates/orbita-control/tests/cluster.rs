@@ -44,6 +44,7 @@ struct Cluster {
     progress: Progress,
     readiness: Arc<Mutex<HashMap<NodeId, bool>>>,
     draining: Arc<Mutex<HashMap<NodeId, bool>>>,
+    reporting: Arc<Mutex<HashMap<NodeId, bool>>>,
     /// What each worker claims its index costs, per partition it holds. Set
     /// by the tests so that the describe surface can be checked against a
     /// known answer rather than against whatever the storage layer produced.
@@ -100,6 +101,9 @@ impl Cluster {
             draining: Arc::new(Mutex::new(
                 WORKERS.into_iter().map(|node| (node, false)).collect(),
             )),
+            reporting: Arc::new(Mutex::new(
+                WORKERS.into_iter().map(|node| (node, true)).collect(),
+            )),
             index_bytes: Arc::new(Mutex::new(HashMap::new())),
         };
         cluster.spawn_sweep(&leader);
@@ -132,51 +136,59 @@ impl Cluster {
         let progress = Arc::clone(&self.progress);
         let readiness = Arc::clone(&self.readiness);
         let draining = Arc::clone(&self.draining);
+        let reporting = Arc::clone(&self.reporting);
         let index_bytes = Arc::clone(&self.index_bytes);
 
         runtime.spawn(async move {
             loop {
-                let map = controller.partition_map().await;
-                let lamport = Lamport(
-                    *progress
-                        .lock()
-                        .expect("progress lock poisoned")
-                        .get(&node)
-                        .unwrap_or(&0),
-                );
-                let index = *index_bytes
+                let should_report = *reporting
                     .lock()
-                    .expect("index bytes lock poisoned")
+                    .expect("reporting lock poisoned")
                     .get(&node)
-                    .unwrap_or(&Some(0));
-                let partitions: Vec<PartitionProgress> = map
-                    .held_by(node)
-                    .map(|info| PartitionProgress {
-                        partition: info.id,
-                        durable_lamport: lamport,
-                        applied_lamport: lamport,
-                        size_bytes: 0,
-                        index_bytes: index,
-                    })
-                    .collect();
-                let status = NodeStatus {
-                    role: NodeRole::Worker,
-                    address: format!("10.0.0.{node}:7000"),
-                    map_version: map.version(),
-                    speaks: orbita_control::binary_speaks(),
-                    ready: *readiness
+                    .unwrap_or(&false);
+                if should_report {
+                    let map = controller.partition_map().await;
+                    let lamport = Lamport(
+                        *progress
+                            .lock()
+                            .expect("progress lock poisoned")
+                            .get(&node)
+                            .unwrap_or(&0),
+                    );
+                    let index = *index_bytes
                         .lock()
-                        .expect("readiness lock poisoned")
+                        .expect("index bytes lock poisoned")
                         .get(&node)
-                        .unwrap_or(&false),
-                    draining: *draining
-                        .lock()
-                        .expect("draining lock poisoned")
-                        .get(&node)
-                        .unwrap_or(&false),
-                    partitions,
-                };
-                let _ = controller.record_status(node, status).await;
+                        .unwrap_or(&Some(0));
+                    let partitions: Vec<PartitionProgress> = map
+                        .held_by(node)
+                        .map(|info| PartitionProgress {
+                            partition: info.id,
+                            durable_lamport: lamport,
+                            applied_lamport: lamport,
+                            size_bytes: 0,
+                            index_bytes: index,
+                        })
+                        .collect();
+                    let status = NodeStatus {
+                        role: NodeRole::Worker,
+                        address: format!("10.0.0.{node}:7000"),
+                        map_version: map.version(),
+                        speaks: orbita_control::binary_speaks(),
+                        ready: *readiness
+                            .lock()
+                            .expect("readiness lock poisoned")
+                            .get(&node)
+                            .unwrap_or(&false),
+                        draining: *draining
+                            .lock()
+                            .expect("draining lock poisoned")
+                            .get(&node)
+                            .unwrap_or(&false),
+                        partitions,
+                    };
+                    let _ = controller.record_status(node, status).await;
+                }
                 clock.sleep(interval).await;
             }
         });
@@ -217,6 +229,13 @@ impl Cluster {
             .lock()
             .expect("draining lock poisoned")
             .insert(node, draining);
+    }
+
+    fn set_reporting(&self, node: NodeId, reporting: bool) {
+        self.reporting
+            .lock()
+            .expect("reporting lock poisoned")
+            .insert(node, reporting);
     }
 
     fn map(&self) -> PartitionMap {
@@ -854,7 +873,7 @@ fn a_promotion_waits_out_the_deposed_owners_read_leases() {
             // fence, which is at or after the fence itself, so a correct
             // implementation can show a gap slightly under the drain. What
             // must not happen is a promotion effectively immediately.
-            if gap + Duration::from_millis(100) < drain {
+            if gap + Duration::from_millis(25) < drain {
                 return Err(cluster.sim.failure(format!(
                     "promoted {gap:?} after the fence, which does not wait out a {drain:?} lease"
                 )));
@@ -862,6 +881,137 @@ fn a_promotion_waits_out_the_deposed_owners_read_leases() {
             Ok(())
         },
     );
+}
+
+#[test]
+fn a_fenced_partition_waits_for_every_survivor_to_observe_the_fence() {
+    let cluster = Cluster::start(1);
+    let partition = cluster.only_partition();
+    let before = cluster.map().partition(partition).unwrap().clone();
+    let deposed = before.owner.expect("an owner");
+    let silent = before.replicas[0];
+
+    cluster.sim.crash(deposed);
+    cluster.sim.run_for(Duration::from_millis(2_750));
+    cluster.set_reporting(silent, false);
+    assert!(cluster.run_until(Duration::from_secs(1), |c| {
+        c.owner_of(partition).is_none()
+    }));
+
+    let config = cluster.controller.config();
+    cluster
+        .sim
+        .run_for(config.lease_drain() + config.sweep_interval.saturating_mul(2));
+    assert_eq!(
+        cluster.owner_of(partition),
+        None,
+        "a survivor whose last report predates the fence may hold the durable tail"
+    );
+
+    cluster.set_reporting(silent, true);
+    assert!(cluster.run_until(Duration::from_secs(2), |c| {
+        c.owner_of(partition).is_some()
+    }));
+}
+
+#[test]
+fn unrelated_map_changes_do_not_invalidate_post_fence_reports() {
+    let cluster = Cluster::start(2);
+    let partition = cluster.only_partition();
+    let before = cluster.map().partition(partition).unwrap().clone();
+    let deposed = before.owner.expect("an owner");
+
+    cluster.sim.crash(deposed);
+    assert!(cluster.run_until(Duration::from_secs(5), |c| {
+        c.owner_of(partition).is_none()
+    }));
+    cluster
+        .sim
+        .run_for(cluster.controller.config().heartbeat_interval);
+    for replica in &before.replicas {
+        cluster.set_reporting(*replica, false);
+    }
+
+    let fence_version = cluster.map().version();
+    let controller = cluster.controller.clone();
+    cluster
+        .sim
+        .block_on(async move {
+            controller
+                .create_keyspace("second", KeyspaceConfig::default())
+                .await
+        })
+        .expect("create an unrelated keyspace");
+    assert!(cluster.map().version() > fence_version);
+
+    assert!(cluster.run_until(Duration::from_secs(2), |c| {
+        c.owner_of(partition).is_some()
+    }));
+}
+
+#[test]
+fn a_new_control_leader_does_not_repeat_a_completed_lease_drain() {
+    let cluster = Cluster::start(3);
+    let partition = cluster.only_partition();
+    let before = cluster.map().partition(partition).unwrap().clone();
+    let deposed = before.owner.expect("an owner");
+
+    cluster.sim.crash(deposed);
+    assert!(cluster.run_until(Duration::from_secs(5), |c| {
+        c.entries().iter().any(|command| {
+            matches!(
+                command,
+                ControlCommand::CompleteFenceDrain { partition: id, .. } if *id == partition
+            )
+        })
+    }));
+    assert_eq!(cluster.owner_of(partition), None);
+
+    cluster.sim.crash(LEADER);
+    let restarted = cluster.sim.restart(LEADER, DiskPolicy::Intact);
+    let promoted = cluster.sim.block_on(async move {
+        let log = Log::open(&restarted).await?;
+        let controller = Controller::new(restarted, log, ControlConfig::default());
+        controller.recover().await?;
+        controller.tick().await?;
+        let map = controller.partition_map().await;
+        for replica in before.replicas {
+            controller
+                .record_status(
+                    replica,
+                    NodeStatus {
+                        role: NodeRole::Worker,
+                        address: format!("10.0.0.{replica}:7000"),
+                        map_version: map.version(),
+                        speaks: binary_speaks(),
+                        ready: true,
+                        draining: false,
+                        partitions: vec![PartitionProgress {
+                            partition,
+                            durable_lamport: Lamport(1),
+                            applied_lamport: Lamport(1),
+                            size_bytes: 0,
+                            // A node speaking the current status method that
+                            // has measured an empty index. This scenario is
+                            // about promotion, so the honest neutral value is
+                            // a measurement, not the absence of one.
+                            index_bytes: Some(0),
+                        }],
+                    },
+                )
+                .await?;
+        }
+        controller.tick().await?;
+        Ok::<_, Error>(
+            controller
+                .partition_map()
+                .await
+                .partition(partition)
+                .and_then(|info| info.owner),
+        )
+    });
+
+    assert!(matches!(promoted, Ok(Some(_))));
 }
 
 #[test]
@@ -1068,77 +1218,50 @@ fn a_control_leader_restart_keeps_the_unacknowledged_handoff_set() {
 }
 
 #[test]
-fn a_split_leaves_every_key_owned_at_every_committed_instant() {
-    check_seeds(
-        "a_split_leaves_every_key_owned_at_every_committed_instant",
-        16,
-        |seed| {
-            let cluster = Cluster::start(seed);
-            let parent = cluster.only_partition();
-            let keyspace = cluster
-                .map()
-                .partition(parent)
-                .expect("the partition")
-                .keyspace;
+fn a_split_is_refused_until_child_storage_can_be_prepared() {
+    let cluster = Cluster::start(1);
+    let parent = cluster.only_partition();
+    let before = cluster.map();
+    let epoch = before.partition(parent).expect("the parent").epoch;
+    let log = Arc::clone(&cluster.log);
+    cluster
+        .sim
+        .block_on(async move {
+            log.propose(ControlCommand::SplitPartition {
+                parent,
+                at: bytes::Bytes::from_static(b"m"),
+                lower: PartitionId(100),
+                upper: PartitionId(101),
+                expect_epoch: epoch,
+            })
+            .await
+        })
+        .expect("commit a split without the controller proposal path");
+    let controller = cluster.controller.clone();
+    cluster
+        .sim
+        .block_on(async move { controller.recover().await })
+        .expect("apply the committed refusal");
 
-            let controller = cluster.controller.clone();
-            let split = cluster.sim.block_on(async move {
-                controller
-                    .split_partition(parent, Some(bytes::Bytes::from_static(b"m")))
-                    .await
-            });
-            let Ok((lower, upper)) = split else {
-                return Err(cluster.sim.failure(format!("the split failed: {split:?}")));
-            };
-            cluster.sim.run_for(Duration::from_secs(1));
-
-            if let Err(reason) = coverage_holds_through_every_entry(&cluster.entries()) {
-                return Err(cluster.sim.failure(reason));
-            }
-
-            let map = cluster.map();
-            for (key, expected) in [
-                (&b"a"[..], lower),
-                (b"l", lower),
-                (b"m", upper),
-                (b"zz", upper),
-            ] {
-                match map.lookup(keyspace, key) {
-                    Some(info) if info.id == expected => {}
-                    other => {
-                        return Err(cluster.sim.failure(format!(
-                            "key {key:?} resolved to {:?}, expected {expected}",
-                            other.map(|i| i.id)
-                        )))
-                    }
-                }
-            }
-            if map.partition(parent).is_some() {
-                return Err(cluster
-                    .sim
-                    .failure("the parent partition outlived the split"));
-            }
-            Ok(())
-        },
-    );
+    assert_eq!(cluster.map(), before);
 }
 
 #[test]
 fn the_partition_map_survives_a_full_restart() {
     check_seeds("the_partition_map_survives_a_full_restart", 16, |seed| {
         let cluster = Cluster::start(seed);
-        let partition = cluster.only_partition();
-
         // Move the map somewhere non-trivial first, so that surviving means
         // more than "the bootstrap ran again".
         let controller = cluster.controller.clone();
-        let split = cluster.sim.block_on(async move {
+        let created = cluster.sim.block_on(async move {
             controller
-                .split_partition(partition, Some(bytes::Bytes::from_static(b"m")))
+                .create_keyspace("second", KeyspaceConfig::default())
                 .await
         });
-        if split.is_err() {
-            return Err(cluster.sim.failure(format!("the split failed: {split:?}")));
+        if created.is_err() {
+            return Err(cluster
+                .sim
+                .failure(format!("keyspace creation failed: {created:?}")));
         }
         cluster.sim.run_for(Duration::from_secs(2));
         let before = cluster.map();
@@ -1482,7 +1605,7 @@ fn an_incompatible_existing_owner_stays_live_while_its_heartbeats_continue() {
                     .find(|view| view.info.id == partition)
                     .map(|view| view.committed_lamport)
             });
-            if progress != Some(Lamport(77)) {
+            if progress != Some(Some(Lamport(77))) {
                 return Err(cluster.sim.failure(format!(
                     "incompatible owner's heartbeat progress was not retained: {progress:?}"
                 )));
@@ -1663,13 +1786,12 @@ fn a_control_log_that_survived_failed_writes_still_replays_in_full() {
         32,
         |seed| {
             let cluster = Cluster::start_with(flaky_disk(seed));
-            let partition = cluster.only_partition();
             cluster.sim.run_for(Duration::from_secs(3));
 
             let controller = cluster.controller.clone();
             let _ = cluster.sim.block_on(async move {
                 controller
-                    .split_partition(partition, Some(bytes::Bytes::from_static(b"m")))
+                    .create_keyspace("second", KeyspaceConfig::default())
                     .await
             });
             cluster.sim.run_for(Duration::from_secs(3));
@@ -2011,9 +2133,75 @@ fn a_describe_response_agrees_with_itself_about_what_each_keyspace_stores() {
         );
         assert_eq!(
             keyspace.stored_bytes,
-            mine.iter().map(|p| p.size_bytes).sum::<u64>(),
+            mine.iter().filter_map(|p| p.size_bytes).sum::<u64>(),
             "keyspace {} totals bytes the partitions beside it do not add up to",
             keyspace.name
         );
+        assert_eq!(
+            keyspace.partitions_without_size as usize,
+            mine.iter().filter(|p| p.size_bytes.is_none()).count(),
+            "keyspace {} disagrees with the same response about how many of \
+             its partitions had nobody reporting a size",
+            keyspace.name
+        );
     }
+}
+
+#[test]
+fn a_fenced_partition_reports_unknown_progress_rather_than_zeroes() {
+    // #53 made a partition sit fenced and unowned for as long as it takes
+    // every surviving replica to report past the fence, which is a state an
+    // operator now meets routinely during a failover. There is no owner to
+    // have reported size, position, or index, so none of those are known.
+    //
+    // Zero is the wrong answer for all three in the same way it was wrong for
+    // an unreported index: a partition holding a gigabyte reads as empty, and
+    // a replica set mid-failover reads as perfectly caught up, at exactly the
+    // moment somebody is deciding whether losing this partition is cheap.
+    let cluster = Cluster::start(31);
+    let partition = cluster.only_partition();
+    let deposed = cluster.owner_of(partition).expect("an owner");
+    cluster.set_index_bytes(deposed, 8_192);
+    cluster.sim.run_for(Duration::from_secs(2));
+
+    let controller = cluster.controller.clone();
+    let before = cluster.sim.block_on(async move { controller.view().await });
+    let described = before
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("the partition is described");
+    assert_eq!(
+        described.index_bytes,
+        Some(8_192),
+        "a served partition reports what its owner measured"
+    );
+    assert!(described.size_bytes.is_some());
+    assert!(described.committed_lamport.is_some());
+
+    // Take the owner away. Nobody is left to report on this partition.
+    cluster.sim.crash(deposed);
+    assert!(cluster.run_until(Duration::from_secs(5), |c| {
+        c.owner_of(partition).is_none()
+    }));
+
+    let controller = cluster.controller.clone();
+    let view = cluster.sim.block_on(async move { controller.view().await });
+    let described = view
+        .partitions
+        .iter()
+        .find(|p| p.info.id == partition)
+        .expect("a fenced partition is still described");
+
+    assert_eq!(described.info.owner, None, "the fence removed the owner");
+    assert_eq!(
+        described.size_bytes, None,
+        "a partition with no owner reporting has an unknown size, not an \
+         empty one"
+    );
+    assert_eq!(
+        described.committed_lamport, None,
+        "and an unknown committed position, not lamport zero"
+    );
+    assert_eq!(described.index_bytes, None);
 }

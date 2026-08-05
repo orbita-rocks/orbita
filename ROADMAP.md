@@ -21,9 +21,11 @@ system is further along and the first measurements exist.
 More is built than the version number suggests. The KV surface (GET, SET,
 DELETE, LIST with cursors, CAS and IF NOT PRESENT, TTLs), keyspaces with
 credentials and quotas, the 2-of-3 replicated WAL, owner failover with epoch
-fencing, split and merge, replica reads behind leases per ADR 0001, the admin
-API and CLI, the deterministic simulator, and a Python end-to-end suite all
-exist and pass.
+fencing, replica reads behind leases per ADR 0001, the admin API and CLI, the
+deterministic simulator, and a Python end-to-end suite all exist and pass. The
+split metadata state machine exists, but the operation is deliberately disabled
+until workers can prepare child storage before the parent map entry is retired;
+merge remains unimplemented.
 
 Two things are deliberately staged rather than missing by accident. The control
 plane runs its replicated state machine over a single-node consensus log, with

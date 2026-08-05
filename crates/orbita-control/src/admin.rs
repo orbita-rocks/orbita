@@ -10,7 +10,6 @@ use crate::controller::{ClusterView, Controller};
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Keyspace, KeyspaceConfig, Permission};
 
-use bytes::Bytes;
 use orbita_core::{Error, KeyspaceId, NodeId, PartitionId, PartitionInfo};
 use orbita_proto::v1 as pb;
 use orbita_runtime::Runtime;
@@ -48,10 +47,17 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
 }
 
 /// What one keyspace's partitions add up to in one observation.
+///
+/// `stored_bytes` is a lower bound rather than a total whenever
+/// `partitions_without_size` is nonzero, which happens while a partition is
+/// fenced and has no owner to have reported its size. A lower bound is a true
+/// statement and a silently short total is not, and the difference decides
+/// whether a keyspace over its quota can be seen to be over it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct KeyspaceTotals {
     partition_count: u32,
     stored_bytes: u64,
+    partitions_without_size: u32,
 }
 
 /// Every keyspace's totals, in one pass over one snapshot.
@@ -67,7 +73,13 @@ fn keyspace_totals(view: &ClusterView) -> HashMap<KeyspaceId, KeyspaceTotals> {
     for partition in &view.partitions {
         let entry = totals.entry(partition.info.keyspace).or_default();
         entry.partition_count += 1;
-        entry.stored_bytes += partition.size_bytes;
+        match partition.size_bytes {
+            Some(bytes) => entry.stored_bytes += bytes,
+            // Counted rather than skipped. Dropping it would make the sum
+            // read as a complete total that happens to be small, which is the
+            // reading a keyspace at its quota can least afford.
+            None => entry.partitions_without_size += 1,
+        }
     }
     totals
 }
@@ -85,6 +97,7 @@ fn keyspace_message(
         created_at_millis: keyspace.created_at_millis,
         partition_count: totals.partition_count,
         stored_bytes: totals.stored_bytes,
+        partitions_without_size: totals.partitions_without_size,
     }
 }
 
@@ -266,7 +279,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
                 // Node ids start at one, so it cannot be confused with a node.
                 owner_node_id: p.info.owner.map_or(0, NodeId::get),
                 epoch: p.info.epoch.get(),
-                committed_lamport: p.committed_lamport.get(),
+                committed_lamport: p.committed_lamport.map(orbita_core::Lamport::get),
                 replicas: p
                     .replica_progress
                     .iter()
@@ -322,26 +335,12 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn split_partition(
         &self,
-        request: Request<pb::SplitPartitionRequest>,
+        _request: Request<pb::SplitPartitionRequest>,
     ) -> Result<Response<pb::SplitPartitionResponse>, Status> {
         self.ready().await?;
-        let request = request.into_inner();
-        let at = if request.split_key.is_empty() {
-            None
-        } else {
-            Some(Bytes::from(request.split_key))
-        };
-        let (lower, upper) = self
-            .controller
-            .split_partition(PartitionId(request.partition_id), at)
-            .await
-            .map_err(status)?;
-
-        let map = self.controller.partition_map().await;
-        Ok(Response::new(pb::SplitPartitionResponse {
-            lower: map.partition(lower).map(partition_message),
-            upper: map.partition(upper).map(partition_message),
-        }))
+        Err(Status::unimplemented(
+            "partition split is disabled until child storage preparation is implemented",
+        ))
     }
 
     async fn merge_partitions(
@@ -390,7 +389,8 @@ fn partition_message(info: &PartitionInfo) -> pb::Partition {
         end_key: info.range.end().unwrap_or_default().to_vec(),
         owner_node_id: info.owner.map_or(0, NodeId::get),
         epoch: info.epoch.get(),
-        committed_lamport: 0,
+        // Nothing was observed on this path, so nothing is claimed.
+        committed_lamport: None,
         replicas: info
             .replicas
             .iter()
@@ -400,9 +400,8 @@ fn partition_message(info: &PartitionInfo) -> pb::Partition {
                 durable_lamport: 0,
             })
             .collect(),
-        size_bytes: 0,
-        // Nothing was observed on this path, so nothing is claimed. A split
-        // result that reported an empty index would be inventing a
+        size_bytes: None,
+        // A partial view that reported an empty index would be inventing a
         // measurement out of the absence of one.
         index_bytes: None,
     }

@@ -472,6 +472,7 @@ pub fn keyspace_usage_view(keyspace: &Keyspace) -> KeyspaceUsageView {
         name: keyspace.name.clone(),
         partition_count: keyspace.partition_count,
         stored_bytes: keyspace.stored_bytes,
+        partitions_without_size: keyspace.partitions_without_size,
         max_storage_bytes: keyspace.config.and_then(|c| c.max_storage_bytes),
     }
 }
@@ -502,13 +503,13 @@ mod tests {
             end_key: Vec::new(),
             owner_node_id: 3,
             epoch: 4,
-            committed_lamport: 5,
+            committed_lamport: Some(5),
             replicas: vec![Replica {
                 node_id: 6,
                 applied_lamport: 5,
                 durable_lamport: 5,
             }],
-            size_bytes: 7,
+            size_bytes: Some(7),
             index_bytes: Some(8),
         });
         assert!(view.end_key.is_none());
@@ -600,6 +601,7 @@ mod tests {
             created_at_millis: 0,
             partition_count: 1,
             stored_bytes: 0,
+            partitions_without_size: 0,
         });
         assert_eq!(view.name, "demo");
         assert_eq!(view.config.default_ttl_millis, None);

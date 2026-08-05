@@ -24,7 +24,6 @@ use crate::model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission
 use crate::state::{ClusterState, NodeRecord, PartitionPhase};
 use crate::version::{binary_speaks, ClusterVersion, CompatibilityRefusal};
 
-use bytes::Bytes;
 use orbita_core::{
     Epoch, Error, Lamport, MapVersion, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
 };
@@ -99,8 +98,17 @@ pub struct PartitionView {
     pub phase: PartitionPhase,
     /// The owner's reported durable Lamport, which is the partition's
     /// committed position.
-    pub committed_lamport: Lamport,
-    pub size_bytes: u64,
+    ///
+    /// `None` when no owner has reported: an unowned partition, or one
+    /// [`PartitionPhase::Fenced`] is holding while its replicas report past
+    /// the fence. Lamport zero is a position a partition can genuinely be at,
+    /// and a fenced partition mid-failover is not at it.
+    pub committed_lamport: Option<Lamport>,
+    /// What the owner reported this partition holds. `None` for the same
+    /// reason as [`Self::committed_lamport`]: a fenced partition full of data
+    /// has an unknown size, not an empty one, and that difference decides
+    /// whether an operator thinks losing it is cheap.
+    pub size_bytes: Option<u64>,
     /// What the owner's index for this partition costs in memory. A single
     /// partition's index has to fit on its owner, so this is read against one
     /// machine rather than against the cluster.
@@ -269,6 +277,11 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// agreed on and not a failure to reach anybody.
     pub async fn submit(&self, command: ControlCommand) -> Result<()> {
         self.ensure_leader_ready().await?;
+        self.inner
+            .lock()
+            .await
+            .state
+            .ensure_command_permitted(&command)?;
         let index = self.log.propose(command).await?;
         self.apply_through(index).await?;
         self.outcome_at(index).await
@@ -724,57 +737,6 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         Ok(())
     }
 
-    /// Splits a partition at `at`, or at the midpoint the owner suggests when
-    /// `at` is `None`.
-    ///
-    /// The map change is a single committed entry, so there is no instant at
-    /// which a key in the parent's range is unowned or doubly owned. Both
-    /// children start at the parent's epoch plus one, which fences any write
-    /// the owner had in flight against the parent.
-    ///
-    /// What is not here yet is the data side of a split: the owner has to
-    /// quiesce, flush, and report a boundary before the children can accept
-    /// writes independently. The metadata operation is the part that has to be
-    /// atomic, and it is; the handshake is a worker protocol.
-    pub async fn split_partition(
-        &self,
-        partition: PartitionId,
-        at: Option<Bytes>,
-    ) -> Result<(PartitionId, PartitionId)> {
-        let (command, lower, upper) = {
-            let inner = self.inner.lock().await;
-            let info = inner
-                .state
-                .map()
-                .partition(partition)
-                .ok_or_else(|| Error::InvalidArgument(format!("no partition {partition}")))?
-                .clone();
-            let at = match at {
-                Some(at) => at,
-                None => suggested_split_key(&info).ok_or_else(|| {
-                    Error::InvalidArgument(
-                        "no split key was given and none could be derived from the range".into(),
-                    )
-                })?,
-            };
-            let lower = inner.state.next_partition_id();
-            let upper = lower.next();
-            (
-                ControlCommand::SplitPartition {
-                    parent: partition,
-                    at,
-                    lower,
-                    upper,
-                    expect_epoch: info.epoch,
-                },
-                lower,
-                upper,
-            )
-        };
-        self.submit(command).await?;
-        Ok((lower, upper))
-    }
-
     /// Hands a partition to one of its replicas, deliberately.
     ///
     /// This is the same two-step sequence as a failover, for the same reason:
@@ -929,29 +891,6 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             .ok_or_else(|| Error::InvalidArgument(format!("no partition {partition}")))
     }
 
-    /// Partitions that have grown past the split threshold.
-    ///
-    /// Reported rather than acted on. A split needs a boundary key, and the
-    /// only thing that can choose a good one is the owner, which is the only
-    /// node that knows how the keys are distributed inside the range. A
-    /// midpoint chosen from the range bounds alone would routinely produce two
-    /// lopsided halves and a second split immediately after.
-    pub async fn split_candidates(&self) -> Vec<PartitionId> {
-        let inner = self.inner.lock().await;
-        let mut out = Vec::new();
-        for info in inner.state.map().partitions() {
-            let size = info
-                .owner
-                .and_then(|o| inner.observations.get(&o))
-                .and_then(|obs| obs.status.progress(info.id))
-                .map_or(0, |p| p.size_bytes);
-            if size >= self.config.split_threshold_bytes {
-                out.push(info.id);
-            }
-        }
-        out
-    }
-
     /// Everything `DescribeCluster` answers with.
     pub async fn view(&self) -> ClusterView {
         let control_leader = self.log.leader().await;
@@ -995,8 +934,13 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                         .state
                         .phase(info.id)
                         .unwrap_or(PartitionPhase::Unowned),
-                    committed_lamport: owner_progress.map_or(Lamport::ZERO, |p| p.durable_lamport),
-                    size_bytes: owner_progress.map_or(0, |p| p.size_bytes),
+                    // All three follow the owner's report, so all three are
+                    // absent together when there is no owner to have made
+                    // one. #53 made that state common rather than fleeting:
+                    // a fenced partition stays unowned until every surviving
+                    // replica has reported past the fence.
+                    committed_lamport: owner_progress.map(|p| p.durable_lamport),
+                    size_bytes: owner_progress.map(|p| p.size_bytes),
                     index_bytes: owner_progress.and_then(|p| p.index_bytes),
                     replica_progress: info
                         .replicas
@@ -1121,7 +1065,6 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 .collect()
         };
 
-        let now = self.runtime.clock().monotonic_nanos();
         for (partition, expect_epoch) in doomed {
             // The epoch bump and the loss of the owner are one entry, and it
             // commits strictly before anything is promoted. That ordering is
@@ -1136,7 +1079,12 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             {
                 Ok(()) => {
                     tracing::info!(%partition, "fenced a dead owner");
-                    self.inner.lock().await.fenced_since.insert(partition, now);
+                    let committed_at = self.runtime.clock().monotonic_nanos();
+                    self.inner
+                        .lock()
+                        .await
+                        .fenced_since
+                        .insert(partition, committed_at);
                 }
                 // Another sweep or another leader got there first. The
                 // partition is fenced either way, which is all this pass
@@ -1152,7 +1100,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         let now = self.runtime.clock().monotonic_nanos();
         let drain = self.config.lease_drain().as_nanos() as u64;
 
-        let ready: Vec<ControlCommand> = {
+        let (completed_drains, ready): (Vec<ControlCommand>, Vec<ControlCommand>) = {
             let mut inner = self.inner.lock().await;
             let fenced: Vec<PartitionInfo> = inner
                 .state
@@ -1168,17 +1116,37 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 .cloned()
                 .collect();
 
-            let mut commands = Vec::new();
+            let mut completed_drains = Vec::new();
+            let mut ready = Vec::new();
             for info in fenced {
+                let Some(PartitionPhase::Fenced {
+                    map_version,
+                    drain_complete,
+                    ..
+                }) = inner.state.phase(info.id)
+                else {
+                    continue;
+                };
                 // A leader that inherited this partition mid-failover has no
                 // record of when the fence happened, so it starts the wait
                 // now. Waiting longer than necessary costs availability;
                 // waiting less could let a replica serve a pre-failover value.
-                let since = *inner.fenced_since.entry(info.id).or_insert(now);
-                if now.saturating_sub(since) < drain {
-                    continue;
+                if !drain_complete {
+                    let since = *inner.fenced_since.entry(info.id).or_insert(now);
+                    if now.saturating_sub(since) < drain {
+                        continue;
+                    }
+                    // Tag 17 belongs to protocol 0.1. Before finalization the
+                    // previous binary must still be able to read every entry.
+                    if inner.state.cluster_version() >= ClusterVersion::new(0, 1) {
+                        completed_drains.push(ControlCommand::CompleteFenceDrain {
+                            partition: info.id,
+                            expect_epoch: info.epoch,
+                        });
+                        continue;
+                    }
                 }
-                let Some(owner) = best_candidate(&inner, &info) else {
+                let Some(owner) = best_candidate(&inner, &info, map_version) else {
                     // No replica has reported its position yet. Promoting one
                     // blind could pick a node that is behind and lose an
                     // acknowledged write, so the partition stays unavailable
@@ -1189,7 +1157,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     );
                     continue;
                 };
-                commands.push(ControlCommand::AssignOwner {
+                ready.push(ControlCommand::AssignOwner {
                     partition: info.id,
                     owner,
                     replicas: info
@@ -1201,8 +1169,22 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     expect_epoch: info.epoch,
                 });
             }
-            commands
+            (completed_drains, ready)
         };
+
+        for command in completed_drains {
+            let partition = match &command {
+                ControlCommand::CompleteFenceDrain { partition, .. } => *partition,
+                _ => continue,
+            };
+            match self.submit(command).await {
+                Ok(()) => {
+                    self.inner.lock().await.fenced_since.remove(&partition);
+                }
+                Err(Error::StaleEpoch { .. } | Error::InvalidArgument(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
 
         for command in ready {
             let (partition, owner) = match &command {
@@ -1329,32 +1311,39 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     }
 }
 
-/// The most caught-up replica eligible for new ownership, or `None` if an
-/// eligible replica has not reached the most durable surviving position.
+/// The most caught-up replica eligible for new ownership, or `None` until
+/// every surviving replica has reported its durable position after the fence.
 ///
 /// Highest durable Lamport wins, because that is what bounds the writes the
 /// cluster has acknowledged: the WAL acknowledges at two of three, so any
 /// acknowledged entry is on at least one surviving node, and promoting the
-/// furthest survivor cannot lose one. Ties break on node id so the choice is
-/// reproducible from a seed.
-fn best_candidate(inner: &Inner, info: &PartitionInfo) -> Option<NodeId> {
-    let durable_required = info
-        .replicas
-        .iter()
-        .filter(|replica| {
-            inner
-                .state
-                .node(**replica)
-                .is_some_and(|node| node.health == NodeHealth::Healthy)
-        })
-        .filter_map(|replica| {
-            inner
-                .observations
-                .get(replica)
-                .and_then(|obs| obs.status.progress(info.id))
-                .map(|progress| progress.durable_lamport)
-        })
-        .max()?;
+/// furthest survivor cannot lose one. A missing report, or one generated from
+/// a pre-fence map, is an unknown upper bound rather than evidence that the
+/// replica is behind. Ties break on node id so the choice is reproducible from
+/// a seed.
+fn best_candidate(
+    inner: &Inner,
+    info: &PartitionInfo,
+    fence_map_version: MapVersion,
+) -> Option<NodeId> {
+    let mut durable_required = None;
+    for replica in &info.replicas {
+        // Replica membership cannot outlive its node record because ForgetNode
+        // refuses held partitions. Fail closed if historical or corrupt state
+        // ever violates that invariant: an unknown replica may hold the tail.
+        let node = inner.state.node(*replica)?;
+        if node.health == NodeHealth::Dead {
+            continue;
+        }
+        let observation = inner.observations.get(replica)?;
+        if observation.status.map_version < fence_map_version {
+            return None;
+        }
+        let durable = observation.status.progress(info.id)?.durable_lamport;
+        durable_required =
+            Some(durable_required.map_or(durable, |seen: Lamport| seen.max(durable)));
+    }
+    let durable_required = durable_required?;
 
     info.replicas
         .iter()
@@ -1393,31 +1382,6 @@ fn classify(silence_nanos: u64, config: &ControlConfig) -> NodeHealth {
         NodeHealth::Suspect
     } else {
         NodeHealth::Healthy
-    }
-}
-
-/// A boundary key derived from the range alone, used only when the caller did
-/// not supply one.
-///
-/// This is a poor split point and it is meant to be: it exists so a manual
-/// split with no key does something rather than failing, and the doc comment
-/// on [`Controller::split_candidates`] explains why a good one has to come
-/// from the owner.
-fn suggested_split_key(info: &PartitionInfo) -> Option<Bytes> {
-    let start = info.range.start();
-    match info.range.end() {
-        // An unbounded range has no midpoint to compute, so the split point is
-        // one byte past the start, which at least produces two legal ranges.
-        None => {
-            let mut key = start.to_vec();
-            key.push(0);
-            Some(Bytes::from(key))
-        }
-        Some(end) => {
-            let mut key = start.to_vec();
-            key.push(0);
-            (key.as_slice() < end).then(|| Bytes::from(key))
-        }
     }
 }
 

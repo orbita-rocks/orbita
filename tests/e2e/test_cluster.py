@@ -169,7 +169,13 @@ def test_describe_reports_storage_against_the_quota_each_keyspace_was_given(
         ]
         assert keyspaces["quotad"].partition_count == len(mine), described
         assert keyspaces["quotad"].stored_bytes == sum(
-            p.size_bytes for p in mine
+            p.size_bytes for p in mine if p.HasField("size_bytes")
+        ), described
+        # A partition with no owner reporting makes stored_bytes a floor
+        # rather than a total, and the count is what says which it is. The
+        # two have to agree inside one response.
+        assert keyspaces["quotad"].partitions_without_size == sum(
+            1 for p in mine if not p.HasField("size_bytes")
         ), described
 
         # Index memory carries proto field presence, which is what lets a
@@ -182,6 +188,10 @@ def test_describe_reports_storage_against_the_quota_each_keyspace_was_given(
             node.HasField("index_memory_bytes")
         for partition in described.partitions:
             partition.HasField("index_bytes")
+            # Size and committed position carry presence for the same reason:
+            # a fenced partition has an unknown size, not a size of zero.
+            partition.HasField("size_bytes")
+            partition.HasField("committed_lamport")
     finally:
         for channel in channels:
             channel.close()

@@ -1,20 +1,34 @@
 //! Integration tests against a live S3-compatible server, MinIO in practice.
 //!
-//! Ignored by default because CI and most laptops have no bucket to talk to.
-//! To run them, point the environment at one and ask for ignored tests:
+//! Ignored by default because most laptops have no bucket to talk to. CI runs
+//! them on every pull request via `moon run orbita-objectstore:test-live-s3`,
+//! against the MinIO digest pinned in `.github/workflows/ci.yml`.
+//!
+//! To run them by hand, stand a server up, point the environment at it, and
+//! use the same task CI uses:
 //!
 //! ```sh
-//! docker run --rm -p 9000:9000 minio/minio server /data
+//! docker run -d --name minio -p 9000:9000 \
+//!   -e MINIO_ROOT_USER=orbita-ci -e MINIO_ROOT_PASSWORD=orbita-ci-secret \
+//!   minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+//! docker exec minio mc alias set ci http://127.0.0.1:9000 orbita-ci orbita-ci-secret
+//! docker exec minio mc mb ci/orbita-ci
+//!
 //! export ORBITA_S3_TEST_ENDPOINT=http://127.0.0.1:9000
-//! export ORBITA_S3_TEST_BUCKET=orbita-test        # must already exist
-//! export ORBITA_S3_TEST_ACCESS_KEY=minioadmin
-//! export ORBITA_S3_TEST_SECRET_KEY=minioadmin
-//! cargo test -p orbita-objectstore --all-features -- --ignored
+//! export ORBITA_S3_TEST_BUCKET=orbita-ci          # must already exist
+//! export ORBITA_S3_TEST_ACCESS_KEY=orbita-ci
+//! export ORBITA_S3_TEST_SECRET_KEY=orbita-ci-secret
+//! moon run orbita-objectstore:test-live-s3
 //! ```
 //!
 //! The conditional-write tests need a MinIO recent enough to implement
-//! conditional PUT (early 2025 or later); against an older server they fail
-//! with the store's explicit 501 diagnostic, which is itself the finding.
+//! conditional PUT, which is early 2025 or later. An older server does not
+//! reliably announce that it cannot: `RELEASE.2023-12-02T10-51-33Z` answers
+//! `200` to a `PUT` carrying `If-None-Match: *` and overwrites the object,
+//! so the finding arrives as a failed assertion here rather than as the
+//! store's 501 diagnostic. That is the entire reason these tests have to run
+//! against a real server instead of a mock, and the reason the image in CI is
+//! pinned rather than tracking a tag.
 
 #![cfg(feature = "hyper-client")]
 
