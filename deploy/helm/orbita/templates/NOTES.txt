@@ -51,3 +51,27 @@ Warning: no object store is configured, so compacted data stays on local disks
 and replacing a worker means rehydrating it from its replicas. Set
 objectStore.endpoint before this cluster holds anything you care about.
 {{- end }}
+{{- if and .Values.objectStore.endpoint (eq (include "orbita.credentialSource" .) "static") }}
+
+This release authenticates to object storage with a static access key. On AWS,
+prefer a keyless source with objectStore.roleArn: the nodes then source
+short-lived credentials (IRSA on EKS, or the instance profile on plain EC2) and
+assume the role that carries the bucket policy, and this release deploys no
+Secret at all. Static keys remain the right answer for MinIO and R2, which
+offer nothing else.
+{{- end }}
+{{- if and .Values.objectStore.endpoint (eq (include "orbita.credentialSource" .) "default") }}
+
+Object store credentials are resolved at node startup, in this order:
+
+  1. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the environment
+  2. EKS IRSA (AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN)
+  3. The container credential endpoint (ECS task role, EKS Pod Identity)
+  4. The EC2 instance profile, over IMDSv2
+
+Each node logs which one it picked. On EKS, note that 2 and 4 are different
+principals: IRSA gives you the service account's role, while the instance
+profile is the node group's. If you meant one specifically, set
+objectStore.credentialSource so a missing source fails at startup instead of
+falling through.
+{{- end }}

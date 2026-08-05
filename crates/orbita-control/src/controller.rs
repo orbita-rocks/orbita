@@ -77,6 +77,13 @@ pub struct NodeView {
     /// How long since the leader last heard from it, in milliseconds. `None`
     /// when this leader has never heard from it at all.
     pub silent_for_millis: Option<u64>,
+    /// The map version this node last said it was routing on. `None` when this
+    /// leader has never heard from it.
+    ///
+    /// This is the leader's own evidence that a decision it published actually
+    /// landed, which is what makes "the cluster has caught up" answerable
+    /// rather than a matter of waiting long enough and assuming.
+    pub reported_map_version: Option<MapVersion>,
     pub is_control_leader: bool,
     /// What the indexes of every partition this node reported cost in memory.
     /// Summed here rather than in the CLI because the leader group holds the
@@ -101,6 +108,10 @@ pub struct PartitionView {
     ///
     /// Read from the owner's committed prefix rather than its durable
     /// position, because the two differ and only one of them is safe to show.
+    /// This is the field issue #87 raised: it used to be filled in from
+    /// `orbita_wal::PartitionLog::durable_lamport`, which is one disk, under
+    /// a name that promises a quorum. Between the two sit entries whose
+    /// `commit` returned `Unavailable`.
     /// A draining owner's `quiesce` truncates the writes it holds alone —
     /// writes whose clients were told they failed — which drops its durable
     /// position. Sourcing this column from that number made a planned
@@ -922,6 +933,10 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     .observations
                     .get(&record.id)
                     .map(|obs| (now.saturating_sub(obs.heard_at_nanos)) / 1_000_000),
+                reported_map_version: inner
+                    .observations
+                    .get(&record.id)
+                    .map(|obs| obs.status.map_version),
                 is_control_leader: control_leader == Some(record.id),
                 // `sum` over an iterator of Options is None if any element
                 // is, which is exactly the wanted arithmetic: one silent

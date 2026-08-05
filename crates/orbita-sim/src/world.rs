@@ -95,6 +95,14 @@ pub(crate) struct SimState {
     pub handlers: BTreeMap<(NodeId, u16), Arc<dyn DynHandler>>,
     pub trace: Trace,
     pub faults_used: u64,
+    /// The virtual instant the last fault was injected, if any. What a
+    /// convergence check measures its bound from, since "recovered" is only
+    /// meaningful relative to the last thing that broke.
+    pub last_fault_nanos: Option<u64>,
+    /// Set once a scenario has stopped breaking the world on purpose. Distinct
+    /// from an exhausted budget, which is a run that ran out of faults rather
+    /// than one that decided it was done.
+    pub faults_frozen: bool,
 }
 
 impl SimState {
@@ -112,6 +120,8 @@ impl SimState {
             handlers: BTreeMap::new(),
             trace: Trace::new(config.seed, config.trace_limit),
             faults_used: 0,
+            last_fault_nanos: None,
+            faults_frozen: false,
         }
     }
 
@@ -186,7 +196,7 @@ impl SimCore {
     /// Every fault site goes through here so that the budget and the warm-up
     /// are enforced in one place rather than remembered at each call site.
     pub fn roll_fault(&self, state: &mut SimState, permille: u64) -> bool {
-        if permille == 0 {
+        if permille == 0 || state.faults_frozen {
             return false;
         }
         if state.now < self.config.fault_warmup.as_nanos() as u64 {
@@ -197,6 +207,7 @@ impl SimCore {
         }
         if self.fault_rng.chance(permille, 1000) {
             state.faults_used += 1;
+            state.last_fault_nanos = Some(state.now);
             true
         } else {
             false

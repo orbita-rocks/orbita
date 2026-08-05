@@ -93,6 +93,24 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "object_store.secret_access_key",
     ),
     (
+        "ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE",
+        "object_store.credential_source: default, static, environment, \
+         web-identity, container, or instance-profile",
+    ),
+    ("ORBITA_OBJECT_STORE_ROLE_ARN", "object_store.role_arn"),
+    (
+        "ORBITA_OBJECT_STORE_ROLE_EXTERNAL_ID",
+        "object_store.role_external_id",
+    ),
+    (
+        "ORBITA_OBJECT_STORE_ROLE_SESSION_NAME",
+        "object_store.role_session_name",
+    ),
+    (
+        "ORBITA_OBJECT_STORE_STS_ENDPOINT",
+        "object_store.sts_endpoint, overriding the partition-derived one",
+    ),
+    (
         "ORBITA_OBJECT_STORE_FORCE_PATH_STYLE",
         "object_store.force_path_style",
     ),
@@ -219,6 +237,66 @@ pub struct ClusterConfig {
     pub drain_timeout_millis: u64,
 }
 
+/// Where a node's S3 credentials come from.
+///
+/// Every value but [`CredentialSource::Default`] is named rather than
+/// discovered, and a named source is used and no other is tried. A provider
+/// chain that falls through at request time is convenient on a laptop and a
+/// liability in production: a node whose intended source is broken authenticates
+/// as whatever else is lying around, and the first anyone hears of it is an
+/// audit log full of the wrong principal.
+///
+/// [`CredentialSource::Default`] is what an unset value means. It resolves the
+/// AWS chain's order once, at startup, and logs which source it picked. It
+/// exists because mapping "no keys configured" straight to `InstanceProfile`
+/// silently re-points every EKS deployment from its workload role to its node
+/// role, which succeeds rather than failing and is therefore worse than an
+/// outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialSource {
+    /// Resolve at startup: environment, then web identity, then container,
+    /// then instance profile. A shared `~/.aws` profile is an error rather
+    /// than a step that gets skipped.
+    Default,
+    /// `access_key_id` and `secret_access_key` from configuration. What MinIO
+    /// and R2 need, and the only thing they offer.
+    Static,
+    /// `AWS_ACCESS_KEY_ID` and friends from the process environment.
+    Environment,
+    /// EKS IRSA: a projected OIDC token traded for a session on the workload
+    /// role. Not the same principal as the node's instance profile.
+    WebIdentity,
+    /// An ECS or Fargate task role, or the EKS Pod Identity agent.
+    Container,
+    /// The EC2 instance profile, over IMDSv2. Needs no Secret at all.
+    InstanceProfile,
+}
+
+impl CredentialSource {
+    /// Whether this source reads `access_key_id` and `secret_access_key`.
+    ///
+    /// One predicate rather than a `==` at each site, so validation and the
+    /// server mapping cannot disagree about whether a key is meaningful.
+    #[must_use]
+    pub fn uses_static_keys(self) -> bool {
+        self == Self::Static
+    }
+}
+
+impl fmt::Display for CredentialSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::Static => "static",
+            Self::Environment => "environment",
+            Self::WebIdentity => "web-identity",
+            Self::Container => "container",
+            Self::InstanceProfile => "instance-profile",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ObjectStoreConfig {
     /// Unset means no object store, which is only viable for a single node on
@@ -226,9 +304,30 @@ pub struct ObjectStoreConfig {
     pub endpoint: Option<String>,
     pub bucket: String,
     pub region: String,
+    /// Resolved rather than configured where it was left out: keys present
+    /// means static, keys absent means the instance profile. An operator who
+    /// wants to be sure which one they get sets it.
+    pub credential_source: CredentialSource,
     pub access_key_id: Option<String>,
     #[serde(skip_serializing)]
     pub secret_access_key: Option<String>,
+    /// The role to assume on top of the base credentials, as a full ARN.
+    /// Unset means the base credentials talk to S3 directly.
+    pub role_arn: Option<String>,
+    /// The external id a cross-account role's trust policy requires. Treated
+    /// as a secret even though AWS does not call it one.
+    #[serde(skip_serializing)]
+    pub role_external_id: Option<String>,
+    /// What the assumed session is called in CloudTrail. It defaults to the
+    /// cluster name and node id, because a session name that is the same on
+    /// every node makes an audit log useless.
+    pub role_session_name: Option<String>,
+    /// Overrides the STS endpoint for role assumption and for the IRSA token
+    /// exchange. Unset derives a regional one from the region's partition,
+    /// which is correct in every partition AWS publishes; this is for
+    /// PrivateLink, for a partition newer than this release, and for a test
+    /// double.
+    pub sts_endpoint: Option<String>,
     /// MinIO and most S3-compatible stores need path style addressing, and AWS
     /// itself does not. The default suits the quickstart, so an AWS deployment
     /// has to turn it off.
@@ -312,8 +411,13 @@ pub struct ObjectStoreLayer {
     pub endpoint: Option<String>,
     pub bucket: Option<String>,
     pub region: Option<String>,
+    pub credential_source: Option<CredentialSource>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+    pub role_arn: Option<String>,
+    pub role_external_id: Option<String>,
+    pub role_session_name: Option<String>,
+    pub sts_endpoint: Option<String>,
     pub force_path_style: Option<bool>,
 }
 
@@ -378,8 +482,13 @@ impl Layer {
             endpoint,
             bucket,
             region,
+            credential_source,
             access_key_id,
             secret_access_key,
+            role_arn,
+            role_external_id,
+            role_session_name,
+            sts_endpoint,
             force_path_style
         );
         overlay!(
@@ -447,6 +556,27 @@ impl Layer {
             })
             .transpose()?;
 
+        let credential_source = get("ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE")
+            .map(
+                |v| match v.to_ascii_lowercase().replace('_', "-").as_str() {
+                    "default" => Ok(CredentialSource::Default),
+                    "static" => Ok(CredentialSource::Static),
+                    "environment" | "env" => Ok(CredentialSource::Environment),
+                    // `irsa` is what the EKS documentation calls this and what
+                    // an operator will reach for first.
+                    "web-identity" | "irsa" => Ok(CredentialSource::WebIdentity),
+                    "container" | "ecs" | "pod-identity" => Ok(CredentialSource::Container),
+                    "instance-profile" | "instance" | "imds" => {
+                        Ok(CredentialSource::InstanceProfile)
+                    }
+                    other => bail!(
+                        "ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE must be one of default, static, \
+                         environment, web-identity, container, or instance-profile, got {other:?}"
+                    ),
+                },
+            )
+            .transpose()?;
+
         let ratio = get("ORBITA_TRACE_SAMPLE_RATIO")
             .map(|v| {
                 v.parse::<f64>().with_context(|| {
@@ -478,8 +608,13 @@ impl Layer {
                 endpoint: get("ORBITA_OBJECT_STORE_ENDPOINT").map(str::to_owned),
                 bucket: get("ORBITA_OBJECT_STORE_BUCKET").map(str::to_owned),
                 region: get("ORBITA_OBJECT_STORE_REGION").map(str::to_owned),
+                credential_source,
                 access_key_id: get("ORBITA_OBJECT_STORE_ACCESS_KEY_ID").map(str::to_owned),
                 secret_access_key: get("ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY").map(str::to_owned),
+                role_arn: get("ORBITA_OBJECT_STORE_ROLE_ARN").map(str::to_owned),
+                role_external_id: get("ORBITA_OBJECT_STORE_ROLE_EXTERNAL_ID").map(str::to_owned),
+                role_session_name: get("ORBITA_OBJECT_STORE_ROLE_SESSION_NAME").map(str::to_owned),
+                sts_endpoint: get("ORBITA_OBJECT_STORE_STS_ENDPOINT").map(str::to_owned),
                 force_path_style: flag("ORBITA_OBJECT_STORE_FORCE_PATH_STYLE")?,
             },
             telemetry: TelemetryLayer {
@@ -570,6 +705,49 @@ impl Layer {
             bail!("telemetry.trace_sample_ratio must be between 0 and 1, got {trace_sample_ratio}");
         }
 
+        // Left unset, the source follows the keys: keys mean static, and no
+        // keys means the node resolves one at startup in the AWS chain's
+        // order. It deliberately does *not* mean the instance profile. On EKS
+        // the instance profile is the node role and IRSA is the workload role,
+        // so defaulting keyless to IMDS would take every existing IRSA
+        // deployment and quietly re-point it at a different principal — which
+        // succeeds, rather than failing, wherever node IMDS is reachable.
+        let has_key = self.object_store.access_key_id.is_some()
+            || self.object_store.secret_access_key.is_some();
+        let credential_source = self.object_store.credential_source.unwrap_or({
+            if has_key {
+                CredentialSource::Static
+            } else {
+                CredentialSource::Default
+            }
+        });
+        // Catching this here rather than at startup means the pod fails with a
+        // sentence instead of a 403 from S3 several minutes into a rollout.
+        if !credential_source.uses_static_keys() && has_key {
+            bail!(
+                "object_store.credential_source is {credential_source}, but a static key is also \
+                 configured; remove the key or set credential_source to static, because a node \
+                 that silently ignores one of them is a node nobody can audit"
+            );
+        }
+        if credential_source == CredentialSource::Static
+            && self.object_store.endpoint.is_some()
+            && !has_key
+        {
+            bail!(
+                "object_store.credential_source is static, but no access_key_id or \
+                 secret_access_key was configured"
+            );
+        }
+        if let Some(sts_endpoint) = &self.object_store.sts_endpoint {
+            if !sts_endpoint.starts_with("http://") && !sts_endpoint.starts_with("https://") {
+                bail!(
+                    "object_store.sts_endpoint must start with http:// or https://, got \
+                     {sts_endpoint:?}"
+                );
+            }
+        }
+
         let endpoint = self
             .client
             .endpoint
@@ -610,8 +788,13 @@ impl Layer {
                     .object_store
                     .region
                     .unwrap_or_else(|| "us-east-1".to_owned()),
+                credential_source,
                 access_key_id: self.object_store.access_key_id,
                 secret_access_key: self.object_store.secret_access_key,
+                role_arn: self.object_store.role_arn,
+                role_external_id: self.object_store.role_external_id,
+                role_session_name: self.object_store.role_session_name,
+                sts_endpoint: self.object_store.sts_endpoint,
                 force_path_style: self.object_store.force_path_style.unwrap_or(true),
             },
             telemetry: TelemetryConfig {
@@ -818,6 +1001,179 @@ mod tests {
         assert_eq!(config.client.endpoint, "http://127.0.0.1:7100");
         assert_eq!(config.telemetry.log_level, "info");
         assert!(config.object_store.endpoint.is_none());
+    }
+
+    #[test]
+    fn an_object_store_with_no_keys_resolves_its_source_rather_than_assuming_imds() {
+        let file =
+            Layer::from_toml("[object_store]\nendpoint = \"https://s3.us-east-1.amazonaws.com\"\n")
+                .unwrap();
+        let config = Layer::default().merge(file).resolve().unwrap();
+        assert_eq!(
+            config.object_store.credential_source,
+            CredentialSource::Default,
+            "a keyless AWS deployment must be the default, but it must not be pinned to the \
+             instance profile: on EKS that is the node role, not the workload role, and \
+             defaulting to it silently changes which principal an existing deployment uses"
+        );
+    }
+
+    #[test]
+    fn every_credential_source_can_be_named_in_the_environment() {
+        for (spelling, expected) in [
+            ("default", CredentialSource::Default),
+            ("static", CredentialSource::Static),
+            ("environment", CredentialSource::Environment),
+            ("env", CredentialSource::Environment),
+            ("web-identity", CredentialSource::WebIdentity),
+            ("web_identity", CredentialSource::WebIdentity),
+            ("irsa", CredentialSource::WebIdentity),
+            ("container", CredentialSource::Container),
+            ("ecs", CredentialSource::Container),
+            ("pod-identity", CredentialSource::Container),
+            ("instance-profile", CredentialSource::InstanceProfile),
+            ("imds", CredentialSource::InstanceProfile),
+        ] {
+            let layer =
+                Layer::from_env(&env(&[("ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE", spelling)]))
+                    .unwrap_or_else(|error| panic!("{spelling:?} should parse: {error:#}"));
+            assert_eq!(
+                layer.object_store.credential_source,
+                Some(expected),
+                "{spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_key_alongside_any_keyless_source_is_refused() {
+        // Not just instance-profile: a key next to IRSA is the same
+        // unauditable ambiguity, and the chart can now render either.
+        for source in [
+            "default",
+            "environment",
+            "web-identity",
+            "container",
+            "instance-profile",
+        ] {
+            let file = Layer::from_toml(&format!(
+                "[object_store]\nendpoint = \"https://s3.us-east-1.amazonaws.com\"\n\
+                 credential_source = \"{source}\"\naccess_key_id = \"a\"\n\
+                 secret_access_key = \"s\"\n"
+            ))
+            .unwrap();
+            let error = Layer::default()
+                .merge(file)
+                .resolve()
+                .err()
+                .unwrap_or_else(|| panic!("{source} alongside a static key should be refused"));
+            assert!(
+                format!("{error:#}").contains("credential_source"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sts_endpoint_must_be_a_url() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"https://s3.us-east-1.amazonaws.com\"\n\
+             sts_endpoint = \"sts.internal.example.com\"\n",
+        )
+        .unwrap();
+        let error = Layer::default().merge(file).resolve().unwrap_err();
+        assert!(format!("{error:#}").contains("sts_endpoint"), "{error:#}");
+    }
+
+    #[test]
+    fn configured_keys_select_the_static_source() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"http://minio:9000\"\naccess_key_id = \"a\"\n\
+             secret_access_key = \"s\"\n",
+        )
+        .unwrap();
+        let config = Layer::default().merge(file).resolve().unwrap();
+        assert_eq!(
+            config.object_store.credential_source,
+            CredentialSource::Static
+        );
+    }
+
+    #[test]
+    fn a_static_key_alongside_the_instance_profile_is_refused() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"https://s3.us-east-1.amazonaws.com\"\n\
+             credential_source = \"instance-profile\"\naccess_key_id = \"a\"\n\
+             secret_access_key = \"s\"\n",
+        )
+        .unwrap();
+        let error = Layer::default().merge(file).resolve().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("credential_source"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_static_source_without_keys_is_refused() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"http://minio:9000\"\ncredential_source = \"static\"\n",
+        )
+        .unwrap();
+        assert!(Layer::default().merge(file).resolve().is_err());
+    }
+
+    #[test]
+    fn the_credential_source_can_be_named_in_the_environment() {
+        let environment = Layer::from_env(&env(&[(
+            "ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE",
+            "instance-profile",
+        )]))
+        .unwrap();
+        assert_eq!(
+            environment.object_store.credential_source,
+            Some(CredentialSource::InstanceProfile)
+        );
+        assert!(Layer::from_env(&env(&[(
+            "ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE",
+            "whatever-is-lying-around",
+        )]))
+        .is_err());
+    }
+
+    #[test]
+    fn the_role_to_assume_comes_from_the_environment_too() {
+        let environment = Layer::from_env(&env(&[
+            (
+                "ORBITA_OBJECT_STORE_ROLE_ARN",
+                "arn:aws:iam::123456789012:role/orbita",
+            ),
+            ("ORBITA_OBJECT_STORE_ROLE_EXTERNAL_ID", "shared-secret"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            environment.object_store.role_arn.as_deref(),
+            Some("arn:aws:iam::123456789012:role/orbita")
+        );
+        assert_eq!(
+            environment.object_store.role_external_id.as_deref(),
+            Some("shared-secret")
+        );
+    }
+
+    #[test]
+    fn a_serialized_configuration_carries_no_credential_material() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"http://minio:9000\"\naccess_key_id = \"the-key-id\"\n\
+             secret_access_key = \"the-secret\"\nrole_external_id = \"the-external-id\"\n",
+        )
+        .unwrap();
+        let config = Layer::default().merge(file).resolve().unwrap();
+        let rendered = serde_json::to_string(&config).expect("serializes");
+        assert!(
+            !rendered.contains("the-secret") && !rendered.contains("the-external-id"),
+            "a printed configuration must not be a credential dump: {rendered}"
+        );
     }
 
     #[test]

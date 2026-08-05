@@ -40,6 +40,7 @@
 //! The store itself never retries, sleeps, or spawns, so every fault a
 //! transport injects surfaces exactly once, as a value.
 
+mod credentials;
 mod http;
 mod list;
 mod sign;
@@ -48,8 +49,9 @@ mod time;
 #[cfg(feature = "hyper-client")]
 mod hyper_transport;
 
+pub use credentials::{CredentialsProvider, StaticCredentials};
 pub use http::{HttpRequest, HttpResponse, HttpTransport, Scheme, TransportFailure};
-pub use sign::Credentials;
+pub use sign::{sign_request, Credentials};
 
 #[cfg(feature = "hyper-client")]
 pub use hyper_transport::HyperTransport;
@@ -70,6 +72,11 @@ pub struct S3Config {
     /// The SigV4 signing region. MinIO accepts anything consistent
     /// (conventionally `us-east-1`); R2 uses `auto`.
     pub region: String,
+    /// The key pair to sign with when nothing refreshable was supplied. A
+    /// deployment whose credentials expire replaces this with
+    /// [`S3Store::with_credentials_provider`]; this field stays because MinIO
+    /// and R2 have nothing else to offer and should not have to build a
+    /// provider to say so.
     pub credentials: Credentials,
     /// Address objects as `endpoint/bucket/key` instead of
     /// `bucket.endpoint/key`. Required for MinIO and anything else without
@@ -90,7 +97,7 @@ pub struct S3Store {
     endpoint_authority: String,
     bucket: String,
     region: String,
-    credentials: Credentials,
+    credentials: Arc<dyn CredentialsProvider>,
     path_style: bool,
     transport: Arc<dyn HttpTransport>,
     now_millis: NowMillis,
@@ -114,7 +121,7 @@ impl S3Store {
             endpoint_authority: authority,
             bucket: config.bucket,
             region: config.region,
-            credentials: config.credentials,
+            credentials: StaticCredentials::shared(config.credentials),
             path_style: config.force_path_style,
             transport,
             now_millis,
@@ -137,16 +144,33 @@ impl S3Store {
         Self::new(config, transport, now)
     }
 
+    /// Signs with whatever `provider` answers instead of the configured key
+    /// pair.
+    ///
+    /// This is how a node on AWS runs without a long-lived key: the provider
+    /// holds the session credential and its expiry, and the store keeps its
+    /// connection pool across every refresh because nothing about the store
+    /// has to be rebuilt when the credential rolls over.
+    #[must_use]
+    pub fn with_credentials_provider(mut self, provider: Arc<dyn CredentialsProvider>) -> Self {
+        self.credentials = provider;
+        self
+    }
+
     /// The signed request for `method` against `key`, or against the bucket
     /// itself when `key` is `None`.
-    fn request(
+    ///
+    /// Fallible and asynchronous because the credential is asked for here, and
+    /// a provider that has to reach the metadata service can fail. Signing
+    /// itself cannot.
+    async fn request(
         &self,
         method: &'static str,
         key: Option<&str>,
         query: Vec<(String, String)>,
         headers: Vec<(String, String)>,
         body: Bytes,
-    ) -> HttpRequest {
+    ) -> ObjectResult<HttpRequest> {
         let encoded_key = key.map(|k| {
             k.split('/')
                 .map(sign::encode_path_segment)
@@ -175,13 +199,15 @@ impl S3Store {
             headers,
             body,
         };
-        sign::sign(
+        let credentials = self.credentials.credentials().await?;
+        sign::sign_request(
             &mut request,
-            &self.credentials,
+            &credentials,
             &self.region,
+            "s3",
             (self.now_millis)(),
         );
-        request
+        Ok(request)
     }
 
     async fn execute(&self, request: HttpRequest) -> ObjectResult<HttpResponse> {
@@ -276,7 +302,7 @@ fn split_endpoint(endpoint: &str) -> ObjectResult<(Scheme, String)> {
 #[async_trait]
 impl ObjectStore for S3Store {
     async fn put(&self, key: &str, data: Bytes) -> ObjectResult<ETag> {
-        let request = self.request("PUT", Some(key), vec![], vec![], data);
+        let request = self.request("PUT", Some(key), vec![], vec![], data).await?;
         let response = self.execute(request).await?;
         if response.status != 200 {
             return Err(error_for(key, &response));
@@ -294,7 +320,9 @@ impl ObjectStore for S3Store {
             Precondition::NotExists => ("if-none-match".to_string(), "*".to_string()),
             Precondition::Match(etag) => ("if-match".to_string(), etag.0.clone()),
         };
-        let request = self.request("PUT", Some(key), vec![], vec![header], data);
+        let request = self
+            .request("PUT", Some(key), vec![], vec![header], data)
+            .await?;
         let response = self.execute(request).await?;
         if response.status == 501 {
             // Only here does a 501 mean the backend cannot guard the manifest
@@ -314,7 +342,9 @@ impl ObjectStore for S3Store {
     }
 
     async fn get(&self, key: &str) -> ObjectResult<(Bytes, ETag)> {
-        let request = self.request("GET", Some(key), vec![], vec![], Bytes::new());
+        let request = self
+            .request("GET", Some(key), vec![], vec![], Bytes::new())
+            .await?;
         let response = self.execute(request).await?;
         if response.status != 200 {
             return Err(error_for(key, &response));
@@ -339,7 +369,9 @@ impl ObjectStore for S3Store {
             "range".to_string(),
             format!("bytes={}-{}", range.start, range.end - 1),
         );
-        let request = self.request("GET", Some(key), vec![], vec![header], Bytes::new());
+        let request = self
+            .request("GET", Some(key), vec![], vec![header], Bytes::new())
+            .await?;
         let response = self.execute(request).await?;
         match response.status {
             206 => Ok(response.body),
@@ -359,7 +391,9 @@ impl ObjectStore for S3Store {
     }
 
     async fn head(&self, key: &str) -> ObjectResult<ObjectMeta> {
-        let request = self.request("HEAD", Some(key), vec![], vec![], Bytes::new());
+        let request = self
+            .request("HEAD", Some(key), vec![], vec![], Bytes::new())
+            .await?;
         let response = self.execute(request).await?;
         if response.status != 200 {
             return Err(error_for(key, &response));
@@ -389,7 +423,9 @@ impl ObjectStore for S3Store {
             if let Some(token) = &continuation {
                 query.push(("continuation-token".to_string(), token.clone()));
             }
-            let request = self.request("GET", None, query, vec![], Bytes::new());
+            let request = self
+                .request("GET", None, query, vec![], Bytes::new())
+                .await?;
             let response = self.execute(request).await?;
             if response.status != 200 {
                 return Err(error_for(prefix, &response));
@@ -405,7 +441,9 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete(&self, key: &str) -> ObjectResult<()> {
-        let request = self.request("DELETE", Some(key), vec![], vec![], Bytes::new());
+        let request = self
+            .request("DELETE", Some(key), vec![], vec![], Bytes::new())
+            .await?;
         let response = self.execute(request).await?;
         match response.status {
             // S3 answers 204 whether or not the key existed, which matches
@@ -701,6 +739,79 @@ mod tests {
                 size: 42,
                 etag: ETag("\"e\"".to_string()),
             }
+        );
+    }
+
+    /// A provider whose answer changes between calls, which is the whole
+    /// reason the seam exists.
+    struct RotatingCredentials {
+        calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl CredentialsProvider for RotatingCredentials {
+        async fn credentials(&self) -> ObjectResult<Credentials> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            Ok(Credentials {
+                access_key_id: format!("AKID{calls}"),
+                secret_access_key: "secret".to_string(),
+                session_token: Some(format!("token{calls}")),
+            })
+        }
+    }
+
+    struct FailingCredentials;
+
+    #[async_trait]
+    impl CredentialsProvider for FailingCredentials {
+        async fn credentials(&self) -> ObjectResult<Credentials> {
+            Err(ObjectError::AccessDenied(
+                "no credential source".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn each_request_signs_with_the_credential_the_provider_answers_now() {
+        let transport = ScriptedTransport::new(vec![
+            Ok(response(200, &[("ETag", "\"e\"")], "v")),
+            Ok(response(200, &[("ETag", "\"e\"")], "v")),
+        ]);
+        let store =
+            store(transport.clone()).with_credentials_provider(Arc::new(RotatingCredentials {
+                calls: Mutex::new(0),
+            }));
+        store.get("k").await.expect("first read");
+        store.get("k").await.expect("second read");
+
+        let requests = transport.requests();
+        let first = requests[0].header("authorization").expect("signed");
+        let second = requests[1].header("authorization").expect("signed");
+        assert!(first.contains("Credential=AKID1/"), "{first}");
+        assert!(
+            second.contains("Credential=AKID2/"),
+            "a rotated credential must reach the next request without rebuilding the store: \
+             {second}"
+        );
+        assert_eq!(requests[1].header("x-amz-security-token"), Some("token2"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_cannot_source_a_credential_makes_no_request() {
+        let transport = ScriptedTransport::new(vec![]);
+        let store =
+            store(transport.clone()).with_credentials_provider(Arc::new(FailingCredentials));
+        let result = store.get("k").await;
+        assert_eq!(
+            result,
+            Err(ObjectError::AccessDenied(
+                "no credential source".to_string()
+            ))
+        );
+        assert!(
+            transport.requests().is_empty(),
+            "an unsigned request must never reach the wire"
         );
     }
 
