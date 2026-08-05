@@ -276,6 +276,267 @@ fn a_log_written_by_two_owners_at_once_is_cut_where_the_lamports_go_backwards() 
 }
 
 // -------------------------------------------------------------------------
+// Hydration: a log whose history starts at a manifest horizon.
+// -------------------------------------------------------------------------
+
+#[test]
+fn a_hydrated_log_resumes_at_the_manifest_horizon_rather_than_at_the_start() {
+    // The claim ADR 0006 makes operationally: a node that downloaded the
+    // partition holds every write below the horizon, so its log says so and a
+    // restart still says so.
+    let base = TestRuntime::solo(40);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        assert_eq!(log.durable_lamport().await, Lamport::ZERO);
+
+        assert!(log.hydrate(Lamport(500)).await.expect("hydrate"));
+        assert_eq!(log.durable_lamport().await, Lamport(500));
+        assert_eq!(log.applied_through().await, Lamport(500));
+        assert_eq!(log.hydrated_through().await, Lamport(500));
+
+        // The next entry follows the horizon, not the empty file.
+        let entry = put(501, 1, "after");
+        log.append_frames(
+            &[format::encode(&LogRecord::Entry(entry.clone()))],
+            entry.lamport,
+        )
+        .await
+        .expect("append");
+
+        let reopened =
+            PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+                .await
+                .expect("reopen");
+        let recovery = reopened.recovery();
+        assert_eq!(recovery.durable_lamport, Lamport(501));
+        assert_eq!(recovery.hydrated_through, Lamport(500));
+        assert_eq!(
+            recovery
+                .entries
+                .iter()
+                .map(|e| e.lamport)
+                .collect::<Vec<_>>(),
+            vec![Lamport(501)],
+            "only the tail above the horizon is replayed; the rest is in the segments"
+        );
+    });
+}
+
+#[test]
+fn hydrating_below_where_the_log_already_stands_is_a_no_op() {
+    let base = TestRuntime::solo(41);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        for i in 1..=4 {
+            let entry = put(i, 1, &format!("key-{i}"));
+            log.append_frames(
+                &[format::encode(&LogRecord::Entry(entry.clone()))],
+                entry.lamport,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(!log.hydrate(Lamport(2)).await.expect("hydrate"));
+        assert_eq!(log.durable_lamport().await, Lamport(4));
+        assert_eq!(
+            log.applied_through().await,
+            Lamport::ZERO,
+            "a stale horizon must not mark unapplied entries applied"
+        );
+    });
+}
+
+#[test]
+fn hydration_survives_a_newer_owner_cutting_the_divergent_tail() {
+    // A fence names where the log's history ends. It cannot name where the
+    // partition's data ends, because the segments below the horizon were
+    // published by a fenced owner for writes that were already acknowledged.
+    let base = TestRuntime::solo(42);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        log.hydrate(Lamport(100)).await.expect("hydrate");
+        for i in 101..=103 {
+            let entry = put(i, 1, &format!("key-{i}"));
+            log.append_frames(
+                &[format::encode(&LogRecord::Entry(entry.clone()))],
+                entry.lamport,
+            )
+            .await
+            .unwrap();
+        }
+
+        log.truncate_above(Lamport(101)).await.expect("truncate");
+        assert_eq!(log.durable_lamport().await, Lamport(101));
+
+        let reopened =
+            PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+                .await
+                .expect("reopen");
+        assert_eq!(reopened.recovery().hydrated_through, Lamport(100));
+        assert_eq!(
+            reopened.recovery().durable_lamport,
+            Lamport(101),
+            "the cut takes the tail and leaves the downloaded horizon standing"
+        );
+    });
+}
+
+#[test]
+fn a_cut_below_the_hydrated_horizon_cannot_disown_the_downloaded_partition() {
+    let base = TestRuntime::solo(43);
+    block_on(&base, async {
+        let log = PartitionLog::open(base.clone(), DIR, PARTITION, DEFAULT_SEGMENT_TARGET_BYTES)
+            .await
+            .expect("open");
+        log.hydrate(Lamport(100)).await.expect("hydrate");
+        let entry = put(101, 1, "tail");
+        log.append_frames(
+            &[format::encode(&LogRecord::Entry(entry.clone()))],
+            entry.lamport,
+        )
+        .await
+        .unwrap();
+
+        log.truncate_above(Lamport(50)).await.expect("truncate");
+        assert_eq!(
+            log.durable_lamport().await,
+            Lamport(100),
+            "the log gives up its tail, never the horizon its data was built from"
+        );
+    });
+}
+
+/// A hydrator that reports a fixed horizon, standing in for a partition whose
+/// manifest the bucket already holds.
+struct FixedHorizon {
+    through: Lamport,
+    calls: Arc<Mutex<usize>>,
+}
+
+#[async_trait::async_trait]
+impl crate::replica::PartitionHydrator for FixedHorizon {
+    async fn hydrate(&self, _partition: PartitionId) -> Lamport {
+        *self.calls.lock().expect("call count poisoned") += 1;
+        self.through
+    }
+}
+
+/// An append that would leave a hole, from a replica's point of view.
+fn append_from(prev: Lamport, lamport: u64) -> AppendRequest {
+    let entry = put(lamport, 1, "beyond");
+    let frame = format::encode(&LogRecord::Entry(entry.clone()));
+    AppendRequest {
+        partition: PARTITION,
+        epoch: Epoch(1),
+        prev_lamport: prev,
+        committed: prev,
+        entries: vec![(entry, frame)],
+    }
+}
+
+#[test]
+fn a_replica_beyond_the_retained_log_reports_a_gap_when_it_cannot_hydrate() {
+    // The behaviour before this change, kept as the contrast: with nothing in
+    // the bucket to build from, the honest answer is still "I have a hole".
+    let base = TestRuntime::solo(44);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        let response = block_on_append(&peer, append_from(Lamport(10), 11)).await;
+        assert_eq!(
+            response,
+            WalResponse::Gap {
+                durable_lamport: Lamport::ZERO,
+                epoch: Epoch(1),
+            }
+        );
+    });
+}
+
+#[test]
+fn a_replica_beyond_the_retained_log_hydrates_instead_of_reporting_a_gap() {
+    // The payoff: the writes under the hole are in the bucket, so the replica
+    // downloads them and takes the batch, instead of asking the owner for a
+    // retransmission the owner may have checkpointed away.
+    let base = TestRuntime::solo(45);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        let calls = Arc::new(Mutex::new(0));
+        peer.service.hydrate_with(Arc::new(FixedHorizon {
+            through: Lamport(10),
+            calls: Arc::clone(&calls),
+        }));
+
+        let response = block_on_append(&peer, append_from(Lamport(10), 11)).await;
+        assert_eq!(
+            response,
+            WalResponse::Ok {
+                durable_lamport: Lamport(11),
+                epoch: Epoch(1),
+            },
+            "the gap closed from object storage and the batch was accepted"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(peer.durable().await, Lamport(11));
+
+        // A batch that follows contiguously does not ask again, because the
+        // download only happens when the log cannot take the entries as they
+        // are.
+        let next = block_on_append(&peer, append_from(Lamport(11), 12)).await;
+        assert!(matches!(next, WalResponse::Ok { .. }));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    });
+}
+
+#[test]
+fn a_hydration_that_does_not_reach_the_batch_still_reports_the_gap_it_closed() {
+    // Honesty under a partial answer: the bucket was behind the batch, so the
+    // owner is told where this replica now stands rather than being left to
+    // assume the append landed.
+    let base = TestRuntime::solo(46);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let peer = peer(&base, &net, PEER_A).await;
+        peer.service.hydrate_with(Arc::new(FixedHorizon {
+            through: Lamport(5),
+            calls: Arc::new(Mutex::new(0)),
+        }));
+
+        let response = block_on_append(&peer, append_from(Lamport(10), 11)).await;
+        assert_eq!(
+            response,
+            WalResponse::Gap {
+                durable_lamport: Lamport(5),
+                epoch: Epoch(1),
+            }
+        );
+    });
+}
+
+async fn block_on_append(peer: &Peer, request: AppendRequest) -> WalResponse {
+    let bytes = orbita_runtime::PeerHandler::handle(
+        &peer.service,
+        OWNER,
+        orbita_runtime::PeerCall {
+            service: ServiceId::Wal,
+            method: crate::wire::METHOD_APPEND,
+            payload: request.encode(),
+        },
+    )
+    .await
+    .expect("the service always answers");
+    WalResponse::decode(&bytes).expect("decodable")
+}
+
+// -------------------------------------------------------------------------
 // A three node partition.
 // -------------------------------------------------------------------------
 
