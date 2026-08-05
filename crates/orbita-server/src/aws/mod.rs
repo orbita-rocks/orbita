@@ -995,4 +995,183 @@ mod tests {
             "sts.internal.example.com"
         );
     }
+
+    // --- The boundary with the object store's error handling ---------------
+    //
+    // `HyperTransport` drops the pooled connection when a conditional write
+    // comes back 409 or 412, because MinIO hangs up after one without saying
+    // so. That is connection hygiene inside the transport and it must stay
+    // invisible here: a losing manifest CAS is the *normal* path for
+    // compaction under contention, and a node that re-resolved its identity
+    // every time it lost a race would hammer IMDS or STS in exactly the
+    // situation where it is already contending.
+
+    /// A store wired to a refreshing instance-profile provider over one
+    /// scripted transport, which is the production shape: the credential
+    /// provider and the object store share a transport.
+    fn store_over_instance_profile(
+        transport: Arc<ScriptedTransport>,
+    ) -> (
+        orbita_objectstore::s3::S3Store,
+        Arc<refresh::RefreshingCredentials<TokioClock, imds::InstanceProfile>>,
+    ) {
+        let provider = Arc::new(refresh::RefreshingCredentials::new(
+            TokioClock::new(),
+            imds::InstanceProfile::new(transport.clone(), imds::IMDS_AUTHORITY),
+        ));
+        let store = orbita_objectstore::s3::S3Store::new(
+            orbita_objectstore::s3::S3Config {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "orbita".to_string(),
+                region: "us-east-1".to_string(),
+                credentials: Credentials {
+                    access_key_id: String::new(),
+                    secret_access_key: String::new(),
+                    session_token: None,
+                },
+                force_path_style: true,
+            },
+            transport,
+            Arc::new(|| 1_369_353_600_000),
+        )
+        .expect("valid store configuration")
+        .with_credentials_provider(provider.clone());
+        (store, provider)
+    }
+
+    /// The three IMDS answers one credential fetch costs.
+    fn imds_script() -> Vec<Result<HttpResponse, TransportFailure>> {
+        vec![
+            ok("the-imds-token"),
+            ok("orbita-node-role"),
+            ok(
+                r#"{"AccessKeyId":"ASIAPROFILE","SecretAccessKey":"s","Token":"t",
+                   "Expiration":"2099-01-01T00:00:00Z"}"#,
+            ),
+        ]
+    }
+
+    fn status(status: u16) -> Result<HttpResponse, TransportFailure> {
+        Ok(HttpResponse {
+            status,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_losing_conditional_write_does_not_re_resolve_the_credential() {
+        use orbita_objectstore::{ObjectStore, Precondition};
+
+        // One credential fetch, then two conditional writes that both lose.
+        let mut script = imds_script();
+        script.push(status(412));
+        script.push(status(409));
+        let transport = ScriptedTransport::new(script);
+        let (store, _provider) = store_over_instance_profile(transport.clone());
+
+        for expected in [412u16, 409] {
+            let error = store
+                .put_if(
+                    "keyspaces/1/partitions/1/manifest.json",
+                    bytes::Bytes::from_static(b"{}"),
+                    Precondition::Match(orbita_objectstore::ETag("stale".to_string())),
+                )
+                .await
+                .expect_err("a stale tag must lose");
+            assert!(
+                matches!(
+                    error,
+                    orbita_objectstore::ObjectError::PreconditionFailed(_)
+                ),
+                "status {expected} must stay a lost CAS, not become a credential problem: \
+                 {error:?}"
+            );
+        }
+
+        // Three IMDS calls plus the two PUTs. If losing a CAS re-resolved the
+        // identity there would be three more metadata calls in here.
+        let paths: Vec<String> = transport
+            .requests()
+            .iter()
+            .map(|request| request.path.clone())
+            .collect();
+        let metadata_calls = paths
+            .iter()
+            .filter(|path| path.starts_with("/latest/"))
+            .count();
+        assert_eq!(
+            metadata_calls, 3,
+            "a losing manifest CAS must not send the node back to the metadata service: {paths:?}"
+        );
+        assert_eq!(transport.requests().len(), 5, "{paths:?}");
+    }
+
+    #[tokio::test]
+    async fn a_losing_conditional_write_does_not_arm_the_credential_retry_deadline() {
+        use orbita_objectstore::{ObjectStore, Precondition};
+
+        let mut script = imds_script();
+        script.push(status(412));
+        let transport = ScriptedTransport::new(script);
+        let (store, provider) = store_over_instance_profile(transport.clone());
+
+        store
+            .put_if(
+                "keyspaces/1/partitions/1/manifest.json",
+                bytes::Bytes::from_static(b"{}"),
+                Precondition::Match(orbita_objectstore::ETag("stale".to_string())),
+            )
+            .await
+            .expect_err("a stale tag must lose");
+
+        // The backoff exists to stop a failing *credential source* being
+        // called once per request. A 412 is not a credential failure, and
+        // arming the deadline here would make the next genuine refresh wait
+        // for a timer set by an unrelated lost race.
+        assert!(
+            provider.backoff_deadline().is_none(),
+            "a lost CAS must not count against the credential source"
+        );
+
+        // And the cached credential is still served without a fetch.
+        let credentials = provider.credentials().await.expect("still cached");
+        assert_eq!(credentials.access_key_id, "ASIAPROFILE");
+        assert_eq!(
+            transport.requests().len(),
+            4,
+            "serving the cached credential must cost no round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_during_a_refresh_is_still_a_credential_failure() {
+        // The other side of the same boundary: #86 flattens hyper's source
+        // chain into the failure message, and a connection dropped underneath
+        // a *credential* fetch is a real credential failure that must still
+        // arm the deadline. Losing that would undo the backoff entirely.
+        let transport = ScriptedTransport::new(vec![Err(TransportFailure {
+            retryable: true,
+            message: "request failed: client error (SendRequest): connection closed before \
+                      message completed"
+                .to_string(),
+        })]);
+        let provider = refresh::RefreshingCredentials::new(
+            TokioClock::new(),
+            imds::InstanceProfile::new(transport, imds::IMDS_AUTHORITY),
+        );
+
+        let error = provider
+            .credentials()
+            .await
+            .expect_err("nothing to serve yet");
+        assert!(
+            error.is_retryable(),
+            "a dropped connection is the weather, not a permanent refusal: {error:?}"
+        );
+        assert!(
+            provider.backoff_deadline().is_some(),
+            "a failed credential fetch must still arm the deadline"
+        );
+    }
 }

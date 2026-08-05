@@ -158,6 +158,20 @@ impl<C: Clock, S: SessionSource> RefreshingCredentials<C, S> {
         waited
     }
 
+    /// When the next fetch is allowed, if a failure armed the deadline.
+    ///
+    /// Exists so a test can assert on the boundary with the object store: a
+    /// conditional write that loses is not a credential failure and must leave
+    /// this unset.
+    #[cfg(test)]
+    pub(crate) fn backoff_deadline(&self) -> Option<u64> {
+        self.backoff
+            .read()
+            .expect("credential cache is not poisoned")
+            .as_ref()
+            .map(|backoff| backoff.retry_at_millis)
+    }
+
     fn clear_backoff(&self) {
         *self
             .backoff
