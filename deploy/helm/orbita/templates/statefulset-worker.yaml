@@ -87,7 +87,9 @@ spec:
           env:
             - name: ORBITA_CONFIG
               value: /etc/orbita/orbita.toml
-            {{- include "orbita.objectStoreEnv" . | nindent 12 }}
+            {{- with (include "orbita.objectStoreEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.service.port }}

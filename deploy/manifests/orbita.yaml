@@ -12,11 +12,12 @@
 # the ConfigMap. Without an endpoint the workers keep everything on local
 # disks.
 #
-# As written, the nodes source credentials from their EC2 instance profile and
-# the Secret below stays empty; on AWS that is the shape to keep, and the
-# Secret and the two environment variables that read it can be deleted
-# outright. Fill the Secret in and set credential_source = "static" for MinIO,
-# R2, or anything else that only speaks access keys.
+# As written, the nodes resolve AWS credentials at startup — IRSA on EKS, the
+# task role on ECS, the EC2 instance profile otherwise — and the Secret below
+# stays empty; on AWS that is the shape to keep, and the Secret and the two
+# environment variables that read it can be deleted outright. Fill the Secret
+# in and set credential_source = "static" for MinIO, R2, or anything else that
+# only speaks access keys.
 #
 # Every node binds two listeners: 7100 for client and admin gRPC, and 7101 for
 # peer traffic. The headless Services carry both so that pods can reach each
@@ -93,16 +94,28 @@ data:
     # endpoint = "https://s3.us-east-1.amazonaws.com"
     bucket = "orbita"
     region = "us-east-1"
-    # Where the credentials come from: "instance-profile" reads short-lived
-    # credentials from the EC2 metadata service over IMDSv2 and needs no
-    # Secret, and "static" uses the key pair in the Secret below, which is what
-    # MinIO and R2 need because they offer nothing else. Left out, this follows
-    # the keys.
-    credential_source = "instance-profile"
+    # Where the credentials come from. "default" resolves one at startup in the
+    # order the AWS SDKs use — environment, then EKS IRSA, then the ECS or Pod
+    # Identity container endpoint, then the EC2 instance profile over IMDSv2 —
+    # and logs which one it picked. Name a source instead ("web-identity",
+    # "container", "instance-profile", "environment", "static") when you want a
+    # missing one to be a startup error rather than a fallthrough.
+    #
+    # On EKS, note that IRSA and the instance profile are different principals:
+    # pinning this to "instance-profile" in a pod makes it authenticate as the
+    # node group's role rather than the service account's.
+    #
+    # "static" uses the key pair in the Secret below, which is what MinIO and
+    # R2 need because they offer nothing else. Left out, this follows the keys.
+    credential_source = "default"
     # The role that carries the bucket policy. Assuming it, rather than
     # granting the instance profile direct access, is what lets an operator
     # re-scope storage access without touching the instances.
     # role_arn = "arn:aws:iam::123456789012:role/orbita"
+    # The STS endpoint is derived from the region's partition, which is right
+    # in the commercial partition, in GovCloud, and in China. Override it for a
+    # PrivateLink endpoint or an isolated partition.
+    # sts_endpoint = "https://sts.us-east-1.amazonaws.com"
     # AWS S3 wants false here. MinIO and most other S3-compatible stores want
     # true.
     force_path_style = false

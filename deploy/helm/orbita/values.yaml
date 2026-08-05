@@ -133,19 +133,35 @@ objectStore:
 
   # Where the node's S3 credentials come from.
   #
+  #   default           Resolve at startup, in the order the AWS SDKs use:
+  #                     AWS_ACCESS_KEY_ID from the environment, then EKS IRSA,
+  #                     then the ECS/Pod Identity container endpoint, then the
+  #                     EC2 instance profile. Whichever it picks is logged once
+  #                     at startup. A shared ~/.aws profile is a startup error
+  #                     rather than a silently skipped step.
+  #   static            An access key pair, from the Secret below. This is what
+  #                     MinIO and R2 need, because they offer nothing else.
+  #   environment       AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and
+  #                     optionally AWS_SESSION_TOKEN, injected by something
+  #                     else in your pod spec.
+  #   web-identity      EKS IRSA. The pod identity webhook injects
+  #                     AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN when the
+  #                     service account carries an eks.amazonaws.com/role-arn
+  #                     annotation. This is the *workload* role.
+  #   container         An ECS or Fargate task role, or the EKS Pod Identity
+  #                     agent.
   #   instance-profile  Read from the EC2 instance metadata service over
-  #                     IMDSv2. No Secret is created and none is mounted, which
-  #                     is the deployment AWS security reviews approve. The
+  #                     IMDSv2. No Secret is created and none is mounted. The
   #                     nodes must run on instances with an instance profile
   #                     attached, and IMDSv2 must be enabled (`HttpTokens` may
   #                     be `required`; this chart never falls back to IMDSv1).
-  #   static            An access key pair, from the Secret below. This is what
-  #                     MinIO and R2 need, because they offer nothing else.
+  #                     Note that on EKS this is the *node* role, which is not
+  #                     the same principal as IRSA gives you.
   #
   # Empty picks one for you: static when accessKeyId or existingSecret is set,
-  # instance-profile otherwise. Naming it explicitly is better in production,
-  # because then a missing key is a startup error rather than a node quietly
-  # authenticating as something nobody expected.
+  # and default otherwise. Naming it explicitly is better in production,
+  # because then a source that is not there is a startup error rather than a
+  # node quietly authenticating as something nobody expected.
   credentialSource: ""
 
   # A role to assume on top of whatever credentialSource produced. This is the
@@ -164,11 +180,23 @@ objectStore:
   # two nodes apart.
   sessionName: ""
 
+  # Overrides the STS endpoint used for role assumption and for the IRSA token
+  # exchange. Empty derives a regional one from the region's partition, which
+  # is correct in the commercial partition, in GovCloud, and in China. Set this
+  # for a PrivateLink endpoint, for an isolated partition, or for a partition
+  # newer than this chart.
+  stsEndpoint: ""
+
   # Static credentials. Set existingSecret to bring your own, with keys
   # access_key_id and secret_access_key, and optionally external_id. Otherwise
   # the chart creates one from the values below, which is fine for a test
   # cluster and not for a real one: inline values end up in the Helm release,
   # readable by anyone who can read releases.
+  #
+  # existingSecret is read for access keys only when credentialSource resolves
+  # to static. With a keyless source it is read only for external_id, and so it
+  # requires roleArn; setting it without one is rejected at template time
+  # rather than mounting a Secret nothing reads.
   #
   # Leave all three empty to deploy with no Secret at all.
   existingSecret: ""

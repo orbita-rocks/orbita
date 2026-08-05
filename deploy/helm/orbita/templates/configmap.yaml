@@ -48,6 +48,9 @@ data:
     {{- with .Values.objectStore.sessionName }}
     role_session_name = {{ . | quote }}
     {{- end }}
+    {{- with .Values.objectStore.stsEndpoint }}
+    sts_endpoint = {{ . | quote }}
+    {{- end }}
     force_path_style = {{ .Values.objectStore.forcePathStyle }}
 
     [telemetry]
