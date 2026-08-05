@@ -157,7 +157,9 @@ are internal libraries, and publishing them would be a semver promise about
 `orbita-core`'s types that is not worth making before 1.0. The product is the
 binary and the image.
 
-There are no musl builds. The image builds RocksDB from source with a C++
-toolchain, and static linking against musl is a project of its own. It becomes
-much cheaper if the storage engine stops needing C++, and is worth revisiting
-then.
+There are no musl builds. Static linking against musl was a project of its own
+while the image had to build the storage engine from C++ sources; the builder
+now needs nothing beyond a Rust toolchain and `protoc`, because that engine was
+replaced. So this is the entry on this list most likely to stop being true, and
+what stands between here and a static binary is build configuration rather than
+a porting effort.
