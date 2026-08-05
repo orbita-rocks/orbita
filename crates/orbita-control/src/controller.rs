@@ -52,22 +52,14 @@ pub struct BootstrapSpec {
     pub leaders: Vec<(NodeId, String)>,
     /// Workers to admit before the first partition is placed, so that the
     /// keyspace is born with an owner rather than born unavailable.
+    ///
+    /// Admitted ready, which is what makes that sentence true: ownership goes
+    /// only to a ready node, so admitting these as not-ready would create the
+    /// keyspace with no owner and leave it unservable until a heartbeat and a
+    /// placement sweep had both happened. Whoever writes this list is starting
+    /// these nodes in the same breath, and any of them that turns out not to
+    /// be ready says so on its first heartbeat, a fraction of a second later.
     pub workers: Vec<(NodeId, String)>,
-}
-
-impl BootstrapSpec {
-    /// A single-node development cluster: one process that is both the leader
-    /// group and the only worker.
-    #[must_use]
-    pub fn dev(node: NodeId, address: impl Into<String>) -> Self {
-        let address = address.into();
-        Self {
-            keyspace: "default".into(),
-            config: KeyspaceConfig::default(),
-            leaders: vec![(node, address.clone())],
-            workers: vec![(node, address)],
-        }
-    }
 }
 
 /// A node as an operator sees it.
@@ -637,7 +629,9 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 role: NodeRole::Worker,
                 address: address.clone(),
                 speaks: binary_speaks(),
-                ready: false,
+                // See `BootstrapSpec::workers`: not-ready here means the
+                // keyspace created below is born with no owner.
+                ready: true,
                 draining: false,
             })
             .await?;

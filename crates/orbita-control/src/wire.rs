@@ -1,10 +1,15 @@
 //! The worker-to-leader-group protocol.
 //!
-//! Two methods: fetch the partition map, and report a node's own status. That
-//! is the whole data plane facing surface of the control plane, and keeping it
-//! that small is deliberate. Everything an operator does goes through the
-//! `Admin` gRPC service instead, so the path a worker depends on stays
-//! something you can hold in your head.
+//! Two methods carry the data plane: fetch the partition map, and report a
+//! node's own status. That is the whole surface a worker depends on, and
+//! keeping it that small is deliberate — it is the path that must keep working
+//! while everything else is on fire, so it should be something you can hold in
+//! your head.
+//!
+//! Everything an operator does goes through the `Admin` gRPC service instead.
+//! One method here carries such a call from the node that received it to the
+//! member that can decide it, in the operator's own encoding, without this
+//! protocol learning what any of them mean. See [`METHOD_ADMIN_CALL`].
 //!
 //! Everything is little endian, framed by [`crate::codec`].
 
@@ -52,6 +57,15 @@ pub const METHOD_REPORT_STATUS_V4: u16 = 8;
 /// the fallback below already knows how to lose a field and keep the
 /// heartbeat.
 pub const METHOD_REPORT_STATUS_V5: u16 = 9;
+/// One `Admin` gRPC call, forwarded by a node that is not the control leader.
+///
+/// The payload is the operator's own protobuf message, re-encoded rather than
+/// translated, for the reason `orbita_server::proxy` gives about client
+/// requests: translating means a second description of every field, and the
+/// copy nobody reads is the one that rots. It rides on the control protocol
+/// because that is the only path with leader discovery and redirect already
+/// built into it, which is precisely what a misdirected admin call needs.
+pub const METHOD_ADMIN_CALL: u16 = 10;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -62,6 +76,8 @@ const STATUS_COMMIT_INDEX: u8 = 5;
 const STATUS_UNAVAILABLE: u8 = 6;
 const STATUS_INCOMPATIBLE: u8 = 7;
 const STATUS_DRAIN_PROGRESS: u8 = 8;
+const STATUS_ADMIN_OK: u8 = 9;
+const STATUS_ADMIN_FAILED: u8 = 10;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -170,6 +186,35 @@ impl ReportStatusRequest {
     }
 }
 
+/// One forwarded admin call: which RPC, and the encoded request behind it.
+///
+/// The method is a discriminant of this crate's own rather than the gRPC
+/// method name, so a forwarded call costs a fixed four bytes and a receiver
+/// that does not recognise it says so instead of guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdminCallRequest {
+    pub method: u32,
+    pub payload: Bytes,
+}
+
+impl AdminCallRequest {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u32(self.method).bytes(&self.payload);
+        w.finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            method: r.u32()?,
+            payload: r.bytes()?,
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DrainNodeRequest {
     pub node: NodeId,
@@ -225,6 +270,18 @@ pub(crate) enum ControlResponse {
     DrainProgress {
         complete: bool,
         map_version: MapVersion,
+    },
+    /// The leader ran a forwarded admin call and it succeeded. The bytes are
+    /// the encoded protobuf response, which the forwarding node hands back to
+    /// its client untouched.
+    AdminOk(Bytes),
+    /// The leader ran a forwarded admin call and it failed. `code` is a
+    /// `tonic::Code` discriminant, carried so the operator sees the leader's
+    /// own refusal rather than a forwarding error wrapped around it — the
+    /// difference between "no such keyspace" and "something went wrong".
+    AdminFailed {
+        code: u32,
+        message: String,
     },
     /// The leader's committed control-command index.
     CommitIndex(crate::LogIndex),
@@ -283,6 +340,12 @@ impl ControlResponse {
                 refusal.speaks.encode(&mut w);
                 refusal.active.encode(&mut w);
             }
+            ControlResponse::AdminOk(payload) => {
+                w.u8(STATUS_ADMIN_OK).bytes(payload);
+            }
+            ControlResponse::AdminFailed { code, message } => {
+                w.u8(STATUS_ADMIN_FAILED).u32(*code).str(message);
+            }
             ControlResponse::CommitIndex(index) => {
                 w.u8(STATUS_COMMIT_INDEX).u64(*index);
             }
@@ -329,6 +392,11 @@ impl ControlResponse {
                 speaks: VersionRange::decode(&mut r)?,
                 active: ClusterVersion::decode(&mut r)?,
             }),
+            STATUS_ADMIN_OK => ControlResponse::AdminOk(r.bytes()?),
+            STATUS_ADMIN_FAILED => ControlResponse::AdminFailed {
+                code: r.u32()?,
+                message: r.string()?,
+            },
             STATUS_COMMIT_INDEX => ControlResponse::CommitIndex(r.u64()?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
             STATUS_UNAVAILABLE => ControlResponse::Unavailable(r.string()?),
@@ -512,6 +580,11 @@ mod tests {
             ControlResponse::Unavailable("catching up".into()),
             ControlResponse::Error("no".into()),
             ControlResponse::CommitIndex(42),
+            ControlResponse::AdminOk(Bytes::from_static(b"encoded response")),
+            ControlResponse::AdminFailed {
+                code: 5,
+                message: "no such keyspace".into(),
+            },
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),
@@ -639,6 +712,19 @@ mod tests {
             ReportStatusRequest::decode_legacy(&request.encode_legacy()),
             Ok(request)
         );
+    }
+
+    #[test]
+    fn a_forwarded_admin_call_carries_its_request_bytes_unchanged() {
+        // The whole design rests on the leader seeing exactly the bytes the
+        // operator's client sent. Anything that reshapes them here would be a
+        // second description of the admin API, which is what forwarding an
+        // opaque payload exists to avoid.
+        let request = AdminCallRequest {
+            method: 3,
+            payload: Bytes::from_static(&[0x0a, 0x04, b'd', b'e', b'm', b'o']),
+        };
+        assert_eq!(AdminCallRequest::decode(&request.encode()), Ok(request));
     }
 
     #[test]

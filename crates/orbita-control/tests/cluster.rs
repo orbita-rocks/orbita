@@ -1222,7 +1222,12 @@ fn bootstrapping_a_cluster_that_already_has_state_changes_nothing() {
     let before = cluster.map();
 
     let controller = cluster.controller.clone();
-    let spec = BootstrapSpec::dev(LEADER, "10.0.0.1:7000");
+    let spec = BootstrapSpec {
+        keyspace: "default".to_string(),
+        config: KeyspaceConfig::default(),
+        leaders: Vec::new(),
+        workers: vec![(LEADER, "10.0.0.1:7000".to_string())],
+    };
     let created = cluster
         .sim
         .block_on(async move { controller.bootstrap(&spec).await });

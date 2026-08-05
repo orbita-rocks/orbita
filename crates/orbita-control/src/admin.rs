@@ -4,35 +4,128 @@
 //! could make is already made behind it, so an operator forcing a split
 //! through the CLI goes down the same path the automatic sweep does and cannot
 //! reach a state the sweep could not.
+//!
+//! # Every node serves this, and only one node answers it
+//!
+//! Only the current Raft leader may take a control plane decision, but an
+//! operator has no way to know which node that is — finding out is what
+//! `cluster describe` is *for*. So every node serves the whole surface and a
+//! node that cannot answer forwards to the one that can, through
+//! [`ControlClient`], which already knows the group's membership and already
+//! follows a leader redirect. That mirrors the KV path, where a worker that
+//! does not own a key forwards rather than telling the client to go elsewhere;
+//! `orbita_server::proxy` has the argument. The alternative, an error naming
+//! the leader, cannot even be written honestly here: the control plane records
+//! each node's *peer* address, which is on a private network and is not
+//! something a client may dial.
 
+use crate::client::{AdminOutcome, ControlClient};
 use crate::consensus::ConsensusLog;
 use crate::controller::{ClusterView, Controller};
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Keyspace, KeyspaceConfig, Permission};
 
+use bytes::Bytes;
 use orbita_core::{Error, KeyspaceId, NodeId, PartitionId, PartitionInfo};
 use orbita_proto::v1 as pb;
 use orbita_runtime::Runtime;
+use prost_proto::Message as _;
 use std::collections::HashMap;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
-/// Serves the `Admin` API for one leader group node.
+/// Which `Admin` RPC a forwarded call is.
+///
+/// A discriminant of this crate's own rather than the gRPC method name,
+/// because a name would put the wire's cost and the wire's compatibility
+/// story at the mercy of a rename in the proto. Values are append-only: a
+/// node mid-rollout may be forwarding to a peer that predates the newest one,
+/// and reusing a number would silently run the wrong RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+enum AdminMethod {
+    CreateKeyspace = 1,
+    UpdateKeyspace = 2,
+    DeleteKeyspace = 3,
+    ListKeyspaces = 4,
+    CreateCredential = 5,
+    RevokeCredential = 6,
+    DescribeCluster = 7,
+    FinalizeUpgrade = 8,
+    SplitPartition = 9,
+    MergePartitions = 10,
+    TransferOwnership = 11,
+}
+
+impl AdminMethod {
+    fn from_u32(value: u32) -> Option<Self> {
+        Some(match value {
+            1 => Self::CreateKeyspace,
+            2 => Self::UpdateKeyspace,
+            3 => Self::DeleteKeyspace,
+            4 => Self::ListKeyspaces,
+            5 => Self::CreateCredential,
+            6 => Self::RevokeCredential,
+            7 => Self::DescribeCluster,
+            8 => Self::FinalizeUpgrade,
+            9 => Self::SplitPartition,
+            10 => Self::MergePartitions,
+            11 => Self::TransferOwnership,
+            _ => return None,
+        })
+    }
+}
+
+/// Serves the `Admin` API for one node, wherever the leader happens to be.
 pub struct AdminService<R: Runtime, L: ConsensusLog> {
-    controller: Controller<R, L>,
+    /// Present when this node hosts the control plane. Answering locally is
+    /// still the fast path; it is only unavailable while this member is not
+    /// the leader.
+    controller: Option<Controller<R, L>>,
+    /// Present when this node knows where the leader group is, which is every
+    /// node in a real cluster. Absent only for a node with no control plane at
+    /// all, which is the static-map test configuration.
+    forward: Option<ControlClient<R>>,
 }
 
 impl<R: Runtime, L: ConsensusLog> Clone for AdminService<R, L> {
     fn clone(&self) -> Self {
         Self {
             controller: self.controller.clone(),
+            forward: self.forward.clone(),
         }
     }
 }
 
 impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
+    /// Serves from the controller on this node, and forwards nowhere.
+    ///
+    /// This is what the leader group's own peer handler uses to run a call
+    /// another node forwarded to it. Having no forwarding client is what makes
+    /// a forwarding loop unrepresentable rather than merely unlikely.
     #[must_use]
     pub fn new(controller: Controller<R, L>) -> Self {
-        Self { controller }
+        Self {
+            controller: Some(controller),
+            forward: None,
+        }
+    }
+
+    /// Serves nothing locally and forwards everything, which is what a worker
+    /// does: it holds no control plane but knows where one is.
+    #[must_use]
+    pub fn forwarding(client: ControlClient<R>) -> Self {
+        Self {
+            controller: None,
+            forward: Some(client),
+        }
+    }
+
+    /// Falls back to the leader group when this node's own controller is not
+    /// the leader, which is the ordinary state of two members out of three.
+    #[must_use]
+    pub fn with_forwarding(mut self, client: ControlClient<R>) -> Self {
+        self.forward = Some(client);
+        self
     }
 
     /// Wraps this in the generated tonic service, ready to add to a server.
@@ -41,8 +134,107 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
         pb::admin_server::AdminServer::new(self)
     }
 
-    async fn ready(&self) -> Result<(), Status> {
-        self.controller.ensure_leader_ready().await.map_err(status)
+    /// Runs one forwarded call against the local controller.
+    ///
+    /// The payload is the operator's own request, so this decodes it, runs the
+    /// ordinary handler, and encodes what came back. Nothing here re-checks
+    /// leadership, because the peer handler that dispatched this already
+    /// established it and doing it twice would only widen the window.
+    pub(crate) async fn invoke(&self, method: u32, payload: &[u8]) -> Result<Bytes, Status> {
+        use pb::admin_server::Admin as _;
+
+        let Some(method) = AdminMethod::from_u32(method) else {
+            return Err(Status::unimplemented(format!(
+                "this node does not serve forwarded admin method {method}"
+            )));
+        };
+
+        macro_rules! run {
+            ($rpc:ident, $request:ty) => {{
+                let request = <$request>::decode(payload).map_err(|e| {
+                    Status::invalid_argument(format!("undecodable forwarded admin request: {e}"))
+                })?;
+                let response = self.$rpc(Request::new(request)).await?;
+                Ok(Bytes::from(response.into_inner().encode_to_vec()))
+            }};
+        }
+
+        match method {
+            AdminMethod::CreateKeyspace => run!(create_keyspace, pb::CreateKeyspaceRequest),
+            AdminMethod::UpdateKeyspace => run!(update_keyspace, pb::UpdateKeyspaceRequest),
+            AdminMethod::DeleteKeyspace => run!(delete_keyspace, pb::DeleteKeyspaceRequest),
+            AdminMethod::ListKeyspaces => run!(list_keyspaces, pb::ListKeyspacesRequest),
+            AdminMethod::CreateCredential => run!(create_credential, pb::CreateCredentialRequest),
+            AdminMethod::RevokeCredential => run!(revoke_credential, pb::RevokeCredentialRequest),
+            AdminMethod::DescribeCluster => run!(describe_cluster, pb::DescribeClusterRequest),
+            AdminMethod::FinalizeUpgrade => run!(finalize_upgrade, pb::FinalizeUpgradeRequest),
+            AdminMethod::SplitPartition => run!(split_partition, pb::SplitPartitionRequest),
+            AdminMethod::MergePartitions => run!(merge_partitions, pb::MergePartitionsRequest),
+            AdminMethod::TransferOwnership => {
+                run!(transfer_ownership, pb::TransferOwnershipRequest)
+            }
+        }
+    }
+
+    /// Decides whether this node answers a call itself, and sends it to the
+    /// leader if not.
+    ///
+    /// `None` means "you are the leader, go ahead". `Some` is the leader's
+    /// answer, already decoded. An error is either the leader's own refusal,
+    /// carried back with its code intact, or the fact that nobody could be
+    /// reached — which a caller can tell apart, and which is the whole reason
+    /// a refusal travels as a value rather than as a transport failure.
+    async fn forwarded<Req, Resp>(
+        &self,
+        method: AdminMethod,
+        request: &Req,
+    ) -> Result<Option<Resp>, Status>
+    where
+        Req: prost_proto::Message,
+        Resp: prost_proto::Message + Default,
+    {
+        if let Some(controller) = &self.controller {
+            match controller.ensure_leader_ready().await {
+                Ok(()) => return Ok(None),
+                // Not being the leader is the ordinary state of a member, not
+                // an error worth showing an operator, so long as this node can
+                // reach the one that is.
+                Err(error) if self.forward.is_none() => return Err(status(error)),
+                Err(error) => {
+                    tracing::debug!(%error, "forwarding an admin call to the control leader");
+                }
+            }
+        }
+
+        let Some(client) = &self.forward else {
+            // Unreachable through either constructor, both of which supply at
+            // least one of the two. Said out loud rather than panicked on,
+            // because an operator is holding this.
+            return Err(Status::unavailable(
+                "this node has no control plane and knows of no leader group",
+            ));
+        };
+
+        match client
+            .admin_call(method as u32, Bytes::from(request.encode_to_vec()))
+            .await
+        {
+            Ok(AdminOutcome::Ok(payload)) => Resp::decode(payload).map(Some).map_err(|e| {
+                Status::internal(format!("the control leader's answer did not decode: {e}"))
+            }),
+            Ok(AdminOutcome::Failed { code, message }) => {
+                Err(Status::new(Code::from_i32(code as i32), message))
+            }
+            Err(error) => Err(status(error)),
+        }
+    }
+
+    /// The controller, for a call [`AdminService::forwarded`] has already said
+    /// this node should answer itself.
+    fn leader(&self) -> &Controller<R, L> {
+        self.controller
+            .as_ref()
+            .expect("forwarded() returns None only when this node holds a ready controller")
     }
 }
 
@@ -107,14 +299,19 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateKeyspaceRequest>,
     ) -> Result<Response<pb::Keyspace>, Status> {
-        self.ready().await?;
         let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::CreateKeyspace, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
         let keyspace = self
-            .controller
+            .leader()
             .create_keyspace(&request.name, config_from(request.config.as_ref()))
             .await
             .map_err(status)?;
-        let view = self.controller.view().await;
+        let view = self.leader().view().await;
         Ok(Response::new(keyspace_message(
             &keyspace,
             &keyspace_totals(&view),
@@ -125,14 +322,19 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::UpdateKeyspaceRequest>,
     ) -> Result<Response<pb::Keyspace>, Status> {
-        self.ready().await?;
         let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::UpdateKeyspace, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
         let keyspace = self
-            .controller
+            .leader()
             .update_keyspace(&request.name, config_from(request.config.as_ref()))
             .await
             .map_err(status)?;
-        let view = self.controller.view().await;
+        let view = self.leader().view().await;
         Ok(Response::new(keyspace_message(
             &keyspace,
             &keyspace_totals(&view),
@@ -143,17 +345,24 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::DeleteKeyspaceRequest>,
     ) -> Result<Response<pb::DeleteKeyspaceResponse>, Status> {
-        self.ready().await?;
         let request = request.into_inner();
         // The proto asks for the name twice so that a script cannot destroy a
         // keyspace with one careless argument. Checking it here rather than in
-        // the CLI means every client gets the guard, not just ours.
+        // the CLI means every client gets the guard, not just ours. Checked
+        // before forwarding as well as on the leader, so a mistyped confirm
+        // costs one round trip rather than two.
         if request.name != request.confirm_name {
             return Err(Status::invalid_argument(
                 "confirm_name must repeat the keyspace name exactly",
             ));
         }
-        self.controller
+        if let Some(response) = self
+            .forwarded(AdminMethod::DeleteKeyspace, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
+        self.leader()
             .delete_keyspace(&request.name)
             .await
             .map_err(status)?;
@@ -162,15 +371,18 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn list_keyspaces(
         &self,
-        _request: Request<pb::ListKeyspacesRequest>,
+        request: Request<pb::ListKeyspacesRequest>,
     ) -> Result<Response<pb::ListKeyspacesResponse>, Status> {
-        self.ready().await?;
+        let request = request.into_inner();
+        if let Some(response) = self.forwarded(AdminMethod::ListKeyspaces, &request).await? {
+            return Ok(Response::new(response));
+        }
         // One view for the whole list. Taking one per keyspace made this
         // quadratic and let two rows disagree about the same cluster.
-        let view = self.controller.view().await;
+        let view = self.leader().view().await;
         let totals = keyspace_totals(&view);
         let keyspaces = self
-            .controller
+            .leader()
             .list_keyspaces()
             .await
             .into_iter()
@@ -183,8 +395,13 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateCredentialRequest>,
     ) -> Result<Response<pb::CreateCredentialResponse>, Status> {
-        self.ready().await?;
         let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::CreateCredential, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
         let permissions: Vec<Permission> = request
             .permissions
             .iter()
@@ -196,7 +413,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
             .collect();
 
         let (id, secret) = self
-            .controller
+            .leader()
             .create_credential(
                 request.keyspaces,
                 permissions,
@@ -216,9 +433,15 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::RevokeCredentialRequest>,
     ) -> Result<Response<pb::RevokeCredentialResponse>, Status> {
-        self.ready().await?;
-        self.controller
-            .revoke_credential(&request.into_inner().credential_id)
+        let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::RevokeCredential, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
+        self.leader()
+            .revoke_credential(&request.credential_id)
             .await
             .map_err(status)?;
         Ok(Response::new(pb::RevokeCredentialResponse {}))
@@ -228,10 +451,16 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::DescribeClusterRequest>,
     ) -> Result<Response<pb::DescribeClusterResponse>, Status> {
-        self.ready().await?;
-        let filter = request.into_inner().keyspace;
-        let view = self.controller.view().await;
-        let snapshot = self.controller.snapshot().await;
+        let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::DescribeCluster, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
+        let filter = request.keyspace;
+        let view = self.leader().view().await;
+        let snapshot = self.leader().snapshot().await;
 
         let wanted = if filter.is_empty() {
             None
@@ -305,7 +534,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         // above them could describe two different moments.
         let totals = keyspace_totals(&view);
         let keyspaces = self
-            .controller
+            .leader()
             .list_keyspaces()
             .await
             .into_iter()
@@ -323,10 +552,16 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn finalize_upgrade(
         &self,
-        _request: Request<pb::FinalizeUpgradeRequest>,
+        request: Request<pb::FinalizeUpgradeRequest>,
     ) -> Result<Response<pb::FinalizeUpgradeResponse>, Status> {
-        self.ready().await?;
-        let finalized = self.controller.finalize_upgrade().await.map_err(status)?;
+        let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::FinalizeUpgrade, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
+        let finalized = self.leader().finalize_upgrade().await.map_err(status)?;
         Ok(Response::new(pb::FinalizeUpgradeResponse {
             previous: Some(version_message(finalized.previous)),
             active: Some(version_message(finalized.active)),
@@ -335,9 +570,15 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn split_partition(
         &self,
-        _request: Request<pb::SplitPartitionRequest>,
+        request: Request<pb::SplitPartitionRequest>,
     ) -> Result<Response<pb::SplitPartitionResponse>, Status> {
-        self.ready().await?;
+        let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::SplitPartition, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
         Err(Status::unimplemented(
             "partition split is disabled until child storage preparation is implemented",
         ))
@@ -345,9 +586,15 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn merge_partitions(
         &self,
-        _request: Request<pb::MergePartitionsRequest>,
+        request: Request<pb::MergePartitionsRequest>,
     ) -> Result<Response<pb::MergePartitionsResponse>, Status> {
-        self.ready().await?;
+        let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::MergePartitions, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
         // Answering with a clear refusal rather than a half-built merge. See
         // the crate documentation for what a correct one has to guarantee.
         Err(Status::unimplemented(
@@ -359,15 +606,20 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::TransferOwnershipRequest>,
     ) -> Result<Response<pb::TransferOwnershipResponse>, Status> {
-        self.ready().await?;
         let request = request.into_inner();
+        if let Some(response) = self
+            .forwarded(AdminMethod::TransferOwnership, &request)
+            .await?
+        {
+            return Ok(Response::new(response));
+        }
         let partition = PartitionId(request.partition_id);
-        self.controller
+        self.leader()
             .transfer_ownership(partition, NodeId(request.to_node_id))
             .await
             .map_err(status)?;
 
-        let map = self.controller.partition_map().await;
+        let map = self.leader().partition_map().await;
         Ok(Response::new(pb::TransferOwnershipResponse {
             partition: map.partition(partition).map(partition_message),
         }))
@@ -459,5 +711,177 @@ fn status(error: Error) -> Status {
             Status::aborted(error.to_string())
         }
         Error::Internal(_) => Status::internal(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ControlConfig;
+    use crate::consensus::SingleNodeLog;
+    use crate::controller::BootstrapSpec;
+    use crate::service::ControlService;
+
+    use orbita_runtime::{ServiceId, Transport};
+    use orbita_sim::{SimRuntime, Simulation};
+    use pb::admin_server::Admin as _;
+    use std::sync::Arc;
+
+    /// A cluster of two: node one holds the control plane, node two holds
+    /// nothing but knows where node one is. That is the shape of every worker
+    /// in a real deployment, and the shape an operator most often points
+    /// `orbita` at, because the worker is the node whose client port is
+    /// published.
+    fn leader_and_a_node_without_one(
+        sim: &Simulation,
+    ) -> (
+        Controller<SimRuntime, SingleNodeLog<SimRuntime>>,
+        AdminService<SimRuntime, SingleNodeLog<SimRuntime>>,
+    ) {
+        let leader_runtime = sim.add_node(orbita_core::NodeId(1));
+        let other_runtime = sim.add_node(orbita_core::NodeId(2));
+
+        let opening = leader_runtime.clone();
+        let log = sim
+            .block_on(async move { SingleNodeLog::open(&opening).await })
+            .expect("the consensus log opens");
+        let controller = Controller::new(
+            leader_runtime.clone(),
+            Arc::clone(&log),
+            ControlConfig::default(),
+        );
+        leader_runtime
+            .transport()
+            .register(ServiceId::Control, ControlService::new(controller.clone()));
+
+        let bootstrapping = controller.clone();
+        sim.block_on(async move {
+            bootstrapping
+                .bootstrap(&BootstrapSpec {
+                    keyspace: "default".to_string(),
+                    config: KeyspaceConfig::default(),
+                    leaders: vec![(orbita_core::NodeId(1), "1:7101".to_string())],
+                    workers: Vec::new(),
+                })
+                .await
+        })
+        .expect("the cluster bootstraps");
+
+        let admin = AdminService::forwarding(ControlClient::new(
+            other_runtime,
+            vec![orbita_core::NodeId(1)],
+        ));
+        (controller, admin)
+    }
+
+    #[test]
+    fn an_admin_call_to_a_node_that_holds_no_control_plane_reaches_the_leader() {
+        let sim = Simulation::new(1);
+        let (controller, admin) = leader_and_a_node_without_one(&sim);
+
+        let created = sim
+            .block_on(async move {
+                admin
+                    .create_keyspace(Request::new(pb::CreateKeyspaceRequest {
+                        name: "demo".to_string(),
+                        config: None,
+                    }))
+                    .await
+            })
+            .expect("a node with no controller must forward rather than refuse");
+
+        assert_eq!(created.into_inner().name, "demo");
+        assert!(
+            sim.block_on(async move { controller.snapshot().await })
+                .keyspace_by_name("demo")
+                .is_some(),
+            "the keyspace has to exist on the leader, not merely be reported"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_read_is_answered_from_the_leaders_state() {
+        let sim = Simulation::new(2);
+        let (_controller, admin) = leader_and_a_node_without_one(&sim);
+
+        let described = sim
+            .block_on(async move {
+                admin
+                    .describe_cluster(Request::new(pb::DescribeClusterRequest {
+                        keyspace: String::new(),
+                    }))
+                    .await
+            })
+            .expect("describe is the call an operator makes to find the leader, so it must work")
+            .into_inner();
+
+        assert_eq!(
+            described
+                .keyspaces
+                .iter()
+                .map(|k| k.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default"]
+        );
+    }
+
+    #[test]
+    fn the_leaders_own_refusal_survives_the_hop_with_its_code() {
+        // A forwarded call that fails must not come back as "forwarding
+        // failed". The operator needs to see that the keyspace already exists,
+        // which is a thing they did, rather than an internal error, which is
+        // a thing to escalate.
+        let sim = Simulation::new(3);
+        let (_controller, admin) = leader_and_a_node_without_one(&sim);
+
+        let refused = sim
+            .block_on(async move {
+                admin
+                    .create_keyspace(Request::new(pb::CreateKeyspaceRequest {
+                        name: "default".to_string(),
+                        config: None,
+                    }))
+                    .await
+            })
+            .expect_err("the keyspace was created by the bootstrap");
+
+        assert_eq!(refused.code(), Code::AlreadyExists);
+    }
+
+    #[test]
+    fn an_unrecognised_forwarded_method_is_refused_rather_than_guessed_at() {
+        let sim = Simulation::new(4);
+        let runtime = sim.add_node(orbita_core::NodeId(1));
+        let opening = runtime.clone();
+        let log = sim
+            .block_on(async move { SingleNodeLog::open(&opening).await })
+            .expect("the consensus log opens");
+        let admin = AdminService::new(Controller::new(runtime, log, ControlConfig::default()));
+
+        let refused = sim
+            .block_on(async move { admin.invoke(u32::MAX, &[]).await })
+            .expect_err("a method this binary does not know cannot be run");
+
+        assert_eq!(refused.code(), Code::Unimplemented);
+    }
+
+    #[test]
+    fn a_call_that_arrived_here_is_never_sent_on_again() {
+        // The loop this forbids is two members mid-election forwarding to each
+        // other. It is prevented structurally rather than by a hop count: the
+        // service the peer handler dispatches into holds no client to forward
+        // with.
+        let sim = Simulation::new(5);
+        let runtime = sim.add_node(orbita_core::NodeId(1));
+        let opening = runtime.clone();
+        let log = sim
+            .block_on(async move { SingleNodeLog::open(&opening).await })
+            .expect("the consensus log opens");
+        let controller = Controller::new(runtime, log, ControlConfig::default());
+
+        assert!(
+            AdminService::new(controller).forward.is_none(),
+            "ControlService dispatches into this, so a forwarding client here would be a loop"
+        );
     }
 }
