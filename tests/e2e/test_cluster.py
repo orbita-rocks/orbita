@@ -160,6 +160,17 @@ def test_describe_reports_storage_against_the_quota_each_keyspace_was_given(
         assert (
             described.HasField("cluster_version") is True
         ), "the describe surface still answers everything it used to"
+
+        # The keyspace totals and the partition rows beside them come from
+        # one observation, so they have to agree inside a single response.
+        # They did not when each keyspace rebuilt its own cluster view.
+        mine = [
+            p for p in described.partitions if p.keyspace_id == keyspaces["quotad"].id
+        ]
+        assert keyspaces["quotad"].partition_count == len(mine), described
+        assert keyspaces["quotad"].stored_bytes == sum(
+            p.size_bytes for p in mine
+        ), described
     finally:
         for channel in channels:
             channel.close()

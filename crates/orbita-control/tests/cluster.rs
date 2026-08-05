@@ -17,6 +17,7 @@ use orbita_control::{
     NodeStatus, PartitionProgress, RegistrationOutcome, SingleNodeLog, VersionRange,
 };
 use orbita_core::{Epoch, Error, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
+use orbita_proto::v1::admin_server::Admin as _;
 use orbita_runtime::{Clock, Runtime, ServiceId, Transport};
 use orbita_sim::{check_seeds, DiskFaults, DiskPolicy, Failure, SimConfig, SimRuntime, Simulation};
 
@@ -1724,4 +1725,169 @@ fn a_client_with_no_reachable_leader_reports_unavailable_rather_than_hanging() {
         matches!(fetched, Err(orbita_core::Error::Unavailable(_))),
         "a worker must be able to tell an outage from a refusal, got {fetched:?}"
     );
+}
+
+/// A consensus log that counts how often the controller asks who the leader
+/// is.
+///
+/// `Controller::view` asks exactly once, which makes this an honest counter of
+/// how many observation snapshots one admin call took. That number is the
+/// thing the describe endpoint got wrong: it is meant to be a constant, and it
+/// was one per keyspace.
+struct CountingLog {
+    inner: Arc<SingleNodeLog<SimRuntime>>,
+    views: Arc<AtomicU64>,
+}
+
+impl ConsensusLog for CountingLog {
+    async fn propose(&self, command: ControlCommand) -> Result<orbita_control::LogIndex, Error> {
+        self.inner.propose(command).await
+    }
+
+    async fn commit_index(&self) -> orbita_control::LogIndex {
+        self.inner.commit_index().await
+    }
+
+    async fn subscribe(
+        &self,
+        after: orbita_control::LogIndex,
+    ) -> Result<Vec<orbita_control::LogEntry>, Error> {
+        self.inner.subscribe(after).await
+    }
+
+    async fn leader_barrier(&self) -> Result<orbita_control::LogIndex, Error> {
+        self.inner.leader_barrier().await
+    }
+
+    async fn is_leader(&self) -> bool {
+        self.inner.is_leader().await
+    }
+
+    async fn leader(&self) -> Option<NodeId> {
+        self.views.fetch_add(1, Ordering::SeqCst);
+        self.inner.leader().await
+    }
+}
+
+/// The describe endpoint, with a counter on the snapshots it takes.
+fn counted_admin(
+    seed: u64,
+    keyspaces: usize,
+) -> (
+    Simulation,
+    orbita_control::AdminService<SimRuntime, CountingLog>,
+    Arc<AtomicU64>,
+) {
+    let sim = Simulation::with_config(SimConfig::new(seed));
+    let leader = sim.add_node(LEADER);
+    for worker in WORKERS {
+        sim.add_node(worker);
+    }
+
+    let opening = leader.clone();
+    let single = sim.block_on(async move { SingleNodeLog::open(&opening).await.expect("open") });
+    let views = Arc::new(AtomicU64::new(0));
+    let log = Arc::new(CountingLog {
+        inner: single,
+        views: Arc::clone(&views),
+    });
+
+    let controller = Controller::new(leader, Arc::clone(&log), ControlConfig::default());
+    let spec = BootstrapSpec {
+        keyspace: "default".into(),
+        config: KeyspaceConfig::default(),
+        leaders: vec![(LEADER, "10.0.0.1:7000".into())],
+        workers: WORKERS
+            .iter()
+            .map(|w| (*w, format!("10.0.0.{w}:7000")))
+            .collect(),
+    };
+    let bootstrapping = controller.clone();
+    assert_eq!(
+        sim.block_on(async move { bootstrapping.bootstrap(&spec).await }),
+        Ok(true)
+    );
+
+    for extra in 1..keyspaces {
+        let controller = controller.clone();
+        let name = format!("tenant-{extra}");
+        sim.block_on(async move {
+            controller
+                .create_keyspace(&name, KeyspaceConfig::default())
+                .await
+                .expect("creating a keyspace");
+        });
+    }
+
+    let admin = orbita_control::AdminService::new(controller);
+    (sim, admin, views)
+}
+
+#[test]
+fn describe_takes_one_observation_snapshot_no_matter_how_many_keyspaces() {
+    // The defect this pins: describe built each keyspace row from its own
+    // freshly rebuilt view, so the work grew with keyspaces times partitions
+    // and, worse, one response could carry rows sampled at different
+    // instants. The snapshot count has to be flat in the keyspace count.
+    let snapshots = |keyspaces: usize| {
+        let (sim, admin, views) = counted_admin(21, keyspaces);
+        views.store(0, Ordering::SeqCst);
+        sim.block_on(async move {
+            admin
+                .describe_cluster(tonic::Request::new(
+                    orbita_proto::v1::DescribeClusterRequest::default(),
+                ))
+                .await
+                .expect("describe answers")
+        });
+        views.load(Ordering::SeqCst)
+    };
+
+    let one = snapshots(1);
+    let eight = snapshots(8);
+    assert_eq!(
+        one, eight,
+        "describing eight keyspaces took {eight} snapshots against {one} for a \
+         single keyspace; the endpoint is rebuilding the cluster view per row"
+    );
+}
+
+#[test]
+fn a_describe_response_agrees_with_itself_about_what_each_keyspace_stores() {
+    // The consistency half of the same defect. Keyspace totals and the
+    // partition rows beside them have to come from one observation, or an
+    // operator reading a describe is comparing two different moments and
+    // cannot tell that they are.
+    let (sim, admin, _) = counted_admin(22, 4);
+    let described = sim
+        .block_on(async move {
+            admin
+                .describe_cluster(tonic::Request::new(
+                    orbita_proto::v1::DescribeClusterRequest::default(),
+                ))
+                .await
+        })
+        .expect("describe answers")
+        .into_inner();
+
+    assert_eq!(described.keyspaces.len(), 4, "every keyspace is described");
+    for keyspace in &described.keyspaces {
+        let mine: Vec<_> = described
+            .partitions
+            .iter()
+            .filter(|p| p.keyspace_id == keyspace.id)
+            .collect();
+        assert_eq!(
+            keyspace.partition_count as usize,
+            mine.len(),
+            "keyspace {} counts partitions the same response does not list",
+            keyspace.name
+        );
+        assert_eq!(
+            keyspace.stored_bytes,
+            mine.iter().map(|p| p.size_bytes).sum::<u64>(),
+            "keyspace {} totals bytes the partitions beside it do not add up to",
+            keyspace.name
+        );
+    }
 }
