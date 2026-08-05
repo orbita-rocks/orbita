@@ -24,7 +24,7 @@
 //! that has not changed since 2011. Adding a JSON codec here would buy
 //! nothing.
 
-use super::{SessionCredentials, SessionSource};
+use super::{partition, SessionCredentials, SessionSource};
 use crate::aws::timestamp::parse_rfc3339_millis;
 
 use async_trait::async_trait;
@@ -89,8 +89,12 @@ impl AssumeRoleConfig {
 /// Regional rather than the global `sts.amazonaws.com` because a global
 /// endpoint is a cross-region dependency: a node in `eu-west-1` should not
 /// lose its credentials because `us-east-1` is having a day.
+///
+/// The DNS suffix comes from the region's partition rather than being spelled
+/// `amazonaws.com` here, because that name does not resolve in China and does
+/// not exist at all in the isolated partitions. See [`super::partition`].
 fn default_endpoint(region: &str) -> String {
-    format!("https://sts.{region}.amazonaws.com")
+    format!("https://sts.{region}.{}", partition::dns_suffix(region))
 }
 
 /// Exchanges a base credential for a session on an assumed role.
@@ -489,6 +493,41 @@ mod tests {
         assert_eq!(
             default_endpoint("eu-west-1"),
             "https://sts.eu-west-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn the_sts_endpoint_follows_the_region_partition() {
+        // `sts.cn-north-1.amazonaws.com` does not resolve. Building it would
+        // turn every credential refresh in China into a DNS failure that looks
+        // like a network problem and is not one.
+        assert_eq!(
+            default_endpoint("cn-north-1"),
+            "https://sts.cn-north-1.amazonaws.com.cn"
+        );
+        assert_eq!(
+            default_endpoint("us-gov-west-1"),
+            "https://sts.us-gov-west-1.amazonaws.com"
+        );
+        assert_eq!(
+            default_endpoint("us-iso-east-1"),
+            "https://sts.us-iso-east-1.c2s.ic.gov"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_sts_endpoint_overrides_the_derived_one() {
+        let mut config = config();
+        config.endpoint = Some("https://vpce-1234.sts.us-east-1.vpce.amazonaws.com".to_string());
+        let transport = ScriptedTransport::new(vec![response(200, &success_document())]);
+        provider(transport.clone(), config)
+            .fetch()
+            .await
+            .expect("assumed");
+        assert_eq!(
+            transport.requests()[0].authority,
+            "vpce-1234.sts.us-east-1.vpce.amazonaws.com",
+            "a PrivateLink or isolated-partition endpoint has to be settable by hand"
         );
     }
 

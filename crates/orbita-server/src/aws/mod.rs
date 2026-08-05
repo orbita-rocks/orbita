@@ -34,6 +34,7 @@
 //!   none of this, which is right: MinIO and R2 have nothing else to offer.
 
 pub(crate) mod imds;
+pub(crate) mod partition;
 pub(crate) mod refresh;
 pub(crate) mod sts;
 mod timestamp;
