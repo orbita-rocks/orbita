@@ -936,9 +936,12 @@ dependencies = [
 name = "orbita-sim"
 version = "0.1.0-dev"
 dependencies = [
+ "async-trait",
  "bytes",
  "orbita-core",
+ "orbita-objectstore",
  "orbita-runtime",
+ "percent-encoding",
  "thiserror 2.0.19",
 ]
 

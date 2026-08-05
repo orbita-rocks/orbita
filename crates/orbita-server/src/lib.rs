@@ -86,6 +86,8 @@ mod aws;
 mod config;
 mod control;
 #[cfg(test)]
+mod durability;
+#[cfg(test)]
 mod forwarding;
 mod frame;
 mod fs_store;

@@ -48,11 +48,25 @@ storage engine now persists exclusively through
 `orbita_objectstore::ObjectStore`, and per this brief's own instruction the
 limit was deleted rather than reworded.
 
-What remains before the public correctness report can claim the whole system
-is verified under simulation: the simulated runs currently stand an in-memory
-store into that seam without injecting faults through it. A fault-injecting
-`ObjectStore` is small next to what the seam replaced and is the natural next
-piece of this crate.
+That seam now has faults injected through it, and the crate is not what does
+the injecting. `orbita_sim::SimBucket` implements
+`orbita_objectstore::s3::HttpTransport`, so a simulated partition persists
+through the same `S3Store` production runs: the signing, the mapping of a
+status onto the error taxonomy, the conditional-write headers, and the
+paginated listing are all under test rather than stubbed out. That is why this
+crate depends on `orbita-objectstore` with only its `s3` feature, which is the
+split that feature was cut for.
+
+The faults are the ones object storage actually produces: a request that never
+arrived, a response that was lost after the store applied the request, a
+throttle, and a crash placed exactly between two store calls. The second is
+the one that earns the design. A conditional write whose answer was lost and
+one that never landed are indistinguishable to the writer and differ by
+whether the partition's data is durable, so the manifest swap being the
+durability boundary is a claim with a failure mode rather than a definition.
+
+The scenarios live in `orbita-server`, in `src/durability.rs`, because that is
+where the ordering they pin lives.
 
 ## Decisions to make and write down
 
