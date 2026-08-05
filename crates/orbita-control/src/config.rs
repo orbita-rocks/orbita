@@ -40,7 +40,8 @@ pub struct ControlConfig {
     /// owner. Three gives the two-of-three durability quorum the WAL assumes.
     pub replication_factor: usize,
 
-    /// Size at which a partition is reported as a split candidate.
+    /// Reserved size threshold for worker-prepared splits. Split execution is
+    /// disabled until that protocol is implemented.
     pub split_threshold_bytes: u64,
 }
 
