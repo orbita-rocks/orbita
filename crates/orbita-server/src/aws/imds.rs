@@ -22,12 +22,12 @@
 //! a node pointed at the profile it no longer has. Three round trips on the
 //! link-local address every fifty-five minutes is not worth optimising.
 
+use super::document::session_from_json;
 use super::{SessionCredentials, SessionSource};
-use crate::aws::timestamp::parse_rfc3339_millis;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use orbita_objectstore::s3::{Credentials, HttpRequest, HttpResponse, HttpTransport, Scheme};
+use orbita_objectstore::s3::{HttpRequest, HttpResponse, HttpTransport, Scheme};
 use orbita_objectstore::{ObjectError, ObjectResult};
 
 use std::sync::Arc;
@@ -161,20 +161,6 @@ fn status_error(what: &str, response: &HttpResponse) -> ObjectError {
     }
 }
 
-/// The credential document IMDS serves.
-///
-/// Field names are AWS's, and `Token` is the session token rather than
-/// anything to do with the IMDSv2 session token, which is a naming collision
-/// AWS chose and this struct has to live with.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ImdsCredentials {
-    access_key_id: String,
-    secret_access_key: String,
-    token: String,
-    expiration: String,
-}
-
 #[async_trait]
 impl SessionSource for InstanceProfile {
     async fn fetch(&self) -> ObjectResult<SessionCredentials> {
@@ -193,33 +179,7 @@ impl SessionSource for InstanceProfile {
             ));
         }
 
-        // The parse error is not carried into the message: the body it failed
-        // on is a credential document, and serde_json quotes the input it
-        // choked on.
-        let parsed: ImdsCredentials = serde_json::from_slice(&response.body).map_err(|_| {
-            ObjectError::Other(
-                "the instance metadata service returned a credential document this node could \
-                 not parse"
-                    .to_string(),
-            )
-        })?;
-
-        let expires_at_millis = parse_rfc3339_millis(&parsed.expiration).ok_or_else(|| {
-            ObjectError::Other(format!(
-                "the instance metadata service reported an expiry this node cannot read: \
-                 {:?}; refusing to guess how long the credential lasts",
-                parsed.expiration
-            ))
-        })?;
-
-        Ok(SessionCredentials {
-            credentials: Credentials {
-                access_key_id: parsed.access_key_id,
-                secret_access_key: parsed.secret_access_key,
-                session_token: Some(parsed.token),
-            },
-            expires_at_millis: Some(expires_at_millis),
-        })
+        session_from_json(&response.body, "the instance metadata service")
     }
 
     fn describe(&self) -> String {

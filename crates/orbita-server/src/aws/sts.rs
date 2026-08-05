@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 /// The `AssumeRole` API version this code speaks. It is a constant of the
 /// protocol, not a thing to configure.
-const STS_API_VERSION: &str = "2011-06-15";
+pub(crate) const STS_API_VERSION: &str = "2011-06-15";
 
 /// How long a session is requested for.
 ///
@@ -93,7 +93,7 @@ impl AssumeRoleConfig {
 /// The DNS suffix comes from the region's partition rather than being spelled
 /// `amazonaws.com` here, because that name does not resolve in China and does
 /// not exist at all in the isolated partitions. See [`super::partition`].
-fn default_endpoint(region: &str) -> String {
+pub(crate) fn default_endpoint(region: &str) -> String {
     format!("https://sts.{region}.{}", partition::dns_suffix(region))
 }
 
@@ -165,7 +165,7 @@ impl AssumeRole {
 /// slashes and both have to survive as escapes rather than as separators.
 /// Space becomes `%20` and not `+`, because the signature covers the body
 /// bytes and STS accepts either.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -177,7 +177,7 @@ fn form_encode(value: &str) -> String {
     out
 }
 
-fn split_endpoint(endpoint: &str) -> ObjectResult<(Scheme, String)> {
+pub(crate) fn split_endpoint(endpoint: &str) -> ObjectResult<(Scheme, String)> {
     let (scheme, rest) = if let Some(rest) = endpoint.strip_prefix("https://") {
         (Scheme::Https, rest)
     } else if let Some(rest) = endpoint.strip_prefix("http://") {
@@ -200,12 +200,65 @@ fn split_endpoint(endpoint: &str) -> ObjectResult<(Scheme, String)> {
 /// `AssumeRole` response is a fixed, tiny document and its shape has not moved
 /// since 2011, which is the same reason `orbita-objectstore` reads S3 error
 /// bodies this way.
-fn xml_field(body: &str, tag: &str) -> Option<String> {
+pub(crate) fn xml_field(body: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body.find(&open)? + open.len();
     let end = body[start..].find(&close)? + start;
     Some(body[start..end].to_string())
+}
+
+/// Turns one STS response into a session credential, or into the error the
+/// operator needs to read.
+///
+/// `AssumeRole` and `AssumeRoleWithWebIdentity` return the same `<Credentials>`
+/// element and the same `<Error>` element, so they share this rather than
+/// having two copies that can drift on which status codes are retryable.
+/// `what` names the operation for the message: it is a role ARN or an audience,
+/// never a credential.
+pub(crate) fn session_from_response(
+    status: u16,
+    text: &str,
+    what: &str,
+) -> ObjectResult<SessionCredentials> {
+    if status != 200 {
+        // The STS error code and message name the actual problem — a trust
+        // policy that does not allow this principal, a missing external
+        // id, an expired web identity token — and an operator needs them
+        // verbatim. Neither is a secret.
+        let detail = match (xml_field(text, "Code"), xml_field(text, "Message")) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (Some(code), None) => code,
+            _ => format!("status {status}"),
+        };
+        let message = format!("{what}: {detail}");
+        return Err(match status {
+            400 | 401 | 403 => ObjectError::AccessDenied(message),
+            429 | 500..=599 => ObjectError::Transient(message),
+            _ => ObjectError::Other(message),
+        });
+    }
+
+    let field = |tag: &str| {
+        xml_field(text, tag)
+            .ok_or_else(|| ObjectError::Other(format!("{what}: the response had no <{tag}>")))
+    };
+    let expiration = field("Expiration")?;
+    let expires_at_millis = parse_rfc3339_millis(&expiration).ok_or_else(|| {
+        ObjectError::Other(format!(
+            "{what}: the session expiry {expiration:?} is unreadable; refusing to guess how \
+             long the session lasts"
+        ))
+    })?;
+
+    Ok(SessionCredentials {
+        credentials: Credentials {
+            access_key_id: field("AccessKeyId")?,
+            secret_access_key: field("SecretAccessKey")?,
+            session_token: Some(field("SessionToken")?),
+        },
+        expires_at_millis: Some(expires_at_millis),
+    })
 }
 
 #[async_trait]
@@ -243,48 +296,11 @@ impl SessionSource for AssumeRole {
         })?;
 
         let text = String::from_utf8_lossy(&response.body);
-        if response.status != 200 {
-            // The STS error code and message name the actual problem — a trust
-            // policy that does not allow this principal, a missing external
-            // id — and an operator needs them verbatim. Neither is a secret.
-            let detail = match (xml_field(&text, "Code"), xml_field(&text, "Message")) {
-                (Some(code), Some(message)) => format!("{code}: {message}"),
-                (Some(code), None) => code,
-                _ => format!("status {}", response.status),
-            };
-            let message = format!("assuming {}: {detail}", self.config.role_arn);
-            return Err(match response.status {
-                400 | 401 | 403 => ObjectError::AccessDenied(message),
-                429 | 500..=599 => ObjectError::Transient(message),
-                _ => ObjectError::Other(message),
-            });
-        }
-
-        let field = |tag: &str| {
-            xml_field(&text, tag).ok_or_else(|| {
-                ObjectError::Other(format!(
-                    "assuming {}: the response had no <{tag}>",
-                    self.config.role_arn
-                ))
-            })
-        };
-        let expiration = field("Expiration")?;
-        let expires_at_millis = parse_rfc3339_millis(&expiration).ok_or_else(|| {
-            ObjectError::Other(format!(
-                "assuming {}: the session expiry {expiration:?} is unreadable; refusing to \
-                 guess how long the session lasts",
-                self.config.role_arn
-            ))
-        })?;
-
-        Ok(SessionCredentials {
-            credentials: Credentials {
-                access_key_id: field("AccessKeyId")?,
-                secret_access_key: field("SecretAccessKey")?,
-                session_token: Some(field("SessionToken")?),
-            },
-            expires_at_millis: Some(expires_at_millis),
-        })
+        session_from_response(
+            response.status,
+            &text,
+            &format!("assuming {}", self.config.role_arn),
+        )
     }
 
     fn describe(&self) -> String {
