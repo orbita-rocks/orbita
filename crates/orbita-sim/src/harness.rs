@@ -25,11 +25,33 @@ impl Failure {
     #[must_use]
     pub fn replay_report(&self, test_name: &str) -> String {
         format!(
-            "\n{self}\n\nreproduce with:\n    {SEED_VAR}={} cargo test -p {} {test_name} -- --exact --nocapture\n\nlast events:\n{}\n",
+            "\n{self}\n\nreproduce with:\n    {SEED_VAR}={} cargo test -p {} {test_name} -- --exact{} --nocapture\n\nlast events:\n{}\n",
             self.seed,
             owning_package(),
+            ignored_filter(),
             self.trace.tail(60)
         )
+    }
+}
+
+/// The filter flag a replay needs in order to run at all.
+///
+/// A scenario that pins a known failure is marked `#[ignore]`, and a command
+/// that omits the flag runs zero tests and reports success, which is a worse
+/// outcome than printing nothing: it tells someone chasing the bug that it is
+/// already fixed. The condition is read from how this run was invoked, since a
+/// test that needed the flag to start needs it to start again.
+///
+/// The flag emitted is `--include-ignored` rather than `--ignored`, because it
+/// runs the named test whether or not the ignore is still there. Someone
+/// replaying a failure a week later should not have their command break on the
+/// commit that removes the attribute.
+fn ignored_filter() -> &'static str {
+    let invoked_with = |flag: &str| std::env::args().any(|arg| arg == flag);
+    if invoked_with("--ignored") || invoked_with("--include-ignored") {
+        " --include-ignored"
+    } else {
+        ""
     }
 }
 
