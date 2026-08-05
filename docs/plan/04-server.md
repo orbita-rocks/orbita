@@ -69,19 +69,25 @@ Do not argue that this is safe. Have the simulator's linearizability checker
 demonstrate it under partitions and failovers, which is the entire reason that
 crate exists.
 
-### WAL retention before hydration
+### WAL retention and hydration
 
 Live flushes checkpoint an owner's local WAL only after the partition manifest
-is published. This bounds owner disk use, but it lands before hydration in
-issue #17. A replica that falls behind the retained WAL asks for entries the
-owner has already removed, receives no catch-up range, and has no snapshot path
-in this release. It remains unavailable rather than inventing state.
+is published, which bounds owner disk use. What that used to cost was recovery:
+a replica behind the retained WAL asked for entries the owner had already
+removed, got no catch-up range, and stayed unavailable rather than inventing
+state.
 
-That is an explicit merge tradeoff for issue #16, not a recovery guarantee. The
-manifest makes the removed entries cluster-durable, but only hydration can turn
-those objects back into a caught-up replica. Until #17 lands, operators must
-repair or replace such a replica after hydration exists; there is no safe
-fallback to an incomplete WAL.
+Hydration is the answer, and it is what makes the retention bound safe rather
+than merely cheap. A node builds the partition from the current manifest and
+records that horizon in its own log, so it resumes replication above the
+horizon instead of at the start. It happens when a partition is opened, which
+is the replacement-worker case, and in place when an inbound batch turns out to
+leave a hole, which is the fell-behind case and does not need a restart.
+
+Two limits remain, and neither is a fallback to an incomplete WAL. A partition
+that has never been flushed has nothing to hydrate from, and a manifest that is
+itself behind the gap closes only part of it. Both are reported as the gap they
+are.
 
 ## Decisions to make and write down
 
