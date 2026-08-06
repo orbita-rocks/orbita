@@ -65,6 +65,8 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "cluster.leader_peers, comma separated NODE_ID=ADDR entries",
     ),
     ("ORBITA_ALLOW_VERSION_SKEW", "cluster.allow_version_skew"),
+    ("ORBITA_REQUIRE_AUTH", "cluster.require_auth"),
+    ("ORBITA_ROOT_CREDENTIAL", "cluster.root_credential"),
     (
         "ORBITA_JOIN_BACKOFF_INITIAL",
         "cluster.join_backoff_initial, a duration such as 250ms",
@@ -222,6 +224,28 @@ pub struct ClusterConfig {
     /// See [`crate::node`] for why.
     pub leader_peers: Vec<String>,
     pub allow_version_skew: bool,
+    /// Whether this cluster requires a credential on every client request.
+    ///
+    /// Off by default so a fresh cluster can be brought up and its first
+    /// credential issued; on, every `Kv` and `Admin` call must carry a valid
+    /// `authorization: Bearer <secret>` header. This is the server-side switch
+    /// the CLI's own credential handling assumes exists.
+    pub require_auth: bool,
+    /// A bootstrap root credential secret, if the operator configured one.
+    ///
+    /// This is what resolves the bootstrap chicken-and-egg: with
+    /// `require_auth` on, the admin surface itself demands a credential, but
+    /// the first credential is created through admin. A root secret named here
+    /// is hashed by the server and honored as a fully privileged identity
+    /// before any credential exists, so it can create the first real one.
+    ///
+    /// It is a config secret with total blast radius: it is never serialized
+    /// back out (see the skipped field below) and it is the operator's job to
+    /// rotate it and remove it once real credentials exist. `None` means no
+    /// root, and a cluster with auth on and no root must create its first
+    /// credential while auth is off.
+    #[serde(skip_serializing)]
+    pub root_credential: Option<String>,
     /// How long to wait before the first retry when the leader group is not
     /// reachable yet.
     pub join_backoff_initial_millis: u64,
@@ -399,6 +423,8 @@ pub struct ClusterLayer {
     pub name: Option<String>,
     pub leader_peers: Option<Vec<String>>,
     pub allow_version_skew: Option<bool>,
+    pub require_auth: Option<bool>,
+    pub root_credential: Option<String>,
     pub join_backoff_initial: Option<String>,
     pub join_backoff_max: Option<String>,
     pub join_timeout: Option<String>,
@@ -471,6 +497,8 @@ impl Layer {
             name,
             leader_peers,
             allow_version_skew,
+            require_auth,
+            root_credential,
             join_backoff_initial,
             join_backoff_max,
             join_timeout,
@@ -599,6 +627,8 @@ impl Layer {
                 name: get("ORBITA_CLUSTER_NAME").map(str::to_owned),
                 leader_peers: get("ORBITA_LEADER_PEERS").map(parse_list),
                 allow_version_skew: flag("ORBITA_ALLOW_VERSION_SKEW")?,
+                require_auth: flag("ORBITA_REQUIRE_AUTH")?,
+                root_credential: get("ORBITA_ROOT_CREDENTIAL").map(str::to_owned),
                 join_backoff_initial: get("ORBITA_JOIN_BACKOFF_INITIAL").map(str::to_owned),
                 join_backoff_max: get("ORBITA_JOIN_BACKOFF_MAX").map(str::to_owned),
                 join_timeout: get("ORBITA_JOIN_TIMEOUT").map(str::to_owned),
@@ -773,6 +803,8 @@ impl Layer {
                 name: self.cluster.name.unwrap_or_else(|| "orbita".to_owned()),
                 leader_peers: self.cluster.leader_peers.unwrap_or_default(),
                 allow_version_skew: self.cluster.allow_version_skew.unwrap_or(false),
+                require_auth: self.cluster.require_auth.unwrap_or(false),
+                root_credential: self.cluster.root_credential,
                 join_backoff_initial_millis,
                 join_backoff_max_millis,
                 join_timeout_millis,
@@ -1164,15 +1196,33 @@ mod tests {
     #[test]
     fn a_serialized_configuration_carries_no_credential_material() {
         let file = Layer::from_toml(
-            "[object_store]\nendpoint = \"http://minio:9000\"\naccess_key_id = \"the-key-id\"\n\
+            "[cluster]\nroot_credential = \"the-root-secret\"\n\
+             [object_store]\nendpoint = \"http://minio:9000\"\naccess_key_id = \"the-key-id\"\n\
              secret_access_key = \"the-secret\"\nrole_external_id = \"the-external-id\"\n",
         )
         .unwrap();
         let config = Layer::default().merge(file).resolve().unwrap();
+        assert_eq!(
+            config.cluster.root_credential.as_deref(),
+            Some("the-root-secret"),
+            "the root secret is still read into the resolved configuration"
+        );
         let rendered = serde_json::to_string(&config).expect("serializes");
         assert!(
-            !rendered.contains("the-secret") && !rendered.contains("the-external-id"),
+            !rendered.contains("the-secret")
+                && !rendered.contains("the-external-id")
+                && !rendered.contains("the-root-secret"),
             "a printed configuration must not be a credential dump: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_root_credential_can_be_named_in_the_environment() {
+        let environment =
+            Layer::from_env(&env(&[("ORBITA_ROOT_CREDENTIAL", "the-root-secret")])).unwrap();
+        assert_eq!(
+            environment.cluster.root_credential.as_deref(),
+            Some("the-root-secret")
         );
     }
 

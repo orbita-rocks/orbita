@@ -747,6 +747,27 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             .await
     }
 
+    /// The current wall-clock time in Unix milliseconds, from the runtime
+    /// rather than the host, so credential expiry is checked against the same
+    /// clock a simulated run drives.
+    #[must_use]
+    pub fn now_millis(&self) -> u64 {
+        self.runtime.clock().now_millis()
+    }
+
+    /// A copy of every live credential, for a worker to enforce against.
+    ///
+    /// This is what closes the gap the [`Controller::authenticate`] comment
+    /// describes: a worker cannot call `authenticate` per request without
+    /// putting the control plane on the data path, so it pulls this snapshot on
+    /// the same timer as its map and runs the same rule locally through
+    /// [`crate::CredentialSnapshot`]. It carries the secret hashes, never the
+    /// secrets, so it is no more sensitive than the replicated log already is.
+    pub async fn credential_snapshot(&self) -> crate::CredentialSnapshot {
+        let inner = self.inner.lock().await;
+        crate::CredentialSnapshot::new(inner.state.credentials().cloned().collect())
+    }
+
     /// Checks a credential against a keyspace and an operation.
     ///
     /// This is the leader group's copy of the check. The worker enforces the

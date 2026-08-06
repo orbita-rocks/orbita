@@ -6,10 +6,12 @@
 //! read path, belongs to the node so that a request that arrives over the peer
 //! transport takes exactly the same path as one that arrives over gRPC.
 
+use crate::auth::Authenticator;
 use crate::node::Node;
 use crate::readiness::{ReadinessCondition, ReadinessGate, ReadinessState};
 use crate::status::to_status;
 
+use orbita_control::Permission;
 use orbita_proto::v1::health_server::Health;
 use orbita_proto::v1::kv_server::Kv;
 use orbita_proto::v1::{
@@ -23,17 +25,45 @@ use tonic::{Request, Response, Status};
 
 pub(crate) struct KvService<R: Runtime> {
     node: Arc<Node<R>>,
+    /// Checks the credential every request before it can reach a partition.
+    /// Held here rather than in the node so a request over the peer transport,
+    /// which is already an authenticated node, does not re-run the client-edge
+    /// check.
+    auth: Arc<Authenticator<R::Clock>>,
 }
 
 impl<R: Runtime> KvService<R> {
-    pub(crate) fn new(node: Arc<Node<R>>) -> Self {
-        Self { node }
+    pub(crate) fn new(node: Arc<Node<R>>, auth: Arc<Authenticator<R::Clock>>) -> Self {
+        Self { node, auth }
+    }
+
+    /// Refuses a request whose credential does not permit `permission` on
+    /// `keyspace`, before any partition work happens.
+    ///
+    /// The keyspace comes from the request body and the permission from the
+    /// method, so a read cannot borrow a write scope or vice versa.
+    ///
+    /// The large-`Err` lint is allowed because the `Err` is a `tonic::Status`,
+    /// the same type every handler here already returns; boxing it just for
+    /// this helper would make the call sites unwrap a box the trait then
+    /// re-wraps.
+    #[allow(clippy::result_large_err)]
+    fn authorize<T>(
+        &self,
+        request: &Request<T>,
+        keyspace: &str,
+        permission: Permission,
+    ) -> Result<(), Status> {
+        self.auth
+            .authorize(request.metadata(), keyspace, permission)
+            .map_err(|e| to_status(&e))
     }
 }
 
 #[tonic::async_trait]
 impl<R: Runtime> Kv for KvService<R> {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        self.authorize(&request, &request.get_ref().keyspace, Permission::Read)?;
         self.node
             .get(request.into_inner(), false)
             .await
@@ -42,6 +72,7 @@ impl<R: Runtime> Kv for KvService<R> {
     }
 
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
+        self.authorize(&request, &request.get_ref().keyspace, Permission::Write)?;
         self.node
             .set(request.into_inner(), false)
             .await
@@ -53,6 +84,7 @@ impl<R: Runtime> Kv for KvService<R> {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        self.authorize(&request, &request.get_ref().keyspace, Permission::Write)?;
         self.node
             .delete(request.into_inner(), false)
             .await
@@ -64,9 +96,11 @@ impl<R: Runtime> Kv for KvService<R> {
         &self,
         request: Request<GetLimitsRequest>,
     ) -> Result<Response<GetLimitsResponse>, Status> {
-        // Answered from the cached map without touching a partition, because a
-        // client calls this before it can do anything else and should not have
-        // its first request depend on a partition being available.
+        // Deliberately unauthenticated. Limits are how a client sizes its gRPC
+        // channel before it holds a credential or has picked a keyspace, and
+        // the empty-keyspace form returns cluster-wide maxima that no
+        // keyspace-scoped credential could name. It exposes no data, only the
+        // sizes this cluster will accept.
         self.node
             .limits(&request.into_inner().keyspace)
             .await
@@ -75,6 +109,7 @@ impl<R: Runtime> Kv for KvService<R> {
     }
 
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        self.authorize(&request, &request.get_ref().keyspace, Permission::Read)?;
         self.node
             .list(request.into_inner(), false)
             .await
@@ -164,7 +199,8 @@ mod tests {
                 "control-plane-joined",
                 "partitions-caught-up",
                 "replicas-recoverable",
-                "accepting-ownership"
+                "accepting-ownership",
+                "auth-policy-agreed"
             ]
         );
     }
