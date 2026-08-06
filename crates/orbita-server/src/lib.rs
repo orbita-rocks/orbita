@@ -216,12 +216,10 @@ impl Server {
             let log = RaftLog::open(&runtime, &config.leader_group).await?;
             let control =
                 Controller::new(runtime.clone(), Arc::clone(&log), ControlConfig::default());
-            runtime
-                .transport()
-                .register(
-                    ServiceId::Control,
-                    ControlService::new(control.clone()).require_auth(config.require_auth),
-                );
+            runtime.transport().register(
+                ServiceId::Control,
+                ControlService::new(control.clone()).require_auth(config.require_auth),
+            );
             raft = Some(log);
             controller = Some(control);
         }

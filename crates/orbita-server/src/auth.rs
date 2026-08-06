@@ -489,7 +489,12 @@ mod tests {
         // outage that has aged everything else out.
         let root = orbita_control::root_secret_hash("root-secret");
         let clock = MovableClock::new(0);
-        let auth = Authenticator::new(true, Some(root), Duration::from_millis(1_000), clock.clone());
+        let auth = Authenticator::new(
+            true,
+            Some(root),
+            Duration::from_millis(1_000),
+            clock.clone(),
+        );
         auth.refresh(CredentialSnapshot::new(vec![credential("s3cret")]));
         clock.advance(10_000);
         // The fetched credential is aged out,
