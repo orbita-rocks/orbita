@@ -116,6 +116,26 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "ORBITA_OBJECT_STORE_FORCE_PATH_STYLE",
         "object_store.force_path_style",
     ),
+    (
+        "ORBITA_SWEEP_ENABLED",
+        "sweep.enabled: turn the destructive orphan sweep on (off by default)",
+    ),
+    (
+        "ORBITA_SWEEP_DRY_RUN",
+        "sweep.dry_run: report candidates instead of deleting them",
+    ),
+    (
+        "ORBITA_SWEEP_GRACE",
+        "sweep.grace, as a duration such as 1h; must exceed the longest read and commit",
+    ),
+    (
+        "ORBITA_SWEEP_SKEW",
+        "sweep.skew, as a duration such as 5m; the object store's worst-case clock skew",
+    ),
+    (
+        "ORBITA_SWEEP_INTERVAL",
+        "sweep.interval, as a duration such as 10m; how often an owner sweeps",
+    ),
     ("ORBITA_OTLP_ENDPOINT", "telemetry.otlp_endpoint"),
     ("ORBITA_TRACE_SAMPLE_RATIO", "telemetry.trace_sample_ratio"),
     ("ORBITA_SERVICE_NAME", "telemetry.service_name"),
@@ -184,6 +204,7 @@ pub struct Config {
     pub node: NodeConfig,
     pub cluster: ClusterConfig,
     pub object_store: ObjectStoreConfig,
+    pub sweep: SweepConfig,
     pub telemetry: TelemetryConfig,
     pub client: ClientConfig,
 }
@@ -358,6 +379,35 @@ pub struct ObjectStoreConfig {
     pub force_path_style: bool,
 }
 
+/// The orphan sweep: the background job that reclaims objects a failed
+/// compaction or an abandoned commit stranded in the bucket.
+///
+/// It is destructive — it deletes objects — so it is off unless an operator
+/// turns it on, and every deployment-specific bound is here rather than baked
+/// into the binary. See `orbita_storage`'s sweep for the grace-period contract.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SweepConfig {
+    /// Whether the sweep runs at all. Off by default: a loop that deletes from
+    /// the bucket should not start itself, and leaked space is a recoverable
+    /// cost where a wrong deletion is not. An operator opts in once the grace
+    /// period is set to something they trust.
+    pub enabled: bool,
+    /// Report candidates instead of deleting them. The "look before it acts"
+    /// switch for a first run against a real bucket.
+    pub dry_run: bool,
+    /// How long the dropping manifest must have been in effect, and the object
+    /// itself must have existed, before the object may be deleted. It has to
+    /// exceed the longest read and the longest commit a deployment allows, which
+    /// only the operator knows, so it is configuration.
+    pub grace_millis: u64,
+    /// How much to widen the grace period for the object store's own worst-case
+    /// internal clock skew.
+    pub skew_millis: u64,
+    /// How often an owner runs the sweep over its partitions. Far slower than a
+    /// flush, because the sweep lists a whole partition prefix.
+    pub interval_millis: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TelemetryConfig {
     /// Unset disables trace and metric export entirely. Logs still go to
@@ -395,6 +445,8 @@ pub struct Layer {
     pub cluster: ClusterLayer,
     #[serde(default)]
     pub object_store: ObjectStoreLayer,
+    #[serde(default)]
+    pub sweep: SweepLayer,
     #[serde(default)]
     pub telemetry: TelemetryLayer,
     #[serde(default)]
@@ -445,6 +497,19 @@ pub struct ObjectStoreLayer {
     pub role_session_name: Option<String>,
     pub sts_endpoint: Option<String>,
     pub force_path_style: Option<bool>,
+}
+
+/// The grace, skew, and interval are strings so a file can say `grace = "1h"`
+/// rather than a bare millisecond count whose unit nobody can see. See
+/// [`parse_duration_millis`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SweepLayer {
+    pub enabled: Option<bool>,
+    pub dry_run: Option<bool>,
+    pub grace: Option<String>,
+    pub skew: Option<String>,
+    pub interval: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -518,6 +583,15 @@ impl Layer {
             role_session_name,
             sts_endpoint,
             force_path_style
+        );
+        overlay!(
+            self.sweep,
+            other.sweep,
+            enabled,
+            dry_run,
+            grace,
+            skew,
+            interval
         );
         overlay!(
             self.telemetry,
@@ -647,6 +721,13 @@ impl Layer {
                 sts_endpoint: get("ORBITA_OBJECT_STORE_STS_ENDPOINT").map(str::to_owned),
                 force_path_style: flag("ORBITA_OBJECT_STORE_FORCE_PATH_STYLE")?,
             },
+            sweep: SweepLayer {
+                enabled: flag("ORBITA_SWEEP_ENABLED")?,
+                dry_run: flag("ORBITA_SWEEP_DRY_RUN")?,
+                grace: get("ORBITA_SWEEP_GRACE").map(str::to_owned),
+                skew: get("ORBITA_SWEEP_SKEW").map(str::to_owned),
+                interval: get("ORBITA_SWEEP_INTERVAL").map(str::to_owned),
+            },
             telemetry: TelemetryLayer {
                 otlp_endpoint: get("ORBITA_OTLP_ENDPOINT").map(str::to_owned),
                 trace_sample_ratio: ratio,
@@ -734,6 +815,21 @@ impl Layer {
         if !(0.0..=1.0).contains(&trace_sample_ratio) {
             bail!("telemetry.trace_sample_ratio must be between 0 and 1, got {trace_sample_ratio}");
         }
+
+        // The grace, skew, and interval default to the same values the server
+        // library uses, resolved here so the CLI and the library never disagree
+        // about what an unset value means. `enabled` defaults to false: the
+        // sweep deletes, so it stays off until an operator turns it on.
+        let sweep = SweepConfig {
+            enabled: self.sweep.enabled.unwrap_or(false),
+            dry_run: self.sweep.dry_run.unwrap_or(false),
+            grace_millis: duration_millis("sweep.grace", self.sweep.grace)?
+                .unwrap_or(orbita_server::DEFAULT_SWEEP_GRACE_MILLIS),
+            skew_millis: duration_millis("sweep.skew", self.sweep.skew)?
+                .unwrap_or(orbita_server::DEFAULT_SWEEP_SKEW_MILLIS),
+            interval_millis: duration_millis("sweep.interval", self.sweep.interval)?
+                .unwrap_or(orbita_server::DEFAULT_SWEEP_INTERVAL.as_millis() as u64),
+        };
 
         // Left unset, the source follows the keys: keys mean static, and no
         // keys means the node resolves one at startup in the AWS chain's
@@ -829,6 +925,7 @@ impl Layer {
                 sts_endpoint: self.object_store.sts_endpoint,
                 force_path_style: self.object_store.force_path_style.unwrap_or(true),
             },
+            sweep,
             telemetry: TelemetryConfig {
                 otlp_endpoint: self.telemetry.otlp_endpoint,
                 trace_sample_ratio,
@@ -1033,6 +1130,41 @@ mod tests {
         assert_eq!(config.client.endpoint, "http://127.0.0.1:7100");
         assert_eq!(config.telemetry.log_level, "info");
         assert!(config.object_store.endpoint.is_none());
+    }
+
+    #[test]
+    fn the_orphan_sweep_is_disabled_until_an_operator_turns_it_on() {
+        // The destructive default guard: a fresh node does not sweep, so no
+        // deployment starts deleting objects it was never told to.
+        let config = Layer::default().resolve().expect("defaults must resolve");
+        assert!(!config.sweep.enabled, "the sweep is off by default");
+        assert!(!config.sweep.dry_run);
+        assert_eq!(
+            config.sweep.grace_millis,
+            orbita_server::DEFAULT_SWEEP_GRACE_MILLIS
+        );
+        assert_eq!(
+            config.sweep.skew_millis,
+            orbita_server::DEFAULT_SWEEP_SKEW_MILLIS
+        );
+    }
+
+    #[test]
+    fn the_orphan_sweep_bounds_come_from_the_environment() {
+        let environment = Layer::from_env(&env(&[
+            ("ORBITA_SWEEP_ENABLED", "true"),
+            ("ORBITA_SWEEP_DRY_RUN", "true"),
+            ("ORBITA_SWEEP_GRACE", "2h"),
+            ("ORBITA_SWEEP_SKEW", "30s"),
+            ("ORBITA_SWEEP_INTERVAL", "15m"),
+        ]))
+        .unwrap();
+        let config = Layer::default().merge(environment).resolve().unwrap();
+        assert!(config.sweep.enabled);
+        assert!(config.sweep.dry_run);
+        assert_eq!(config.sweep.grace_millis, 2 * 60 * 60 * 1000);
+        assert_eq!(config.sweep.skew_millis, 30 * 1000);
+        assert_eq!(config.sweep.interval_millis, 15 * 60 * 1000);
     }
 
     #[test]

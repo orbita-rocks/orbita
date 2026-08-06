@@ -29,9 +29,10 @@
 //! through the same manifest swap as a flush, so one that dies half way costs
 //! objects rather than data.
 //! The objects it replaces are deleted once the new manifest is committed;
-//! anything a crash strands is left for a sweep, which does not exist yet and
-//! is deliberate scope for later, as is a cache for values read back out of
-//! segments.
+//! anything a crash strands is left for the orphan sweep,
+//! [`Partition::sweep_orphans`], which reclaims what an interrupted compaction
+//! or an abandoned commit leaves behind. A cache for values read back out of
+//! segments is still deliberate scope for later.
 
 use crate::cursor::Cursor;
 use crate::mutation::{version_at, Mutation, MutationOp};
@@ -43,8 +44,8 @@ use orbita_core::{
 };
 use orbita_format::segment::{Segment, SegmentBuilder};
 use orbita_format::{
-    compact, CommitPlan, FormatError, PartitionPath, PartitionWriter, RecordValue, SegmentEntry,
-    SegmentRecord, Snapshot,
+    compact, sweep_partition, CommitPlan, FormatError, PartitionPath, PartitionWriter, RecordValue,
+    SegmentEntry, SegmentRecord, Snapshot, SweepReport,
 };
 use orbita_objectstore::{ObjectError, ObjectStore};
 use orbita_runtime::{Clock, Runtime};
@@ -88,6 +89,36 @@ const COMPACT_TRIGGER_TIMER_FLUSHES: usize = 120;
 /// The bookkeeping cost charged to the flush trigger per entry, on top of the
 /// key and value bytes. An estimate is all a trigger needs.
 const ENTRY_OVERHEAD_BYTES: u64 = 64;
+
+/// How long the orphan sweep leaves an unreferenced object alone before it is a
+/// deletion candidate.
+///
+/// This bound is the whole safety of the sweep, and the number is chosen to
+/// exceed both quantities it has to clear rather than the smaller of them. An
+/// object becomes unreferenced the instant a manifest swap drops it, but a
+/// reader that opened a snapshot against the *previous* manifest is still
+/// entitled to fetch it, and an in-flight commit writes objects nothing
+/// references until its own manifest swap makes them live. So the grace period
+/// has to outlast the longest read a client can hold open *and* the longest
+/// commit a writer can be part way through. An hour is far above either on this
+/// engine — a scan drains in seconds and a commit is a handful of conditional
+/// writes — while still bounding how long a genuinely stranded object lingers.
+/// It is a default rather than a law: a deployment whose reads or commits run
+/// longer raises it, which is why the sweep takes it as an argument.
+pub const DEFAULT_SWEEP_GRACE_MILLIS: u64 = 60 * 60 * 1000;
+
+/// How much the orphan sweep widens the grace period to cover the backend's own
+/// worst-case internal clock skew.
+///
+/// The sweep judges an object's age by comparing its write time to a reference
+/// time, both read from the object store's clock domain. But even one backend
+/// is a distributed system: S3 stamps two objects, or answers a "now", from
+/// servers whose clocks need not agree to the millisecond. This allowance is
+/// added on top of the grace period so an object has to clear the grace *and*
+/// the skew before it is touched, so that two backend clocks disagreeing can
+/// never be mistaken for elapsed time. Five minutes is generous for a
+/// well-run store and costs only a slightly later reclaim.
+pub const DEFAULT_SWEEP_SKEW_MILLIS: u64 = 5 * 60 * 1000;
 
 /// What one index entry costs beyond its key bytes: the key handle, the
 /// location record, and this entry's share of the B-tree node holding them.
@@ -840,6 +871,52 @@ impl<R: Runtime> Partition<R> {
         self.compact_locked(&mut state).await
     }
 
+    /// Reclaims objects this partition no longer references and is safely done
+    /// needing: the segments an interrupted compaction replaced and the objects
+    /// an abandoned commit wrote but never published.
+    ///
+    /// Compaction deletes the objects it replaces itself, so this is the
+    /// backstop for the cases where that delete never happened — a crash, or a
+    /// store that refused the delete after the manifest swap already succeeded.
+    /// Without it, every such object accumulates in the bucket forever.
+    ///
+    /// An object is deleted only when it is both unreferenced *and* provably
+    /// older than `grace_millis` (widened by `max_skew_millis`) in the object
+    /// store's own clock domain — never the host clock's. That is what keeps the
+    /// sweep from deleting an object a slow reader still holds a reference to or
+    /// an in-flight commit is about to publish; see [`DEFAULT_SWEEP_GRACE_MILLIS`]
+    /// for why the bound is configured rather than assumed. An object whose
+    /// backend write time is unknown is refused rather than guessed old.
+    ///
+    /// With `dry_run`, nothing is deleted and the returned report names what a
+    /// real run would remove, so a first run against a real bucket can be looked
+    /// at before it acts.
+    ///
+    /// This is safe to call only on the current owner. Publishing and reclaiming
+    /// a partition's objects is the owner's job — a deposed writer that swept
+    /// would race its replacement — which is why it lives beside [`flush`] and
+    /// [`compact`] and is left to the host to invoke only for a partition it
+    /// owns, exactly as flush publication is.
+    ///
+    /// [`flush`]: Partition::flush
+    /// [`compact`]: Partition::compact
+    pub async fn sweep_orphans(
+        &self,
+        grace_millis: u64,
+        max_skew_millis: u64,
+        dry_run: bool,
+    ) -> Result<SweepReport> {
+        sweep_partition(
+            self.store.as_ref(),
+            &self.path,
+            grace_millis,
+            max_skew_millis,
+            dry_run,
+        )
+        .await
+        .map_err(format_error)
+    }
+
     fn now_millis(&self) -> u64 {
         self.runtime.clock().now_millis()
     }
@@ -1131,8 +1208,9 @@ impl<R: Runtime> Partition<R> {
         // swapped, and this is the only writer, so deleting them now is safe.
         // An external reader hydrating from the old manifest fails its read
         // and retries against the new one, which the format documents as the
-        // deal. Failures here strand objects for a future sweep rather than
-        // failing the compaction that already happened.
+        // deal. Failures here strand objects for the orphan sweep
+        // ([`Partition::sweep_orphans`]) to reclaim rather than failing the
+        // compaction that already happened.
         for name in replaced {
             let _ = self.store.delete(&self.path.object(&name)).await;
         }
@@ -2761,6 +2839,70 @@ mod tests {
             None,
             "timer-only partitions still receive eventual physical reclamation"
         );
+    }
+
+    #[tokio::test]
+    async fn the_orphan_sweep_reclaims_a_stranded_object_once_it_ages_out() {
+        use crate::testing::owner_with_clocked_store;
+        use orbita_core::{KeyspaceId, PartitionId};
+        use orbita_format::paths::segment_name;
+
+        let (p, store, clock) = owner_with_clocked_store().await;
+        let path = PartitionPath::new("", KeyspaceId(1), PartitionId(1));
+
+        // An object an abandoned commit could leave: a segment name this format
+        // parses, written under the partition prefix, that no manifest names.
+        let orphan = path.object(&segment_name(Epoch(1), 999));
+        clock.set_millis(1_000);
+        store
+            .put(&orphan, Bytes::from_static(b"stranded"))
+            .await
+            .unwrap();
+
+        // Publish a manifest at the same instant. The manifest that leaves the
+        // orphan unreferenced has only just been published, so nothing is safe
+        // to delete yet.
+        clock.set_millis(1_000);
+        p.put(b"a", bytes("v"), None, WriteCondition::None)
+            .await
+            .unwrap();
+        p.flush().await.unwrap();
+
+        let report = p.sweep_orphans(5_000, 0, false).await.unwrap();
+        assert!(
+            report.deleted.is_empty(),
+            "the dropping manifest has not settled yet"
+        );
+        assert!(
+            store.keys().contains(&orphan),
+            "and so the orphan is still on the store"
+        );
+
+        // A later flush republishes the manifest; then time advances past the
+        // grace period, so the manifest that dropped the orphan has settled and
+        // the orphan is old in its own right.
+        clock.set_millis(10_000);
+        p.put(b"b", bytes("v"), None, WriteCondition::None)
+            .await
+            .unwrap();
+        p.flush().await.unwrap();
+        clock.set_millis(20_000);
+
+        // A dry run first: it names the orphan without removing it.
+        let preview = p.sweep_orphans(5_000, 0, true).await.unwrap();
+        assert_eq!(preview.deleted, vec![orphan.clone()]);
+        assert!(store.keys().contains(&orphan), "a dry run touches nothing");
+
+        // Then for real.
+        let swept = p.sweep_orphans(5_000, 0, false).await.unwrap();
+        assert_eq!(swept.deleted, vec![orphan.clone()]);
+        assert!(
+            !store.keys().contains(&orphan),
+            "the aged orphan is reclaimed"
+        );
+        // The live keys and their segments are untouched.
+        assert!(p.get(b"a").await.unwrap().is_some());
+        assert!(p.get(b"b").await.unwrap().is_some());
     }
 
     #[tokio::test]

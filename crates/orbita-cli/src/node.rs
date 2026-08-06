@@ -306,6 +306,16 @@ fn server_config(
         });
     }
 
+    // The orphan sweep. Off unless the operator turned it on, and every bound
+    // is a deployment decision resolved from configuration rather than a
+    // constant in the binary, because the grace period has to exceed this
+    // deployment's longest read and commit.
+    server_config = server_config
+        .with_sweep_enabled(config.sweep.enabled)
+        .with_sweep_dry_run(config.sweep.dry_run)
+        .with_sweep_bounds(config.sweep.grace_millis, config.sweep.skew_millis)
+        .with_sweep_interval(Duration::from_millis(config.sweep.interval_millis));
+
     // The keyspace has to exist before the node serves, because the map a
     // worker opens its partitions from is built at start. Creating it after
     // would mean a second start to pick it up, which is exactly the extra step

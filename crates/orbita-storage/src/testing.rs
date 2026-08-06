@@ -403,6 +403,42 @@ pub(crate) async fn owner_with_clock() -> (Owner, ManualClock) {
     (owner_from(partition), clock)
 }
 
+/// An owner whose object store stamps write times from the same clock the
+/// engine reads, plus that store and clock.
+///
+/// The default test store reports no write time, standing in for a backend that
+/// cannot, which is exactly what the orphan sweep must refuse to act on. This
+/// one is the other case: a backend that does stamp times, so a test can drive
+/// the sweep's grace period through virtual time within one clock domain, the
+/// way a simulated run does.
+pub(crate) async fn owner_with_clocked_store() -> (Owner, Arc<MemoryStore>, ManualClock) {
+    let clock = ManualClock::default();
+    let store = Arc::new(MemoryStore::with_clock(clock.clone()));
+    let runtime = TestRuntime {
+        clock: clock.clone(),
+        disk: NoDisk,
+        transport: NoTransport,
+        rng: SharedRng(Arc::new(SeededRng::new(0))),
+    };
+    let range = KeyRange::unbounded();
+    let inner = crate::Partition::open(
+        runtime.clone(),
+        store.clone(),
+        partition_path(),
+        Epoch(1),
+        range.clone(),
+    )
+    .await
+    .expect("opening a partition over a clocked store");
+    let partition = TempPartition {
+        inner,
+        store: store.clone(),
+        runtime,
+        range,
+    };
+    (owner_from(partition), store, clock)
+}
+
 fn owner_from(partition: TempPartition) -> Owner {
     Owner {
         partition,
