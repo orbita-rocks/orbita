@@ -16,5 +16,17 @@ publish = false
 [dependencies]
 orbita-core.workspace = true
 orbita-runtime.workspace = true
+# The `s3` feature and not `hyper-client`: the simulator drives the real S3
+# store through its own `HttpTransport`, which is what that feature split was
+# cut for. Taking the transport instead of the `ObjectStore` trait means the
+# signing, the status mapping, and the XML parsing under test are the ones
+# that ship, and it keeps a TLS stack out of a build that never opens a
+# socket.
+orbita-objectstore = { workspace = true, features = ["s3"] }
+async-trait.workspace = true
 bytes.workspace = true
+# Reverses exactly what the store's own path encoder does. Hand-rolling the
+# inverse would let the simulated endpoint disagree with a real one about a
+# key, which is the one thing this transport must never do.
+percent-encoding = "2"
 thiserror.workspace = true

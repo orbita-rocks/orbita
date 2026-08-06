@@ -109,7 +109,7 @@ fn start_with_auth(
 /// limits, it just never asks for a credential.
 fn start(sim: &Simulation, specs: &[KeyspaceSpec]) -> Arc<Node<SimRuntime>> {
     let clock = sim.add_node(NodeId(1)).clock().clone();
-    let authenticator = Arc::new(Authenticator::new(false, None, clock));
+    let authenticator = Arc::new(Authenticator::new(false, None, std::time::Duration::from_secs(86_400), clock));
     start_with_auth(sim, specs, authenticator)
 }
 
@@ -117,7 +117,7 @@ fn start(sim: &Simulation, specs: &[KeyspaceSpec]) -> Arc<Node<SimRuntime>> {
 /// `secret` and is scoped to read and write every keyspace in `specs`.
 fn start_authed(sim: &Simulation, specs: &[KeyspaceSpec], secret: &str) -> Arc<Node<SimRuntime>> {
     let clock = sim.add_node(NodeId(1)).clock().clone();
-    let authenticator = Arc::new(Authenticator::new(true, None, clock));
+    let authenticator = Arc::new(Authenticator::new(true, None, std::time::Duration::from_secs(86_400), clock));
     authenticator.refresh(CredentialSnapshot::new(vec![Credential {
         id: "cred-1".into(),
         secret_hash: hash_secret(secret),

@@ -179,6 +179,20 @@ pub struct ServerConfig {
     /// replicated control plane rather than only consuming it.
     pub leader_member: bool,
 
+    /// Whether a leader group member also owns partitions.
+    ///
+    /// False in production, because the control plane is deliberately off the
+    /// data path: a member that was also compacting a partition would put
+    /// storage work in front of an election. `orbita dev` is the one exception
+    /// and is documented as one, being "one node that is its own leader group
+    /// and its own worker" — and a single-node cluster whose only node cannot
+    /// own a partition serves nothing at all.
+    ///
+    /// It reads as a role to the control plane, which admits only workers as
+    /// owners. That check stays where it is: relaxing it for a group of one
+    /// would put the rule at the mercy of how many nodes happened to be up.
+    pub leader_owns_partitions: bool,
+
     /// How often this node refetches the map and reports its own progress.
     ///
     /// One timer for both because they answer each other: the report says how
@@ -207,6 +221,17 @@ pub struct ServerConfig {
     /// Where the partition map comes from. A single node uses a static map; a
     /// real cluster will use an adapter over the control plane.
     pub map_source: BoxedMapSource,
+
+    /// The keyspaces that exist the moment this cluster is first created.
+    ///
+    /// Kept beside [`ServerConfig::map_source`] rather than folded into it
+    /// because the two answer the same question for different cluster shapes,
+    /// and a node can now be both: with a control plane the map is fetched and
+    /// this is what the very first bootstrap writes into it, while without one
+    /// the static map is the whole answer. Both are set by
+    /// [`ServerConfig::with_keyspaces`], so they cannot drift apart and leave
+    /// `orbita dev --keyspace demo` serving a keyspace called something else.
+    pub keyspaces: Vec<KeyspaceName>,
 
     /// How long a read lease granted to a replica lasts.
     ///
@@ -264,6 +289,7 @@ impl Default for ServerConfig {
             peer_call_timeout: DEFAULT_PEER_CALL_TIMEOUT,
             leader_group: Vec::new(),
             leader_member: false,
+            leader_owns_partitions: false,
             control_poll_interval: DEFAULT_CONTROL_POLL_INTERVAL,
             data_dir: PathBuf::from("data"),
             object_store: None,
@@ -273,6 +299,7 @@ impl Default for ServerConfig {
                 node_id,
                 &[KeyspaceName::new(DEFAULT_KEYSPACE).expect("a literal name is valid")],
             ))),
+            keyspaces: vec![KeyspaceName::new(DEFAULT_KEYSPACE).expect("a literal name is valid")],
             lease_duration: DEFAULT_LEASE_DURATION,
             rng_seed: None,
             require_auth: false,
@@ -295,14 +322,18 @@ impl ServerConfig {
         }
     }
 
-    /// Replaces the keyspaces a single-node server serves.
+    /// Replaces the keyspaces this server starts life with.
     ///
-    /// Keyspace creation belongs to the admin API and the control plane. Until
-    /// that exists, this is how a test or a laptop cluster gets more than one.
+    /// For a node with no control plane that is the whole map, forever. For
+    /// one that has a control plane, it is what the first bootstrap creates
+    /// and the control plane owns them from then on, so this is a starting
+    /// condition rather than a standing configuration: a keyspace created or
+    /// deleted through the admin API afterwards is not affected by it.
     #[must_use]
     pub fn with_keyspaces(mut self, names: &[KeyspaceName]) -> Self {
         self.map_source =
             BoxedMapSource::new(StaticMapSource::new(single_node_map(self.node_id, names)));
+        self.keyspaces = names.to_vec();
         self
     }
 
@@ -357,6 +388,14 @@ impl ServerConfig {
     #[must_use]
     pub fn with_leader_member(mut self, leader_member: bool) -> Self {
         self.leader_member = leader_member;
+        self
+    }
+
+    /// Lets this leader group member own partitions too, which is what makes
+    /// `orbita dev` a whole cluster in one process.
+    #[must_use]
+    pub fn with_leader_owns_partitions(mut self, owns: bool) -> Self {
+        self.leader_owns_partitions = owns;
         self
     }
 

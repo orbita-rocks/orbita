@@ -87,6 +87,8 @@ mod aws;
 mod config;
 mod control;
 #[cfg(test)]
+mod durability;
+#[cfg(test)]
 mod forwarding;
 mod frame;
 mod fs_store;
@@ -188,6 +190,16 @@ impl Server {
             .root_credential
             .as_deref()
             .map(orbita_control::root_secret_hash);
+        // How long the credential cache may go unrefreshed before it stops
+        // being trusted. Tied to the poll cadence rather than a bare wall-clock
+        // constant so that raising `control_poll_interval` cannot make the
+        // bound smaller than a single poll and trip on ordinary jitter: it is a
+        // budget of missed polls. At the default 250ms poll that is 10s, which
+        // bounds how long a credential revoked during a control-plane outage
+        // can keep authorizing. See `auth::Authenticator`.
+        const CREDENTIAL_CACHE_STALENESS_POLLS: u32 = 40;
+        let credential_cache_max_staleness =
+            config.control_poll_interval * CREDENTIAL_CACHE_STALENESS_POLLS;
         // The credential cache the client edge enforces against. Empty until
         // the control loop's first fetch, apart from the root overlay above;
         // harmless while auth is off, and safe while it is on, since an empty
@@ -195,6 +207,7 @@ impl Server {
         let authenticator = Arc::new(auth::Authenticator::new(
             config.require_auth,
             root_credential,
+            credential_cache_max_staleness,
             runtime.clock().clone(),
         ));
         for (node, address) in &config.peers {
@@ -206,9 +219,10 @@ impl Server {
             let log = RaftLog::open(&runtime, &config.leader_group).await?;
             let control =
                 Controller::new(runtime.clone(), Arc::clone(&log), ControlConfig::default());
-            runtime
-                .transport()
-                .register(ServiceId::Control, ControlService::new(control.clone()));
+            runtime.transport().register(
+                ServiceId::Control,
+                ControlService::new(control.clone()).require_auth(config.require_auth),
+            );
             raft = Some(log);
             controller = Some(control);
         }
@@ -242,15 +256,7 @@ impl Server {
                     .local_addr()
                     .to_string()
             });
-            start_control_plane(
-                &runtime,
-                log,
-                control,
-                &config.leader_group,
-                &config.peers,
-                &local_address,
-            )
-            .await?;
+            start_control_plane(&runtime, log, control, &config, &local_address).await?;
         }
         let store: Arc<dyn ObjectStore> = match config.object_store {
             Some(object_store) => Arc::new(
@@ -283,6 +289,11 @@ impl Server {
 
         let readiness = Arc::new(ReadinessGate::new());
         readiness.mark(ReadinessCondition::AcceptingOwnership);
+        // Auth-policy agreement starts met and is cleared only on a positive
+        // disagreement with the leader group, so a cluster that cannot advertise
+        // its policy (an older leader, or no leader group at all) is never
+        // wedged unready. The control loop below re-evaluates it each poll.
+        readiness.mark(ReadinessCondition::AuthPolicyAgreed);
         // A node with no leader group answers to nobody, so the join condition
         // is met by construction rather than left to hang readiness forever.
         // A joined node's condition is marked by the control loop below, on
@@ -337,9 +348,17 @@ impl Server {
             config.flush_interval,
         ));
 
+        // Kept before the reporting loop takes ownership of the client, so
+        // that an admin call this node cannot answer has somewhere to go.
+        let admin_forward = control.clone();
+
         let mut reporter = None;
         let reporting = control.map(|client| {
-            let role = if config.leader_member {
+            // The role reported here is the one the control plane admits
+            // owners by, so a leader group member that also serves partitions
+            // has to report as a worker or it would never be given one. See
+            // `ServerConfig::leader_owns_partitions`.
+            let role = if config.leader_member && !config.leader_owns_partitions {
                 orbita_control::NodeRole::Leader
             } else {
                 orbita_control::NodeRole::Worker
@@ -373,6 +392,17 @@ impl Server {
                     config.control_poll_interval,
                 ));
             }
+            // Its own loop, spawned whether or not this node requires auth,
+            // because the shape it guards against is a node that requires *no*
+            // auth while the cluster does: that node has to learn the cluster's
+            // policy and pull itself from rotation, which it cannot do if the
+            // check only ran when auth was already on locally.
+            tokio::spawn(Self::auth_policy_loop(
+                client.clone(),
+                config.require_auth,
+                config.control_poll_interval,
+                Arc::clone(&readiness),
+            ));
             tokio::spawn(Self::control_loop(
                 Arc::downgrade(&node),
                 status,
@@ -400,8 +430,28 @@ impl Server {
         let (shutdown, stop) = tokio::sync::oneshot::channel();
         let service = KvServer::new(KvService::new(Arc::clone(&node)));
         let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
-        let admin = controller.map(|controller| {
-            AdminService::new(controller)
+        // Every node that knows where the control plane is serves the whole
+        // admin surface, whether or not it holds one. A member that is not the
+        // current Raft leader, and a worker that hosts no controller at all,
+        // both forward: an operator cannot be expected to know which node is
+        // leader, since finding that out is what `cluster describe` is for.
+        // Only a node with no control plane at all serves no admin surface,
+        // and that shape exists only in tests over a static map.
+        //
+        // Whichever shape it takes, enforcement and the root identity are
+        // configured on it the same way: authorization happens on the node the
+        // operator dialled, before any forward, so a forwarding worker enforces
+        // too. See `AdminService::authorize`.
+        let admin = match (controller, admin_forward) {
+            (Some(controller), Some(client)) => {
+                Some(AdminService::new(controller).with_forwarding(client))
+            }
+            (Some(controller), None) => Some(AdminService::new(controller)),
+            (None, Some(client)) => Some(AdminService::forwarding(client)),
+            (None, None) => None,
+        }
+        .map(|admin| {
+            admin
                 .require_auth(config.require_auth)
                 .root_credential(root_credential)
         });
@@ -570,6 +620,37 @@ impl Server {
                 },
             }
             drop(authenticator);
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// Keeps this node's readiness honest about the cluster's auth policy,
+    /// forever.
+    ///
+    /// `require_auth` is this node's own setting. Each tick asks the leader
+    /// group whether the cluster requires auth and, when it gets an answer,
+    /// reconciles [`ReadinessCondition::AuthPolicyAgreed`]: agreement keeps the
+    /// node ready, disagreement pulls it from the load balancer. This is what
+    /// closes the rolling-update window in which an auth-disabled node would go
+    /// on serving unauthenticated requests while its peers reject them. A
+    /// leader that cannot report a policy — one predating the method — leaves
+    /// the condition untouched, which is the documented residual: the gate only
+    /// protects a cluster whose control plane can advertise the policy.
+    async fn auth_policy_loop(
+        client: ControlClient<ServerRuntime>,
+        require_auth: bool,
+        interval: Duration,
+        readiness: Arc<ReadinessGate>,
+    ) {
+        loop {
+            match client.fetch_auth_policy().await {
+                Ok(cluster_requires_auth) => {
+                    update_auth_policy_readiness(&readiness, require_auth, cluster_requires_auth);
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "could not learn the cluster's auth policy");
+                }
+            }
             tokio::time::sleep(interval).await;
         }
     }
@@ -903,11 +984,11 @@ async fn start_control_plane(
     runtime: &ServerRuntime,
     log: &Arc<RaftLog>,
     controller: &Controller<ServerRuntime, RaftLog>,
-    voters: &[orbita_core::NodeId],
-    peers: &[(orbita_core::NodeId, String)],
+    config: &ServerConfig,
     local_address: &str,
 ) -> Result<()> {
-    let client = ControlClient::new(runtime.clone(), voters.to_vec());
+    let voters = &config.leader_group;
+    let client = ControlClient::new(runtime.clone(), voters.clone());
     controller.recover().await?;
     let deadline = runtime.clock().monotonic_nanos() + Duration::from_secs(30).as_nanos() as u64;
     loop {
@@ -921,19 +1002,43 @@ async fn start_control_plane(
             }
         }
         if fresh && log.is_leader().await {
-            let leaders = peers
+            let members: Vec<_> = config
+                .peers
                 .iter()
                 .filter(|(node, _)| voters.contains(node))
                 .cloned()
                 .collect();
+            // A voter that also owns partitions is admitted as a worker,
+            // because that is the role the control plane hands ownership to.
+            // Written into the bootstrap rather than left to the first
+            // heartbeat to correct, so `cluster describe` never shows a role
+            // that was true for a quarter of a second.
+            let (leaders, workers) = if config.leader_owns_partitions {
+                (Vec::new(), members)
+            } else {
+                (members, Vec::new())
+            };
+            // The first keyspace is born with the cluster, because a bootstrap
+            // that leaves no keyspace behind means the first write needs an
+            // admin call that the operator did not know to make.
+            let mut wanted = config.keyspaces.iter();
+            let first = wanted.next().map_or_else(
+                || DEFAULT_KEYSPACE.to_string(),
+                |name| name.as_str().to_string(),
+            );
             controller
                 .bootstrap(&BootstrapSpec {
-                    keyspace: DEFAULT_KEYSPACE.to_string(),
+                    keyspace: first,
                     config: KeyspaceConfig::default(),
                     leaders,
-                    workers: Vec::new(),
+                    workers,
                 })
                 .await?;
+            for name in wanted {
+                controller
+                    .create_keyspace(name.as_str(), KeyspaceConfig::default())
+                    .await?;
+            }
             tracing::info!(address = local_address, "bootstrapped the leader group");
             return Ok(());
         }
@@ -964,6 +1069,30 @@ fn update_control_readiness(
         Some(_) => readiness.clear(ReadinessCondition::ControlPlaneJoined),
         None if reported => readiness.mark(ReadinessCondition::ControlPlaneJoined),
         None => {}
+    }
+}
+
+/// Reconciles the auth-policy readiness condition against the cluster's policy.
+///
+/// `local` is this node's own `require_auth`; `cluster` is what the leader
+/// group advertises. They must match for this node to be ready: a node that
+/// requires no auth while the cluster does is a bypass hole and is pulled from
+/// rotation, and the reverse — auth on while the cluster is off — is failed
+/// too, because a disagreement in either direction is a misconfiguration an
+/// operator needs surfaced rather than silently served. Agreement marks the
+/// condition; only a positive disagreement clears it, so a cluster that cannot
+/// report a policy at all never reaches this code and stays ready.
+fn update_auth_policy_readiness(readiness: &ReadinessGate, local: bool, cluster: bool) {
+    if local == cluster {
+        readiness.mark(ReadinessCondition::AuthPolicyAgreed);
+    } else {
+        tracing::warn!(
+            local_require_auth = local,
+            cluster_require_auth = cluster,
+            "this node's require_auth disagrees with the cluster's; failing readiness so a \
+             half-rolled auth change cannot serve a bypass behind the load balancer"
+        );
+        readiness.clear(ReadinessCondition::AuthPolicyAgreed);
     }
 }
 
@@ -1020,5 +1149,59 @@ mod leader_readiness_tests {
         update_control_readiness(&readiness, true, Some(false));
 
         assert!(!readiness.is_ready());
+    }
+
+    /// Marks everything but auth-policy agreement, so a test of that condition
+    /// reads off exactly what the reconciler decided.
+    fn all_but_auth_policy() -> ReadinessGate {
+        let readiness = ReadinessGate::new();
+        for condition in ReadinessCondition::ALL {
+            if condition != ReadinessCondition::AuthPolicyAgreed {
+                readiness.mark(condition);
+            }
+        }
+        readiness
+    }
+
+    #[test]
+    fn an_auth_disabled_node_in_an_auth_on_cluster_is_not_ready() {
+        // The bypass shape: no auth locally, auth required cluster-wide. This
+        // node must be pulled from the load balancer.
+        let readiness = all_but_auth_policy();
+        update_auth_policy_readiness(&readiness, false, true);
+        assert_eq!(
+            readiness.state().unmet(),
+            vec![ReadinessCondition::AuthPolicyAgreed]
+        );
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn an_auth_on_node_disagreeing_with_an_auth_off_cluster_is_not_ready() {
+        // The safe-but-misconfigured direction is failed too: disagreement in
+        // either direction is surfaced rather than served.
+        let readiness = all_but_auth_policy();
+        update_auth_policy_readiness(&readiness, true, false);
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn agreement_on_auth_policy_makes_the_node_ready() {
+        for policy in [false, true] {
+            let readiness = all_but_auth_policy();
+            update_auth_policy_readiness(&readiness, policy, policy);
+            assert!(readiness.is_ready(), "agreement on require_auth={policy}");
+        }
+    }
+
+    #[test]
+    fn learning_agreement_clears_an_earlier_disagreement() {
+        // A node that briefly disagreed and then a later poll agrees — for
+        // instance after its own config caught up — becomes ready again.
+        let readiness = all_but_auth_policy();
+        update_auth_policy_readiness(&readiness, false, true);
+        assert!(!readiness.is_ready());
+        update_auth_policy_readiness(&readiness, true, true);
+        assert!(readiness.is_ready());
     }
 }

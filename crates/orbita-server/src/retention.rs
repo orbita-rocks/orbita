@@ -189,6 +189,7 @@ fn start_node(
             let authenticator = Arc::new(crate::auth::Authenticator::new(
                 false,
                 None,
+                std::time::Duration::from_secs(86_400),
                 runtime.clock().clone(),
             ));
             Node::start(runtime, node, layout, source, lease, gate, authenticator)

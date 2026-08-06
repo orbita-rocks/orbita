@@ -82,6 +82,7 @@ fn start(sim: &Simulation, node: NodeId) -> Arc<Node<SimRuntime>> {
         let authenticator = Arc::new(crate::auth::Authenticator::new(
             false,
             None,
+            std::time::Duration::from_secs(86_400),
             runtime.clock().clone(),
         ));
         Node::start(

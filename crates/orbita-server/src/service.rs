@@ -98,6 +98,7 @@ impl<R: Runtime> Kv for KvService<R> {
         // sizes this cluster will accept.
         self.node
             .limits(&request.into_inner().keyspace)
+            .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
     }
@@ -193,7 +194,8 @@ mod tests {
                 "control-plane-joined",
                 "partitions-caught-up",
                 "replicas-recoverable",
-                "accepting-ownership"
+                "accepting-ownership",
+                "auth-policy-agreed"
             ]
         );
     }

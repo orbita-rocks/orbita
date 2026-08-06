@@ -233,7 +233,18 @@ services:
       - |
         set -eu
         orbita keyspace create demo
-        orbita set demo greeting hello
+        # A keyspace exists the instant the control plane commits it, but its
+        # partition is not open on the nodes that replicate it until each of
+        # them next refreshes its map, and an owner cannot acknowledge a write
+        # it has not been able to put on a second copy. So the first write
+        # after a creation can be refused, with Unavailable, which is the
+        # status that means "ask again". A script talking to a distributed
+        # system should do that rather than treat a retryable answer as a
+        # failure, and this one is the worked example.
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+          orbita set demo greeting hello && break
+          sleep 1
+        done
         orbita get demo greeting
         orbita cluster describe
     depends_on:

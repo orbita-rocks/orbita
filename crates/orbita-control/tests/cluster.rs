@@ -1222,7 +1222,12 @@ fn bootstrapping_a_cluster_that_already_has_state_changes_nothing() {
     let before = cluster.map();
 
     let controller = cluster.controller.clone();
-    let spec = BootstrapSpec::dev(LEADER, "10.0.0.1:7000");
+    let spec = BootstrapSpec {
+        keyspace: "default".to_string(),
+        config: KeyspaceConfig::default(),
+        leaders: Vec::new(),
+        workers: vec![(LEADER, "10.0.0.1:7000".to_string())],
+    };
     let created = cluster
         .sim
         .block_on(async move { controller.bootstrap(&spec).await });
@@ -1443,6 +1448,79 @@ fn an_unready_most_durable_replica_blocks_promotion_until_a_ready_copy_catches_u
     );
 }
 
+/// The other half of ADR 0008, and the half that keeps it honest.
+///
+/// The fence leaves the deposed owner in the replica set, which makes it a
+/// candidate. It does not make it a claimant. A node whose disk came back
+/// shorter than it went away, from a torn tail or a replaced volume, reports
+/// a lower position and loses to a copy that did not, exactly like any other
+/// replica. If this ever starts passing by
+/// promoting the deposed owner, the promotion rule has quietly become an
+/// identity check and the no-lost-write argument no longer holds.
+#[test]
+fn a_deposed_owner_that_came_back_short_loses_to_a_replica_that_did_not() {
+    check_seeds(
+        "a_deposed_owner_that_came_back_short_loses_to_a_replica_that_did_not",
+        16,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let before = cluster.map().partition(partition).unwrap().clone();
+            let deposed = before.owner.expect("an owner");
+            let [behind, ahead] = before.replicas.as_slice() else {
+                return Err(cluster
+                    .sim
+                    .failure("expected two replicas to choose between"));
+            };
+
+            // One replica is far past anything the returning owner will
+            // report. Both are held unready so that nothing is promoted while
+            // the owner is away, which is what leaves all three copies in the
+            // running for a single decision.
+            cluster.set_progress(*ahead, 900);
+            cluster.set_ready(*behind, false);
+            cluster.set_ready(*ahead, false);
+            cluster.sim.run_for(Duration::from_secs(1));
+
+            cluster.sim.crash(deposed);
+            let fenced = cluster.run_until(Duration::from_secs(10), |c| {
+                c.map()
+                    .partition(partition)
+                    .is_some_and(|p| p.owner.is_none())
+            });
+            if !fenced {
+                return Err(cluster.sim.failure("a dead owner is fenced"));
+            }
+            if !cluster
+                .map()
+                .partition(partition)
+                .is_some_and(|p| p.replicas.contains(&deposed))
+            {
+                return Err(cluster
+                    .sim
+                    .failure("the fence should have left the deposed owner in the replica set"));
+            }
+
+            cluster.sim.restart(deposed, DiskPolicy::Intact);
+            cluster.spawn_heartbeats(deposed);
+            cluster.set_ready(*ahead, true);
+            let replaced =
+                cluster.run_until(Duration::from_secs(10), |c| c.owner_of(partition).is_some());
+            if !replaced {
+                return Err(cluster.sim.failure("nothing was promoted at all"));
+            }
+            if cluster.owner_of(partition) != Some(*ahead) {
+                return Err(cluster.sim.failure(format!(
+                    "promoted {:?}, but replica {ahead} reported the furthest durable position",
+                    cluster.owner_of(partition)
+                )));
+            }
+            cluster.set_ready(*behind, true);
+            cluster.converged()
+        },
+    );
+}
+
 #[test]
 fn an_incompatible_most_durable_replica_blocks_promotion_until_a_compatible_copy_catches_up() {
     check_seeds(
@@ -1658,11 +1736,22 @@ fn a_new_control_leader_does_not_repeat_a_completed_lease_drain() {
 
     cluster.sim.crash(LEADER);
     let restarted = cluster.sim.restart(LEADER, DiskPolicy::Intact);
+    let clock = restarted.clock().clone();
     let promoted = cluster.sim.block_on(async move {
         let log = Log::open(&restarted).await?;
         let controller = Controller::new(restarted, log, ControlConfig::default());
         controller.recover().await?;
         controller.tick().await?;
+        // A leader that has just taken over holds no observations, so its
+        // first sweep treats every node as freshly heard from, the deposed
+        // owner included: since ADR 0008 the fence leaves that node in the
+        // replica set, and a candidate nobody has heard from is an unknown
+        // upper bound rather than a node that is behind. Letting its silence
+        // age out is what a real successor sees, and it is deliberately not
+        // the thing under test. What is under test is that the promotion
+        // below costs no second `lease_drain` on top of it, because the
+        // completed drain was replicated.
+        clock.sleep(controller.config().dead_after).await;
         let map = controller.partition_map().await;
         for replica in before.replicas {
             controller
@@ -2077,6 +2166,7 @@ fn a_credential_round_trips_through_the_replicated_log() {
                         vec![orbita_control::Permission::Read],
                         "a reader".into(),
                         None,
+                        0x1234_5678_9abc_def0,
                     )
                     .await
             }
@@ -2412,14 +2502,13 @@ fn rolling_upgrade_ranges_are_accepted_under_deterministic_simulation() {
     );
 }
 
-/// Ignored on the same terms as the networked batch: it reaches the defect in
-/// issue #76 on 2 of the first 20000 seeds, 4422 the lowest, by killing both
-/// replicas of an already fenced partition and then bringing the deposed owner
-/// back. That is a third independent route into the same stuck state, which is
-/// the strongest thing this scenario has said so far and the reason to keep it
-/// rather than trim its schedule. Remove the ignore with the fix.
+/// Ran ignored until issue #76 was fixed, because it reached that defect on 2
+/// of the first 20000 seeds, 4422 the lowest, by killing both replicas of an
+/// already fenced partition and then bringing the deposed owner back. That was
+/// a third independent route into the same stuck state, and it is the reason
+/// to keep this scenario's schedule rather than trim it: seed 4422 is now a
+/// regression test for the fence keeping the deposed owner in the replica set.
 #[test]
-#[ignore = "finds the known liveness defect tracked by issue #76"]
 fn a_cluster_converges_after_an_arbitrary_sequence_of_worker_failures() {
     // The scenarios above each break one thing at a chosen moment, which is
     // what makes their safety assertions readable and what makes them a thin
@@ -2485,18 +2574,15 @@ fn hostile_network(seed: u64) -> SimConfig {
     }
 }
 
-/// Ignored because it reaches the defect in issue #76 on 15 of the first
-/// 20000 seeds, 130 being the lowest, and a scenario that goes red on the
-/// nightly batch is a scenario people learn to ignore for real. The invariant
-/// is not relaxed to get it green: the check is right and the cluster is
-/// wrong. Remove the ignore with the fix.
+/// Ran ignored until issue #76 was fixed, because it reached that defect on 15
+/// of the first 20000 seeds, 130 being the lowest. The invariant was never
+/// relaxed to get it green: the check was right and the cluster was wrong.
 ///
 /// Those seed numbers move whenever the traffic this scenario generates
 /// changes, since a seed names an interleaving rather than a state. The
-/// deterministic reproduction below is the one to work from; these are here
-/// to say how often the defect is reachable, not to be replayed.
+/// deterministic reproductions below are the ones to work from; these are here
+/// to say how often the defect was reachable, not to be replayed.
 #[test]
-#[ignore = "finds the known liveness defect tracked by issue #76"]
 fn a_cluster_converges_after_the_network_stops_eating_heartbeats() {
     let faults = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&faults);
@@ -2543,18 +2629,19 @@ fn a_cluster_converges_after_the_network_stops_eating_heartbeats() {
 ///    partition `Fenced` with nothing named on it.
 /// 3. Every worker comes back healthy, ready, and eligible.
 ///
-/// The partition stays unavailable forever, because each of the three sweep
-/// stages declines it in turn: `promote_drained_partitions` reads candidates
-/// out of an empty `replicas`, `place_unowned_partitions` only looks at
-/// `Unowned` partitions, and `repair_replica_sets` only looks at `Serving`
-/// ones. Safe, and stuck.
+/// The partition used to stay unavailable forever, because each of the three
+/// sweep stages declined it in turn: `promote_drained_partitions` read
+/// candidates out of an empty `replicas`, `place_unowned_partitions` only
+/// looks at `Unowned` partitions, and `repair_replica_sets` only looks at
+/// `Serving` ones. Safe, and stuck.
 ///
-/// Ignored rather than deleted: it is the tracking case for issue #76, and
-/// removing the ignore is how the fix proves itself. Fixing it is a decision
-/// about whether a fenced owner may be promoted again, which belongs in its
-/// own change rather than smuggled into a test harness.
+/// What unsticks it is the fence demoting the deposed owner into the replica
+/// set instead of dropping it, per ADR 0008, so a fence can no longer leave a
+/// partition with nothing named on it. Here that node is also the only node
+/// that ever held the data: with an empty replica set `Wal::replicate` needs
+/// no acknowledgement at all, so the owner was committing writes on its own
+/// disk alone and promoting anything else would lose them.
 #[test]
-#[ignore = "known liveness defect, tracked by issue #76"]
 fn a_partition_fenced_with_an_empty_replica_set_is_placed_again() {
     let cluster = Cluster::start(41);
     let partition = cluster.only_partition();
@@ -2628,25 +2715,42 @@ fn a_replica_that_fell_behind_catches_up_once_it_can_follow_again() {
 }
 
 /// The same defect as the test above, reached from the other side, and the
-/// shape that says most clearly what the fix has to decide.
+/// shape that says most clearly what the fix had to decide.
 ///
-/// Here the replica set is full when the owner is fenced. The fence removes
-/// the deposed owner from it, per `fence_partition`, and then both remaining
-/// replicas die. The deposed owner comes back healthy and ready, holding the
-/// data, and it is the only node that could serve the partition. It is also
-/// the one node the fence took out of `replicas`, so `best_candidate` cannot
-/// see it, and no other sweep stage looks at a `Fenced` partition at all.
+/// Here the replica set is full when the owner is fenced, and then both
+/// remaining replicas die. The deposed owner comes back healthy and ready,
+/// holding the data, and it is the only node that could serve the partition.
+/// It used to be the one node the fence took out of `replicas`, so
+/// `best_candidate` could not see it, and no other sweep stage looks at a
+/// `Fenced` partition at all.
 ///
 /// A cluster with a live, ready, caught-up copy of a partition and no way to
-/// route to it is the clearest statement of the question in #76: whether a
-/// fenced owner may be promoted again. Ignored on the same terms.
+/// route to it was the clearest statement of the question in #76: whether a
+/// fenced owner may be promoted again. ADR 0008 answers yes, at the epoch the
+/// fence produced and on the position the node reports, and this is the case
+/// that answer exists for.
+///
+/// The replicas are made unready before the owner dies, which is doing real
+/// work rather than decorating the setup. Without it the leader promotes one
+/// of them out of a report that landed in the same millisecond as the fence,
+/// even though the test has since crashed it, and the scenario turns into a
+/// second failover from an owner that never served a request. That state is
+/// genuinely unrecoverable, because the promoted node may have accepted writes
+/// for all the leader can tell and so nothing older than it may be promoted,
+/// and it is not the state this test is about. Unready keeps the replicas in
+/// the replica set, where `repair_replica_sets` leaves them, while taking them
+/// out of the running.
 #[test]
-#[ignore = "known liveness defect, tracked by issue #76"]
 fn a_fenced_owner_that_returns_can_take_its_partition_back() {
     let cluster = Cluster::start(47);
     let partition = cluster.only_partition();
     let info = cluster.map().partition(partition).unwrap().clone();
     let deposed = info.owner.expect("an owner");
+
+    for replica in &info.replicas {
+        cluster.set_ready(*replica, false);
+    }
+    cluster.sim.run_for(Duration::from_secs(1));
 
     cluster.sim.crash(deposed);
     let fenced = cluster.run_until(Duration::from_secs(10), |c| {
@@ -2655,11 +2759,17 @@ fn a_fenced_owner_that_returns_can_take_its_partition_back() {
             .is_some_and(|p| p.owner.is_none())
     });
     assert!(fenced, "a dead owner is fenced");
+    let after_fence = cluster.map().partition(partition).unwrap().replicas.clone();
+    assert!(
+        info.replicas.iter().all(|r| after_fence.contains(r)),
+        "the replica set is still full at the fence, which is what makes this \
+         the other route into #76 rather than the emptied one above"
+    );
 
     // Everything that was left on the partition goes away, so the deposed
     // owner is the only copy the cluster has.
-    for replica in cluster.map().partition(partition).unwrap().replicas.clone() {
-        cluster.sim.crash(replica);
+    for replica in &info.replicas {
+        cluster.sim.crash(*replica);
     }
     let stranded = cluster.run_until(Duration::from_secs(10), |c| {
         c.map().partition(partition).is_some_and(|p| {
@@ -2675,6 +2785,11 @@ fn a_fenced_owner_that_returns_can_take_its_partition_back() {
     expect_converged(
         "a_fenced_owner_that_returns_can_take_its_partition_back",
         cluster.converged(),
+    );
+    assert_eq!(
+        cluster.owner_of(partition),
+        Some(deposed),
+        "the only node holding the partition is the one that got it back"
     );
 }
 
@@ -2924,6 +3039,33 @@ fn a_worker_reaches_the_leader_group_over_the_transport() {
         }
     });
     assert_eq!(reported, Ok(()));
+}
+
+#[test]
+fn a_node_learns_the_leader_groups_auth_policy_over_the_transport() {
+    // The signal the readiness gate leans on: a node must be able to ask the
+    // leader group whether the cluster requires auth, so it can catch a
+    // half-rolled `require_auth` change instead of trusting its own config in
+    // isolation.
+    for require_auth in [false, true] {
+        let cluster = Cluster::start(21);
+        let leader = cluster.sim.runtime(LEADER);
+        leader.transport().register(
+            ServiceId::Control,
+            ControlService::new(cluster.controller.clone()).require_auth(require_auth),
+        );
+
+        let worker = cluster.sim.runtime(WORKERS[0]);
+        let client = ControlClient::new(worker, vec![LEADER]);
+        let learned = cluster
+            .sim
+            .block_on(async move { client.fetch_auth_policy().await });
+        assert_eq!(
+            learned,
+            Ok(require_auth),
+            "a node reads back exactly the policy the leader advertises"
+        );
+    }
 }
 
 #[test]
@@ -3443,9 +3585,12 @@ fn a_configured_root_bootstraps_admin_before_any_credential_exists() {
         .expect("the root creates the first credential")
         .into_inner();
 
-    // The credential the root just minted now authorizes the admin surface on
-    // its own, so the operator can remove the root afterward.
-    let listed = cluster.sim.block_on({
+    // The credential the root just minted is a tenant credential: it may write
+    // its own keyspace on the data plane, but it must NOT administer the
+    // cluster. Deriving admin from a per-keyspace write is the cross-tenant
+    // escalation this boundary exists to prevent, so the admin surface refuses
+    // it with PermissionDenied even though it is a real, unexpired credential.
+    let denied = cluster.sim.block_on({
         let admin = admin.clone();
         let secret = created.secret.clone();
         async move {
@@ -3457,10 +3602,24 @@ fn a_configured_root_bootstraps_admin_before_any_credential_exists() {
                 .await
         }
     });
-    assert!(
-        listed.is_ok(),
-        "the credential the root created must work like any other"
+    assert_eq!(
+        denied
+            .expect_err("a tenant credential cannot administer the cluster")
+            .code(),
+        tonic::Code::PermissionDenied,
+        "a per-keyspace write must not confer cluster administration"
     );
+
+    // Only the root administers, and it keeps working after minting tenants.
+    let listed = cluster.sim.block_on(async move {
+        admin
+            .list_keyspaces(admin_request(
+                orbita_proto::v1::ListKeyspacesRequest::default(),
+                Some("root-secret"),
+            ))
+            .await
+    });
+    assert!(listed.is_ok(), "the root administers the cluster");
 }
 
 #[test]
