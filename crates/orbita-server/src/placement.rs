@@ -32,10 +32,9 @@ use orbita_core::{
 };
 use orbita_format::testing::MemoryStore;
 use orbita_proto::v1::{GetRequest, SetRequest};
-use orbita_runtime::Runtime;
+use orbita_runtime::{Clock, Runtime};
 use orbita_sim::{harness, SimRuntime, Simulation};
 
-use orbita_runtime::{Clock, Runtime};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -120,6 +119,14 @@ fn start_node_on_store(
     let source = BoxedMapSource::new(source.clone());
     let gate = Arc::new(crate::ReadinessGate::new());
     sim.block_on(async move {
+        // Authentication off: placement is about ownership and catch-up, so
+        // admission lets every request through to the routing under test.
+        let authenticator = Arc::new(crate::auth::Authenticator::new(
+            false,
+            None,
+            std::time::Duration::from_secs(86_400),
+            runtime.clock().clone(),
+        ));
         Node::start(
             runtime,
             node,
@@ -127,6 +134,7 @@ fn start_node_on_store(
             source,
             Duration::from_millis(150),
             gate,
+            authenticator,
         )
         .await
         .expect("the node starts")
@@ -718,6 +726,7 @@ fn a_write_acknowledged_while_a_handoff_is_in_flight_survives_it() {
                                 condition: None,
                             },
                             false,
+                            None,
                         )
                         .await;
                     if matches!(outcome, Ok(response) if response.applied) {
@@ -889,6 +898,7 @@ fn a_planned_drain_closes_write_admission_before_it_quiesces() {
                                 condition: None,
                             },
                             false,
+                            None,
                         )
                         .await;
                     if matches!(outcome, Ok(response) if response.applied) {

@@ -44,3 +44,6 @@ orbita-sim = { path = "../orbita-sim" }
 # The in-memory object store, so simulated partitions touch no filesystem.
 orbita-format = { workspace = true, features = ["testing"] }
 orbita-proto.workspace = true
+# So an over-the-wire test can size a request to the exact byte the server
+# advertises, by measuring a request's encoded length rather than guessing it.
+prost = "0.13"
