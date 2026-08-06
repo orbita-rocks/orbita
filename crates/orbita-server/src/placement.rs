@@ -739,11 +739,30 @@ fn a_write_acknowledged_while_a_handoff_is_in_flight_survives_it() {
             // the bucket rather than out of any log.
             sim.heal_all();
 
-            // Close write admission and let replication settle, then confirm
-            // FIRST is caught up to the owner exactly as the control plane
-            // requires before it will hand a partition over. Only then is a
-            // lost write a reopen bug rather than the promotion of a replica
-            // that never had it.
+            // Flag the writer to stop and quiesce the owner directly, rather
+            // than through `Server::drain`. This is deliberate, and it is the
+            // seam this regression has to use: `Server::drain` holds
+            // `Node::begin_draining` across `prepare_handoff` (see
+            // `crate::Server::drain`), and `begin_draining` closes admission and
+            // then awaits `writes.write()`, which every `set` holds a read
+            // permit against for the whole of `host.write().await` — commit
+            // included. So the guard does not return until every admitted write
+            // has resolved, and the quiesce it fronts meets an empty in-flight
+            // set. The #77 loss is precisely a batch whose acknowledgement lands
+            // *during* the truncate inside quiesce, so routing this write
+            // through the real guard would drain the very batch the race needs
+            // and the bug would vanish (confirmed: through `begin_draining` this
+            // seed passes on the pre-fix WAL). Calling `prepare_handoff` while a
+            // write is still in flight is the only faithful way to open that
+            // window deterministically. The companion
+            // `a_planned_drain_closes_write_admission_before_it_quiesces`
+            // traverses the guard end to end to prove the composed drain path
+            // never exposes an acknowledged write to the truncate.
+            //
+            // After the quiesce, confirm FIRST is caught up to the owner exactly
+            // as the control plane requires before it will hand a partition
+            // over. Only then is a lost write a reopen bug rather than the
+            // promotion of a replica that never had it.
             stop.store(true, Ordering::Relaxed);
             let syncing = Arc::clone(&owner);
             sim.block_on(async move { syncing.prepare_handoff().await });
@@ -788,6 +807,154 @@ fn a_write_acknowledged_while_a_handoff_is_in_flight_survives_it() {
                 return Err(sim.failure(format!(
                     "{} acknowledged write(s) went missing across an in-flight handoff, \
                      e.g. {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(5)],
+                )));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_planned_drain_closes_write_admission_before_it_quiesces() {
+    // The companion to `a_write_acknowledged_while_a_handoff_is_in_flight_...`.
+    // That one isolates the WAL window the fix closes by quiescing directly
+    // while a write is in flight. This one traverses the real drain the way
+    // `Server::drain` does — `Node::begin_draining` held across
+    // `prepare_handoff` — to prove the composed production path never hands an
+    // acknowledged write to the truncate in the first place.
+    //
+    // It passes with and without the WAL fix, and that is the point rather than
+    // a gap: `begin_draining` closes admission and awaits `writes.write()`,
+    // which every `set` holds a read permit against through commit, so by the
+    // time the quiesce runs there is no in-flight batch whose acknowledgement
+    // could race it. The property under guard is the drain *ordering* — that
+    // admission is closed and drained before the log is cut — so a future
+    // refactor that quiesced before draining admission would reopen the #77
+    // window and, on a WAL that had also regressed, drop the write this asserts
+    // survives.
+    harness::check_seeds(
+        "placement::a_planned_drain_closes_write_admission_before_it_quiesces",
+        400,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let source = StaticMapSource::new(placed_on_both());
+            // One bucket, as production runs it, so the promoted node reopens
+            // over the manifest the old owner published.
+            let store = Arc::new(MemoryStore::new());
+            let owner = start_node_on_store(&sim, OWNER, &source, Arc::clone(&store));
+            let first = start_node_on_store(&sim, FIRST, &source, Arc::clone(&store));
+            let second = start_node_on_store(&sim, SECOND, &source, Arc::clone(&store));
+            poll_maps(&sim, &[&owner, &first, &second], 1);
+
+            // Same load the in-flight scenario uses: FIRST is cut off while a
+            // writer and a flusher keep batches moving against the owner, so
+            // there is genuinely a write in flight when the drain begins. The
+            // difference is only how the drain is entered below.
+            sim.partition(OWNER, FIRST);
+
+            let acked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let writer_runtime = sim.runtime(OWNER);
+            let writing = Arc::clone(&owner);
+            let acked_writer = Arc::clone(&acked);
+            let stop_writer = Arc::clone(&stop);
+            sim.spawn(async move {
+                let mut i = 0u64;
+                while !stop_writer.load(Ordering::Relaxed) {
+                    let key = format!("drain-{i}");
+                    let outcome = writing
+                        .set(
+                            SetRequest {
+                                keyspace: KEYSPACE.to_string(),
+                                key: key.clone().into_bytes(),
+                                value: i.to_be_bytes().to_vec(),
+                                ttl_millis: None,
+                                condition: None,
+                            },
+                            false,
+                        )
+                        .await;
+                    if matches!(outcome, Ok(response) if response.applied) {
+                        acked_writer.lock().unwrap().push(key);
+                    }
+                    i += 1;
+                    writer_runtime
+                        .clock()
+                        .sleep(Duration::from_micros(200))
+                        .await;
+                }
+            });
+
+            let flusher_runtime = sim.runtime(OWNER);
+            let flushing = Arc::clone(&owner);
+            let stop_flusher = Arc::clone(&stop);
+            sim.spawn(async move {
+                while !stop_flusher.load(Ordering::Relaxed) {
+                    flushing.flush_owned().await;
+                    flusher_runtime
+                        .clock()
+                        .sleep(Duration::from_micros(500))
+                        .await;
+                }
+            });
+
+            sim.run_for(Duration::from_millis(5));
+            sim.heal_all();
+
+            // The real drain entry, in the order `Server::drain` uses it:
+            // `begin_draining` closes write admission and does not return until
+            // every admitted write has resolved, and the guard it returns is
+            // held across `prepare_handoff` so no write can be admitted while
+            // the log is being cut. The writer keeps running into this call on
+            // purpose, so the guard has an in-flight write to drain rather than
+            // a quiet log; it is stopped only once the guard owns the node.
+            let draining = Arc::clone(&owner);
+            sim.block_on(async move {
+                let _writes = draining.begin_draining().await;
+                draining.prepare_handoff().await;
+            });
+            stop.store(true, Ordering::Relaxed);
+            sim.run_until_idle();
+
+            let owner_at = sim.block_on(durable(Arc::clone(&owner)));
+            let first_at = sim.block_on(durable(Arc::clone(&first)));
+            if first_at < owner_at {
+                return Err(sim.failure(format!(
+                    "FIRST is at {first_at:?} while the owner holds {owner_at:?}, so this seed \
+                     promotes a replica the control plane would have refused",
+                )));
+            }
+
+            // The handoff: a caught-up replica takes the partition at a higher
+            // epoch, reopens as owner, and republishes its manifest.
+            source.set(map_with(
+                MapVersion(3),
+                FIRST,
+                Epoch(2),
+                vec![OWNER, SECOND],
+            ));
+            poll_maps(&sim, &[&first, &second, &owner], 2);
+            let republishing = Arc::clone(&first);
+            sim.block_on(async move { republishing.flush_owned().await });
+            sim.run_until_idle();
+
+            let acked = std::mem::take(&mut *acked.lock().unwrap());
+            let missing: Vec<String> = acked
+                .iter()
+                .filter(|key| !is_visible(&sim, &first, key))
+                .cloned()
+                .collect();
+            drop(owner);
+            drop(first);
+            drop(second);
+
+            if !missing.is_empty() {
+                return Err(sim.failure(format!(
+                    "{} acknowledged write(s) went missing across a drain that closed write \
+                     admission first, e.g. {:?}",
                     missing.len(),
                     &missing[..missing.len().min(5)],
                 )));
