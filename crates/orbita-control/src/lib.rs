@@ -99,6 +99,7 @@ mod config;
 pub mod consensus;
 mod controller;
 mod membership;
+mod metrics;
 mod model;
 mod raft;
 mod service;

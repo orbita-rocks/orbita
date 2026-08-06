@@ -96,6 +96,27 @@ pub struct BeyondRetention {
     pub retained_from: Option<Lamport>,
 }
 
+/// How far this owner's advertised replicas trail its committed prefix.
+///
+/// This is the WAL replication-lag signal the observability requirement asks
+/// for, folded to two numbers so it labels a partition rather than a partition
+/// crossed with a node: a per-replica label would grow the metric with the
+/// cluster twice over, once per partition and again per replica, and the
+/// question an operator asks — is this partition's replication keeping up — is
+/// answered by the worst replica and the count of laggards, not by naming each
+/// one. A replica that is [`ReplicaCatchUp::Stranded`] is not lag: no number of
+/// Lamports describes a copy a retry cannot advance, and it is reported through
+/// [`Wal::beyond_retention`] instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplicationLag {
+    /// Advertised replicas short of the committed prefix, excluding stranded
+    /// ones. Zero is the healthy answer.
+    pub replicas_behind: u64,
+    /// The largest Lamport distance any of those replicas trails the committed
+    /// prefix by. Zero when nothing is behind.
+    pub max_lamports: u64,
+}
+
 /// What an owner has established about one replica: where its log ends, and
 /// whether this log can still extend it.
 ///
@@ -471,6 +492,34 @@ impl<R: Runtime> Wal<R> {
             })
             .map(|(node, _)| node)
             .collect()
+    }
+
+    /// How far this owner's advertised replicas trail its committed prefix.
+    ///
+    /// Read off the same per-replica record as [`Wal::replicas_behind`], so the
+    /// count here and the nodes named there cannot disagree. An `Unestablished`
+    /// replica counts as behind by the full committed prefix once there is
+    /// history to hand over, because nothing is known to have reached it; a
+    /// `Following` replica counts by exactly what it has not yet confirmed; a
+    /// `Stranded` one is not lag and is excluded.
+    #[must_use]
+    pub fn replication_lag(&self) -> ReplicationLag {
+        let committed = self.committed_lamport();
+        if committed == Lamport::ZERO {
+            return ReplicationLag::default();
+        }
+        let mut lag = ReplicationLag::default();
+        for (_, status) in self.catch_up_status() {
+            let through = match status {
+                ReplicaCatchUp::Following { through } if through < committed => through,
+                ReplicaCatchUp::Unestablished => Lamport::ZERO,
+                // Caught up, or stranded and reported elsewhere.
+                ReplicaCatchUp::Following { .. } | ReplicaCatchUp::Stranded(_) => continue,
+            };
+            lag.replicas_behind += 1;
+            lag.max_lamports = lag.max_lamports.max(committed.get() - through.get());
+        }
+        lag
     }
 
     #[must_use]

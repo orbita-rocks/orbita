@@ -8,7 +8,7 @@ use orbita_runtime::{Rng, Runtime, ServiceId, Transport};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
 use crate::log::{CatchUp, PartitionLog, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES};
-use crate::owner::{BeyondRetention, ReplicaCatchUp, Wal, WalConfig};
+use crate::owner::{BeyondRetention, ReplicaCatchUp, ReplicationLag, Wal, WalConfig};
 use crate::replica::{Hydration, WalService};
 use crate::testkit::{block_on, yield_now, Faults, MemDisk, MemNetwork, TestRuntime};
 use crate::wire::{AppendRequest, WalResponse};
@@ -1490,6 +1490,53 @@ fn quiescing_cannot_strand_a_replica_that_was_following() {
         assert!(
             owner.replicas_behind().is_empty(),
             "a replica holding the committed prefix is not outstanding catch-up work"
+        );
+    });
+}
+
+#[test]
+fn replication_lag_measures_the_worst_replica_that_trails_the_committed_prefix() {
+    // The WAL replication-lag signal. A healthy owner reports nothing behind;
+    // once a replica is cut off while writes keep committing on the others, the
+    // committed prefix advances past it and the lag is exactly that gap.
+    let base = TestRuntime::solo(31);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let owner_runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let config = WalConfig::new(PARTITION, DIR, Epoch(1)).with_replicas(vec![PEER_A, PEER_B]);
+        let owner = Wal::open(owner_runtime, config).await.expect("open owner");
+        // Bound rather than dropped: a peer owns the handler it registered.
+        let _peers = [
+            peer(&base, &net, PEER_A).await,
+            peer(&base, &net, PEER_B).await,
+        ];
+
+        for i in 1..=5 {
+            owner.commit(op(&format!("k{i}"))).await.unwrap();
+        }
+        assert_eq!(owner.committed_lamport(), Lamport(5));
+        assert_eq!(
+            owner.replication_lag(),
+            ReplicationLag::default(),
+            "with every replica caught up nothing is behind"
+        );
+
+        // One replica goes away. A majority still stores each write, so the
+        // committed prefix climbs to 9 while the isolated replica stays at 5.
+        net.isolate(PEER_B);
+        for i in 6..=9 {
+            owner.commit(op(&format!("k{i}"))).await.unwrap();
+        }
+        assert_eq!(owner.committed_lamport(), Lamport(9));
+
+        let lag = owner.replication_lag();
+        assert_eq!(
+            lag.replicas_behind, 1,
+            "exactly the isolated replica trails the committed prefix"
+        );
+        assert_eq!(
+            lag.max_lamports, 4,
+            "and it trails by the four writes committed without it"
         );
     });
 }
