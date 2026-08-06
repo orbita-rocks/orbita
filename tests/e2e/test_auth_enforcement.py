@@ -21,10 +21,13 @@ The rules under test, read off the merged enforcement code
   is `PERMISSION_DENIED`.
 * Admin is root-only: a tenant credential — even a writer — is
   `PERMISSION_DENIED` on any Admin RPC. Only the configured root passes.
-* Revocation takes effect on the next request against the same connection, not
-  the next connection: the worker refreshes its credential cache on a timer
-  (the control poll interval, 250ms by default) and reads the fresh set on the
-  very next call.
+* Revocation is bounded-eventual, not literally next-request: the worker
+  enforces against a credential cache it refreshes on the control-poll timer
+  (250ms by default), so a revoke lands on the next refresh — within about one
+  interval — rather than on the next call. The test states that bound and fails
+  if a revoke never lands or drifts past it, and it checks the refusal on the
+  same open connection so it is the cache being re-read, not a per-connection
+  verdict.
 
 # TLS posture (the recorded deployment contract)
 
@@ -34,13 +37,20 @@ supplied by a proxy or service mesh in front of it (the peer listener is meant
 for a private network for the same reason; see `config.rs`). That decision is
 made visible rather than ambient by
 `test_the_server_speaks_plaintext_grpc_and_terminates_no_tls`, which proves an
-insecure channel is served and a TLS channel is refused. If a future change
-makes the node terminate TLS, that test fails and this contract gets revisited
-on purpose.
+insecure channel is served and — independently of certificate trust — that the
+port completes no TLS handshake. The check disables certificate verification on
+purpose, so it distinguishes a plaintext server from a TLS one rather than a
+trusted certificate from an untrusted one: a TLS server with a self-signed or
+private-CA certificate would complete the handshake and flip the test red. If a
+future change makes the node terminate TLS on this port, that test fails and
+this contract gets revisited on purpose.
 """
 
 from __future__ import annotations
 
+import socket
+import ssl
+import time
 from types import SimpleNamespace
 
 import grpc
@@ -55,6 +65,18 @@ from conftest import poll_until
 # only credential that exists before any is minted through Admin, so every test
 # that needs to create or revoke a credential authenticates as this.
 ROOT_SECRET = "root-bootstrap-secret-for-the-e2e-suite"
+
+# The worker refreshes its credential cache off the control-poll timer, which is
+# DEFAULT_CONTROL_POLL_INTERVAL in crates/orbita-server/src/config.rs — 250ms.
+# Enforcement, including revocation, is therefore bounded-eventual: a change to
+# the credential set lands on the next refresh, within about one interval.
+CREDENTIAL_REFRESH_INTERVAL_SECONDS = 0.25
+
+# The window a revocation must land within, stated rather than left open. A
+# generous multiple of the refresh interval so a loaded CI runner does not flake,
+# but bounded so the test FAILS if a revoke never takes effect or drifts far past
+# one interval — the honest contract is "within about one refresh", not "never".
+REVOCATION_BOUND_SECONDS = 20 * CREDENTIAL_REFRESH_INTERVAL_SECONDS
 
 # The stub modules the harness Node binds, in the shape it expects. conftest has
 # already generated the stubs and put them on the path by the time this imports.
@@ -306,18 +328,24 @@ def test_a_valid_credential_on_its_keyspace_reads_and_writes(auth_node):
     assert got.found and got.value == b"granted"
 
 
-# --- Revocation takes effect on the next request, not the next connection ------
+# --- Revocation is bounded-eventual: it lands within about one refresh --------
 
 
-def test_a_revoked_credential_is_refused_on_the_next_request(auth_node):
-    """A revoked credential stops working on the same open channel.
+def test_a_revoked_credential_stops_working_within_one_refresh_interval(auth_node):
+    """A revoked credential is refused within a bounded window, on the same channel.
 
-    The credential works, is revoked through Admin as root, and then fails on
-    the *same* stub and channel — no reconnect. That is what distinguishes
-    next-request enforcement (the worker re-reads a refreshed credential set)
-    from next-connection enforcement (a per-connection verdict that a revoke
-    could not reach). A revoked secret names no credential, so the refusal is
-    UNAUTHENTICATED.
+    The honest contract is bounded-eventual, not literally next-request: the
+    worker enforces against a cached credential set it refreshes off the
+    control-poll timer (~250ms), so a revoke lands on the next refresh rather
+    than on the next call. This test states that bound
+    (`REVOCATION_BOUND_SECONDS`) and fails if the revoke never takes effect or
+    takes longer than it — an unbounded poll would instead pass no matter how
+    long revocation drifted.
+
+    What it still proves about the mechanism: the refusal arrives on the *same*
+    stub and channel that just succeeded — no reconnect — so this is the cache
+    being re-read, not a fresh per-connection verdict. A revoked secret names no
+    credential, so the refusal is UNAUTHENTICATED, and it stays refused.
     """
     credential_id, secret = _create_credential(
         auth_node,
@@ -325,13 +353,16 @@ def test_a_revoked_credential_is_refused_on_the_next_request(auth_node):
         permissions=[admin_pb2.PERMISSION_READ, admin_pb2.PERMISSION_WRITE],
     )
 
+    def get_with_credential():
+        return auth_node.kv.Get(
+            kv_pb2.GetRequest(keyspace=KS, key=b"k"),
+            timeout=5.0,
+            metadata=bearer(secret),
+        )
+
     def usable():
         try:
-            auth_node.kv.Get(
-                kv_pb2.GetRequest(keyspace=KS, key=b"k"),
-                timeout=5.0,
-                metadata=bearer(secret),
-            )
+            get_with_credential()
             return True
         except grpc.RpcError:
             return None
@@ -344,25 +375,33 @@ def test_a_revoked_credential_is_refused_on_the_next_request(auth_node):
         metadata=ROOT_METADATA,
     )
 
-    # The worker refreshes its credential cache on the control-poll timer, so
-    # the refusal lands within a couple of intervals. Crucially this is the same
-    # channel that just succeeded: no new connection is opened between the two.
-    def refused():
+    # Poll against a stated deadline rather than an open-ended one: the revoke
+    # must land within REVOCATION_BOUND_SECONDS or this fails. Same channel
+    # throughout, so a success here would be a per-connection verdict a revoke
+    # could not reach; a bounded refusal is the cache having been re-read.
+    deadline = time.monotonic() + REVOCATION_BOUND_SECONDS
+    refused_code = None
+    while time.monotonic() < deadline:
         try:
-            auth_node.kv.Get(
-                kv_pb2.GetRequest(keyspace=KS, key=b"k"),
-                timeout=5.0,
-                metadata=bearer(secret),
-            )
-            return None
+            get_with_credential()
         except grpc.RpcError as error:
-            return error.code()
+            refused_code = error.code()
+            break
+        time.sleep(0.02)
 
-    code = poll_until(refused)
-    assert code == grpc.StatusCode.UNAUTHENTICATED, (
-        "a revoked credential names no credential, so the next request is "
-        "UNAUTHENTICATED"
+    assert refused_code == grpc.StatusCode.UNAUTHENTICATED, (
+        "the revoked credential was still accepted "
+        f"{REVOCATION_BOUND_SECONDS} seconds after revocation; revocation must "
+        "land within about one refresh interval, and a revoked secret names no "
+        "credential so the refusal is UNAUTHENTICATED"
     )
+
+    # And it stays refused: revocation is not a one-shot blip that a later
+    # refresh could undo. A handful of follow-up calls all fail the same way.
+    for _ in range(5):
+        with pytest.raises(grpc.RpcError) as caught:
+            get_with_credential()
+        assert caught.value.code() == grpc.StatusCode.UNAUTHENTICATED
 
 
 # --- Admin is root-only --------------------------------------------------------
@@ -415,33 +454,59 @@ def test_admin_is_root_only_a_tenant_writer_is_denied_but_root_succeeds(auth_nod
 # --- TLS posture: plaintext-plus-proxy is the recorded contract ----------------
 
 
+def _completes_a_tls_handshake(host: str, port: int, timeout: float = 10.0) -> bool:
+    """Whether the server completes a TLS handshake on this port.
+
+    Certificate trust is deliberately turned OFF: the context does not verify
+    the hostname and accepts any certificate. That is what makes this a test of
+    the *protocol* rather than of trust — a TLS server presenting a self-signed
+    cert, a private-CA cert, or a cert not valid for 127.0.0.1 would all still
+    complete the handshake here and return True. Only a server that does not
+    speak TLS at all — one sending plaintext HTTP/2 bytes where a ServerHello is
+    expected — makes the handshake fail, which surfaces as an ``ssl.SSLError``
+    (typically "wrong version number"). So a False return means "this port does
+    not terminate TLS", provably, without depending on any certificate being
+    trusted.
+    """
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            raw.settimeout(timeout)
+            with context.wrap_socket(raw, server_hostname=host):
+                # The handshake completed. A TLS server got here regardless of
+                # whether its certificate would be trusted.
+                return True
+    except ssl.SSLError:
+        # Bytes that are not a TLS record: the server is not speaking TLS.
+        return False
+    except (OSError, socket.timeout):
+        # A refused or silent connection is not a completed TLS handshake.
+        return False
+
+
 def test_the_server_speaks_plaintext_grpc_and_terminates_no_tls(node):
-    """The node serves h2c and refuses a TLS handshake.
+    """The node serves h2c and completes no TLS handshake on its client port.
 
     This records the deployment contract in an executable form: transport
-    security is a proxy's job, not the node's. The plaintext channel every
-    other test uses is served; a TLS channel against the same port cannot
-    complete a handshake, because there is no server certificate to complete it
-    with. See this module's docstring for why that is by design.
+    security is a proxy's job, not the node's. The check is independent of
+    certificate trust (see `_completes_a_tls_handshake`), so it cannot be
+    satisfied by a TLS server with a self-signed or private-CA certificate —
+    that server would complete the handshake and flip this test red. If the node
+    ever starts terminating TLS on this port, this fails and the contract is
+    revisited on purpose. See this module's docstring for why plaintext is the
+    design today.
     """
     # Plaintext is served: the running node answered its probe over exactly this
-    # kind of channel, and does so again here.
+    # kind of insecure channel, and does so again here.
     served = node.kv.GetLimits(kv_pb2.GetLimitsRequest(keyspace=KS), timeout=10.0)
     assert served.max_message_bytes > 0
 
-    # TLS is not: a secure channel to a plaintext listener cannot handshake, so
-    # the call fails rather than returning. If the node ever starts terminating
-    # TLS, this stops raising and the contract is revisited on purpose.
-    tls_channel = grpc.secure_channel(
-        f"127.0.0.1:{node.port}", grpc.ssl_channel_credentials()
+    # TLS is not terminated: a handshake with verification disabled still fails,
+    # which can only mean the server is not speaking TLS at all. A self-signed or
+    # private-CA TLS server would instead complete the handshake and fail this.
+    assert not _completes_a_tls_handshake("127.0.0.1", node.port), (
+        "the node completed a TLS handshake on its client port; the recorded "
+        "contract is plaintext h2c with TLS terminated by a proxy in front"
     )
-    try:
-        tls_stub = kv_pb2_grpc.KvStub(tls_channel)
-        with pytest.raises(grpc.RpcError) as caught:
-            tls_stub.GetLimits(kv_pb2.GetLimitsRequest(keyspace=KS), timeout=10.0)
-        assert caught.value.code() == grpc.StatusCode.UNAVAILABLE, (
-            "a plaintext server cannot complete a TLS handshake, so the client "
-            "sees the connection fail"
-        )
-    finally:
-        tls_channel.close()
