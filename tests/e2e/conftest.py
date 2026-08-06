@@ -41,6 +41,21 @@ def orbita_binary():
     return harness.build_binary()
 
 
+@pytest.fixture(scope="session")
+def previous_binary():
+    """A binary one minor older than the one under test, or a skip.
+
+    The rolling-upgrade test needs two real binaries whose speakable cluster
+    versions differ. This produces the older one; when it cannot (no prior
+    release exists and no build is possible), it turns the specific reason into
+    a skip so the suite says why rather than passing silently.
+    """
+    try:
+        return harness.previous_binary()
+    except harness.PreviousBinaryUnavailable as reason:
+        pytest.skip(str(reason))
+
+
 @pytest.fixture
 def node(orbita_binary, tmp_path):
     """A running single node, on its own port, over its own data directory."""

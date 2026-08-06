@@ -10,6 +10,7 @@ the server, and nothing is hand-written that a code generator could produce.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -88,6 +89,138 @@ def build_binary() -> Path:
     if not path.exists():
         raise RuntimeError(f"cargo build did not produce {path}")
     return path
+
+
+class PreviousBinaryUnavailable(RuntimeError):
+    """Raised when the prior-minor binary cannot be obtained.
+
+    Carries a human sentence the caller turns into a pytest skip, because the
+    honest reason ("this repo has never cut a release, so there is no prior
+    binary to download") is exactly what a reader of a skipped upgrade test
+    needs to see.
+    """
+
+
+def _workspace_version() -> tuple[int, int]:
+    """The (major, minor) of the workspace, parsed from the root Cargo.toml.
+
+    The cluster version a binary speaks is derived from the same crate version
+    at compile time (`orbita-control::version`), so the previous *minor* is the
+    only thing that produces a binary with a different, older speakable range.
+    """
+    text = (REPO_ROOT / "Cargo.toml").read_text()
+    match = re.search(r'^version\s*=\s*"(\d+)\.(\d+)\.', text, re.MULTILINE)
+    if not match:
+        raise PreviousBinaryUnavailable(
+            "could not parse the workspace version out of Cargo.toml"
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
+def previous_binary() -> Path:
+    """A binary one *minor* older than this one, for the two-binary upgrade test.
+
+    Resolution, in order:
+
+    1. ``ORBITA_PREV_BINARY`` — an explicit path, which is what CI or a
+       developer with a real prior release on disk should point at.
+    2. A synthesized build: the committed source at HEAD, stamped down to the
+       previous minor and compiled. This exists because the repo has cut no
+       releases and pushed no tags, so there is nothing to `gh release
+       download`; the cluster-version machinery keys off the crate version, so
+       the same source at ``0.(minor-1).0`` is a faithful "speaks only the
+       previous version" peer for the compatibility gate under test.
+
+    Raises :class:`PreviousBinaryUnavailable` with a specific reason when
+    neither path yields a binary, so the test skips loudly rather than lying.
+    """
+    override = os.environ.get("ORBITA_PREV_BINARY")
+    if override:
+        path = Path(override)
+        if not path.exists():
+            raise PreviousBinaryUnavailable(
+                f"ORBITA_PREV_BINARY points at {path}, which does not exist"
+            )
+        return path
+
+    major, minor = _workspace_version()
+    if minor == 0:
+        # A binary at minor zero speaks only its own version, so there is no
+        # older minor to build a distinct peer from. Naming it would be a lie.
+        raise PreviousBinaryUnavailable(
+            f"the workspace is at {major}.{minor}, whose previous minor is not "
+            "expressible; there is no older cluster version to roll from"
+        )
+    prev = f"{major}.{minor - 1}.0"
+
+    cache = Path(os.environ.get("TMPDIR", "/tmp")) / "orbita-e2e-prev" / prev
+    cached = cache / "orbita"
+    if cached.exists():
+        return cached
+
+    return _build_previous_binary(prev, cache)
+
+
+def _build_previous_binary(prev: str, cache: Path) -> Path:
+    """Compile the HEAD tree stamped down to version ``prev`` and cache it.
+
+    The build happens in an exported copy of the committed tree rather than in
+    place, so nothing edits the working Cargo.toml or clobbers the current
+    binary in ``target/debug``. It reuses the machine's cargo caches, so in
+    practice only the orbita crates recompile.
+    """
+    if shutil.which("cargo") is None:
+        raise PreviousBinaryUnavailable("cargo is not on PATH, so no prior binary can be built")
+
+    src = cache.parent / f"{prev}-src"
+    if src.exists():
+        shutil.rmtree(src)
+    src.mkdir(parents=True)
+
+    export = subprocess.run(
+        ["git", "archive", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+    )
+    if export.returncode != 0:
+        raise PreviousBinaryUnavailable(
+            f"git archive HEAD failed: {export.stderr.decode(errors='replace')}"
+        )
+    unpack = subprocess.run(["tar", "-x", "-C", str(src)], input=export.stdout, capture_output=True)
+    if unpack.returncode != 0:
+        raise PreviousBinaryUnavailable(
+            f"unpacking the HEAD tree failed: {unpack.stderr.decode(errors='replace')}"
+        )
+
+    manifest = src / "Cargo.toml"
+    stamped = re.sub(
+        r'^(version\s*=\s*)"[^"]+"',
+        rf'\1"{prev}"',
+        manifest.read_text(),
+        count=1,
+        flags=re.MULTILINE,
+    )
+    manifest.write_text(stamped)
+
+    build = subprocess.run(
+        ["cargo", "build", "--bin", "orbita", "--manifest-path", str(manifest)],
+        capture_output=True,
+        text=True,
+    )
+    if build.returncode != 0:
+        raise PreviousBinaryUnavailable(
+            "building the previous-minor binary failed:\n"
+            f"{build.stdout}\n{build.stderr}"
+        )
+
+    built = src / "target" / "debug" / "orbita"
+    if not built.exists():
+        raise PreviousBinaryUnavailable(f"the previous build did not produce {built}")
+
+    cache.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(built, cache / "orbita")
+    (cache / "orbita").chmod(0o755)
+    return cache / "orbita"
 
 
 def free_port() -> int:
