@@ -18,6 +18,7 @@ pub struct SimConfig {
 
     pub network: NetworkFaults,
     pub disk: DiskFaults,
+    pub store: StoreFaults,
 
     /// How long a peer call waits before giving up. A dropped message only
     /// becomes an observable failure when this expires, so it also bounds how
@@ -56,6 +57,7 @@ impl SimConfig {
             seed,
             network: NetworkFaults::none(),
             disk: DiskFaults::none(),
+            store: StoreFaults::none(),
             call_timeout: Duration::from_millis(500),
             fault_budget: u64::MAX,
             fault_warmup: Duration::ZERO,
@@ -74,6 +76,7 @@ impl SimConfig {
         Self {
             network: NetworkFaults::chaotic(),
             disk: DiskFaults::chaotic(),
+            store: StoreFaults::chaotic(),
             ..Self::new(seed)
         }
     }
@@ -181,6 +184,70 @@ impl DiskFaults {
             read_corruption_permille: 10,
             lying_fsync_permille: 20,
             torn_tail_on_crash: true,
+            ..Self::none()
+        }
+    }
+}
+
+/// What the object store does to a request.
+///
+/// The distinction that earns its keep here is between a request that never
+/// arrived and a response that never came back. Both look identical to the
+/// caller, and only the second leaves the store changed, so a commit protocol
+/// that treats them as the same thing is a commit protocol that either loses
+/// a write or publishes one twice. Per ADR 0006 the manifest swap is the
+/// durability boundary, and this is what puts that claim under load.
+#[derive(Debug, Clone)]
+pub struct StoreFaults {
+    /// Chance in a thousand that the request never reaches the store, so
+    /// nothing was applied and a retry is free.
+    pub request_lost_permille: u64,
+
+    /// Chance in a thousand that the store applies the request and the answer
+    /// is lost on the way back. This is the one that matters: a conditional
+    /// write that succeeded and was reported as a failure is the case a
+    /// writer cannot distinguish from one that never happened.
+    pub response_lost_permille: u64,
+
+    /// Chance in a thousand that the store answers `503 Slow Down`, which is
+    /// what a throttled or overloaded bucket does. Nothing is applied, and the
+    /// caller is expected to treat it as retryable.
+    pub server_error_permille: u64,
+
+    /// Chance in a thousand that a request is held far longer than usual,
+    /// which is what turns a flush into something a lease can expire under.
+    pub slow_permille: u64,
+
+    /// Object storage is a network round trip rather than a disk seek, so the
+    /// floor here is deliberately an order of magnitude above the disk's. A
+    /// simulation that made a manifest swap as cheap as an fsync would never
+    /// explore the window a real one leaves open.
+    pub min_latency: Duration,
+    pub max_latency: Duration,
+    pub slow_latency: Duration,
+}
+
+impl StoreFaults {
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            request_lost_permille: 0,
+            response_lost_permille: 0,
+            server_error_permille: 0,
+            slow_permille: 0,
+            min_latency: Duration::from_millis(1),
+            max_latency: Duration::from_millis(10),
+            slow_latency: Duration::from_millis(500),
+        }
+    }
+
+    #[must_use]
+    pub fn chaotic() -> Self {
+        Self {
+            request_lost_permille: 20,
+            response_lost_permille: 20,
+            server_error_permille: 20,
+            slow_permille: 20,
             ..Self::none()
         }
     }
