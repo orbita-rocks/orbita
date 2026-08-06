@@ -843,6 +843,16 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
 
     /// Transfers every partition owned by a draining worker to a ready,
     /// caught-up replica. It never expands a replica set or rebalances ranges.
+    ///
+    /// "Caught up" is measured against the owner's committed prefix, not its
+    /// durable position: the receiver must hold every write a durability
+    /// quorum acknowledged, which is the no-lost-write floor a handoff has to
+    /// keep, and nothing more. The owner's durable tail may run ahead of that
+    /// with entries it could not replicate, and demanding a receiver reach
+    /// them would be demanding the impossible — the WAL never ships past the
+    /// committed prefix. #79's `quiesce` already truncates the draining owner
+    /// to that prefix, which used to make the comparison safe by coincidence;
+    /// reading the prefix here makes it safe by construction instead.
     pub async fn drain_node(&self, node: NodeId) -> Result<bool> {
         let commands = {
             let inner = self.inner.lock().await;
@@ -876,19 +886,47 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 let owner_progress = inner
                     .observations
                     .get(&node)
-                    .and_then(|observation| observation.status.progress(info.id))
-                    .map_or(Lamport::ZERO, |progress| progress.durable_lamport);
+                    .and_then(|observation| observation.status.progress(info.id));
+                // The position a receiver must already hold. It is the owner's
+                // committed prefix — the highest Lamport a durability quorum
+                // confirmed — not its raw durable position. The two differ by
+                // exactly the tail the owner wrote to its own disk and could
+                // not replicate, whose clients were told the write failed. The
+                // WAL is not allowed to ship that tail, so requiring a replica
+                // to reach the owner's durable position asks for a Lamport no
+                // receiver can attain without inventing writes the cluster
+                // never promised; requiring the committed prefix is always
+                // satisfiable, because every replica in the durability quorum
+                // already holds it. #79's `quiesce` truncates the draining
+                // owner's tail back to this same prefix before a handoff, so
+                // today the two numbers coincide at the moment of comparison
+                // and the drain is safe by that coincidence. Comparing the
+                // committed prefix directly makes the drain safe by
+                // construction instead, whether or not quiesce has run — the
+                // #87 invariant that the receiver test names a ceiling a
+                // catch-up can actually reach.
+                //
+                // Falls back to the durable position only when the owner
+                // reported no committed prefix, which is a pre-V5 binary
+                // mid-rollout. There the older, incidental safety still holds:
+                // quiesce is what lowers that durable number to the committed
+                // prefix, and it does so for exactly the owners that cannot
+                // yet report the prefix directly.
+                let required = owner_progress
+                    .and_then(|progress| progress.committed_lamport)
+                    .or_else(|| owner_progress.map(|progress| progress.durable_lamport))
+                    .unwrap_or(Lamport::ZERO);
                 let target = info.replicas.iter().copied().find(|candidate| {
                     inner.state.is_eligible_owner(*candidate)
                         && inner
                             .observations
                             .get(candidate)
                             .and_then(|observation| observation.status.progress(info.id))
-                            .is_some_and(|progress| progress.durable_lamport >= owner_progress)
+                            .is_some_and(|progress| progress.durable_lamport >= required)
                 });
                 let Some(target) = target else {
                     return Err(Error::Unavailable(format!(
-                        "partition {} has no eligible ready replica caught up through {owner_progress}",
+                        "partition {} has no eligible ready replica caught up through {required}",
                         info.id
                     )));
                 };
