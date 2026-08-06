@@ -28,6 +28,7 @@ use crate::host::{HostSpec, LeasePolicy, PartitionHost, PartitionPaths, Read, Wr
 use crate::lease::DEFAULT_LEASE_MARGIN;
 use crate::map_source::{BoxedMapSource, MapSource};
 use crate::proxy;
+use crate::quota::{Admission, Direction};
 use crate::readiness::{ReadinessCondition, ReadinessGate};
 use crate::replication::{Applies, ReplicaBridge};
 use crate::validate;
@@ -45,7 +46,8 @@ use orbita_proto::v1::{
     ListRequest, ListResponse, SetRequest, SetResponse,
 };
 use orbita_runtime::{
-    join_all, PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError, TransportResult,
+    join_all, Clock, PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError,
+    TransportResult,
 };
 use orbita_wal::WalService;
 
@@ -53,6 +55,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
+
+/// How stale the storage figure a write is admitted against may be.
+///
+/// The number is the worker's own view — the sum over the partitions it owns
+/// for the keyspace — not a control-plane round trip, because coupling every
+/// write to a shared aggregate is exactly the cross-keyspace dependency
+/// admission has to avoid. It is remeasured at most this often; between
+/// remeasures a keyspace can overshoot its cap only by the writes admitted
+/// inside one interval. One second keeps the per-write cost to a cached read
+/// while bounding that overshoot to a interval's worth of traffic.
+const STORAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Where a node's data goes.
 ///
@@ -114,6 +127,9 @@ pub(crate) struct Node<R: Runtime> {
     /// hold the read side through their acknowledgement, so the final progress
     /// report cannot race an acknowledged write.
     writes: tokio::sync::RwLock<()>,
+    /// Per-keyspace storage and rate admission, isolated so one tenant's
+    /// throttling never touches another's path. See [`crate::quota`].
+    admission: Admission,
 }
 
 /// Where a request has to go.
@@ -181,6 +197,7 @@ impl<R: Runtime> Node<R> {
             readiness,
             accepting_writes: AtomicBool::new(true),
             writes: tokio::sync::RwLock::new(()),
+            admission: Admission::new(),
         });
         node.reconcile_hosts().await?;
         // Nothing is known to be stranded before a single heartbeat has gone
@@ -498,6 +515,7 @@ impl<R: Runtime> Node<R> {
     }
 
     pub(crate) async fn get(&self, request: GetRequest, forwarded: bool) -> Result<GetResponse> {
+        self.admit_rate(&request.keyspace, Direction::Read, forwarded)?;
         match self.try_get(&request, forwarded).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
@@ -548,6 +566,7 @@ impl<R: Runtime> Node<R> {
     }
 
     pub(crate) async fn set(&self, request: SetRequest, forwarded: bool) -> Result<SetResponse> {
+        self.admit_rate(&request.keyspace, Direction::Write, forwarded)?;
         let _permit = self.write_permit().await?;
         match self.try_set(&request, forwarded).await {
             Err(error) if self.should_repair(&error, forwarded) => {
@@ -574,6 +593,13 @@ impl<R: Runtime> Node<R> {
 
         match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
             Hop::Local(host, ..) => {
+                // Storage is enforced where the data lands, so the figure is the
+                // owner's own footprint for the keyspace and no cross-node round
+                // trip stands in the write path.
+                if let Some(cap) = keyspace.max_storage_bytes {
+                    self.admit_storage(keyspace.id, cap, request.value.len() as u64)
+                        .await?;
+                }
                 let op = WriteOp::Put {
                     value: Bytes::from(request.value.clone()),
                     // A keyspace's default TTL applies to a write that did not
@@ -606,6 +632,7 @@ impl<R: Runtime> Node<R> {
         request: DeleteRequest,
         forwarded: bool,
     ) -> Result<DeleteResponse> {
+        self.admit_rate(&request.keyspace, Direction::Write, forwarded)?;
         let _permit = self.write_permit().await?;
         match self.try_delete(&request, forwarded).await {
             Err(error) if self.should_repair(&error, forwarded) => {
@@ -679,6 +706,7 @@ impl<R: Runtime> Node<R> {
     }
 
     pub(crate) async fn list(&self, request: ListRequest, forwarded: bool) -> Result<ListResponse> {
+        self.admit_rate(&request.keyspace, Direction::Read, forwarded)?;
         match self.try_list(&request, forwarded).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
@@ -875,6 +903,94 @@ impl<R: Runtime> Node<R> {
         // which keeps a heartbeat from looking like a change.
         progress.sort_unstable_by_key(|p| p.partition.get());
         progress
+    }
+
+    /// Charges one client request against the keyspace's per-direction rate
+    /// limit, at the worker edge.
+    ///
+    /// A forwarded request is not charged: it was already counted on the node
+    /// the client reached, and counting it again would bill a single request
+    /// twice and make an internal hop look like client load.
+    /// An `Err` here is a `ResourceExhausted` whose message names the direction
+    /// so a client can tell a rate refusal from a storage one.
+    fn admit_rate(&self, keyspace: &str, direction: Direction, forwarded: bool) -> Result<()> {
+        if forwarded {
+            return Ok(());
+        }
+        let info = self.keyspace(keyspace)?;
+        let rate = match direction {
+            Direction::Read => info.max_reads_per_second,
+            Direction::Write => info.max_writes_per_second,
+        };
+        let Some(limit) = rate else {
+            return Ok(());
+        };
+        let now = self.runtime.clock().monotonic_nanos();
+        if self
+            .admission
+            .admit_rate(info.id, direction, Some(limit), now)
+        {
+            return Ok(());
+        }
+        Err(Error::QuotaExceeded(match direction {
+            Direction::Read => {
+                format!("read rate limit of {limit} reads/s for keyspace {keyspace}")
+            }
+            Direction::Write => {
+                format!("write rate limit of {limit} writes/s for keyspace {keyspace}")
+            }
+        }))
+    }
+
+    /// Refuses a write that would carry the keyspace past its storage cap.
+    ///
+    /// The figure compared against is this worker's cached view of the storage
+    /// it owns for the keyspace, at most [`STORAGE_SAMPLE_INTERVAL`] stale, plus
+    /// the size of the write being admitted. Charging the incoming write means a
+    /// single write larger than the remaining room is refused up front rather
+    /// than only being noticed by the next sample. The message names storage so
+    /// a client can tell it from a rate refusal.
+    async fn admit_storage(&self, keyspace: KeyspaceId, cap: u64, incoming: u64) -> Result<()> {
+        let now = self.runtime.clock().monotonic_nanos();
+        let freshness = STORAGE_SAMPLE_INTERVAL.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let held = match self.admission.storage_sample(keyspace, now, freshness) {
+            Some(bytes) => bytes,
+            None => {
+                let measured = self.owned_storage_bytes(keyspace).await;
+                self.admission.record_storage(keyspace, measured, now);
+                measured
+            }
+        };
+        if held.saturating_add(incoming) > cap {
+            return Err(Error::QuotaExceeded(format!(
+                "storage cap of {cap} bytes for keyspace {} reached ({held} bytes held)",
+                keyspace.get()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The bytes this worker holds for a keyspace: the sum over the partitions
+    /// it currently owns for it.
+    ///
+    /// A replica's copy is not counted, because the cap is on stored data and
+    /// counting every replica would multiply a keyspace's footprint by its
+    /// replication factor.
+    async fn owned_storage_bytes(&self, keyspace: KeyspaceId) -> u64 {
+        let ids: Vec<PartitionId> = self
+            .map()
+            .partitions()
+            .filter(|p| p.keyspace == keyspace && p.owner == Some(self.node_id))
+            .map(|p| p.id)
+            .collect();
+        let hosts = self.hosts.read().await;
+        let mut total = 0u64;
+        for id in ids {
+            if let Some(host) = hosts.get(&id) {
+                total = total.saturating_add(host.size_bytes().await.unwrap_or(0));
+            }
+        }
+        total
     }
 
     async fn write_permit(&self) -> Result<tokio::sync::RwLockReadGuard<'_, ()>> {

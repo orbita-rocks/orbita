@@ -102,6 +102,9 @@ mod pending;
 #[cfg(test)]
 mod placement;
 mod proxy;
+mod quota;
+#[cfg(test)]
+mod quotas;
 mod readiness;
 mod replication;
 #[cfg(test)]
