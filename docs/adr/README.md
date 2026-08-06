@@ -21,3 +21,4 @@ forward. The history of a wrong turn is worth more than a tidy directory.
 | [0005](0005-upgrades-follow-kubernetes-rollouts.md) | Upgrades follow Kubernetes rollouts | Accepted |
 | [0006](0006-partitions-are-an-index-over-immutable-objects.md) | Partitions are a memory-resident index over immutable objects | Accepted |
 | [0007](0007-large-values-are-their-own-objects.md) | Large values are their own objects | Accepted |
+| [0008](0008-a-fenced-owner-stays-a-replica.md) | A fenced owner stays a replica | Accepted |

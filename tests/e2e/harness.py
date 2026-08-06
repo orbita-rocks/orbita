@@ -10,6 +10,7 @@ the server, and nothing is hand-written that a code generator could produce.
 from __future__ import annotations
 
 import os
+import random
 import re
 import shutil
 import socket
@@ -24,8 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PROTO_DIR = REPO_ROOT / "proto"
 GENERATED_DIR = Path(__file__).resolve().parent / ".generated"
 
-# The keyspace `orbita dev` creates on startup. Nothing else can create one,
-# because the Admin service is not implemented yet.
+# The keyspace `orbita dev` creates on startup, so that a test needing one key
+# does not need an admin call first. The Admin service can create more; see
+# test_admin.py.
 DEFAULT_KEYSPACE = "default"
 
 # How long we are willing to wait for a node to answer its first request. A
@@ -223,6 +225,18 @@ def _build_previous_binary(prev: str, cache: Path) -> Path:
     return cache / "orbita"
 
 
+# Where this suite looks for ports, chosen to sit below the range every
+# operating system hands out for the source port of an outbound connection:
+# 49152 upwards on macOS, 32768 upwards on Linux. That matters because this
+# suite is a client as well as a server. Asking the kernel for a free port with
+# bind(0) draws from the ephemeral range, and every reconnection attempt the
+# gRPC channel makes while a node is still starting draws from it too, so the
+# port reserved a moment ago for the node's second listener could be taken by
+# the test's own socket before the node got to it. That failed as
+# "Address already in use" in perhaps one run in four.
+PORT_RANGE = (20000, 30000)
+
+
 def free_port() -> int:
     """Pick a port where this port and the next one are both free.
 
@@ -233,19 +247,20 @@ def free_port() -> int:
     conflict.
 
     There is still a window between closing these sockets and the node binding
-    them, but the alternative is a fixed port that collides with whatever the
-    developer is already running.
+    them. What [`PORT_RANGE`] removes is the part of that window this suite
+    causes itself; a collision with something else on the machine is still
+    possible and is why this retries.
     """
-    for _ in range(50):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as first:
-            first.bind(("127.0.0.1", 0))
-            port = first.getsockname()[1]
-            try:
+    for _ in range(200):
+        port = random.randrange(PORT_RANGE[0], PORT_RANGE[1], 2)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as first:
+                first.bind(("127.0.0.1", port))
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as second:
                     second.bind(("127.0.0.1", port + 1))
-            except OSError:
-                continue
-            return port
+        except OSError:
+            continue
+        return port
     raise RuntimeError("could not find two consecutive free ports")
 
 

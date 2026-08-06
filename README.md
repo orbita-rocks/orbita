@@ -40,9 +40,10 @@ on, that is the thing worth reading.
 Orbita is being built in the open and is not ready for production. Nothing here
 is stable yet, including the on-disk format and the wire protocol.
 
-A single node serves reads, writes, deletes, and scans end to end today. A
-multi-node cluster starts and reports healthy, but workers do not yet register
-with the leader group, and the admin service is not implemented server-side.
+A single node serves reads, writes, deletes, scans, and the admin surface end
+to end today. A multi-node cluster starts, its workers register with the leader
+group, and writes replicate; an admin call sent to any node reaches the control
+plane's leader. Partition split and merge are refused on purpose.
 [docs/QUICKSTART.md](docs/QUICKSTART.md) keeps the current list of what works
 and what does not, and is the honest one to read before you spend an hour on
 this.

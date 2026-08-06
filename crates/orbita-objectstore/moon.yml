@@ -20,6 +20,13 @@ tasks:
   #
   # The endpoint comes from ORBITA_S3_TEST_* in the environment; see the module
   # docs in tests/minio.rs for a one-liner that stands one up locally.
+  #
+  # There is one task rather than one per backend, because the tests name no
+  # backend. Pull requests point it at MinIO in a container; the weekly job in
+  # .github/workflows/live-object-store.yml points the same task at a real AWS
+  # bucket and a real R2 bucket. Splitting it would let the thing that runs on
+  # every pull request drift away from the thing that checks the backends we
+  # actually tell people to use.
   test-live-s3:
     # Two commands, because a test binary containing no tests exits 0 and reads
     # as coverage. `--list` is the cheap assertion that the binary still holds

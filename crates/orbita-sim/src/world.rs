@@ -22,7 +22,7 @@ use orbita_runtime::{PeerCall, Rng, SeededRng, TransportError};
 pub(crate) type TransportResult<T> = Result<T, TransportError>;
 
 use bytes::Bytes;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -69,6 +69,43 @@ pub(crate) struct NodeState {
     pub files: BTreeMap<String, FileState>,
 }
 
+/// One object as the simulated store holds it.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredObject {
+    pub bytes: Bytes,
+    pub etag: String,
+}
+
+/// One bucket.
+///
+/// Buckets live in the world rather than in the handles that address them,
+/// for the same reason files do: a bucket is shared by every node that names
+/// it, and a replacement worker hydrating from what its predecessor wrote is
+/// the case the whole design turns on. A per-handle bucket would quietly make
+/// that case untestable.
+#[derive(Debug, Default)]
+pub(crate) struct BucketState {
+    pub objects: BTreeMap<String, StoredObject>,
+    /// Entity tags are never reused, including for an object that was deleted
+    /// and written again, so a compare-and-swap cannot succeed against a
+    /// version that no longer means what its holder thinks.
+    pub next_tag: u64,
+    /// Faults a scenario asked for by name, each fired at most once and
+    /// matched in the order they were queued.
+    pub injected: VecDeque<crate::objectstore::PendingFault>,
+    pub requests: u64,
+}
+
+impl BucketState {
+    pub fn tag(&mut self) -> String {
+        self.next_tag += 1;
+        // Quoted, because a real entity tag is a quoted string and the store
+        // passes it back into `If-Match` verbatim. An unquoted tag here would
+        // let a bug in that round trip pass.
+        format!("\"sim-{}\"", self.next_tag)
+    }
+}
+
 pub(crate) struct TaskSlot {
     /// The node the task belongs to, if any. Crashing a node drops its tasks,
     /// which is what makes a crash abrupt rather than graceful.
@@ -87,6 +124,7 @@ pub(crate) struct SimState {
     /// the same nanosecond still fire in a fixed order.
     pub timers: BTreeMap<(u64, u64), Waker>,
     pub nodes: BTreeMap<NodeId, NodeState>,
+    pub buckets: BTreeMap<String, BucketState>,
     /// Directed links that are down. `(a, b)` present means a message from `a`
     /// to `b` is discarded, while `b` to `a` may still flow. Asymmetric
     /// reachability is the case that finds bugs symmetric partitions do not,
@@ -116,6 +154,7 @@ impl SimState {
             ready: BTreeSet::new(),
             timers: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             blocked: BTreeSet::new(),
             handlers: BTreeMap::new(),
             trace: Trace::new(config.seed, config.trace_limit),
@@ -344,6 +383,61 @@ impl SimCore {
         }
         state.record(format!("clock advanced, {} timers fire", wakers.len()));
         Some(wakers)
+    }
+
+    /// Kills a node where it stands.
+    ///
+    /// This lives here rather than only on `Simulation` because a crash is not
+    /// always something a test schedules from the outside. The object store
+    /// can be asked to kill the node that issued a request, which is the only
+    /// way to place a crash exactly between a segment upload and the manifest
+    /// swap that would publish it, and that window is the one ADR 0006's
+    /// durability claim rests on.
+    pub fn crash_node(&self, node: NodeId) {
+        self.kill_node_tasks(node);
+        let mut state = self.state();
+        state.last_fault_nanos = Some(state.now);
+        let torn = self.config.disk.torn_tail_on_crash;
+        let mut torn_bytes = Vec::new();
+        if let Some(entry) = state.nodes.get_mut(&node) {
+            entry.up = false;
+            for (path, file) in entry.files.iter_mut() {
+                let unsynced = file.visible.len().saturating_sub(file.durable.len());
+                let keep = if torn && unsynced > 1 {
+                    // A prefix of the unsynced tail reached the platter. How
+                    // much is arbitrary, which is the point.
+                    self.fault_below(unsynced as u64) as usize
+                } else {
+                    0
+                };
+                if keep > 0 {
+                    torn_bytes.push((path.clone(), keep));
+                }
+                let end = file.durable.len() + keep;
+                file.visible.truncate(end);
+                file.durable.clear();
+                file.durable.extend_from_slice(&file.visible);
+            }
+        }
+        // Removed handlers are collected and dropped after the lock is
+        // released, the same rule task futures and re-registered handlers
+        // follow: a handler's destructor can reach back into the world, for
+        // example by waking the task that owned the other end of a channel.
+        let mut doomed = Vec::new();
+        state.handlers.retain(|(owner, _), handler| {
+            if *owner == node {
+                doomed.push(handler.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for (path, keep) in torn_bytes {
+            state.record(format!("torn tail node={node} path={path} bytes={keep}"));
+        }
+        state.record(format!("node {node} crashed"));
+        drop(state);
+        drop(doomed);
     }
 
     /// Drops every task belonging to a node. Used by crash, where the point is
