@@ -9,9 +9,9 @@ use crate::controller::Controller;
 use crate::controller::RegistrationOutcome;
 use crate::wire::{
     ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest, METHOD_DRAIN_NODE,
-    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
-    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
-    METHOD_REPORT_STATUS_V5,
+    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
+    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
+    METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
 };
 
 use bytes::Bytes;
@@ -145,6 +145,13 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 Err(e) => ControlResponse::Error(format!("undecodable drain request: {e}")),
             },
             METHOD_FETCH_NODES => ControlResponse::Nodes(self.controller.node_addresses().await),
+            METHOD_FETCH_CREDENTIALS => ControlResponse::Credentials(
+                self.controller
+                    .credential_snapshot()
+                    .await
+                    .credentials()
+                    .to_vec(),
+            ),
             METHOD_FETCH_COMMIT_INDEX => {
                 ControlResponse::CommitIndex(self.controller.commit_index().await)
             }

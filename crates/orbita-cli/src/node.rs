@@ -216,7 +216,8 @@ fn server_config(
         .with_node_id(NodeId(config.node.id))
         .with_listen_addr(listen)
         .with_peer_listen_addr(peer_listen)
-        .with_peer_advertise_addr(config.node.peer_advertise.clone());
+        .with_peer_advertise_addr(config.node.peer_advertise.clone())
+        .with_require_auth(config.cluster.require_auth);
 
     let peers = parse_leader_peers(&config.cluster.leader_peers)?;
     if !peers.is_empty() {

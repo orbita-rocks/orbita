@@ -82,6 +82,7 @@
 
 #![forbid(unsafe_code)]
 
+mod auth;
 mod aws;
 mod config;
 mod control;
@@ -176,6 +177,13 @@ impl Server {
     pub async fn start(config: ServerConfig) -> Result<Self> {
         let runtime = ServerRuntime::new(config.node_id, &config.data_dir, config.rng_seed)
             .with_peer_call_timeout(config.node_id, config.peer_call_timeout);
+        // The credential cache the client edge enforces against. Empty until
+        // the control loop's first fetch; harmless while auth is off, and safe
+        // while it is on, since an empty cache refuses rather than admits.
+        let authenticator = Arc::new(auth::Authenticator::new(
+            config.require_auth,
+            runtime.clock().clone(),
+        ));
         for (node, address) in &config.peers {
             runtime.transport().set_peer(*node, address.clone());
         }
@@ -334,6 +342,23 @@ impl Server {
             let directory =
                 PeerDirectorySync::new(client.clone(), runtime.transport().clone(), config.node_id);
             let leader_controller = controller.clone();
+            // Keep the credential cache warm on its own timer, but only when
+            // authentication is on: a cluster with it off never reads the cache,
+            // and skipping the fetch keeps a worker from calling a method an
+            // older leader may not serve. Separate from the map loop because it
+            // has a different failure story: a fetch that fails leaves the last
+            // good set in place rather than touching readiness or routing, so a
+            // control plane outage never fails every request closed. A leader
+            // member reads its own committed state; a worker pulls it over the
+            // wire.
+            if config.require_auth {
+                tokio::spawn(Self::refresh_credentials_loop(
+                    Arc::downgrade(&authenticator),
+                    client.clone(),
+                    leader_controller.clone(),
+                    config.control_poll_interval,
+                ));
+            }
             tokio::spawn(Self::control_loop(
                 Arc::downgrade(&node),
                 status,
@@ -359,9 +384,13 @@ impl Server {
             .map_err(|e| Error::Internal(format!("serving on {local_addr}: {e}")))?;
 
         let (shutdown, stop) = tokio::sync::oneshot::channel();
-        let service = KvServer::new(KvService::new(Arc::clone(&node)));
+        let service = KvServer::new(KvService::new(
+            Arc::clone(&node),
+            Arc::clone(&authenticator),
+        ));
         let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
-        let admin = controller.map(AdminService::new);
+        let admin = controller
+            .map(|controller| AdminService::new(controller).require_auth(config.require_auth));
         let serving = tokio::spawn(async move {
             let shutdown = async {
                 // A dropped sender means the `Server` handle went away, so
@@ -488,6 +517,46 @@ impl Server {
                 return;
             };
             live.flush_owned().await;
+        }
+    }
+
+    /// Keeps the client edge's credential cache in step with the control plane,
+    /// forever.
+    ///
+    /// This is the worker half of the enforcement the `authenticate` comment in
+    /// `orbita_control` describes: rather than a control-plane round trip per
+    /// request, the worker pulls the whole credential set on a timer and checks
+    /// against it locally. Refreshing the whole set is what makes revocation
+    /// take effect on the next request rather than the next connection. A weak
+    /// reference to the authenticator, so a dropped node stops refreshing rather
+    /// than pinning itself alive. A leader member reads its own committed state
+    /// with no transport in the way; a worker fetches it over the wire, and a
+    /// fetch that fails leaves the last good set in place.
+    async fn refresh_credentials_loop(
+        authenticator: std::sync::Weak<auth::Authenticator<<ServerRuntime as Runtime>::Clock>>,
+        client: ControlClient<ServerRuntime>,
+        leader_controller: Option<Controller<ServerRuntime, RaftLog>>,
+        interval: Duration,
+    ) {
+        loop {
+            let Some(authenticator) = authenticator.upgrade() else {
+                return;
+            };
+            match &leader_controller {
+                Some(controller) => {
+                    authenticator.refresh(controller.credential_snapshot().await);
+                }
+                None => match client.fetch_credentials().await {
+                    Ok(credentials) => {
+                        authenticator.refresh(orbita_control::CredentialSnapshot::new(credentials));
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "could not refresh the credential cache");
+                    }
+                },
+            }
+            drop(authenticator);
+            tokio::time::sleep(interval).await;
         }
     }
 

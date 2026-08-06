@@ -10,6 +10,7 @@
 
 use crate::codec::{CodecError, CodecResult, Reader, Writer};
 use crate::membership::NodeStatus;
+use crate::model::Credential;
 use crate::version::{ClusterVersion, CompatibilityRefusal, VersionRange};
 
 use bytes::Bytes;
@@ -52,6 +53,10 @@ pub const METHOD_REPORT_STATUS_V4: u16 = 8;
 /// the fallback below already knows how to lose a field and keep the
 /// heartbeat.
 pub const METHOD_REPORT_STATUS_V5: u16 = 9;
+/// Fetches every live credential, secret hashes and all, so a worker can
+/// enforce authentication against a cached copy rather than a control-plane
+/// round trip per request. A worker polls this on the same timer as its map.
+pub const METHOD_FETCH_CREDENTIALS: u16 = 10;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -62,6 +67,7 @@ const STATUS_COMMIT_INDEX: u8 = 5;
 const STATUS_UNAVAILABLE: u8 = 6;
 const STATUS_INCOMPATIBLE: u8 = 7;
 const STATUS_DRAIN_PROGRESS: u8 = 8;
+const STATUS_CREDENTIALS: u8 = 9;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -226,6 +232,12 @@ pub(crate) enum ControlResponse {
         complete: bool,
         map_version: MapVersion,
     },
+    /// Every live credential, secret hashes and all.
+    ///
+    /// This is the one control-plane answer that carries secret material, and
+    /// it carries only the hashes the replicated log already holds, never a
+    /// secret. A worker caches it to enforce authentication locally.
+    Credentials(Vec<Credential>),
     /// The leader's committed control-command index.
     CommitIndex(crate::LogIndex),
     /// This member cannot establish leader authority right now. Unlike a
@@ -283,6 +295,10 @@ impl ControlResponse {
                 refusal.speaks.encode(&mut w);
                 refusal.active.encode(&mut w);
             }
+            ControlResponse::Credentials(credentials) => {
+                w.u8(STATUS_CREDENTIALS);
+                w.seq(credentials, |w, credential| credential.encode(w));
+            }
             ControlResponse::CommitIndex(index) => {
                 w.u8(STATUS_COMMIT_INDEX).u64(*index);
             }
@@ -329,6 +345,7 @@ impl ControlResponse {
                 speaks: VersionRange::decode(&mut r)?,
                 active: ClusterVersion::decode(&mut r)?,
             }),
+            STATUS_CREDENTIALS => ControlResponse::Credentials(r.seq(|r| Credential::decode(r))?),
             STATUS_COMMIT_INDEX => ControlResponse::CommitIndex(r.u64()?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
             STATUS_UNAVAILABLE => ControlResponse::Unavailable(r.string()?),
@@ -512,6 +529,15 @@ mod tests {
             ControlResponse::Unavailable("catching up".into()),
             ControlResponse::Error("no".into()),
             ControlResponse::CommitIndex(42),
+            ControlResponse::Credentials(vec![Credential {
+                id: "cred-1".into(),
+                secret_hash: crate::model::hash_secret("s3cret"),
+                keyspaces: vec!["catalog".into()],
+                permissions: vec![crate::model::Permission::Read],
+                description: "a worker's cached copy".into(),
+                created_at_millis: 7,
+                expires_at_millis: Some(99),
+            }]),
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),

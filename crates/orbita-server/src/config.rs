@@ -218,6 +218,18 @@ pub struct ServerConfig {
     /// Pins the node's randomness so that a production run can be replayed
     /// with the same jitter decisions. Unset draws one at startup.
     pub rng_seed: Option<u64>,
+
+    /// Whether clients must present a credential.
+    ///
+    /// Off by default, because a cluster that refuses its first request before
+    /// anyone has issued a credential is a cluster nobody can bootstrap, and
+    /// the single-node and test shapes have no control plane to issue one at
+    /// all. Turning it on is an explicit operator decision (`ORBITA_REQUIRE_AUTH`)
+    /// that the CLI mirrors: with it off, an unauthenticated request is allowed
+    /// through rather than rejected, so the server is the one place that decides
+    /// whether a credential was required. See [`crate::Server`] and the `auth`
+    /// module for the enforcement path.
+    pub require_auth: bool,
 }
 
 impl Default for ServerConfig {
@@ -243,6 +255,7 @@ impl Default for ServerConfig {
             ))),
             lease_duration: DEFAULT_LEASE_DURATION,
             rng_seed: None,
+            require_auth: false,
         }
     }
 }
@@ -357,6 +370,14 @@ impl ServerConfig {
     #[must_use]
     pub fn with_lease_duration(mut self, duration: Duration) -> Self {
         self.lease_duration = duration;
+        self
+    }
+
+    /// Turns credential enforcement on, so every client request must carry a
+    /// valid `authorization: Bearer <secret>` header.
+    #[must_use]
+    pub fn with_require_auth(mut self, require_auth: bool) -> Self {
+        self.require_auth = require_auth;
         self
     }
 

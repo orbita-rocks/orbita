@@ -65,6 +65,7 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "cluster.leader_peers, comma separated NODE_ID=ADDR entries",
     ),
     ("ORBITA_ALLOW_VERSION_SKEW", "cluster.allow_version_skew"),
+    ("ORBITA_REQUIRE_AUTH", "cluster.require_auth"),
     (
         "ORBITA_JOIN_BACKOFF_INITIAL",
         "cluster.join_backoff_initial, a duration such as 250ms",
@@ -222,6 +223,13 @@ pub struct ClusterConfig {
     /// See [`crate::node`] for why.
     pub leader_peers: Vec<String>,
     pub allow_version_skew: bool,
+    /// Whether this cluster requires a credential on every client request.
+    ///
+    /// Off by default so a fresh cluster can be brought up and its first
+    /// credential issued; on, every `Kv` and `Admin` call must carry a valid
+    /// `authorization: Bearer <secret>` header. This is the server-side switch
+    /// the CLI's own credential handling assumes exists.
+    pub require_auth: bool,
     /// How long to wait before the first retry when the leader group is not
     /// reachable yet.
     pub join_backoff_initial_millis: u64,
@@ -399,6 +407,7 @@ pub struct ClusterLayer {
     pub name: Option<String>,
     pub leader_peers: Option<Vec<String>>,
     pub allow_version_skew: Option<bool>,
+    pub require_auth: Option<bool>,
     pub join_backoff_initial: Option<String>,
     pub join_backoff_max: Option<String>,
     pub join_timeout: Option<String>,
@@ -471,6 +480,7 @@ impl Layer {
             name,
             leader_peers,
             allow_version_skew,
+            require_auth,
             join_backoff_initial,
             join_backoff_max,
             join_timeout,
@@ -599,6 +609,7 @@ impl Layer {
                 name: get("ORBITA_CLUSTER_NAME").map(str::to_owned),
                 leader_peers: get("ORBITA_LEADER_PEERS").map(parse_list),
                 allow_version_skew: flag("ORBITA_ALLOW_VERSION_SKEW")?,
+                require_auth: flag("ORBITA_REQUIRE_AUTH")?,
                 join_backoff_initial: get("ORBITA_JOIN_BACKOFF_INITIAL").map(str::to_owned),
                 join_backoff_max: get("ORBITA_JOIN_BACKOFF_MAX").map(str::to_owned),
                 join_timeout: get("ORBITA_JOIN_TIMEOUT").map(str::to_owned),
@@ -773,6 +784,7 @@ impl Layer {
                 name: self.cluster.name.unwrap_or_else(|| "orbita".to_owned()),
                 leader_peers: self.cluster.leader_peers.unwrap_or_default(),
                 allow_version_skew: self.cluster.allow_version_skew.unwrap_or(false),
+                require_auth: self.cluster.require_auth.unwrap_or(false),
                 join_backoff_initial_millis,
                 join_backoff_max_millis,
                 join_timeout_millis,

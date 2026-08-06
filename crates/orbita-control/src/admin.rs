@@ -19,12 +19,17 @@ use tonic::{Request, Response, Status};
 /// Serves the `Admin` API for one leader group node.
 pub struct AdminService<R: Runtime, L: ConsensusLog> {
     controller: Controller<R, L>,
+    /// Whether a caller must present a credential. Off by default so a cluster
+    /// stays easy to bring up; a node running with authentication on turns it
+    /// on. See [`AdminService::require_auth`].
+    require_auth: bool,
 }
 
 impl<R: Runtime, L: ConsensusLog> Clone for AdminService<R, L> {
     fn clone(&self) -> Self {
         Self {
             controller: self.controller.clone(),
+            require_auth: self.require_auth,
         }
     }
 }
@@ -32,7 +37,22 @@ impl<R: Runtime, L: ConsensusLog> Clone for AdminService<R, L> {
 impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
     #[must_use]
     pub fn new(controller: Controller<R, L>) -> Self {
-        Self { controller }
+        Self {
+            controller,
+            require_auth: false,
+        }
+    }
+
+    /// Turns credential enforcement on for this admin surface.
+    ///
+    /// A cluster with authentication off is an explicit, node-level decision,
+    /// not an accident of a missing credential: the flag is what the server and
+    /// the CLI agree on, so an operator can always tell an open cluster apart
+    /// from one whose caller forgot a token.
+    #[must_use]
+    pub fn require_auth(mut self, require_auth: bool) -> Self {
+        self.require_auth = require_auth;
+        self
     }
 
     /// Wraps this in the generated tonic service, ready to add to a server.
@@ -43,6 +63,28 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
 
     async fn ready(&self) -> Result<(), Status> {
         self.controller.ensure_leader_ready().await.map_err(status)
+    }
+
+    /// Authorizes a cluster-wide admin call from the request's bearer token.
+    ///
+    /// Admin runs only on a leader group member, which holds the credential
+    /// state locally, so this is a lock and a scan rather than a round trip.
+    /// The rule is [`crate::CredentialSnapshot::authorize_admin`]: any
+    /// unexpired, write-capable credential may operate the cluster.
+    async fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if !self.require_auth {
+            return Ok(());
+        }
+        let header = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        let secret = crate::bearer_secret(header).map_err(status)?;
+        self.controller
+            .credential_snapshot()
+            .await
+            .authorize_admin(secret, self.controller.now_millis())
+            .map_err(status)
     }
 }
 
@@ -107,6 +149,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateKeyspaceRequest>,
     ) -> Result<Response<pb::Keyspace>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         let request = request.into_inner();
         let keyspace = self
@@ -125,6 +168,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::UpdateKeyspaceRequest>,
     ) -> Result<Response<pb::Keyspace>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         let request = request.into_inner();
         let keyspace = self
@@ -143,6 +187,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::DeleteKeyspaceRequest>,
     ) -> Result<Response<pb::DeleteKeyspaceResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         let request = request.into_inner();
         // The proto asks for the name twice so that a script cannot destroy a
@@ -162,8 +207,9 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn list_keyspaces(
         &self,
-        _request: Request<pb::ListKeyspacesRequest>,
+        request: Request<pb::ListKeyspacesRequest>,
     ) -> Result<Response<pb::ListKeyspacesResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         // One view for the whole list. Taking one per keyspace made this
         // quadratic and let two rows disagree about the same cluster.
@@ -183,6 +229,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateCredentialRequest>,
     ) -> Result<Response<pb::CreateCredentialResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         let request = request.into_inner();
         let permissions: Vec<Permission> = request
@@ -216,6 +263,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::RevokeCredentialRequest>,
     ) -> Result<Response<pb::RevokeCredentialResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         self.controller
             .revoke_credential(&request.into_inner().credential_id)
@@ -228,6 +276,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::DescribeClusterRequest>,
     ) -> Result<Response<pb::DescribeClusterResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         let filter = request.into_inner().keyspace;
         let view = self.controller.view().await;
@@ -323,8 +372,9 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn finalize_upgrade(
         &self,
-        _request: Request<pb::FinalizeUpgradeRequest>,
+        request: Request<pb::FinalizeUpgradeRequest>,
     ) -> Result<Response<pb::FinalizeUpgradeResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         let finalized = self.controller.finalize_upgrade().await.map_err(status)?;
         Ok(Response::new(pb::FinalizeUpgradeResponse {
@@ -335,8 +385,9 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn split_partition(
         &self,
-        _request: Request<pb::SplitPartitionRequest>,
+        request: Request<pb::SplitPartitionRequest>,
     ) -> Result<Response<pb::SplitPartitionResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         Err(Status::unimplemented(
             "partition split is disabled until child storage preparation is implemented",
@@ -345,8 +396,9 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
 
     async fn merge_partitions(
         &self,
-        _request: Request<pb::MergePartitionsRequest>,
+        request: Request<pb::MergePartitionsRequest>,
     ) -> Result<Response<pb::MergePartitionsResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         // Answering with a clear refusal rather than a half-built merge. See
         // the crate documentation for what a correct one has to guarantee.
@@ -359,6 +411,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::TransferOwnershipRequest>,
     ) -> Result<Response<pb::TransferOwnershipResponse>, Status> {
+        self.authorize(&request).await?;
         self.ready().await?;
         let request = request.into_inner();
         let partition = PartitionId(request.partition_id);
