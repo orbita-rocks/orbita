@@ -60,17 +60,31 @@ pub enum ReadinessCondition {
     /// The node has not begun a planned shutdown. Clearing this makes the
     /// readiness probe fail before ownership starts moving away.
     AcceptingOwnership,
+    /// This node's `require_auth` agrees with the cluster's authentication
+    /// policy, as advertised by the leader group.
+    ///
+    /// Met by default and cleared only on a *positive* disagreement, so it
+    /// never wedges a cluster that cannot advertise the policy (a leader too
+    /// old to serve it, or a node with no leader group). Its whole job is to
+    /// pull the one dangerous shape out of the load balancer: a node that
+    /// requires no auth while the cluster does, which would otherwise let a
+    /// client bypass the boundary through that node during a rolling change to
+    /// the setting. A node that requires auth while the cluster does not is not
+    /// a bypass, but it is still misconfigured, so it is failed too — the
+    /// disagreement is what matters, not its direction.
+    AuthPolicyAgreed,
 }
 
 impl ReadinessCondition {
     /// Every condition, in the order reports list them.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ClusterVersionCompatible,
         Self::ControlPlaneJoined,
         Self::WalRecovered,
         Self::PartitionsCaughtUp,
         Self::ReplicasRecoverable,
         Self::AcceptingOwnership,
+        Self::AuthPolicyAgreed,
     ];
 
     /// A stable machine-readable name, which is what crosses the wire and what
@@ -84,6 +98,7 @@ impl ReadinessCondition {
             Self::PartitionsCaughtUp => "partitions-caught-up",
             Self::ReplicasRecoverable => "replicas-recoverable",
             Self::AcceptingOwnership => "accepting-ownership",
+            Self::AuthPolicyAgreed => "auth-policy-agreed",
         }
     }
 }
@@ -106,6 +121,7 @@ pub struct ReadinessState {
     caught_up: bool,
     replicas_recoverable: bool,
     accepting_ownership: bool,
+    auth_policy_agreed: bool,
 }
 
 impl ReadinessState {
@@ -118,6 +134,7 @@ impl ReadinessState {
             && self.caught_up
             && self.replicas_recoverable
             && self.accepting_ownership
+            && self.auth_policy_agreed
     }
 
     /// Whether one condition holds.
@@ -130,6 +147,7 @@ impl ReadinessState {
             ReadinessCondition::PartitionsCaughtUp => self.caught_up,
             ReadinessCondition::ReplicasRecoverable => self.replicas_recoverable,
             ReadinessCondition::AcceptingOwnership => self.accepting_ownership,
+            ReadinessCondition::AuthPolicyAgreed => self.auth_policy_agreed,
         }
     }
 
@@ -150,6 +168,7 @@ impl ReadinessState {
             ReadinessCondition::PartitionsCaughtUp => self.caught_up = met,
             ReadinessCondition::ReplicasRecoverable => self.replicas_recoverable = met,
             ReadinessCondition::AcceptingOwnership => self.accepting_ownership = met,
+            ReadinessCondition::AuthPolicyAgreed => self.auth_policy_agreed = met,
         }
     }
 }

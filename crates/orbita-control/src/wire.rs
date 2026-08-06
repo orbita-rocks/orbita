@@ -15,6 +15,7 @@
 
 use crate::codec::{CodecError, CodecResult, Reader, Writer};
 use crate::membership::NodeStatus;
+use crate::model::Credential;
 use crate::version::{ClusterVersion, CompatibilityRefusal, VersionRange};
 
 use bytes::Bytes;
@@ -66,6 +67,19 @@ pub const METHOD_REPORT_STATUS_V5: u16 = 9;
 /// because that is the only path with leader discovery and redirect already
 /// built into it, which is precisely what a misdirected admin call needs.
 pub const METHOD_ADMIN_CALL: u16 = 10;
+/// Fetches every live credential, secret hashes and all, so a worker can
+/// enforce authentication against a cached copy rather than a control-plane
+/// round trip per request. A worker polls this on the same timer as its map.
+pub const METHOD_FETCH_CREDENTIALS: u16 = 11;
+/// Asks the leader group whether the cluster requires authentication.
+///
+/// This is what lets a node gate its readiness on agreeing with the cluster's
+/// auth policy rather than on its own config alone: without it, a rolling
+/// change to `require_auth` leaves a window where an auth-disabled node behind
+/// the load balancer accepts unauthenticated requests while its peers reject
+/// them. A leader too old to serve this returns an error, which the caller
+/// reads as "cannot determine" and does not gate on — the documented residual.
+pub const METHOD_FETCH_AUTH_POLICY: u16 = 12;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -78,6 +92,8 @@ const STATUS_INCOMPATIBLE: u8 = 7;
 const STATUS_DRAIN_PROGRESS: u8 = 8;
 const STATUS_ADMIN_OK: u8 = 9;
 const STATUS_ADMIN_FAILED: u8 = 10;
+const STATUS_CREDENTIALS: u8 = 11;
+const STATUS_AUTH_POLICY: u8 = 12;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -289,6 +305,15 @@ pub(crate) enum ControlResponse {
         complete: bool,
         map_version: MapVersion,
     },
+    /// Every live credential, secret hashes and all.
+    ///
+    /// This is the one control-plane answer that carries secret material, and
+    /// it carries only the hashes the replicated log already holds, never a
+    /// secret. A worker caches it to enforce authentication locally.
+    Credentials(Vec<Credential>),
+    /// Whether the leader group requires authentication, for a node checking
+    /// its own `require_auth` against the cluster's before it reports ready.
+    AuthPolicy(bool),
     /// The leader ran a forwarded admin call and it succeeded. The bytes are
     /// the encoded protobuf response, which the forwarding node hands back to
     /// its client untouched.
@@ -358,6 +383,13 @@ impl ControlResponse {
                 refusal.speaks.encode(&mut w);
                 refusal.active.encode(&mut w);
             }
+            ControlResponse::Credentials(credentials) => {
+                w.u8(STATUS_CREDENTIALS);
+                w.seq(credentials, |w, credential| credential.encode(w));
+            }
+            ControlResponse::AuthPolicy(require_auth) => {
+                w.u8(STATUS_AUTH_POLICY).u8(u8::from(*require_auth));
+            }
             ControlResponse::AdminOk(payload) => {
                 w.u8(STATUS_ADMIN_OK).bytes(payload);
             }
@@ -410,6 +442,8 @@ impl ControlResponse {
                 speaks: VersionRange::decode(&mut r)?,
                 active: ClusterVersion::decode(&mut r)?,
             }),
+            STATUS_CREDENTIALS => ControlResponse::Credentials(r.seq(|r| Credential::decode(r))?),
+            STATUS_AUTH_POLICY => ControlResponse::AuthPolicy(r.u8()? != 0),
             STATUS_ADMIN_OK => ControlResponse::AdminOk(r.bytes()?),
             STATUS_ADMIN_FAILED => ControlResponse::AdminFailed {
                 code: r.u32()?,
@@ -598,11 +632,22 @@ mod tests {
             ControlResponse::Unavailable("catching up".into()),
             ControlResponse::Error("no".into()),
             ControlResponse::CommitIndex(42),
+            ControlResponse::Credentials(vec![Credential {
+                id: "cred-1".into(),
+                secret_hash: crate::model::hash_secret("s3cret"),
+                keyspaces: vec!["catalog".into()],
+                permissions: vec![crate::model::Permission::Read],
+                description: "a worker's cached copy".into(),
+                created_at_millis: 7,
+                expires_at_millis: Some(99),
+            }]),
             ControlResponse::AdminOk(Bytes::from_static(b"encoded response")),
             ControlResponse::AdminFailed {
                 code: 5,
                 message: "no such keyspace".into(),
             },
+            ControlResponse::AuthPolicy(true),
+            ControlResponse::AuthPolicy(false),
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),

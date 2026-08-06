@@ -128,6 +128,10 @@ Upgrading is a StatefulSet rolling update and nothing else. `docs/UPGRADES.md`
 has the procedure and is honest about which parts of it the server does not
 support yet.
 
+To stand up a throwaway cluster on real EKS with S3 as the object store —
+`credentialSource: web-identity`, an IRSA role, gp3 — `docs/TESTING-ON-EKS.md`
+is one command up and one command down.
+
 ## The two ports
 
 Every node binds two listeners, and the difference matters when you deploy.

@@ -9,19 +9,49 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use orbita_objectstore::{ETag, ObjectError, ObjectMeta, ObjectResult, ObjectStore, Precondition};
+use orbita_objectstore::{
+    BackendTime, ETag, ObjectError, ObjectMeta, ObjectResult, ObjectStore, Precondition,
+};
+use orbita_runtime::Clock;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Default)]
+/// A source of write times for the store to stamp on objects.
+///
+/// It is a captured closure rather than a `dyn Clock` because [`Clock`] is not
+/// object safe (its `sleep` returns an `impl Future`), and rather than a
+/// generic parameter because that would ripple `MemoryStore<C>` through every
+/// test and helper that names the type. `None` here is the whole point: a
+/// store built without a clock cannot report a write time, which is exactly
+/// the case the sweep must refuse to act on.
+type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+#[derive(Default)]
 pub struct MemoryStore {
     state: Mutex<State>,
+    /// The runtime clock this store stamps writes from, if any. Held outside
+    /// the locked state because it never changes after construction.
+    clock: Option<ClockFn>,
+}
+
+impl fmt::Debug for MemoryStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoryStore")
+            .field("state", &self.state)
+            .field("clock", &self.clock.as_ref().map(|_| "set"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Default)]
 struct State {
-    objects: BTreeMap<String, (Bytes, ETag)>,
+    /// Each object is its bytes, its current tag, and the write time the store
+    /// stamped, which is `None` unless the store was built with a clock. The
+    /// stamp is a [`BackendTime`] because this store's clock stands in for the
+    /// backend's own clock domain, the one the orphan sweep must reason within.
+    objects: BTreeMap<String, (Bytes, ETag, Option<BackendTime>)>,
     /// Entity tags are never reused, including for an object that was deleted
     /// and written again, so a compare-and-swap cannot succeed against a
     /// version that no longer means what the holder thinks.
@@ -43,6 +73,28 @@ impl MemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store that stamps every write with `clock`'s current time.
+    ///
+    /// The simulator hands its own [`Clock`] here so the write times objects
+    /// carry advance with virtual time, which is what lets a simulated orphan
+    /// sweep reason about a grace period deterministically instead of racing
+    /// the wall clock. A store built with [`new`](Self::new) has no clock and
+    /// reports `None`, standing in for a backend that cannot report a time.
+    #[must_use]
+    pub fn with_clock<C: Clock>(clock: C) -> Self {
+        Self {
+            state: Mutex::default(),
+            clock: Some(Arc::new(move || clock.now_millis())),
+        }
+    }
+
+    /// The write time the configured clock would stamp right now, or `None`
+    /// when no clock was configured. It is a [`BackendTime`]: to a caller this
+    /// store is the backend, so its clock is the backend's clock domain.
+    fn stamp(&self) -> Option<BackendTime> {
+        self.clock.as_ref().map(|clock| BackendTime(clock()))
     }
 
     /// Every key currently held, for a test that wants to assert about orphans.
@@ -75,9 +127,12 @@ impl MemoryStore {
 #[async_trait]
 impl ObjectStore for MemoryStore {
     async fn put(&self, key: &str, data: Bytes) -> ObjectResult<ETag> {
+        let stamp = self.stamp();
         let mut state = self.lock();
         let tag = state.tag();
-        state.objects.insert(key.to_string(), (data, tag.clone()));
+        state
+            .objects
+            .insert(key.to_string(), (data, tag.clone(), stamp));
         Ok(tag)
     }
 
@@ -87,8 +142,9 @@ impl ObjectStore for MemoryStore {
         data: Bytes,
         precondition: Precondition,
     ) -> ObjectResult<ETag> {
+        let stamp = self.stamp();
         let mut state = self.lock();
-        let current = state.objects.get(key).map(|(_, tag)| tag.clone());
+        let current = state.objects.get(key).map(|(_, tag, _)| tag.clone());
         let holds = match (&precondition, &current) {
             (Precondition::NotExists, None) => true,
             (Precondition::Match(expected), Some(actual)) => expected == actual,
@@ -98,7 +154,9 @@ impl ObjectStore for MemoryStore {
             return Err(ObjectError::PreconditionFailed(key.to_string()));
         }
         let tag = state.tag();
-        state.objects.insert(key.to_string(), (data, tag.clone()));
+        state
+            .objects
+            .insert(key.to_string(), (data, tag.clone(), stamp));
         Ok(tag)
     }
 
@@ -106,14 +164,14 @@ impl ObjectStore for MemoryStore {
         self.lock()
             .objects
             .get(key)
-            .cloned()
+            .map(|(data, tag, _)| (data.clone(), tag.clone()))
             .ok_or_else(|| ObjectError::NotFound(key.to_string()))
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> ObjectResult<Bytes> {
         let mut state = self.lock();
         state.ranges.push((key.to_string(), range.clone()));
-        let (data, _) = state
+        let (data, _, _) = state
             .objects
             .get(key)
             .ok_or_else(|| ObjectError::NotFound(key.to_string()))?;
@@ -129,7 +187,7 @@ impl ObjectStore for MemoryStore {
 
     async fn head(&self, key: &str) -> ObjectResult<ObjectMeta> {
         let state = self.lock();
-        let (data, tag) = state
+        let (data, tag, last_modified) = state
             .objects
             .get(key)
             .ok_or_else(|| ObjectError::NotFound(key.to_string()))?;
@@ -137,6 +195,7 @@ impl ObjectStore for MemoryStore {
             key: key.to_string(),
             size: data.len() as u64,
             etag: tag.clone(),
+            last_modified: *last_modified,
         })
     }
 
@@ -146,10 +205,11 @@ impl ObjectStore for MemoryStore {
             .objects
             .range(prefix.to_string()..)
             .take_while(|(key, _)| key.starts_with(prefix))
-            .map(|(key, (data, tag))| ObjectMeta {
+            .map(|(key, (data, tag, last_modified))| ObjectMeta {
                 key: key.clone(),
                 size: data.len() as u64,
                 etag: tag.clone(),
+                last_modified: *last_modified,
             })
             .collect())
     }
@@ -158,6 +218,42 @@ impl ObjectStore for MemoryStore {
         self.lock().objects.remove(key);
         Ok(())
     }
+}
+
+/// A hand-driven clock, so a test can advance write time without pulling in the
+/// simulator. It reports the same `now_millis` every call until moved forward,
+/// which is all the store's stamping needs.
+#[cfg(test)]
+#[derive(Clone)]
+struct ManualClock {
+    millis: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    fn at(millis: u64) -> Self {
+        Self {
+            millis: Arc::new(std::sync::atomic::AtomicU64::new(millis)),
+        }
+    }
+
+    fn set(&self, millis: u64) {
+        self.millis
+            .store(millis, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl Clock for ManualClock {
+    fn now_millis(&self) -> u64 {
+        self.millis.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn monotonic_nanos(&self) -> u64 {
+        self.now_millis().saturating_mul(1_000_000)
+    }
+
+    async fn sleep(&self, _duration: std::time::Duration) {}
 }
 
 #[cfg(test)]
@@ -225,5 +321,54 @@ mod tests {
             .map(|m| m.key)
             .collect();
         assert_eq!(listed, vec!["p/a".to_string(), "p/b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_clocked_store_stamps_the_write_time_the_listing_reports() {
+        let clock = ManualClock::at(1_000);
+        let store = MemoryStore::with_clock(clock.clone());
+        store.put("p/a", Bytes::from_static(b"x")).await.unwrap();
+
+        // A later write is stamped with the clock's later reading, so the times
+        // objects carry track virtual time rather than an insertion counter.
+        clock.set(5_000);
+        store.put("p/b", Bytes::from_static(b"y")).await.unwrap();
+
+        let listed = store.list("p/").await.unwrap();
+        let times: Vec<Option<BackendTime>> = listed.iter().map(|m| m.last_modified).collect();
+        assert_eq!(
+            times,
+            vec![Some(BackendTime(1_000)), Some(BackendTime(5_000))]
+        );
+        // The same stamp is reachable through head, which is where a caller
+        // that already knows the key looks.
+        assert_eq!(
+            store.head("p/a").await.unwrap().last_modified,
+            Some(BackendTime(1_000))
+        );
+
+        // The stamp comes from the controllable runtime clock, so a sweep can
+        // reason about age entirely within that one domain: an object written
+        // at 1_000 is not yet old at a same-domain now of 3_000 against a
+        // 2_500ms grace, but is old once the clock reaches 5_000.
+        let object = store.head("p/a").await.unwrap();
+        assert!(!object.is_safely_older_than(BackendTime(3_000), 2_500, 0));
+        assert!(object.is_safely_older_than(BackendTime(5_000), 2_500, 0));
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_clock_cannot_report_a_write_time() {
+        // This stands in for a backend that cannot report a time: the sweep is
+        // required to refuse to act on such an object rather than read the
+        // absence as "very old".
+        let store = MemoryStore::new();
+        store.put("p/a", Bytes::from_static(b"x")).await.unwrap();
+        assert_eq!(store.head("p/a").await.unwrap().last_modified, None);
+        assert_eq!(store.list("p/").await.unwrap()[0].last_modified, None);
+
+        // And with no write time, the object is never a deletion candidate, no
+        // matter how far the reference clock has advanced.
+        let object = store.head("p/a").await.unwrap();
+        assert!(!object.is_safely_older_than(BackendTime(u64::MAX), 0, 0));
     }
 }

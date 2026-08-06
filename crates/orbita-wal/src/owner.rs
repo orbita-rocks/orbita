@@ -907,13 +907,18 @@ impl<R: Runtime> Wal<R> {
     ///
     /// [ADR 0002]: https://github.com/orbita-rocks/orbita/blob/develop/docs/adr/0002-key-versions-are-partition-lamports.md
     pub async fn quiesce(&self) -> Result<Lamport> {
-        let (committed, durable) = {
+        let (committed, dropped_from) = {
             let mut state = self.state();
             if let Some(fatal) = &state.fatal {
                 return Err(fatal.clone());
             }
             // Set before the check below, so that a caller that has to retry
-            // is not racing new writes on the way back in.
+            // is not racing new writes on the way back in. It also freezes the
+            // committed prefix: from here [`advance`] refuses to raise it, so a
+            // batch acknowledged during the truncate below cannot report an
+            // entry committed that this call is about to drop. Without that,
+            // the acknowledgement racing the truncate is exactly how a planned
+            // handoff loses an acknowledged write (issue #77).
             state.quiesced = true;
             if !state.pending.is_empty() {
                 return Err(Error::Internal(format!(
@@ -924,8 +929,8 @@ impl<R: Runtime> Wal<R> {
             }
             (state.replicated, state.durable_local)
         };
-        if durable <= committed {
-            return Ok(durable);
+        if dropped_from <= committed {
+            return Ok(dropped_from);
         }
 
         self.log.truncate_above(committed).await?;
@@ -934,9 +939,17 @@ impl<R: Runtime> Wal<R> {
             let mut state = self.state();
             state.durable_local = durable;
             state.next_lamport = durable;
+            // Everything the truncation dropped sat above the committed prefix,
+            // so no client was told it succeeded — and with the prefix frozen,
+            // none can be. Marking the dropped span failed is what turns the
+            // still-pending `commit` of a batch that was in flight when the
+            // drain began into the `Unavailable` its client must get, rather
+            // than leaving it to wait forever on a prefix that will never reach
+            // it. The floor is the committed prefix, so a kept entry is never
+            // failed by this.
+            state.failed_through = state.failed_through.max(dropped_from);
             // A batch that is gone from the log cannot be rescued by a reply
-            // that is still on the wire. `advance` clamps as well; this keeps
-            // the two from disagreeing about what is even in flight.
+            // that is still on the wire.
             state.inflight.retain(|batch| batch.last <= durable);
         }
         self.progress.notify_waiters();
@@ -1333,6 +1346,19 @@ enum Outcome {
 /// durable position, and only after the replies that could arrive late were
 /// already for entries no client is waiting on.
 fn advance(state: &mut OwnerState) {
+    // A quiescing owner has already chosen the position it is truncating the
+    // log down to and frozen its committed prefix there. A batch whose
+    // acknowledgement lands during the truncate must not raise the prefix past
+    // that floor: [`Wal::quiesce`] drops everything above it, so reporting one
+    // of those entries committed here would hand a client an acknowledgement
+    // for a write the log no longer holds and the next owner never sees. That
+    // is the acknowledged write that goes missing across a planned handoff in
+    // issue #77. The drop the drain performs is the source of truth once
+    // quiescing has begun; the late reply is stale by exactly the shape the
+    // freeze exists to reject.
+    if state.quiesced {
+        return;
+    }
     let mut best = state.replicated;
     for batch in &state.inflight {
         if batch.acked && batch.last > best {

@@ -2,9 +2,17 @@
 //!
 //! This layer is thin on purpose. It turns a tonic request into the node's
 //! request, and an `orbita_core::Error` into a status through the one mapping
-//! in [`crate::status`]. Everything else, meaning routing, conditions, and the
-//! read path, belongs to the node so that a request that arrives over the peer
-//! transport takes exactly the same path as one that arrives over gRPC.
+//! in [`crate::status`]. Everything else, meaning routing, conditions, the
+//! credential rule, and the rate and storage limits, belongs to the node so
+//! that a request that arrives over the peer transport takes exactly the same
+//! path as one that arrives over gRPC, and so a request is admitted once,
+//! against a single keyspace resolution, rather than in two layers.
+//!
+//! The only thing this layer knows that the node does not is the gRPC metadata,
+//! so its whole job for admission is to lift the `authorization` header out of
+//! that metadata and hand it to the node as a plain `Option<&str>`. The node's
+//! admission boundary does the rest, in order: credential, then rate, then —
+//! for a write, at the owner — storage.
 
 use crate::node::Node;
 use crate::readiness::{ReadinessCondition, ReadinessGate, ReadinessState};
@@ -19,6 +27,7 @@ use orbita_proto::v1::{
 use orbita_runtime::Runtime;
 
 use std::sync::Arc;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
 pub(crate) struct KvService<R: Runtime> {
@@ -31,19 +40,36 @@ impl<R: Runtime> KvService<R> {
     }
 }
 
+/// The raw `authorization` header value, if the request carried one that is
+/// representable as text, owned so the request body can be moved on into the
+/// node while the credential outlives the borrow of the metadata.
+///
+/// A binary or absent header reads as `None`, which the node's authenticator
+/// turns into `Unauthenticated` when authentication is on and ignores when it
+/// is off. Lifting it here keeps the node — and its admission boundary — free
+/// of any dependency on `tonic`.
+fn credential(metadata: &MetadataMap) -> Option<String> {
+    metadata
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
 #[tonic::async_trait]
 impl<R: Runtime> Kv for KvService<R> {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let credential = credential(request.metadata());
         self.node
-            .get(request.into_inner(), false)
+            .get(request.into_inner(), false, credential.as_deref())
             .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
     }
 
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
+        let credential = credential(request.metadata());
         self.node
-            .set(request.into_inner(), false)
+            .set(request.into_inner(), false, credential.as_deref())
             .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
@@ -53,8 +79,9 @@ impl<R: Runtime> Kv for KvService<R> {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        let credential = credential(request.metadata());
         self.node
-            .delete(request.into_inner(), false)
+            .delete(request.into_inner(), false, credential.as_deref())
             .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
@@ -64,9 +91,11 @@ impl<R: Runtime> Kv for KvService<R> {
         &self,
         request: Request<GetLimitsRequest>,
     ) -> Result<Response<GetLimitsResponse>, Status> {
-        // Answered from the cached map without touching a partition, because a
-        // client calls this before it can do anything else and should not have
-        // its first request depend on a partition being available.
+        // Deliberately unauthenticated. Limits are how a client sizes its gRPC
+        // channel before it holds a credential or has picked a keyspace, and
+        // the empty-keyspace form returns cluster-wide maxima that no
+        // keyspace-scoped credential could name. It exposes no data, only the
+        // sizes this cluster will accept.
         self.node
             .limits(&request.into_inner().keyspace)
             .await
@@ -75,8 +104,9 @@ impl<R: Runtime> Kv for KvService<R> {
     }
 
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        let credential = credential(request.metadata());
         self.node
-            .list(request.into_inner(), false)
+            .list(request.into_inner(), false, credential.as_deref())
             .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
@@ -164,7 +194,8 @@ mod tests {
                 "control-plane-joined",
                 "partitions-caught-up",
                 "replicas-recoverable",
-                "accepting-ownership"
+                "accepting-ownership",
+                "auth-policy-agreed"
             ]
         );
     }

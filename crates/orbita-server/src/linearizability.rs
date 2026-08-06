@@ -287,6 +287,14 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
     };
     let source = BoxedMapSource::new(StaticMapSource::new(owner_and_replica_map()));
     sim.block_on(async move {
+        // Authentication off: this suite drives the read path directly, so
+        // admission passes every request through to it.
+        let authenticator = Arc::new(crate::auth::Authenticator::new(
+            false,
+            None,
+            std::time::Duration::from_secs(86_400),
+            runtime.clock().clone(),
+        ));
         Node::start(
             runtime,
             node,
@@ -294,6 +302,7 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
             source,
             lease,
             Arc::new(crate::ReadinessGate::new()),
+            authenticator,
         )
         .await
         .expect("the node starts")
@@ -352,6 +361,7 @@ fn a_replica_serving_reads_never_answers_with_a_value_a_write_has_replaced() {
                                     condition: None,
                                 },
                                 false,
+                                None,
                             )
                             .await;
                         match written {
@@ -390,6 +400,7 @@ fn a_replica_serving_reads_never_answers_with_a_value_a_write_has_replaced() {
                                     key: KEY.to_vec(),
                                 },
                                 false,
+                                None,
                             )
                             .await;
                         match found {

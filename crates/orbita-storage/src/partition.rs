@@ -1259,7 +1259,21 @@ fn adopt<S: ObjectStore + ?Sized>(state: &mut State, snapshot: &Snapshot<S>) {
 
 /// What one entry charges against the flush trigger.
 fn entry_cost(key: &Bytes, entry: &Stored) -> u64 {
-    key.len() as u64 + entry.value.len() as u64 + ENTRY_OVERHEAD_BYTES
+    record_footprint(key.len(), entry.value.len())
+}
+
+/// The bytes a single stored record adds to [`Partition::size_bytes`]: its key,
+/// its value, and the fixed per-entry bookkeeping the size figure charges on
+/// top of them.
+///
+/// Exposed so a caller reserving space before a write — admission checking a
+/// storage cap — charges the same footprint storage will actually add, rather
+/// than the value alone. Counting only the value would let a zero-byte cap
+/// admit a keyed write whose real cost is the key plus this framing, so the two
+/// must not drift; keeping the estimate here is what keeps them in step.
+#[must_use]
+pub fn record_footprint(key_len: usize, value_len: usize) -> u64 {
+    key_len as u64 + value_len as u64 + ENTRY_OVERHEAD_BYTES
 }
 
 fn segment_record_of(key: &Bytes, entry: &Stored) -> SegmentRecord {
