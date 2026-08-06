@@ -3042,6 +3042,33 @@ fn a_worker_reaches_the_leader_group_over_the_transport() {
 }
 
 #[test]
+fn a_node_learns_the_leader_groups_auth_policy_over_the_transport() {
+    // The signal the readiness gate leans on: a node must be able to ask the
+    // leader group whether the cluster requires auth, so it can catch a
+    // half-rolled `require_auth` change instead of trusting its own config in
+    // isolation.
+    for require_auth in [false, true] {
+        let cluster = Cluster::start(21);
+        let leader = cluster.sim.runtime(LEADER);
+        leader.transport().register(
+            ServiceId::Control,
+            ControlService::new(cluster.controller.clone()).require_auth(require_auth),
+        );
+
+        let worker = cluster.sim.runtime(WORKERS[0]);
+        let client = ControlClient::new(worker, vec![LEADER]);
+        let learned = cluster
+            .sim
+            .block_on(async move { client.fetch_auth_policy().await });
+        assert_eq!(
+            learned,
+            Ok(require_auth),
+            "a node reads back exactly the policy the leader advertises"
+        );
+    }
+}
+
+#[test]
 fn the_drain_protocol_distinguishes_progress_from_refusal() {
     let cluster = Cluster::start(13);
     let partition = cluster.only_partition();

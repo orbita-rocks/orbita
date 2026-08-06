@@ -199,7 +199,8 @@ mod tests {
                 "control-plane-joined",
                 "partitions-caught-up",
                 "replicas-recoverable",
-                "accepting-ownership"
+                "accepting-ownership",
+                "auth-policy-agreed"
             ]
         );
     }

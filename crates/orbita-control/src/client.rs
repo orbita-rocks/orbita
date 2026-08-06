@@ -13,9 +13,10 @@ use crate::model::Credential;
 use crate::version::{ClusterVersion, CompatibilityRefusal};
 use crate::wire::{
     AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest,
-    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_CREDENTIALS,
-    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
-    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
+    METHOD_REPORT_STATUS_V5,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
@@ -130,6 +131,24 @@ impl<R: Runtime> ControlClient<R> {
             .await?
         {
             ControlResponse::Credentials(credentials) => Ok(credentials),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Whether the leader group requires authentication.
+    ///
+    /// A node checks this against its own `require_auth` before reporting
+    /// ready, so a half-rolled change to the setting cannot leave an
+    /// auth-disabled node accepting unauthenticated requests behind the load
+    /// balancer while its peers reject them. An `Err` — including from a leader
+    /// too old to serve the method — means the policy could not be determined,
+    /// and the caller does not gate on it rather than guessing.
+    pub async fn fetch_auth_policy(&self) -> Result<bool> {
+        match self
+            .call(METHOD_FETCH_AUTH_POLICY, bytes::Bytes::new())
+            .await?
+        {
+            ControlResponse::AuthPolicy(require_auth) => Ok(require_auth),
             other => Err(unexpected(&other)),
         }
     }

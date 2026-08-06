@@ -71,6 +71,15 @@ pub const METHOD_ADMIN_CALL: u16 = 10;
 /// enforce authentication against a cached copy rather than a control-plane
 /// round trip per request. A worker polls this on the same timer as its map.
 pub const METHOD_FETCH_CREDENTIALS: u16 = 11;
+/// Asks the leader group whether the cluster requires authentication.
+///
+/// This is what lets a node gate its readiness on agreeing with the cluster's
+/// auth policy rather than on its own config alone: without it, a rolling
+/// change to `require_auth` leaves a window where an auth-disabled node behind
+/// the load balancer accepts unauthenticated requests while its peers reject
+/// them. A leader too old to serve this returns an error, which the caller
+/// reads as "cannot determine" and does not gate on — the documented residual.
+pub const METHOD_FETCH_AUTH_POLICY: u16 = 12;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -84,6 +93,7 @@ const STATUS_DRAIN_PROGRESS: u8 = 8;
 const STATUS_ADMIN_OK: u8 = 9;
 const STATUS_ADMIN_FAILED: u8 = 10;
 const STATUS_CREDENTIALS: u8 = 11;
+const STATUS_AUTH_POLICY: u8 = 12;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -301,6 +311,9 @@ pub(crate) enum ControlResponse {
     /// it carries only the hashes the replicated log already holds, never a
     /// secret. A worker caches it to enforce authentication locally.
     Credentials(Vec<Credential>),
+    /// Whether the leader group requires authentication, for a node checking
+    /// its own `require_auth` against the cluster's before it reports ready.
+    AuthPolicy(bool),
     /// The leader ran a forwarded admin call and it succeeded. The bytes are
     /// the encoded protobuf response, which the forwarding node hands back to
     /// its client untouched.
@@ -374,6 +387,9 @@ impl ControlResponse {
                 w.u8(STATUS_CREDENTIALS);
                 w.seq(credentials, |w, credential| credential.encode(w));
             }
+            ControlResponse::AuthPolicy(require_auth) => {
+                w.u8(STATUS_AUTH_POLICY).u8(u8::from(*require_auth));
+            }
             ControlResponse::AdminOk(payload) => {
                 w.u8(STATUS_ADMIN_OK).bytes(payload);
             }
@@ -427,6 +443,7 @@ impl ControlResponse {
                 active: ClusterVersion::decode(&mut r)?,
             }),
             STATUS_CREDENTIALS => ControlResponse::Credentials(r.seq(|r| Credential::decode(r))?),
+            STATUS_AUTH_POLICY => ControlResponse::AuthPolicy(r.u8()? != 0),
             STATUS_ADMIN_OK => ControlResponse::AdminOk(r.bytes()?),
             STATUS_ADMIN_FAILED => ControlResponse::AdminFailed {
                 code: r.u32()?,
@@ -629,6 +646,8 @@ mod tests {
                 code: 5,
                 message: "no such keyspace".into(),
             },
+            ControlResponse::AuthPolicy(true),
+            ControlResponse::AuthPolicy(false),
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),

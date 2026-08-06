@@ -218,7 +218,10 @@ impl Server {
                 Controller::new(runtime.clone(), Arc::clone(&log), ControlConfig::default());
             runtime
                 .transport()
-                .register(ServiceId::Control, ControlService::new(control.clone()));
+                .register(
+                    ServiceId::Control,
+                    ControlService::new(control.clone()).require_auth(config.require_auth),
+                );
             raft = Some(log);
             controller = Some(control);
         }
@@ -285,6 +288,11 @@ impl Server {
 
         let readiness = Arc::new(ReadinessGate::new());
         readiness.mark(ReadinessCondition::AcceptingOwnership);
+        // Auth-policy agreement starts met and is cleared only on a positive
+        // disagreement with the leader group, so a cluster that cannot advertise
+        // its policy (an older leader, or no leader group at all) is never
+        // wedged unready. The control loop below re-evaluates it each poll.
+        readiness.mark(ReadinessCondition::AuthPolicyAgreed);
         // A node with no leader group answers to nobody, so the join condition
         // is met by construction rather than left to hang readiness forever.
         // A joined node's condition is marked by the control loop below, on
@@ -382,6 +390,17 @@ impl Server {
                     config.control_poll_interval,
                 ));
             }
+            // Its own loop, spawned whether or not this node requires auth,
+            // because the shape it guards against is a node that requires *no*
+            // auth while the cluster does: that node has to learn the cluster's
+            // policy and pull itself from rotation, which it cannot do if the
+            // check only ran when auth was already on locally.
+            tokio::spawn(Self::auth_policy_loop(
+                client.clone(),
+                config.require_auth,
+                config.control_poll_interval,
+                Arc::clone(&readiness),
+            ));
             tokio::spawn(Self::control_loop(
                 Arc::downgrade(&node),
                 status,
@@ -602,6 +621,37 @@ impl Server {
                 },
             }
             drop(authenticator);
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// Keeps this node's readiness honest about the cluster's auth policy,
+    /// forever.
+    ///
+    /// `require_auth` is this node's own setting. Each tick asks the leader
+    /// group whether the cluster requires auth and, when it gets an answer,
+    /// reconciles [`ReadinessCondition::AuthPolicyAgreed`]: agreement keeps the
+    /// node ready, disagreement pulls it from the load balancer. This is what
+    /// closes the rolling-update window in which an auth-disabled node would go
+    /// on serving unauthenticated requests while its peers reject them. A
+    /// leader that cannot report a policy — one predating the method — leaves
+    /// the condition untouched, which is the documented residual: the gate only
+    /// protects a cluster whose control plane can advertise the policy.
+    async fn auth_policy_loop(
+        client: ControlClient<ServerRuntime>,
+        require_auth: bool,
+        interval: Duration,
+        readiness: Arc<ReadinessGate>,
+    ) {
+        loop {
+            match client.fetch_auth_policy().await {
+                Ok(cluster_requires_auth) => {
+                    update_auth_policy_readiness(&readiness, require_auth, cluster_requires_auth);
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "could not learn the cluster's auth policy");
+                }
+            }
             tokio::time::sleep(interval).await;
         }
     }
@@ -1023,6 +1073,30 @@ fn update_control_readiness(
     }
 }
 
+/// Reconciles the auth-policy readiness condition against the cluster's policy.
+///
+/// `local` is this node's own `require_auth`; `cluster` is what the leader
+/// group advertises. They must match for this node to be ready: a node that
+/// requires no auth while the cluster does is a bypass hole and is pulled from
+/// rotation, and the reverse — auth on while the cluster is off — is failed
+/// too, because a disagreement in either direction is a misconfiguration an
+/// operator needs surfaced rather than silently served. Agreement marks the
+/// condition; only a positive disagreement clears it, so a cluster that cannot
+/// report a policy at all never reaches this code and stays ready.
+fn update_auth_policy_readiness(readiness: &ReadinessGate, local: bool, cluster: bool) {
+    if local == cluster {
+        readiness.mark(ReadinessCondition::AuthPolicyAgreed);
+    } else {
+        tracing::warn!(
+            local_require_auth = local,
+            cluster_require_auth = cluster,
+            "this node's require_auth disagrees with the cluster's; failing readiness so a \
+             half-rolled auth change cannot serve a bypass behind the load balancer"
+        );
+        readiness.clear(ReadinessCondition::AuthPolicyAgreed);
+    }
+}
+
 #[cfg(test)]
 mod leader_readiness_tests {
     use super::*;
@@ -1076,5 +1150,59 @@ mod leader_readiness_tests {
         update_control_readiness(&readiness, true, Some(false));
 
         assert!(!readiness.is_ready());
+    }
+
+    /// Marks everything but auth-policy agreement, so a test of that condition
+    /// reads off exactly what the reconciler decided.
+    fn all_but_auth_policy() -> ReadinessGate {
+        let readiness = ReadinessGate::new();
+        for condition in ReadinessCondition::ALL {
+            if condition != ReadinessCondition::AuthPolicyAgreed {
+                readiness.mark(condition);
+            }
+        }
+        readiness
+    }
+
+    #[test]
+    fn an_auth_disabled_node_in_an_auth_on_cluster_is_not_ready() {
+        // The bypass shape: no auth locally, auth required cluster-wide. This
+        // node must be pulled from the load balancer.
+        let readiness = all_but_auth_policy();
+        update_auth_policy_readiness(&readiness, false, true);
+        assert_eq!(
+            readiness.state().unmet(),
+            vec![ReadinessCondition::AuthPolicyAgreed]
+        );
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn an_auth_on_node_disagreeing_with_an_auth_off_cluster_is_not_ready() {
+        // The safe-but-misconfigured direction is failed too: disagreement in
+        // either direction is surfaced rather than served.
+        let readiness = all_but_auth_policy();
+        update_auth_policy_readiness(&readiness, true, false);
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn agreement_on_auth_policy_makes_the_node_ready() {
+        for policy in [false, true] {
+            let readiness = all_but_auth_policy();
+            update_auth_policy_readiness(&readiness, policy, policy);
+            assert!(readiness.is_ready(), "agreement on require_auth={policy}");
+        }
+    }
+
+    #[test]
+    fn learning_agreement_clears_an_earlier_disagreement() {
+        // A node that briefly disagreed and then a later poll agrees — for
+        // instance after its own config caught up — becomes ready again.
+        let readiness = all_but_auth_policy();
+        update_auth_policy_readiness(&readiness, false, true);
+        assert!(!readiness.is_ready());
+        update_auth_policy_readiness(&readiness, true, true);
+        assert!(readiness.is_ready());
     }
 }

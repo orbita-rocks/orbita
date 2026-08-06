@@ -16,9 +16,10 @@ use crate::controller::Controller;
 use crate::controller::RegistrationOutcome;
 use crate::wire::{
     AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest,
-    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_CREDENTIALS,
-    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
-    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
+    METHOD_REPORT_STATUS_V5,
 };
 
 use bytes::Bytes;
@@ -31,6 +32,11 @@ pub struct ControlService<R: Runtime, L: ConsensusLog> {
     /// construction, so a call that arrived here can never be sent on again
     /// and two members mid-election cannot bounce one between them.
     admin: AdminService<R, L>,
+    /// Whether this leader group member requires authentication, from its own
+    /// configuration. Served on [`METHOD_FETCH_AUTH_POLICY`] so a node can gate
+    /// its readiness on agreeing with the cluster's policy rather than trusting
+    /// its local `require_auth` in isolation.
+    require_auth: bool,
 }
 
 impl<R: Runtime, L: ConsensusLog> Clone for ControlService<R, L> {
@@ -38,6 +44,7 @@ impl<R: Runtime, L: ConsensusLog> Clone for ControlService<R, L> {
         Self {
             controller: self.controller.clone(),
             admin: self.admin.clone(),
+            require_auth: self.require_auth,
         }
     }
 }
@@ -48,7 +55,21 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
         Self {
             admin: AdminService::new(controller.clone()),
             controller,
+            require_auth: false,
         }
+    }
+
+    /// Records the cluster's authentication policy this member advertises.
+    ///
+    /// A node asks the leader group this to check its own `require_auth`
+    /// against the cluster's before reporting ready, so that a half-rolled
+    /// change to the setting cannot leave an auth-disabled node serving
+    /// unauthenticated requests behind the load balancer. Defaults to off,
+    /// which is what the test and single-node shapes run with.
+    #[must_use]
+    pub fn require_auth(mut self, require_auth: bool) -> Self {
+        self.require_auth = require_auth;
+        self
     }
 
     async fn dispatch(&self, call: PeerCall) -> ControlResponse {
@@ -188,6 +209,7 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
             METHOD_FETCH_COMMIT_INDEX => {
                 ControlResponse::CommitIndex(self.controller.commit_index().await)
             }
+            METHOD_FETCH_AUTH_POLICY => ControlResponse::AuthPolicy(self.require_auth),
             other => ControlResponse::Error(format!("unknown control method {other}")),
         }
     }
