@@ -16,10 +16,16 @@
 //! only read duration would delete objects an in-flight commit is about to
 //! publish.
 //!
-//! Judging either clock needs to know when an object was written, and
-//! [`ObjectMeta`](orbita_objectstore::ObjectMeta) does not carry that. Until it
-//! does, this module answers the question it can answer from the objects
-//! themselves, and the caller supplies the timing.
+//! Judging either clock needs to know when an object was written, which
+//! [`ObjectMeta::last_modified`](orbita_objectstore::ObjectMeta::last_modified)
+//! now carries. This module still answers only the question it can answer from
+//! the objects themselves, but the write time it will need is reachable on each
+//! listing entry, and the caller supplies the grace period.
+//!
+//! That timestamp is an `Option`, and the sweep that #100 adds must treat
+//! `None` as "do not touch". A backend that cannot report a write time reports
+//! `None` rather than a zero, because zero reads as the epoch, and treating an
+//! unknown time as ancient deletes live data. See the field's own contract.
 
 use crate::manifest::Manifest;
 use crate::paths::{self, PartitionPath};
@@ -117,6 +123,7 @@ mod tests {
             key: path().object(relative),
             size: 1024,
             etag: ETag("etag".to_string()),
+            last_modified: Some(1_000),
         }
     }
 
@@ -193,6 +200,7 @@ mod tests {
                 key: "somewhere/else.oseg".to_string(),
                 size: 1,
                 etag: ETag("etag".to_string()),
+                last_modified: Some(1_000),
             },
         ];
         assert!(unreferenced(&referenced, &path(), &listing).is_empty());

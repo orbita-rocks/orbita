@@ -244,6 +244,11 @@ impl ObjectStore for FsStore {
             key: key.to_string(),
             size: bytes.len() as u64,
             etag: etag_of(&bytes),
+            // The only write time this store could offer is the file's mtime,
+            // which is wall-clock and outside the runtime clock the sweep
+            // reasons against. Reporting `None` tells the sweep to leave the
+            // object alone rather than hand it a time it cannot trust.
+            last_modified: None,
         })
     }
 
@@ -267,6 +272,9 @@ impl ObjectStore for FsStore {
                     key,
                     size: bytes.len() as u64,
                     etag: etag_of(&bytes),
+                    // See `head`: the fs store has no runtime-clock write time
+                    // to report, so it refuses rather than offering an mtime.
+                    last_modified: None,
                 })
             })
             .collect()

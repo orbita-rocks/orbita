@@ -1,5 +1,6 @@
 //! Parsing the one XML response the store reads: `ListObjectsV2`.
 
+use crate::s3::time::parse_iso8601_millis;
 use crate::{ETag, ObjectError, ObjectMeta, ObjectResult};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -16,9 +17,15 @@ pub(crate) struct ListPage {
 /// Parses a `ListBucketResult` document.
 ///
 /// Only the fields the [`ObjectStore`](crate::ObjectStore) contract surfaces
-/// are read: key, size, and entity tag per object, plus the pagination
-/// markers. Everything else in the document is skipped without complaint,
-/// because S3-compatible servers disagree about the optional elements.
+/// are read: key, size, entity tag, and last-modified time per object, plus
+/// the pagination markers. Everything else in the document is skipped without
+/// complaint, because S3-compatible servers disagree about the optional
+/// elements.
+///
+/// `LastModified` is one such optional element: a server that omits it, or
+/// emits a time this crate cannot parse, yields `None` for that object's
+/// [`ObjectMeta::last_modified`](crate::ObjectMeta::last_modified) rather than
+/// a guessed instant, which the sweep is required to treat as "do not touch".
 pub(crate) fn parse_list_page(body: &[u8]) -> ObjectResult<ListPage> {
     let mut reader = Reader::from_reader(body);
     let mut buf = Vec::new();
@@ -29,6 +36,7 @@ pub(crate) fn parse_list_page(body: &[u8]) -> ObjectResult<ListPage> {
     let mut key = String::new();
     let mut size = String::new();
     let mut etag = String::new();
+    let mut last_modified = String::new();
     let mut truncated = false;
     let mut token = String::new();
 
@@ -41,6 +49,7 @@ pub(crate) fn parse_list_page(body: &[u8]) -> ObjectResult<ListPage> {
                     key.clear();
                     size.clear();
                     etag.clear();
+                    last_modified.clear();
                 } else {
                     current_tag = Some(name);
                 }
@@ -53,6 +62,7 @@ pub(crate) fn parse_list_page(body: &[u8]) -> ObjectResult<ListPage> {
                     Some("Key") if in_contents => key.push_str(&value),
                     Some("Size") if in_contents => size.push_str(&value),
                     Some("ETag") if in_contents => etag.push_str(&value),
+                    Some("LastModified") if in_contents => last_modified.push_str(&value),
                     Some("IsTruncated") => truncated = value.trim() == "true",
                     Some("NextContinuationToken") => token.push_str(&value),
                     _ => {}
@@ -80,7 +90,9 @@ pub(crate) fn parse_list_page(body: &[u8]) -> ObjectResult<ListPage> {
                         key: std::mem::take(&mut key),
                         size,
                         etag: ETag(std::mem::take(&mut etag)),
+                        last_modified: parse_iso8601_millis(&last_modified),
                     });
+                    last_modified.clear();
                 }
                 current_tag = None;
             }
@@ -153,11 +165,16 @@ mod tests {
                     key: "p/a".to_string(),
                     size: 3,
                     etag: ETag("\"abc\"".to_string()),
+                    // Wired through from the entry's LastModified.
+                    last_modified: Some(1_767_225_600_000),
                 },
                 ObjectMeta {
                     key: "p/b&c".to_string(),
                     size: 10,
                     etag: ETag("\"def\"".to_string()),
+                    // This entry carries no LastModified, so the sweep is told
+                    // to leave it alone rather than handed a zero.
+                    last_modified: None,
                 },
             ]
         );

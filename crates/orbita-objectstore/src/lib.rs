@@ -63,6 +63,27 @@ pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
     pub etag: ETag,
+
+    /// When the object was last written, as Unix milliseconds on the same
+    /// scale as `orbita_runtime`'s `Clock::now_millis`, or `None` when the
+    /// backend cannot report a time.
+    ///
+    /// # `None` means refuse to act
+    ///
+    /// The orphan sweep may delete an object only after a grace period that
+    /// exceeds both the longest read and the longest commit, and it judges
+    /// that period from this timestamp. A missing time is therefore not a
+    /// licence to assume the object is old: an absent value reads as the
+    /// epoch, which is the direction that deletes live data. A sweep that
+    /// finds `None` must refuse to act on that object rather than guess, so
+    /// backends that genuinely cannot report a write time say so here instead
+    /// of reporting a zero that would be mistaken for "very old".
+    ///
+    /// Backends populate it from the listing they already read: the S3 store
+    /// wires through `LastModified`, and the in-memory store stamps the
+    /// runtime clock at write time so a simulated run can drive the grace
+    /// period deterministically.
+    pub last_modified: Option<u64>,
 }
 
 /// The precondition on a conditional write.

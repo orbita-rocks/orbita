@@ -28,8 +28,9 @@ implement against is a single-implementation format with extra steps.
 - The write-ahead log, replication, ownership, and the partition map.
 - Deleting anything. [`sweep`](../../crates/orbita-format/src/sweep.rs) finds
   unreferenced objects; the grace period that decides when one may go is the
-  caller's, and needs object creation times that
-  `orbita_objectstore::ObjectMeta` does not yet carry.
+  caller's. It reasons from the write time that
+  `orbita_objectstore::ObjectMeta::last_modified` now carries, an `Option` the
+  sweep must treat as "do not touch" when absent.
 
 ## What is left
 
@@ -40,9 +41,10 @@ above `committed_lamport`, and the compaction schedule. Doing that in a
 separate change from the format was the point: the bytes were reviewed alone,
 because the bytes are the part another implementation has to agree with.
 
-Still open here: the sweep's grace period, which waits on object creation
-times `orbita_objectstore::ObjectMeta` does not carry, and a store-level
-fault-injection seam for the simulator (see brief 05).
+Still open here: the sweep's grace period, which now has the write time it
+waits on (`orbita_objectstore::ObjectMeta::last_modified`) but not yet the
+period itself, and a store-level fault-injection seam for the simulator (see
+brief 05).
 
 ## Done when
 

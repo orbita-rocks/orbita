@@ -863,6 +863,7 @@ dependencies = [
  "crc32c",
  "orbita-core",
  "orbita-objectstore",
+ "orbita-runtime",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
