@@ -118,6 +118,6 @@ mod testing;
 
 pub use mutation::{Mutation, MutationOp};
 pub use partition::{
-    record_footprint, Hydration, Partition, ScanEntry, ScanPage, WriteOutcome,
+    record_footprint, Hydration, Partition, ScanBudget, ScanEntry, ScanPage, WriteOutcome,
     TOMBSTONE_RETENTION_MILLIS,
 };

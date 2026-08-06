@@ -34,6 +34,7 @@ use orbita_format::testing::MemoryStore;
 use orbita_proto::v1::{GetRequest, SetRequest};
 use orbita_runtime::{Clock, Runtime};
 use orbita_sim::{harness, SimRuntime, Simulation};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

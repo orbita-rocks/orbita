@@ -56,12 +56,58 @@ use orbita_runtime::{
     join_all, Clock, PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError,
     TransportResult,
 };
+use orbita_storage::ScanBudget;
 use orbita_wal::WalService;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
+
+/// The gRPC message-size ceiling implied by a keyspace whose values may reach
+/// `max_value_bytes`.
+///
+/// This is the one piece of arithmetic behind both halves of the contract: it
+/// is what `GetLimits` publishes as `max_message_bytes`, and, evaluated at the
+/// hard value cap by [`max_transport_message_bytes`], what the transport is
+/// sized to accept. Keeping it a single function is the whole point: a server
+/// that advertised one number and enforced another would let a client send
+/// exactly what it was told to and be refused by the transport before its
+/// request was ever seen.
+pub fn message_bytes_ceiling(max_value_bytes: u64) -> u64 {
+    max_value_bytes.max(MAX_LIST_BYTES) + MESSAGE_OVERHEAD_BYTES
+}
+
+/// The largest message any keyspace on this cluster can make cross the wire.
+///
+/// This sizes the gRPC servers' decode and encode limits and the client
+/// channel. It is [`message_bytes_ceiling`] at [`MAX_VALUE_BYTES`], the hard
+/// cap `GetLimits` clamps every keyspace's value size to, so it is at least as
+/// large as any per-keyspace ceiling a client could be told, and the store
+/// never advertises a size it would then reject.
+pub fn max_transport_message_bytes() -> usize {
+    // The cast cannot lose data: the ceiling is a few megabytes and usize is
+    // at least 32 bits on every target this builds for.
+    message_bytes_ceiling(MAX_VALUE_BYTES as u64) as usize
+}
+
+/// The message ceiling the Admin surface uses, which is deliberately not the KV
+/// ceiling.
+///
+/// A `DescribeCluster` or `ListKeyspaces` response grows with the shape of the
+/// cluster — one entry per partition, each carrying boundary keys up to
+/// [`MAX_KEY_BYTES`] — not with any keyspace's value or list limit. Sizing it
+/// from the KV ceiling would cap a truthful description of a few hundred
+/// partitions and refuse it with `OUT_OF_RANGE`, a worse failure than the DoS
+/// the cap defends against: the store would be unable to describe itself. This
+/// is a generous fixed bound instead, large enough for thousands of partitions
+/// even at the maximum boundary-key size and far more with the modest
+/// boundaries a real cluster has, and small enough to bound a decoder's memory.
+/// A cluster that outgrows it needs a paginated Admin contract, not a bigger
+/// number here.
+pub fn max_admin_message_bytes() -> usize {
+    64 * 1024 * 1024
+}
 
 /// How stale the storage figure a write is admitted against may be.
 ///
@@ -927,6 +973,11 @@ impl<R: Runtime> Node<R> {
     /// Reports the sizes this cluster accepts, for the named keyspace or for
     /// the whole cluster when none is named.
     ///
+    /// The number this returns as `max_message_bytes` is the same one
+    /// [`message_bytes_ceiling`] produces, so the ceiling a client is told and
+    /// the ceiling the transport is sized to (see
+    /// [`max_transport_message_bytes`]) come from one place and cannot drift.
+    ///
     /// The cluster-wide answer is the largest any keyspace allows rather than
     /// the smallest, because a client asking without naming a keyspace is
     /// sizing a connection it intends to reuse, and a connection has to be big
@@ -957,7 +1008,7 @@ impl<R: Runtime> Node<R> {
             // name, and framing. Reporting one number means a client sets its
             // channel once and never has to do this arithmetic or get it
             // slightly wrong.
-            max_message_bytes: max_value_bytes.max(MAX_LIST_BYTES) + MESSAGE_OVERHEAD_BYTES,
+            max_message_bytes: message_bytes_ceiling(max_value_bytes),
         })
     }
 
@@ -1024,8 +1075,21 @@ impl<R: Runtime> Node<R> {
                 // replica) so a scan-heavy client cannot dodge the read rate by
                 // spreading across edges.
                 self.charge_rate(keyspace, Access::Read)?;
+                // Bound the page by encoded bytes as well as by count. The byte
+                // budget is `MAX_LIST_BYTES`, the same figure the transport
+                // ceiling is built from (see [`message_bytes_ceiling`]), so a
+                // full page always fits under the ceiling the client was told,
+                // and the cursor the scan returns pages the remainder. Values
+                // count toward the budget only when the caller asked for them,
+                // so a keys-only page is not truncated for bytes it will not
+                // send.
+                let budget = ScanBudget {
+                    max_entries: limit,
+                    max_bytes: MAX_LIST_BYTES,
+                    include_values: request.include_values,
+                };
                 let page = host
-                    .scan(&request.prefix, resume.inner.as_deref(), limit)
+                    .scan(&request.prefix, resume.inner.as_deref(), budget)
                     .await?;
                 let entries = page
                     .entries

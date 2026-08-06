@@ -41,7 +41,7 @@ use orbita_core::{
 use orbita_format::PartitionPath;
 use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
-use orbita_storage::{Mutation, Partition, ScanPage, TOMBSTONE_RETENTION_MILLIS};
+use orbita_storage::{Mutation, Partition, ScanBudget, ScanPage, TOMBSTONE_RETENTION_MILLIS};
 use orbita_wal::{CatchUpPass, Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
@@ -581,10 +581,10 @@ impl<R: Runtime> PartitionHost<R> {
         &self,
         prefix: &[u8],
         cursor: Option<&[u8]>,
-        limit: u32,
+        budget: ScanBudget,
     ) -> Result<ScanPage> {
         self.wait_for_applies().await;
-        self.storage.scan(prefix, cursor, limit).await
+        self.storage.scan(prefix, cursor, budget).await
     }
 
     /// The highest Lamport this partition has applied, which is what a replica

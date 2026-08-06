@@ -25,8 +25,16 @@ use crate::config::Config;
 use crate::output::{render, Blob, DeleteView, Format, GetView, ListEntryView, ListView, SetView};
 
 /// Opens a data client against the configured endpoint.
+///
+/// The decode and encode limits match the ceiling the server advertises and
+/// sizes its own transport to, so a maximum list page or a value at the
+/// largest keyspace cap is not refused inside this client's gRPC stack with an
+/// error about message size and nothing about Orbita.
 pub fn connect(config: &Config) -> Result<KvClient<Channel>> {
-    Ok(KvClient::new(channel(config)?))
+    let limit = orbita_server::max_transport_message_bytes();
+    Ok(KvClient::new(channel(config)?)
+        .max_decoding_message_size(limit)
+        .max_encoding_message_size(limit))
 }
 
 /// Reads one key.
