@@ -34,3 +34,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+proptest.workspace = true
+# The byte-decoder property tests repair CRC32C checksums after mutating an
+# input, so a corrupted-but-checksum-valid object flows past the integrity gate
+# into the parsing logic. That needs the same hasher the encoders use.
+crc32c.workspace = true
