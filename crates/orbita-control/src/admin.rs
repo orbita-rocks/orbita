@@ -117,10 +117,13 @@ pub struct AdminService<R: Runtime, L: ConsensusLog> {
     require_auth: bool,
     /// The config-derived root secret hash, if the operator configured one.
     ///
-    /// Overlaid onto the credential snapshot at authorization time so the root
-    /// identity satisfies the admin rule from configuration, before any
-    /// credential has been created through the log. It is only ever this hash
-    /// and only in memory: it is never written to the replicated state. See
+    /// Admin is a cluster-wide privilege, so it is granted only to this root
+    /// identity, never derived from a tenant credential's per-keyspace write
+    /// (see [`crate::CredentialSnapshot::authorize_admin`]). The hash is
+    /// overlaid at authorization time from this node's own configuration, so
+    /// every node — leader or forwarding worker — can check it without any
+    /// credential state from the log. It is only ever this hash and only in
+    /// memory: it is never written to the replicated state. See
     /// [`crate::root_secret_hash`] for why it exists and its blast radius.
     root: Option<[u8; 32]>,
 }
@@ -329,11 +332,16 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
     /// Checked here, on the node the operator dialled, rather than after the
     /// forward to the leader — because the bearer token rides in request
     /// metadata, and [`AdminService::forwarded`] re-encodes only the protobuf
-    /// body, so the token does not survive the hop. A node that hosts the
-    /// leader scans its own credential snapshot; a forwarding-only node holds
-    /// no such state, so it authorizes against an empty set plus the config
-    /// root overlay. Either way the rule is
-    /// [`crate::CredentialSnapshot::authorize_admin`].
+    /// body, so the token does not survive the hop. That is safe to do off the
+    /// leader precisely because admin is root-only: the rule is
+    /// [`crate::CredentialSnapshot::authorize_admin`], which grants the cluster
+    /// to the config-derived root identity alone and never to a tenant
+    /// credential's per-keyspace write. Every node carries that root hash from
+    /// its own configuration, so the pass verdict needs no credential state at
+    /// all. When this node hosts the leader, its snapshot is folded in only to
+    /// sharpen the *refusal* — a known tenant credential is told
+    /// `PermissionDenied` rather than `Unauthenticated` — never to widen who
+    /// passes.
     async fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if !self.require_auth {
             return Ok(());

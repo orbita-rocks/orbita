@@ -162,39 +162,45 @@ impl CredentialSnapshot {
 
     /// Authorizes a cluster-wide admin call.
     ///
-    /// Admin operations are not keyspace-scoped the way a credential is, so
-    /// there is no per-keyspace permission to check against. The coarse rule
-    /// this iteration settles on: any unexpired credential that carries the
-    /// `Write` permission on at least one keyspace may administer the cluster.
-    /// A read-only or expired credential is refused. That deliberately treats
-    /// "can write somewhere" as "can operate the cluster"; finer-grained admin
-    /// roles are future work (issue #67), and the tradeoff is documented rather
-    /// than hidden so a stricter rule can replace it without surprising anyone.
+    /// Cluster administration is a whole-cluster privilege — deleting any
+    /// tenant's keyspace, minting unrestricted credentials, revoking others,
+    /// transferring ownership, finalizing an upgrade — so it is granted only to
+    /// the root identity and is **never** derived from a tenant credential's
+    /// data-plane access. An earlier iteration let any credential with `Write`
+    /// on a single keyspace administer the cluster; that turned the compromise
+    /// of one tenant's writer into full cluster compromise (delete unrelated
+    /// keyspaces, revoke others, mint unrestricted credentials), so it is gone.
+    /// The root secret (see [`root_secret_hash`] and
+    /// [`CredentialSnapshot::with_root`]) is the one cluster-admin identity,
+    /// which also breaks the bootstrap chicken-and-egg: it is configured on the
+    /// node, needs no log entry, and so can create the very first tenant
+    /// credential. A dedicated, revocable cluster-admin *scope* is the natural
+    /// next step, but a per-credential scope is a credential-shape (wire)
+    /// change against a frozen contract, so it is left to its own issue;
+    /// root-only holds the boundary correctly until then.
     ///
-    /// An unknown secret is [`Error::Unauthenticated`]; a known but
-    /// insufficient one is [`Error::PermissionDenied`].
+    /// `now_millis` is retained for that future scope, where a non-root
+    /// cluster-admin credential would carry an expiry to honour. Root never
+    /// expires and no other identity passes, so the current rule does not
+    /// consult it.
     ///
-    /// This is where the bootstrap chicken-and-egg lives: with auth on, admin
-    /// demands a write-capable credential, but the first credential is created
-    /// through admin. A configured root secret (see [`root_secret_hash`] and
-    /// [`CredentialSnapshot::with_root`]) breaks the cycle: it satisfies this
-    /// rule from configuration, without a log entry, so it can create the
-    /// first real credential.
+    /// An unknown secret is [`Error::Unauthenticated`]; a known tenant
+    /// credential — which may still operate its own keyspaces on the data
+    /// plane — is [`Error::PermissionDenied`] here.
     pub fn authorize_admin(&self, secret: &str, now_millis: u64) -> Result<()> {
-        // The root is a write-capable, non-expiring identity, so it may
-        // administer the cluster. Checked ahead of the scan so it is the
-        // bootstrap identity that creates the first real credential.
+        let _ = now_millis;
+        // The root is the sole cluster-admin identity. Checked against the
+        // config overlay, so it authorizes on an empty set and is the bootstrap
+        // identity that creates the first real credential.
         if self.is_root(secret) {
             return Ok(());
         }
-        let credential = self.by_secret(secret).ok_or(Error::Unauthenticated)?;
-        if credential.is_expired(now_millis) {
-            return Err(Error::PermissionDenied);
-        }
-        if credential.permissions.contains(&Permission::Write) && !credential.keyspaces.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::PermissionDenied)
+        // A known but non-root secret is a tenant credential: refused the
+        // cluster outright, whatever it can write on the data plane. An unknown
+        // secret cannot be told apart from a typo, so it is unauthenticated.
+        match self.by_secret(secret) {
+            Some(_) => Err(Error::PermissionDenied),
+            None => Err(Error::Unauthenticated),
         }
     }
 }
@@ -303,12 +309,16 @@ mod tests {
     }
 
     #[test]
-    fn admin_needs_a_write_capable_credential() {
-        assert_eq!(snapshot("s3cret").authorize_admin("s3cret", 0), Ok(()));
+    fn admin_is_root_only_never_a_tenant_writer() {
+        // A per-keyspace Write credential is exactly the identity the old rule
+        // wrongly promoted to cluster admin. It must be refused now: writing to
+        // a keyspace does not confer the power to delete unrelated keyspaces,
+        // mint credentials, or revoke others.
         assert_eq!(
-            snapshot("s3cret").authorize_admin("wrong", 0),
-            Err(Error::Unauthenticated)
+            snapshot("s3cret").authorize_admin("s3cret", 0),
+            Err(Error::PermissionDenied)
         );
+        // A read-only tenant credential is refused for the same reason.
         let read_only = CredentialSnapshot::new(vec![Credential {
             permissions: vec![Permission::Read],
             ..credential("s3cret")
@@ -316,6 +326,18 @@ mod tests {
         assert_eq!(
             read_only.authorize_admin("s3cret", 0),
             Err(Error::PermissionDenied)
+        );
+        // An unknown secret is unauthenticated, not merely denied.
+        assert_eq!(
+            snapshot("s3cret").authorize_admin("wrong", 0),
+            Err(Error::Unauthenticated)
+        );
+        // Only the configured root passes.
+        assert_eq!(
+            snapshot("s3cret")
+                .with_root(Some(hash_secret("root")))
+                .authorize_admin("root", 0),
+            Ok(())
         );
     }
 

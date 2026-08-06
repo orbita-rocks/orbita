@@ -3558,9 +3558,12 @@ fn a_configured_root_bootstraps_admin_before_any_credential_exists() {
         .expect("the root creates the first credential")
         .into_inner();
 
-    // The credential the root just minted now authorizes the admin surface on
-    // its own, so the operator can remove the root afterward.
-    let listed = cluster.sim.block_on({
+    // The credential the root just minted is a tenant credential: it may write
+    // its own keyspace on the data plane, but it must NOT administer the
+    // cluster. Deriving admin from a per-keyspace write is the cross-tenant
+    // escalation this boundary exists to prevent, so the admin surface refuses
+    // it with PermissionDenied even though it is a real, unexpired credential.
+    let denied = cluster.sim.block_on({
         let admin = admin.clone();
         let secret = created.secret.clone();
         async move {
@@ -3572,10 +3575,24 @@ fn a_configured_root_bootstraps_admin_before_any_credential_exists() {
                 .await
         }
     });
-    assert!(
-        listed.is_ok(),
-        "the credential the root created must work like any other"
+    assert_eq!(
+        denied
+            .expect_err("a tenant credential cannot administer the cluster")
+            .code(),
+        tonic::Code::PermissionDenied,
+        "a per-keyspace write must not confer cluster administration"
     );
+
+    // Only the root administers, and it keeps working after minting tenants.
+    let listed = cluster.sim.block_on(async move {
+        admin
+            .list_keyspaces(admin_request(
+                orbita_proto::v1::ListKeyspacesRequest::default(),
+                Some("root-secret"),
+            ))
+            .await
+    });
+    assert!(listed.is_ok(), "the root administers the cluster");
 }
 
 #[test]
