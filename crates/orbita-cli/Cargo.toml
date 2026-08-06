@@ -34,11 +34,16 @@ clap = { version = "4.6.5", features = ["derive", "wrap_help"] }
 # rt-tokio because the OTLP batch and periodic exporters run their background
 # work on the same runtime the node already has, which is also what a
 # deterministic build would swap out. grpc-tonic so the exporter speaks OTLP
-# over the tonic stack the rest of the binary links anyway.
+# over the tonic stack the rest of the binary links anyway. tls-webpki-roots so
+# an `https://` collector endpoint gets a TLS connector backed by bundled trust
+# roots: without it grpc-tonic has no way to establish TLS, and a production
+# collector would be reachable only over plaintext OTLP. Webpki roots rather
+# than the system trust store so the image needs no CA bundle baked in.
 opentelemetry.workspace = true
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", default-features = false, features = [
     "grpc-tonic",
+    "tls-webpki-roots",
     "trace",
     "metrics",
 ] }
