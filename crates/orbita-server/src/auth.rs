@@ -1,13 +1,19 @@
 //! Credential enforcement on the worker's data surface.
 //!
-//! Every `Kv` RPC funnels through an [`Authenticator`] before it reaches a
-//! partition. The rule it applies is the leader group's own, from
-//! `orbita_control`: read the `authorization: Bearer <secret>` header, hash the
-//! secret, and check it against a cached [`CredentialSnapshot`] for the
-//! keyspace and permission the request needs. The cache is refreshed on the
-//! same timer as the partition map, so enforcement costs a hash and a scan of a
-//! small list rather than a control-plane round trip, and a revoked credential
-//! is refused the next time it is presented rather than the next connection.
+//! Every `Kv` RPC funnels through an [`Authenticator`] as the first step of the
+//! node's admission boundary, before it reaches a partition and before it can
+//! spend a rate token or be measured against storage. The rule it applies is
+//! the leader group's own, from `orbita_control`: read the
+//! `authorization: Bearer <secret>` header, hash the secret, and check it
+//! against a cached [`CredentialSnapshot`] for the keyspace and permission the
+//! request needs. The cache is refreshed on the same timer as the partition
+//! map, so enforcement costs a hash and a scan of a small list rather than a
+//! control-plane round trip, and a revoked credential is refused the next time
+//! it is presented rather than the next connection.
+//!
+//! The header is extracted from the gRPC metadata at the transport edge and
+//! handed in as a plain `Option<&str>`, so this type — and the [`crate::node`]
+//! admission path that drives it — never depends on `tonic`.
 //!
 //! # Authentication off
 //!
@@ -24,7 +30,6 @@ use orbita_core::Result;
 use orbita_runtime::Clock;
 
 use std::sync::{Arc, Mutex};
-use tonic::metadata::MetadataMap;
 
 /// Enforces credentials against a cached snapshot for one node.
 ///
@@ -77,34 +82,28 @@ impl<C: Clock> Authenticator<C> {
         *self.snapshot.lock().expect("credential cache poisoned") = snapshot.with_root(self.root);
     }
 
-    /// Authorizes a `permission` on `keyspace` from a request's metadata.
+    /// Authorizes a `permission` on `keyspace` from a request's `authorization`
+    /// header value.
     ///
-    /// A no-op when authentication is off. Otherwise it is the worker's copy of
-    /// `Controller::authenticate`: an unknown or missing secret is
-    /// `Unauthenticated`, and a known secret out of scope, without the
+    /// `credential` is the raw header the client sent, already lifted out of the
+    /// transport metadata by the caller; `None` means the request carried no
+    /// usable header at all. A no-op when authentication is off. Otherwise it is
+    /// the worker's copy of `Controller::authenticate`: an unknown or missing
+    /// secret is `Unauthenticated`, and a known secret out of scope, without the
     /// permission, or expired is `PermissionDenied`.
     pub(crate) fn authorize(
         &self,
-        metadata: &MetadataMap,
+        credential: Option<&str>,
         keyspace: &str,
         permission: Permission,
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
-        let secret = bearer_secret(header(metadata))?;
+        let secret = bearer_secret(credential)?;
         let snapshot = self.snapshot.lock().expect("credential cache poisoned");
         snapshot.authorize(secret, keyspace, permission, self.clock.now_millis())
     }
-}
-
-/// The raw `authorization` header value, if the request carried one that is
-/// representable as text. A binary or absent header reads as no header, which
-/// [`bearer_secret`] turns into `Unauthenticated`.
-fn header(metadata: &MetadataMap) -> Option<&str> {
-    metadata
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
 }
 
 #[cfg(test)]
@@ -150,29 +149,27 @@ mod tests {
         auth
     }
 
-    fn bearer(secret: &str) -> MetadataMap {
-        let mut metadata = MetadataMap::new();
-        metadata.insert(
-            "authorization",
-            format!("Bearer {secret}")
-                .parse()
-                .expect("a bearer token is a valid header"),
-        );
-        metadata
+    /// The raw `authorization` header value a client presenting `secret` would
+    /// send, as the transport edge would hand it to [`Authenticator::authorize`].
+    fn bearer(secret: &str) -> String {
+        format!("Bearer {secret}")
     }
 
     #[test]
     fn a_disabled_authenticator_allows_a_request_with_no_credential() {
         let auth = Authenticator::new(false, None, FrozenClock(0));
-        let empty = MetadataMap::new();
-        assert_eq!(auth.authorize(&empty, "catalog", Permission::Write), Ok(()));
+        assert_eq!(auth.authorize(None, "catalog", Permission::Write), Ok(()));
     }
 
     #[test]
     fn a_valid_credential_passes() {
         let auth = enabled("s3cret");
         assert_eq!(
-            auth.authorize(&bearer("s3cret"), "catalog", Permission::Write),
+            auth.authorize(
+                Some(bearer("s3cret").as_str()),
+                "catalog",
+                Permission::Write
+            ),
             Ok(())
         );
     }
@@ -181,7 +178,7 @@ mod tests {
     fn a_missing_credential_is_unauthenticated() {
         let auth = enabled("s3cret");
         assert_eq!(
-            auth.authorize(&MetadataMap::new(), "catalog", Permission::Read),
+            auth.authorize(None, "catalog", Permission::Read),
             Err(Error::Unauthenticated)
         );
     }
@@ -190,7 +187,7 @@ mod tests {
     fn a_wrong_secret_is_unauthenticated() {
         let auth = enabled("s3cret");
         assert_eq!(
-            auth.authorize(&bearer("nope"), "catalog", Permission::Read),
+            auth.authorize(Some(bearer("nope").as_str()), "catalog", Permission::Read),
             Err(Error::Unauthenticated)
         );
     }
@@ -199,7 +196,7 @@ mod tests {
     fn a_wrong_keyspace_is_permission_denied() {
         let auth = enabled("s3cret");
         assert_eq!(
-            auth.authorize(&bearer("s3cret"), "locks", Permission::Read),
+            auth.authorize(Some(bearer("s3cret").as_str()), "locks", Permission::Read),
             Err(Error::PermissionDenied)
         );
     }
@@ -212,7 +209,11 @@ mod tests {
             ..credential("s3cret")
         }]));
         assert_eq!(
-            auth.authorize(&bearer("s3cret"), "catalog", Permission::Write),
+            auth.authorize(
+                Some(bearer("s3cret").as_str()),
+                "catalog",
+                Permission::Write
+            ),
             Err(Error::PermissionDenied)
         );
     }
@@ -221,13 +222,13 @@ mod tests {
     fn a_revoked_credential_is_refused_on_the_next_request() {
         let auth = enabled("s3cret");
         assert_eq!(
-            auth.authorize(&bearer("s3cret"), "catalog", Permission::Read),
+            auth.authorize(Some(bearer("s3cret").as_str()), "catalog", Permission::Read),
             Ok(())
         );
         // A revoke reaches the worker as a refresh with the credential gone.
         auth.refresh(CredentialSnapshot::default());
         assert_eq!(
-            auth.authorize(&bearer("s3cret"), "catalog", Permission::Read),
+            auth.authorize(Some(bearer("s3cret").as_str()), "catalog", Permission::Read),
             Err(Error::Unauthenticated)
         );
     }
@@ -240,7 +241,7 @@ mod tests {
             ..credential("s3cret")
         }]));
         assert_eq!(
-            auth.authorize(&bearer("s3cret"), "catalog", Permission::Read),
+            auth.authorize(Some(bearer("s3cret").as_str()), "catalog", Permission::Read),
             Err(Error::PermissionDenied)
         );
     }
@@ -252,7 +253,11 @@ mod tests {
         let root = orbita_control::root_secret_hash("root-secret");
         let auth = Authenticator::new(true, Some(root), FrozenClock(0));
         assert_eq!(
-            auth.authorize(&bearer("root-secret"), "any-keyspace", Permission::Write),
+            auth.authorize(
+                Some(bearer("root-secret").as_str()),
+                "any-keyspace",
+                Permission::Write
+            ),
             Ok(())
         );
     }
@@ -264,12 +269,20 @@ mod tests {
         // A fetch delivers a set that knows nothing of the root.
         auth.refresh(CredentialSnapshot::new(vec![credential("s3cret")]));
         assert_eq!(
-            auth.authorize(&bearer("root-secret"), "locks", Permission::Write),
+            auth.authorize(
+                Some(bearer("root-secret").as_str()),
+                "locks",
+                Permission::Write
+            ),
             Ok(()),
             "the root survives a refresh; the log never carries it to restore"
         );
         assert_eq!(
-            auth.authorize(&bearer("s3cret"), "catalog", Permission::Write),
+            auth.authorize(
+                Some(bearer("s3cret").as_str()),
+                "catalog",
+                Permission::Write
+            ),
             Ok(()),
             "and the fetched credentials still enforce their own scope"
         );
@@ -280,7 +293,11 @@ mod tests {
         let root = orbita_control::root_secret_hash("root-secret");
         let auth = Authenticator::new(true, Some(root), FrozenClock(0));
         assert_eq!(
-            auth.authorize(&bearer("not-the-root"), "catalog", Permission::Read),
+            auth.authorize(
+                Some(bearer("not-the-root").as_str()),
+                "catalog",
+                Permission::Read
+            ),
             Err(Error::Unauthenticated)
         );
     }
@@ -289,10 +306,7 @@ mod tests {
     fn auth_off_ignores_the_root_entirely() {
         let root = orbita_control::root_secret_hash("root-secret");
         let auth = Authenticator::new(false, Some(root), FrozenClock(0));
-        assert_eq!(
-            auth.authorize(&MetadataMap::new(), "catalog", Permission::Write),
-            Ok(())
-        );
+        assert_eq!(auth.authorize(None, "catalog", Permission::Write), Ok(()));
     }
 
     #[test]
@@ -304,7 +318,7 @@ mod tests {
         assert_eq!(
             to_status(
                 &auth
-                    .authorize(&MetadataMap::new(), "catalog", Permission::Read)
+                    .authorize(None, "catalog", Permission::Read)
                     .unwrap_err()
             )
             .code(),
@@ -313,7 +327,7 @@ mod tests {
         assert_eq!(
             to_status(
                 &auth
-                    .authorize(&bearer("s3cret"), "locks", Permission::Read)
+                    .authorize(Some(bearer("s3cret").as_str()), "locks", Permission::Read)
                     .unwrap_err()
             )
             .code(),

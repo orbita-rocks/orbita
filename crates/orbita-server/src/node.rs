@@ -24,6 +24,7 @@
 //! connections rather than accumulating work that will be too late by the time
 //! it runs.
 
+use crate::auth::Authenticator;
 use crate::host::{HostSpec, LeasePolicy, PartitionHost, PartitionPaths, Read, WriteAck, WriteOp};
 use crate::lease::DEFAULT_LEASE_MARGIN;
 use crate::map_source::{BoxedMapSource, MapSource};
@@ -34,6 +35,7 @@ use crate::replication::{Applies, ReplicaBridge};
 use crate::validate;
 
 use bytes::Bytes;
+use orbita_control::Permission;
 use orbita_core::{
     Error, KeyspaceId, KeyspaceInfo, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
     Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
@@ -130,6 +132,14 @@ pub(crate) struct Node<R: Runtime> {
     /// Per-keyspace storage and rate admission, isolated so one tenant's
     /// throttling never touches another's path. See [`crate::quota`].
     admission: Admission,
+    /// The credential rule the client edge enforces, the first gate of the
+    /// admission boundary. Held here, alongside the rate and storage state, so
+    /// a request is authorized, rate-checked, and storage-checked against a
+    /// single keyspace resolution rather than in two independently placed
+    /// layers. A forwarded (node-to-node) request never reaches it: the
+    /// admission boundary is skipped wholesale for a request that already
+    /// crossed it at the edge the client reached.
+    authenticator: Arc<Authenticator<R::Clock>>,
 }
 
 /// Where a request has to go.
@@ -159,6 +169,36 @@ enum Purpose {
     Write,
 }
 
+/// What a Kv request needs to clear admission: the credential permission it is
+/// authorized for, paired with the rate-limit direction it is charged against.
+///
+/// The two travel together so a request can never be authorized as one kind and
+/// metered as the other — a read authorized with [`Permission::Read`] is always
+/// charged against the read bucket, a write against the write bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+}
+
+impl Access {
+    /// The credential permission the authorizer checks for this access.
+    fn permission(self) -> Permission {
+        match self {
+            Access::Read => Permission::Read,
+            Access::Write => Permission::Write,
+        }
+    }
+
+    /// The rate bucket this access is charged against.
+    fn direction(self) -> Direction {
+        match self {
+            Access::Read => Direction::Read,
+            Access::Write => Direction::Write,
+        }
+    }
+}
+
 impl<R: Runtime> Node<R> {
     /// Fetches the map, opens every partition this node holds, and starts
     /// serving peer traffic.
@@ -169,6 +209,7 @@ impl<R: Runtime> Node<R> {
         source: BoxedMapSource,
         lease_duration: Duration,
         readiness: Arc<ReadinessGate>,
+        authenticator: Arc<Authenticator<R::Clock>>,
     ) -> Result<Arc<Self>> {
         let map = source.fetch().await?;
         let (bridge, applies) = ReplicaBridge::start(&runtime);
@@ -198,6 +239,7 @@ impl<R: Runtime> Node<R> {
             accepting_writes: AtomicBool::new(true),
             writes: tokio::sync::RwLock::new(()),
             admission: Admission::new(),
+            authenticator,
         });
         node.reconcile_hosts().await?;
         // Nothing is known to be stranded before a single heartbeat has gone
@@ -514,19 +556,28 @@ impl<R: Runtime> Node<R> {
         proxy::decode_reply::<Res>(&reply)
     }
 
-    pub(crate) async fn get(&self, request: GetRequest, forwarded: bool) -> Result<GetResponse> {
-        self.admit_rate(&request.keyspace, Direction::Read, forwarded)?;
-        match self.try_get(&request, forwarded).await {
+    pub(crate) async fn get(
+        &self,
+        request: GetRequest,
+        forwarded: bool,
+        credential: Option<&str>,
+    ) -> Result<GetResponse> {
+        let keyspace = self.admit(credential, &request.keyspace, Access::Read, forwarded)?;
+        match self.try_get(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
-                self.try_get(&request, forwarded).await
+                self.try_get(&request, forwarded, &keyspace).await
             }
             other => other,
         }
     }
 
-    async fn try_get(&self, request: &GetRequest, forwarded: bool) -> Result<GetResponse> {
-        let keyspace = self.keyspace(&request.keyspace)?;
+    async fn try_get(
+        &self,
+        request: &GetRequest,
+        forwarded: bool,
+        keyspace: &KeyspaceInfo,
+    ) -> Result<GetResponse> {
         validate::key(&request.key)?;
 
         let (owner, partition) = match self.hop(keyspace.id, &request.key, Purpose::Read).await? {
@@ -565,20 +616,29 @@ impl<R: Runtime> Node<R> {
         self.forward(owner, proxy::METHOD_GET, request).await
     }
 
-    pub(crate) async fn set(&self, request: SetRequest, forwarded: bool) -> Result<SetResponse> {
-        self.admit_rate(&request.keyspace, Direction::Write, forwarded)?;
+    pub(crate) async fn set(
+        &self,
+        request: SetRequest,
+        forwarded: bool,
+        credential: Option<&str>,
+    ) -> Result<SetResponse> {
+        let keyspace = self.admit(credential, &request.keyspace, Access::Write, forwarded)?;
         let _permit = self.write_permit().await?;
-        match self.try_set(&request, forwarded).await {
+        match self.try_set(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
-                self.try_set(&request, forwarded).await
+                self.try_set(&request, forwarded, &keyspace).await
             }
             other => other,
         }
     }
 
-    async fn try_set(&self, request: &SetRequest, forwarded: bool) -> Result<SetResponse> {
-        let keyspace = self.keyspace(&request.keyspace)?;
+    async fn try_set(
+        &self,
+        request: &SetRequest,
+        forwarded: bool,
+        keyspace: &KeyspaceInfo,
+    ) -> Result<SetResponse> {
         validate::key(&request.key)?;
         validate::value(&request.value)?;
         if let Some(limit) = keyspace.max_value_bytes {
@@ -631,20 +691,25 @@ impl<R: Runtime> Node<R> {
         &self,
         request: DeleteRequest,
         forwarded: bool,
+        credential: Option<&str>,
     ) -> Result<DeleteResponse> {
-        self.admit_rate(&request.keyspace, Direction::Write, forwarded)?;
+        let keyspace = self.admit(credential, &request.keyspace, Access::Write, forwarded)?;
         let _permit = self.write_permit().await?;
-        match self.try_delete(&request, forwarded).await {
+        match self.try_delete(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
-                self.try_delete(&request, forwarded).await
+                self.try_delete(&request, forwarded, &keyspace).await
             }
             other => other,
         }
     }
 
-    async fn try_delete(&self, request: &DeleteRequest, forwarded: bool) -> Result<DeleteResponse> {
-        let keyspace = self.keyspace(&request.keyspace)?;
+    async fn try_delete(
+        &self,
+        request: &DeleteRequest,
+        forwarded: bool,
+        keyspace: &KeyspaceInfo,
+    ) -> Result<DeleteResponse> {
         validate::key(&request.key)?;
 
         match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
@@ -705,19 +770,28 @@ impl<R: Runtime> Node<R> {
         })
     }
 
-    pub(crate) async fn list(&self, request: ListRequest, forwarded: bool) -> Result<ListResponse> {
-        self.admit_rate(&request.keyspace, Direction::Read, forwarded)?;
-        match self.try_list(&request, forwarded).await {
+    pub(crate) async fn list(
+        &self,
+        request: ListRequest,
+        forwarded: bool,
+        credential: Option<&str>,
+    ) -> Result<ListResponse> {
+        let keyspace = self.admit(credential, &request.keyspace, Access::Read, forwarded)?;
+        match self.try_list(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
-                self.try_list(&request, forwarded).await
+                self.try_list(&request, forwarded, &keyspace).await
             }
             other => other,
         }
     }
 
-    async fn try_list(&self, request: &ListRequest, forwarded: bool) -> Result<ListResponse> {
-        let keyspace = self.keyspace(&request.keyspace)?;
+    async fn try_list(
+        &self,
+        request: &ListRequest,
+        forwarded: bool,
+        keyspace: &KeyspaceInfo,
+    ) -> Result<ListResponse> {
         validate::prefix(&request.prefix)?;
         let limit = validate::list_limit(request.limit);
 
@@ -905,22 +979,56 @@ impl<R: Runtime> Node<R> {
         progress
     }
 
-    /// Charges one client request against the keyspace's per-direction rate
-    /// limit, at the worker edge.
+    /// The one admission boundary a Kv request crosses, and the single place its
+    /// keyspace is resolved.
     ///
-    /// A forwarded request is not charged: it was already counted on the node
-    /// the client reached, and counting it again would bill a single request
-    /// twice and make an internal hop look like client load.
-    /// An `Err` here is a `ResourceExhausted` whose message names the direction
-    /// so a client can tell a rate refusal from a storage one.
-    fn admit_rate(&self, keyspace: &str, direction: Direction, forwarded: bool) -> Result<()> {
+    /// In order:
+    ///   1. credential authorization — `Unauthenticated` / `PermissionDenied`
+    ///   2. keyspace resolution (once, reused by the rate charge below, and by
+    ///      the storage cap and routing on the write path)
+    ///   3. the per-keyspace rate limit — `ResourceExhausted`
+    ///
+    /// Credential first is deliberate: an unauthenticated caller must never
+    /// spend a rate token or be measured against storage, so the deny lands
+    /// before any tenant-attributable counter moves. Authorization is judged on
+    /// the request's keyspace *name*, before resolution, so a caller who cannot
+    /// authenticate learns only that it is `Unauthenticated`, not whether the
+    /// keyspace exists.
+    ///
+    /// A forwarded (node-to-node) request skips both the credential check and
+    /// the rate charge: it was already authenticated and counted at the edge the
+    /// client reached, the peer transport carries no client credential, and
+    /// charging it again would bill one request twice and make an internal hop
+    /// look like client load. It still resolves the keyspace here so the owner's
+    /// write path — the one place storage is enforced — shares this resolution
+    /// rather than taking its own.
+    fn admit(
+        &self,
+        credential: Option<&str>,
+        keyspace: &str,
+        access: Access,
+        forwarded: bool,
+    ) -> Result<KeyspaceInfo> {
         if forwarded {
-            return Ok(());
+            return self.keyspace(keyspace);
         }
+        self.authenticator
+            .authorize(credential, keyspace, access.permission())?;
         let info = self.keyspace(keyspace)?;
+        self.charge_rate(&info, access.direction())?;
+        Ok(info)
+    }
+
+    /// Charges one client request against the keyspace's per-direction rate
+    /// limit, against the keyspace [`Self::admit`] already resolved.
+    ///
+    /// An unset rate is unlimited. An `Err` here is a `ResourceExhausted` whose
+    /// message names the direction so a client can tell a rate refusal from a
+    /// storage one.
+    fn charge_rate(&self, keyspace: &KeyspaceInfo, direction: Direction) -> Result<()> {
         let rate = match direction {
-            Direction::Read => info.max_reads_per_second,
-            Direction::Write => info.max_writes_per_second,
+            Direction::Read => keyspace.max_reads_per_second,
+            Direction::Write => keyspace.max_writes_per_second,
         };
         let Some(limit) = rate else {
             return Ok(());
@@ -928,16 +1036,17 @@ impl<R: Runtime> Node<R> {
         let now = self.runtime.clock().monotonic_nanos();
         if self
             .admission
-            .admit_rate(info.id, direction, Some(limit), now)
+            .admit_rate(keyspace.id, direction, Some(limit), now)
         {
             return Ok(());
         }
+        let name = &keyspace.name;
         Err(Error::QuotaExceeded(match direction {
             Direction::Read => {
-                format!("read rate limit of {limit} reads/s for keyspace {keyspace}")
+                format!("read rate limit of {limit} reads/s for keyspace {name}")
             }
             Direction::Write => {
-                format!("write rate limit of {limit} writes/s for keyspace {keyspace}")
+                format!("write rate limit of {limit} writes/s for keyspace {name}")
             }
         }))
     }
@@ -1161,7 +1270,7 @@ async fn dispatch<R: Runtime>(node: &Node<R>, call: PeerCall) -> Bytes {
     macro_rules! run {
         ($request:ty, $method:ident) => {
             match <$request as prost::Message>::decode(call.payload.as_ref()) {
-                Ok(request) => match node.$method(request, true).await {
+                Ok(request) => match node.$method(request, true, None).await {
                     Ok(response) => proxy::encode_ok(&response),
                     Err(error) => proxy::encode_error(&error),
                 },
@@ -1470,6 +1579,8 @@ mod tests {
             let source = BoxedMapSource::new(source.clone());
             let gate = Arc::clone(&gate);
             sim.block_on(async move {
+                let authenticator =
+                    Arc::new(Authenticator::new(false, None, runtime.clock().clone()));
                 Node::start(
                     runtime,
                     NodeId(1),
@@ -1477,6 +1588,7 @@ mod tests {
                     source,
                     crate::DEFAULT_LEASE_DURATION,
                     gate,
+                    authenticator,
                 )
                 .await
                 .expect("the node starts")

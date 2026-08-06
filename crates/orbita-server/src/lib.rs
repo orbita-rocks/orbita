@@ -299,6 +299,7 @@ impl Server {
             map_source,
             config.lease_duration,
             Arc::clone(&readiness),
+            Arc::clone(&authenticator),
         )
         .await?;
 
@@ -397,10 +398,7 @@ impl Server {
             .map_err(|e| Error::Internal(format!("serving on {local_addr}: {e}")))?;
 
         let (shutdown, stop) = tokio::sync::oneshot::channel();
-        let service = KvServer::new(KvService::new(
-            Arc::clone(&node),
-            Arc::clone(&authenticator),
-        ));
+        let service = KvServer::new(KvService::new(Arc::clone(&node)));
         let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
         let admin = controller.map(|controller| {
             AdminService::new(controller)
