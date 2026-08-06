@@ -22,12 +22,13 @@ More is built than the version number suggests. The KV surface (GET, SET,
 DELETE, LIST with cursors, CAS and IF NOT PRESENT, TTLs), keyspaces with
 credentials and quotas, the 2-of-3 replicated WAL, owner failover with epoch
 fencing, replica reads behind leases per ADR 0001, the admin API and CLI, the
-deterministic simulator, and a Python end-to-end suite all exist and pass.
-Partition split runs the worker-prepared protocol: an operator-driven split
-opens as intent, waits for every holder of the parent to ready storage for the
-children, and only then retires the parent, so no key is ever owned by a
-partition that has nowhere to put it. Triggering that split automatically from
-size is still to come, and merge remains unimplemented.
+deterministic simulator, and a Python end-to-end suite all exist and pass. The
+control-plane split protocol exists — the replicated state machine refuses to
+retire a parent until every holder has prepared child storage — but split
+execution is deliberately disabled at the operator surface: the worker side
+that durably prepares child storage and quiesces the parent's writes is not
+built, and completing a split without it would make the parent's data
+unreachable. Merge remains unimplemented.
 
 One thing is deliberately staged rather than missing by accident: the control
 plane runs its replicated state machine over a single-node consensus log, with

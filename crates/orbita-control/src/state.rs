@@ -59,10 +59,6 @@ pub(crate) struct PendingSplit {
     /// what makes every later entry in this split fail closed rather than act
     /// on a parent the cluster has already moved out from under the split.
     pub epoch: Epoch,
-    /// The map version the opening entry produced. A holder whose last report
-    /// is at or beyond it has seen the split and had the chance to prepare;
-    /// that is the evidence the controller turns into a `MarkSplitPrepared`.
-    pub begin_map_version: MapVersion,
     /// The owner and replicas that held the parent when the split began. Every
     /// one must prepare, because any of them can be the child owner or a
     /// replica a later failover promotes.
@@ -211,14 +207,9 @@ impl ClusterState {
         self.phases.get(&partition).copied()
     }
 
-    /// The splits in flight, for the controller's driver to advance.
-    pub(crate) fn pending_splits(&self) -> impl Iterator<Item = (PartitionId, &PendingSplit)> {
-        self.pending_splits.iter().map(|(id, split)| (*id, split))
-    }
-
     /// Whether `partition` is the parent of a split that has begun and not
-    /// finished. Exposed for the coverage the acceptance test reads: a child
-    /// id must never appear in the map while its parent is still pending.
+    /// finished. A child id must never appear in the map while its parent is
+    /// still pending, which is the invariant the split unit tests read.
     #[must_use]
     pub fn is_splitting(&self, partition: PartitionId) -> bool {
         self.pending_splits.contains_key(&partition)
@@ -881,17 +872,15 @@ impl ClusterState {
         expect_epoch: Epoch,
     ) -> Result<()> {
         let mut info = self.check_epoch(partition, expect_epoch)?;
-        // The replica set is the snapshot a pending split's `required` was
-        // taken from, and a holder added now would never be asked to prepare
-        // yet could be a child owner after completion. Freezing the set for the
-        // duration of the split keeps `required` equal to who actually holds
-        // the parent.
-        if self.pending_splits.contains_key(&partition) {
-            return Err(Error::InvalidArgument(format!(
-                "partition {partition} is splitting; its replica set cannot change until the \
-                 split completes or aborts"
-            )));
-        }
+        // A pending split snapshotted the current holders as the set that must
+        // prepare its children. If a required replica dies, repair wants to
+        // replace it — but that replacement can never be one of the holders the
+        // split is still waiting on, so a split held open against a dead
+        // replica would wedge forever. A replica-set change therefore *aborts*
+        // the split rather than being blocked by it. The parent is untouched
+        // and still covers its whole range, so nothing is lost; the split is
+        // simply reopened once the set has settled. This is the P1-review's P2.
+        self.pending_splits.remove(&partition);
         if info.owner.is_some_and(|o| replicas.contains(&o)) {
             return Err(Error::InvalidArgument(
                 "the owner must not also be listed as a replica".into(),
@@ -1015,8 +1004,9 @@ impl ClusterState {
             .next_partition_id
             .max(lower.get() + 1)
             .max(upper.get() + 1);
-        // Bump first, then read: the version stored on the pending split is the
-        // one holders will report once they have seen the split begin.
+        // Bump the map version so holders notice the split has begun even
+        // though the partition table is unchanged; that is the only signal a
+        // worker gets to start preparing child storage.
         self.bump_map_version();
         self.pending_splits.insert(
             parent,
@@ -1025,7 +1015,6 @@ impl ClusterState {
                 lower,
                 upper,
                 epoch: info.epoch,
-                begin_map_version: self.map.version(),
                 required,
                 prepared: BTreeSet::new(),
             },
@@ -1916,13 +1905,16 @@ mod tests {
     }
 
     #[test]
-    fn a_splitting_partitions_replica_set_is_frozen_until_the_split_resolves() {
-        // `required` is a snapshot of the holders at begin, so letting the
-        // replica set move mid-split could name a child owner that never
-        // prepared. The set is frozen until the split completes or aborts.
+    fn a_replica_set_change_aborts_a_pending_split_rather_than_wedging_it() {
+        // The P2 from the split review: if a required replica dies after the
+        // split began, it can never be marked prepared. Repair replaces it with
+        // a SetReplicas, and that has to be able to proceed — so it aborts the
+        // split rather than being blocked by it. The parent is left exactly as
+        // it was, ready for the split to be reopened once the set settles.
         let mut state = bootstrapped();
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
+        let new_replicas = vec![parent.replicas[0]];
         state
             .apply(&ControlCommand::BeginSplit {
                 parent: parent.id,
@@ -1933,12 +1925,23 @@ mod tests {
             })
             .unwrap();
 
-        let refused = state.apply(&ControlCommand::SetReplicas {
-            partition: parent.id,
-            replicas: vec![],
-            expect_epoch: parent.epoch,
-        });
-        assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+        state
+            .apply(&ControlCommand::SetReplicas {
+                partition: parent.id,
+                replicas: new_replicas.clone(),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+
+        assert!(
+            !state.is_splitting(parent.id),
+            "the replica-set change aborts the split instead of wedging on a dead holder"
+        );
+        assert_eq!(
+            state.map().partition(parent.id).unwrap().replicas,
+            new_replicas
+        );
+        assert_eq!(state.map().check_coverage(), Ok(()));
     }
 
     /// Runs a split all the way through: open it, prepare every holder, retire

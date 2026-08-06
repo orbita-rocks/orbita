@@ -13,10 +13,11 @@
 //! partition that will only ever see a single increment. The `outcome` label is
 //! a fixed, small set, so the metric never grows with the cluster.
 //!
-//! Split now runs the worker-prepared protocol and records `committed` when it
-//! retires a parent and `failed` when it is refused; merge is still unbuilt and
-//! records `unimplemented`. The label set stays fixed and small, so the series
-//! never grows with the cluster.
+//! Split and merge both record `unimplemented` today: the control-plane split
+//! protocol exists but its data-plane half (worker child-storage preparation
+//! and parent quiescing) does not, so the operator surface fails closed. The
+//! counters are wired now so the series exist the day execution does; the label
+//! set stays fixed and small, so it never grows with the cluster.
 
 use std::sync::OnceLock;
 
@@ -48,20 +49,14 @@ fn instruments() -> &'static Instruments {
 /// How a split or merge attempt resolved. A fixed set, so the label is bounded.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Outcome {
-    /// The operation took effect: the parent retired and the children own its
-    /// range.
-    Committed,
-    /// The operation was refused without changing the map.
-    Failed,
-    /// The operation is not yet built and was refused without changing the map.
+    /// The operation is not yet executable and was refused without changing the
+    /// map.
     Unimplemented,
 }
 
 impl Outcome {
     fn as_str(self) -> &'static str {
         match self {
-            Outcome::Committed => "committed",
-            Outcome::Failed => "failed",
             Outcome::Unimplemented => "unimplemented",
         }
     }
@@ -91,8 +86,7 @@ mod tests {
     // exporter.
     #[test]
     fn split_and_merge_counters_record_without_a_provider() {
-        record_split(Outcome::Committed);
-        record_split(Outcome::Failed);
+        record_split(Outcome::Unimplemented);
         record_merge(Outcome::Unimplemented);
     }
 }

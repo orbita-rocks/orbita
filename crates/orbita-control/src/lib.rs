@@ -2,9 +2,11 @@
 //!
 //! The nodes that hold the cluster's authoritative metadata: the partition
 //! map, worker membership, keyspace definitions and quotas, and ownership
-//! epochs. It detects dead workers, fences and replaces partition owners, and
-//! drives the worker-prepared partition split that has workers ready child
-//! storage before a parent's map entry retires.
+//! epochs. It detects dead workers and fences and replaces partition owners.
+//! It also carries the replicated vocabulary of a worker-prepared partition
+//! split — the state machine refuses to retire a parent until every holder has
+//! prepared child storage — but split execution is disabled at the operator
+//! surface until the worker side that prepares that storage exists.
 //!
 //! Nothing here is on the data path. Workers cache what they need and keep
 //! serving reads while the leader group is unavailable, which is deliberate: a
