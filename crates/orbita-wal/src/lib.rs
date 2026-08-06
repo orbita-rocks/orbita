@@ -126,6 +126,9 @@ mod wire;
 mod testkit;
 
 #[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
 mod tests;
 
 pub use format::{WalEntry, WalOp};
