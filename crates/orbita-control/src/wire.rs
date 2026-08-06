@@ -186,28 +186,46 @@ impl ReportStatusRequest {
     }
 }
 
-/// One forwarded admin call: which RPC, and the encoded request behind it.
+/// One forwarded admin call: which RPC, a stable operation id, and the encoded
+/// request behind it.
 ///
 /// The method is a discriminant of this crate's own rather than the gRPC
 /// method name, so a forwarded call costs a fixed four bytes and a receiver
 /// that does not recognise it says so instead of guessing.
+///
+/// `op_id` is the forwarding node's name for *this* logical invocation,
+/// minted once before the first send and reused on every retry the transport
+/// or the leader sweep makes underneath. It is what lets the leader tell a
+/// resent call apart from a fresh one: the peer transport resends after an
+/// ambiguous connection loss even though the leader may already have applied
+/// the first copy, and a non-idempotent mutation replayed that way would
+/// commit twice. The token is opaque to this protocol; only the mutation that
+/// needs it reads it. See `AdminService::forwarded`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdminCallRequest {
     pub method: u32,
+    pub op_id: u128,
     pub payload: Bytes,
 }
 
 impl AdminCallRequest {
     pub(crate) fn encode(&self) -> Bytes {
         let mut w = Writer::new();
-        w.u32(self.method).bytes(&self.payload);
+        w.u32(self.method)
+            .u64((self.op_id >> 64) as u64)
+            .u64(self.op_id as u64)
+            .bytes(&self.payload);
         w.finish()
     }
 
     pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
         let mut r = Reader::new(buf);
+        let method = r.u32()?;
+        let op_hi = r.u64()?;
+        let op_lo = r.u64()?;
         let request = Self {
-            method: r.u32()?,
+            method,
+            op_id: (u128::from(op_hi) << 64) | u128::from(op_lo),
             payload: r.bytes()?,
         };
         r.done()?;
@@ -722,6 +740,7 @@ mod tests {
         // opaque payload exists to avoid.
         let request = AdminCallRequest {
             method: 3,
+            op_id: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
             payload: Bytes::from_static(&[0x0a, 0x04, b'd', b'e', b'm', b'o']),
         };
         assert_eq!(AdminCallRequest::decode(&request.encode()), Ok(request));

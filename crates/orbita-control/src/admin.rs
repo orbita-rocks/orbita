@@ -75,6 +75,32 @@ impl AdminMethod {
     }
 }
 
+/// The forwarding node's stable name for one forwarded invocation.
+///
+/// Carried as a request extension across the re-entry into the ordinary
+/// handler so a mutation that must be exactly-once can bind its result to it.
+/// A newtype rather than a bare `u128` because a tonic extension is fetched by
+/// type, and a bare integer would collide with any other the stack might add.
+#[derive(Debug, Clone, Copy)]
+struct ForwardedOpId(u128);
+
+/// Draws a fresh operation id from the operating system.
+///
+/// Like the credential secret it names, this does not go through
+/// `orbita_runtime::Rng`: nothing about a deterministic run depends on the
+/// value, only on two attempts at the same operation sharing one. The width is
+/// a full 128 bits so that two operators creating credentials at the same
+/// instant cannot collide onto one derived id.
+fn fresh_operation_id() -> Result<u128, Error> {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).map_err(|e| {
+        Error::Internal(format!(
+            "no operating system entropy for an operation id: {e}"
+        ))
+    })?;
+    Ok(u128::from_le_bytes(buf))
+}
+
 /// Serves the `Admin` API for one node, wherever the leader happens to be.
 pub struct AdminService<R: Runtime, L: ConsensusLog> {
     /// Present when this node hosts the control plane. Answering locally is
@@ -140,7 +166,18 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
     /// ordinary handler, and encodes what came back. Nothing here re-checks
     /// leadership, because the peer handler that dispatched this already
     /// established it and doing it twice would only widen the window.
-    pub(crate) async fn invoke(&self, method: u32, payload: &[u8]) -> Result<Bytes, Status> {
+    ///
+    /// `op_id` is the forwarding node's stable name for this invocation. It is
+    /// carried into the re-entered handler as a request extension so that a
+    /// mutation which must be exactly-once can tie its outcome to it and refuse
+    /// a resend the transport made after an ambiguous loss. A handler that does
+    /// not need it simply ignores it.
+    pub(crate) async fn invoke(
+        &self,
+        method: u32,
+        op_id: u128,
+        payload: &[u8],
+    ) -> Result<Bytes, Status> {
         use pb::admin_server::Admin as _;
 
         let Some(method) = AdminMethod::from_u32(method) else {
@@ -154,7 +191,9 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
                 let request = <$request>::decode(payload).map_err(|e| {
                     Status::invalid_argument(format!("undecodable forwarded admin request: {e}"))
                 })?;
-                let response = self.$rpc(Request::new(request)).await?;
+                let mut request = Request::new(request);
+                request.extensions_mut().insert(ForwardedOpId(op_id));
+                let response = self.$rpc(request).await?;
                 Ok(Bytes::from(response.into_inner().encode_to_vec()))
             }};
         }
@@ -215,8 +254,14 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
             ));
         };
 
+        // Minted once, here, before the first send. Every retry the transport
+        // makes underneath `admin_call` carries this same value, which is what
+        // lets the leader recognise a resend as the same operation rather than
+        // a new one. Regenerating it per attempt would be indistinguishable
+        // from an operator issuing the command twice.
+        let op_id = fresh_operation_id().map_err(status)?;
         match client
-            .admin_call(method as u32, Bytes::from(request.encode_to_vec()))
+            .admin_call(method as u32, op_id, Bytes::from(request.encode_to_vec()))
             .await
         {
             Ok(AdminOutcome::Ok(payload)) => Resp::decode(payload).map(Some).map_err(|e| {
@@ -395,6 +440,11 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateCredentialRequest>,
     ) -> Result<Response<pb::CreateCredentialResponse>, Status> {
+        // Read before `into_inner` drops the extensions. Present when this call
+        // reached the leader by being forwarded; absent when an operator dialled
+        // the leader directly, in which case there is no resend to guard against
+        // and a fresh id is correct.
+        let forwarded_op_id = request.extensions().get::<ForwardedOpId>().map(|f| f.0);
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::CreateCredential, &request)
@@ -412,21 +462,40 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
             })
             .collect();
 
-        let (id, secret) = self
+        let op_id = match forwarded_op_id {
+            Some(op_id) => op_id,
+            None => fresh_operation_id().map_err(status)?,
+        };
+
+        match self
             .leader()
             .create_credential(
                 request.keyspaces,
                 permissions,
                 request.description,
                 request.expires_at_millis,
+                op_id,
             )
             .await
-            .map_err(status)?;
-
-        Ok(Response::new(pb::CreateCredentialResponse {
-            credential_id: id,
-            secret,
-        }))
+        {
+            Ok((id, secret)) => Ok(Response::new(pb::CreateCredentialResponse {
+                credential_id: id,
+                secret,
+            })),
+            // The one place a derived id turns into a visible outcome: a resend
+            // of a forwarded creation whose first attempt already committed
+            // lands on the same id and is refused here. The secret it returned
+            // then is gone, so there is nothing to hand back and inventing a
+            // second credential is exactly what this exists to prevent. Named
+            // as the ambiguity it is, and coded `Aborted` so a client re-reads
+            // rather than blindly retries.
+            Err(Error::AlreadyExists) => Err(Status::aborted(
+                "this create-credential was retried after an ambiguous connection loss and its \
+                 first attempt had already committed; the one-time secret cannot be shown again. \
+                 List credentials to find it, or revoke it and reissue if it was not captured.",
+            )),
+            Err(error) => Err(status(error)),
+        }
     }
 
     async fn revoke_credential(
@@ -859,7 +928,7 @@ mod tests {
         let admin = AdminService::new(Controller::new(runtime, log, ControlConfig::default()));
 
         let refused = sim
-            .block_on(async move { admin.invoke(u32::MAX, &[]).await })
+            .block_on(async move { admin.invoke(u32::MAX, 0, &[]).await })
             .expect_err("a method this binary does not know cannot be run");
 
         assert_eq!(refused.code(), Code::Unimplemented);
@@ -882,6 +951,142 @@ mod tests {
         assert!(
             AdminService::new(controller).forward.is_none(),
             "ControlService dispatches into this, so a forwarding client here would be a loop"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_credential_replayed_with_its_operation_id_commits_exactly_once() {
+        // The peer transport resends a forwarded call after an ambiguous
+        // connection loss, and the leader may already have applied the first
+        // copy. A credential minted afresh on each apply would commit twice and
+        // orphan the first one-time secret; a credential id derived from the
+        // operation id makes the resend land on the same id, where the
+        // replicated duplicate check refuses it. Without the derivation this
+        // second call would succeed with a new id and the assertion below
+        // would fail.
+        let sim = Simulation::new(6);
+        let (controller, _forwarding) = leader_and_a_node_without_one(&sim);
+
+        let op_id = 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100_u128;
+
+        let (id, secret) = sim
+            .block_on({
+                let controller = controller.clone();
+                async move {
+                    controller
+                        .create_credential(
+                            vec!["default".to_string()],
+                            vec![Permission::Read],
+                            "a service".to_string(),
+                            None,
+                            op_id,
+                        )
+                        .await
+                }
+            })
+            .expect("the first attempt issues the credential");
+
+        let replay = sim.block_on({
+            let controller = controller.clone();
+            async move {
+                controller
+                    .create_credential(
+                        vec!["default".to_string()],
+                        vec![Permission::Read],
+                        "a service".to_string(),
+                        None,
+                        op_id,
+                    )
+                    .await
+            }
+        });
+        assert!(
+            matches!(replay, Err(Error::AlreadyExists)),
+            "a resend carrying the same operation id must be refused, not mint a second \
+             credential: {replay:?}"
+        );
+
+        // The credential that did commit is untouched: the replay neither
+        // replaced it nor invalidated the secret returned the first time.
+        let authenticated = sim.block_on({
+            let controller = controller.clone();
+            let id = id.clone();
+            async move {
+                controller
+                    .authenticate(&id, &secret, "default", Permission::Read)
+                    .await
+            }
+        });
+        assert_eq!(
+            authenticated,
+            Ok(()),
+            "the one credential that committed still authenticates"
+        );
+
+        // A genuinely different operation is still free to mint its own.
+        let (other_id, _) = sim
+            .block_on(async move {
+                controller
+                    .create_credential(
+                        vec!["default".to_string()],
+                        vec![Permission::Read],
+                        "another service".to_string(),
+                        None,
+                        op_id.wrapping_add(1),
+                    )
+                    .await
+            })
+            .expect("a fresh operation id still issues a credential");
+        assert_ne!(
+            other_id, id,
+            "distinct operations must get distinct credentials"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_create_credential_resent_to_the_leader_fails_closed() {
+        // The same guarantee, exercised through the exact path a forwarded call
+        // takes on the leader: `invoke`, carrying the operation id the
+        // forwarding node minted. The first lands; the resend is named as the
+        // ambiguity it is rather than silently committing a second credential.
+        use prost_proto::Message as _;
+
+        let sim = Simulation::new(7);
+        let (controller, _forwarding) = leader_and_a_node_without_one(&sim);
+        let leader = AdminService::new(controller);
+
+        let op_id = 0x0000_0000_dead_beef_u128;
+        let payload = pb::CreateCredentialRequest {
+            keyspaces: vec!["default".to_string()],
+            permissions: vec![pb::Permission::Read as i32],
+            description: "a service".to_string(),
+            expires_at_millis: None,
+        }
+        .encode_to_vec();
+        let method = AdminMethod::CreateCredential as u32;
+
+        let first = sim
+            .block_on({
+                let leader = leader.clone();
+                let payload = payload.clone();
+                async move { leader.invoke(method, op_id, &payload).await }
+            })
+            .expect("the first forwarded attempt commits the credential");
+        let first = pb::CreateCredentialResponse::decode(first)
+            .expect("the leader's answer is a create-credential response");
+        assert!(
+            first.credential_id.starts_with("cred-"),
+            "the credential id is server-issued, got {}",
+            first.credential_id
+        );
+
+        let refused = sim
+            .block_on(async move { leader.invoke(method, op_id, &payload).await })
+            .expect_err("a resend with the same operation id must be refused");
+        assert_eq!(
+            refused.code(),
+            Code::Aborted,
+            "a replayed mutation fails closed rather than double-applying"
         );
     }
 }

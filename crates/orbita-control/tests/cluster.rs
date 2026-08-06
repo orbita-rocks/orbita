@@ -2082,6 +2082,7 @@ fn a_credential_round_trips_through_the_replicated_log() {
                         vec![orbita_control::Permission::Read],
                         "a reader".into(),
                         None,
+                        0x1234_5678_9abc_def0,
                     )
                     .await
             }

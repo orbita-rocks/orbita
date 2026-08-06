@@ -160,7 +160,11 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 Err(e) => ControlResponse::Error(format!("undecodable drain request: {e}")),
             },
             METHOD_ADMIN_CALL => match AdminCallRequest::decode(&call.payload) {
-                Ok(request) => match self.admin.invoke(request.method, &request.payload).await {
+                Ok(request) => match self
+                    .admin
+                    .invoke(request.method, request.op_id, &request.payload)
+                    .await
+                {
                     Ok(payload) => ControlResponse::AdminOk(payload),
                     // The leader's own status code travels back rather than
                     // being flattened into an error string, because "no such

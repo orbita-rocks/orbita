@@ -175,8 +175,24 @@ impl<R: Runtime> ControlClient<R> {
     /// rather than making a worker fail. What it buys is that an operator may
     /// point `orbita` at any node in the cluster, which is the same promise
     /// the KV path already makes.
-    pub async fn admin_call(&self, method: u32, payload: bytes::Bytes) -> Result<AdminOutcome> {
-        let request = AdminCallRequest { method, payload }.encode();
+    ///
+    /// `op_id` names this invocation so that a resend the transport makes after
+    /// an ambiguous loss is recognisable as the same operation on the leader,
+    /// rather than a fresh one. The caller mints it once and passes the same
+    /// value into every retry; regenerating it per attempt would defeat the
+    /// point.
+    pub async fn admin_call(
+        &self,
+        method: u32,
+        op_id: u128,
+        payload: bytes::Bytes,
+    ) -> Result<AdminOutcome> {
+        let request = AdminCallRequest {
+            method,
+            op_id,
+            payload,
+        }
+        .encode();
         match self.call(METHOD_ADMIN_CALL, request).await? {
             ControlResponse::AdminOk(payload) => Ok(AdminOutcome::Ok(payload)),
             ControlResponse::AdminFailed { code, message } => {
