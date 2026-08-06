@@ -138,11 +138,12 @@ pub(crate) struct Node<R: Runtime> {
     admission: Admission,
     /// The credential rule the client edge enforces, the first gate of the
     /// admission boundary. Held here, alongside the rate and storage state, so
-    /// a request is authorized, rate-checked, and storage-checked against a
-    /// single keyspace resolution rather than in two independently placed
-    /// layers. A forwarded (node-to-node) request never reaches it: the
-    /// admission boundary is skipped wholesale for a request that already
-    /// crossed it at the edge the client reached.
+    /// a request is authorized and storage-checked against a single keyspace
+    /// resolution rather than in independently placed layers. A forwarded
+    /// (node-to-node) request skips the credential check — it was already
+    /// authenticated at the edge the client reached, which the peer transport
+    /// does not carry — but it is still rate- and storage-checked on the node
+    /// that serves it, so an internal hop cannot be used to dodge a quota.
     authenticator: Arc<Authenticator<R::Clock>>,
     /// When a request last made this node look again for a keyspace its map
     /// did not know. See [`KEYSPACE_MISS_REPAIR_INTERVAL`].
@@ -614,7 +615,9 @@ impl<R: Runtime> Node<R> {
         forwarded: bool,
         credential: Option<&str>,
     ) -> Result<GetResponse> {
-        let keyspace = self.admit(credential, &request.keyspace, Access::Read, forwarded).await?;
+        let keyspace = self
+            .admit(credential, &request.keyspace, Access::Read, forwarded)
+            .await?;
         match self.try_get(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
@@ -635,6 +638,10 @@ impl<R: Runtime> Node<R> {
         let (owner, partition) = match self.hop(keyspace.id, &request.key, Purpose::Read).await? {
             Hop::Local(host, owner, partition) => match host.read(&request.key).await? {
                 Read::Served(record) => {
+                    // Charged on the node that served the read — owner or
+                    // serving replica — so reads fanned through many edges
+                    // cannot each win a full bucket. See [`Self::charge_rate`].
+                    self.charge_rate(keyspace, Access::Read)?;
                     if !host.is_owner() {
                         // Counted because "replicas serve reads" is the claim
                         // the read path exists to make, and it is otherwise
@@ -674,7 +681,9 @@ impl<R: Runtime> Node<R> {
         forwarded: bool,
         credential: Option<&str>,
     ) -> Result<SetResponse> {
-        let keyspace = self.admit(credential, &request.keyspace, Access::Write, forwarded).await?;
+        let keyspace = self
+            .admit(credential, &request.keyspace, Access::Write, forwarded)
+            .await?;
         let _permit = self.write_permit().await?;
         match self.try_set(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
@@ -705,12 +714,22 @@ impl<R: Runtime> Node<R> {
 
         match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
             Hop::Local(host, ..) => {
-                // Storage is enforced where the data lands, so the figure is the
-                // owner's own footprint for the keyspace and no cross-node round
-                // trip stands in the write path.
+                // The rate is charged here, on the owner every write converges
+                // on, and forwarded writes are charged too — see
+                // [`Self::charge_rate`].
+                self.charge_rate(keyspace, Access::Write)?;
+                // Storage is enforced where the data lands. The figure is this
+                // owner's own footprint for the keyspace, compared against its
+                // share of the cap so N owners cannot each grow to the full cap.
+                // The reserved size is the record's whole footprint — key, value
+                // and framing — the same accounting storage will add, not the
+                // value alone, so a keyed write is never admitted as if it were
+                // free below the framing overhead.
                 if let Some(cap) = keyspace.max_storage_bytes {
-                    self.admit_storage(keyspace.id, cap, request.value.len() as u64)
-                        .await?;
+                    let footprint =
+                        orbita_storage::record_footprint(request.key.len(), request.value.len());
+                    let share = self.storage_share(keyspace.id, cap);
+                    self.admit_storage(keyspace.id, share, footprint).await?;
                 }
                 let op = WriteOp::Put {
                     value: Bytes::from(request.value.clone()),
@@ -745,7 +764,9 @@ impl<R: Runtime> Node<R> {
         forwarded: bool,
         credential: Option<&str>,
     ) -> Result<DeleteResponse> {
-        let keyspace = self.admit(credential, &request.keyspace, Access::Write, forwarded).await?;
+        let keyspace = self
+            .admit(credential, &request.keyspace, Access::Write, forwarded)
+            .await?;
         let _permit = self.write_permit().await?;
         match self.try_delete(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
@@ -766,6 +787,9 @@ impl<R: Runtime> Node<R> {
 
         match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
             Hop::Local(host, ..) => {
+                // A delete is a write for rate purposes and converges on the
+                // owner, charged here so forwarded deletes are metered too.
+                self.charge_rate(keyspace, Access::Write)?;
                 let ack: WriteAck = host
                     .write(
                         Bytes::from(request.key.clone()),
@@ -829,7 +853,9 @@ impl<R: Runtime> Node<R> {
         forwarded: bool,
         credential: Option<&str>,
     ) -> Result<ListResponse> {
-        let keyspace = self.admit(credential, &request.keyspace, Access::Read, forwarded).await?;
+        let keyspace = self
+            .admit(credential, &request.keyspace, Access::Read, forwarded)
+            .await?;
         match self.try_list(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
@@ -854,6 +880,10 @@ impl<R: Runtime> Node<R> {
             .await?
         {
             Hop::Local(host, ..) => {
+                // A list is a read; charged on the serving node (owner or
+                // replica) so a scan-heavy client cannot dodge the read rate by
+                // spreading across edges.
+                self.charge_rate(keyspace, Access::Read)?;
                 let page = host
                     .scan(&request.prefix, resume.inner.as_deref(), limit)
                     .await?;
@@ -1032,29 +1062,37 @@ impl<R: Runtime> Node<R> {
         progress
     }
 
-    /// The one admission boundary a Kv request crosses, and the single place its
-    /// keyspace is resolved.
+    /// The client-edge admission boundary a Kv request crosses, and the single
+    /// place its keyspace is resolved.
     ///
     /// In order:
     ///   1. credential authorization — `Unauthenticated` / `PermissionDenied`
-    ///   2. keyspace resolution (once, reused by the rate charge below, and by
-    ///      the storage cap and routing on the write path)
-    ///   3. the per-keyspace rate limit — `ResourceExhausted`
+    ///   2. keyspace resolution (once, reused by the storage cap and routing on
+    ///      the write path, and by the rate charge on the serving node)
     ///
-    /// Credential first is deliberate: an unauthenticated caller must never
-    /// spend a rate token or be measured against storage, so the deny lands
-    /// before any tenant-attributable counter moves. Authorization is judged on
-    /// the request's keyspace *name*, before resolution, so a caller who cannot
-    /// authenticate learns only that it is `Unauthenticated`, not whether the
-    /// keyspace exists.
+    /// Credential first is deliberate: an unauthenticated caller must never be
+    /// routed or measured against a quota, so the deny lands before any
+    /// tenant-attributable work. Authorization is judged on the request's
+    /// keyspace *name*, before resolution, so a caller who cannot authenticate
+    /// learns only that it is `Unauthenticated`, not whether the keyspace
+    /// exists.
     ///
-    /// A forwarded (node-to-node) request skips both the credential check and
-    /// the rate charge: it was already authenticated and counted at the edge the
-    /// client reached, the peer transport carries no client credential, and
-    /// charging it again would bill one request twice and make an internal hop
-    /// look like client load. It still resolves the keyspace here so the owner's
-    /// write path — the one place storage is enforced — shares this resolution
-    /// rather than taking its own.
+    /// The rate limit is deliberately *not* charged here. It is charged on the
+    /// node that ends up serving the request — the partition owner for a write,
+    /// the owner or a serving replica for a read — see [`Self::charge_rate`].
+    /// Metering at the edge that received the request let a client multiply its
+    /// budget by fanning one hot partition's traffic through every worker: each
+    /// edge held its own token bucket and forwarded the load onto the same
+    /// owner, so a keyspace capped at N/s admitted N × worker_count. Charging at
+    /// the point of service makes the owner the single meter every path
+    /// converges on.
+    ///
+    /// A forwarded (node-to-node) request skips the credential check: it was
+    /// already authenticated at the edge the client reached, and the peer
+    /// transport carries no client credential. It still resolves the keyspace
+    /// here so the serving path shares this resolution, and it is still rate
+    /// charged where it is served, precisely so a forwarded request cannot dodge
+    /// the meter.
     async fn admit(
         &self,
         credential: Option<&str>,
@@ -1067,18 +1105,28 @@ impl<R: Runtime> Node<R> {
         }
         self.authenticator
             .authorize(credential, keyspace, access.permission())?;
-        let info = self.keyspace(keyspace).await?;
-        self.charge_rate(&info, access.direction())?;
-        Ok(info)
+        self.keyspace(keyspace).await
     }
 
-    /// Charges one client request against the keyspace's per-direction rate
-    /// limit, against the keyspace [`Self::admit`] already resolved.
+    /// Charges one request this node is about to serve against the keyspace's
+    /// per-direction rate limit.
     ///
-    /// An unset rate is unlimited. An `Err` here is a `ResourceExhausted` whose
-    /// message names the direction so a client can tell a rate refusal from a
-    /// storage one.
-    fn charge_rate(&self, keyspace: &KeyspaceInfo, direction: Direction) -> Result<()> {
+    /// This runs on the node that serves the request, not the edge that received
+    /// it, so every path for a partition converges on one meter: all writes on
+    /// the owner, all reads on the owner or a serving replica. A forwarded
+    /// request is charged here too — it is not exempt — which is what stops a
+    /// client fanning a partition's load through many edges to win a full bucket
+    /// from each.
+    ///
+    /// Because a keyspace's configured rate is cluster-wide but each serving
+    /// node meters on its own, the rate is split into a per-node share
+    /// ([`Self::rate_share`]) so the sum across every node serving the keyspace
+    /// cannot exceed the configured total. An unset rate is unlimited; a rate of
+    /// zero admits nothing. An `Err` here is a `ResourceExhausted` whose message
+    /// names the direction so a client can tell a rate refusal from a storage
+    /// one.
+    fn charge_rate(&self, keyspace: &KeyspaceInfo, access: Access) -> Result<()> {
+        let direction = access.direction();
         let rate = match direction {
             Direction::Read => keyspace.max_reads_per_second,
             Direction::Write => keyspace.max_writes_per_second,
@@ -1086,10 +1134,11 @@ impl<R: Runtime> Node<R> {
         let Some(limit) = rate else {
             return Ok(());
         };
+        let share = self.rate_share(keyspace.id, access, limit);
         let now = self.runtime.clock().monotonic_nanos();
         if self
             .admission
-            .admit_rate(keyspace.id, direction, Some(limit), now)
+            .admit_rate(keyspace.id, direction, Some(share), now)
         {
             return Ok(());
         }
@@ -1104,15 +1153,82 @@ impl<R: Runtime> Node<R> {
         }))
     }
 
-    /// Refuses a write that would carry the keyspace past its storage cap.
+    /// The slice of a keyspace-wide rate this one node may admit on its own, so
+    /// the sum across every node serving the keyspace stays within the
+    /// configured limit.
     ///
-    /// The figure compared against is this worker's cached view of the storage
-    /// it owns for the keyspace, at most [`STORAGE_SAMPLE_INTERVAL`] stale, plus
-    /// the size of the write being admitted. Charging the incoming write means a
-    /// single write larger than the remaining room is refused up front rather
-    /// than only being noticed by the next sample. The message names storage so
-    /// a client can tell it from a rate refusal.
-    async fn admit_storage(&self, keyspace: KeyspaceId, cap: u64, incoming: u64) -> Result<()> {
+    /// It is `limit / serving_node_count`, floored — the floor keeps the sum at
+    /// or below the limit rather than above it. Two exceptions keep the number
+    /// honest at the edges: a limit of zero stays zero (a keyspace configured to
+    /// admit nothing must not be handed a token by division), and a positive
+    /// limit never floors to zero, because a keyspace with a real rate must not
+    /// be silenced just because it is spread across more nodes than it has
+    /// tokens. That last clamp is the one documented slack: when a positive
+    /// `limit` is smaller than the serving-node count, each node admits one and
+    /// the aggregate can exceed `limit` by at most `serving_node_count - limit`
+    /// per second. The count is read from the same cached map routing uses, so
+    /// during a placement change nodes can briefly disagree on it; the overshoot
+    /// that disagreement can cause is bounded by the same slack and lasts only
+    /// until the map converges.
+    fn rate_share(&self, keyspace: KeyspaceId, access: Access, limit: u32) -> u32 {
+        if limit == 0 {
+            return 0;
+        }
+        (limit / self.serving_node_count(keyspace, access)).max(1)
+    }
+
+    /// The number of distinct nodes that can serve `access` for `keyspace`, per
+    /// this worker's cached map: partition owners for a write, owners and
+    /// replicas for a read. At least one.
+    ///
+    /// This is the divisor that turns a cluster-wide quota into a per-node
+    /// share. Reading it from the map the worker already holds — rather than a
+    /// control-plane round trip — is what keeps quota enforcement off the
+    /// control plane's back and inside the keyspace, respecting the isolation
+    /// requirement that no admission decision take a dependency spanning
+    /// keyspaces.
+    fn serving_node_count(&self, keyspace: KeyspaceId, access: Access) -> u32 {
+        use std::collections::HashSet;
+        let map = self.map();
+        let mut nodes: HashSet<NodeId> = HashSet::new();
+        for partition in map.partitions().filter(|p| p.keyspace == keyspace) {
+            if let Some(owner) = partition.owner {
+                nodes.insert(owner);
+            }
+            if access == Access::Read {
+                nodes.extend(partition.replicas.iter().copied());
+            }
+        }
+        u32::try_from(nodes.len()).unwrap_or(u32::MAX).max(1)
+    }
+
+    /// Refuses a write that would carry this owner past its share of the
+    /// keyspace's storage cap.
+    ///
+    /// The cap is keyspace-wide, but each owner measures only the partitions it
+    /// holds ([`Self::owned_storage_bytes`]) — a worker has no cheap, current
+    /// view of what its peers store, and the control plane's keyspace-wide
+    /// aggregate is not reachable here without changing the frozen
+    /// `KeyspaceInfo`. Counting only local bytes against the *whole* cap would
+    /// let every owner independently grow its subset to the full cap, so a
+    /// keyspace split across N owners could store N times its limit. To bound
+    /// the aggregate the caller passes this owner's *share* of the cap
+    /// ([`Self::storage_share`]), `cap / owner_count`, so the sum across owners
+    /// cannot exceed the cap.
+    ///
+    /// The figure compared against is this owner's cached local view, at most
+    /// [`STORAGE_SAMPLE_INTERVAL`] stale, plus the footprint of the write being
+    /// admitted. Charging the incoming write means one larger than the remaining
+    /// room is refused up front rather than only being noticed by the next
+    /// sample. The message names storage so a client can tell it from a rate
+    /// refusal.
+    ///
+    /// The residual: the share is floored, and the local view is sampled, so
+    /// within one sample interval an owner can overshoot its share by the writes
+    /// admitted in that window, and skew between owners (one holding more than
+    /// its share after a split) is under-admitted rather than over — the safe
+    /// direction, since the aggregate stays at or under the cap.
+    async fn admit_storage(&self, keyspace: KeyspaceId, share: u64, incoming: u64) -> Result<()> {
         let now = self.runtime.clock().monotonic_nanos();
         let freshness = STORAGE_SAMPLE_INTERVAL.as_nanos().min(u128::from(u64::MAX)) as u64;
         let held = match self.admission.storage_sample(keyspace, now, freshness) {
@@ -1123,13 +1239,23 @@ impl<R: Runtime> Node<R> {
                 measured
             }
         };
-        if held.saturating_add(incoming) > cap {
+        if held.saturating_add(incoming) > share {
             return Err(Error::QuotaExceeded(format!(
-                "storage cap of {cap} bytes for keyspace {} reached ({held} bytes held)",
+                "storage cap reached for keyspace {}: this owner's share is {share} bytes ({held} held)",
                 keyspace.get()
             )));
         }
         Ok(())
+    }
+
+    /// This owner's slice of a keyspace-wide storage cap: `cap / owner_count`,
+    /// so the sum of every owner's share cannot exceed the cap.
+    ///
+    /// The owner count is read from the same cached map routing uses, so no
+    /// control-plane round trip and no cross-keyspace dependency stands in the
+    /// write path.
+    fn storage_share(&self, keyspace: KeyspaceId, cap: u64) -> u64 {
+        cap / u64::from(self.serving_node_count(keyspace, Access::Write))
     }
 
     /// The bytes this worker holds for a keyspace: the sum over the partitions
@@ -1137,7 +1263,9 @@ impl<R: Runtime> Node<R> {
     ///
     /// A replica's copy is not counted, because the cap is on stored data and
     /// counting every replica would multiply a keyspace's footprint by its
-    /// replication factor.
+    /// replication factor. This is only this owner's local subset; the
+    /// keyspace-wide bound comes from comparing it against a per-owner share,
+    /// not from summing peers. See [`Self::admit_storage`].
     async fn owned_storage_bytes(&self, keyspace: KeyspaceId) -> u64 {
         let ids: Vec<PartitionId> = self
             .map()
@@ -1632,13 +1760,12 @@ mod tests {
             let source = BoxedMapSource::new(source.clone());
             let gate = Arc::clone(&gate);
             sim.block_on(async move {
-                let authenticator =
-                    Arc::new(Authenticator::new(
-                        false,
-                        None,
-                        std::time::Duration::from_secs(86_400),
-                        runtime.clock().clone(),
-                    ));
+                let authenticator = Arc::new(Authenticator::new(
+                    false,
+                    None,
+                    std::time::Duration::from_secs(86_400),
+                    runtime.clock().clone(),
+                ));
                 Node::start(
                     runtime,
                     NodeId(1),

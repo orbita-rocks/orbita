@@ -109,7 +109,12 @@ fn start_with_auth(
 /// limits, it just never asks for a credential.
 fn start(sim: &Simulation, specs: &[KeyspaceSpec]) -> Arc<Node<SimRuntime>> {
     let clock = sim.add_node(NodeId(1)).clock().clone();
-    let authenticator = Arc::new(Authenticator::new(false, None, std::time::Duration::from_secs(86_400), clock));
+    let authenticator = Arc::new(Authenticator::new(
+        false,
+        None,
+        std::time::Duration::from_secs(86_400),
+        clock,
+    ));
     start_with_auth(sim, specs, authenticator)
 }
 
@@ -117,7 +122,12 @@ fn start(sim: &Simulation, specs: &[KeyspaceSpec]) -> Arc<Node<SimRuntime>> {
 /// `secret` and is scoped to read and write every keyspace in `specs`.
 fn start_authed(sim: &Simulation, specs: &[KeyspaceSpec], secret: &str) -> Arc<Node<SimRuntime>> {
     let clock = sim.add_node(NodeId(1)).clock().clone();
-    let authenticator = Arc::new(Authenticator::new(true, None, std::time::Duration::from_secs(86_400), clock));
+    let authenticator = Arc::new(Authenticator::new(
+        true,
+        None,
+        std::time::Duration::from_secs(86_400),
+        clock,
+    ));
     authenticator.refresh(CredentialSnapshot::new(vec![Credential {
         id: "cred-1".into(),
         secret_hash: hash_secret(secret),
@@ -150,6 +160,79 @@ fn get(keyspace: &str, key: &str) -> GetRequest {
         keyspace: keyspace.to_string(),
         key: key.as_bytes().to_vec(),
     }
+}
+
+/// Starts an auth-off node hosting `NodeId(1)` against an arbitrary map, so a
+/// test can place a keyspace across more than one owner and observe the
+/// per-owner quota share the worker computes from what it sees in the map.
+fn start_with_map(sim: &Simulation, map: PartitionMap) -> Arc<Node<SimRuntime>> {
+    let runtime = sim.add_node(NodeId(1));
+    let clock = runtime.clock().clone();
+    let layout = DataLayout {
+        store: Arc::new(MemoryStore::new()),
+        wal_root: "wal".to_string(),
+        wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+    };
+    let source = BoxedMapSource::new(StaticMapSource::new(map));
+    let authenticator = Arc::new(Authenticator::new(
+        false,
+        None,
+        std::time::Duration::from_secs(86_400),
+        clock,
+    ));
+    sim.block_on(async move {
+        Node::start(
+            runtime,
+            NodeId(1),
+            layout,
+            source,
+            crate::DEFAULT_LEASE_DURATION,
+            Arc::new(crate::ReadinessGate::new()),
+            authenticator,
+        )
+        .await
+        .expect("the node starts")
+    })
+}
+
+/// A single keyspace split across two owners: `NodeId(1)` owns the lower half
+/// (keys below "m"), `NodeId(2)` the upper. Only `NodeId(1)` is hosted in these
+/// tests; `NodeId(2)` exists in the map purely so the worker sees two owners
+/// and splits the keyspace-wide quota into a per-owner share.
+fn two_owner_map(cap: Option<u64>, writes: Option<u32>) -> PartitionMap {
+    let keyspace = KeyspaceId(1);
+    let mut map = PartitionMap::new(MapVersion(1));
+    map.insert_keyspace(KeyspaceInfo {
+        id: keyspace,
+        name: KeyspaceName::new("default").unwrap(),
+        default_ttl_millis: None,
+        max_value_bytes: None,
+        max_storage_bytes: cap,
+        max_reads_per_second: None,
+        max_writes_per_second: writes,
+    });
+    map.insert_partition(PartitionInfo {
+        id: PartitionId(1),
+        keyspace,
+        range: KeyRange::new(bytes::Bytes::new(), Some(bytes::Bytes::from_static(b"m"))).unwrap(),
+        owner: Some(NodeId(1)),
+        epoch: Epoch(1),
+        replicas: Vec::new(),
+    });
+    map.insert_partition(PartitionInfo {
+        id: PartitionId(2),
+        keyspace,
+        range: KeyRange::new(bytes::Bytes::from_static(b"m"), None).unwrap(),
+        owner: Some(NodeId(2)),
+        epoch: Epoch(1),
+        replicas: Vec::new(),
+    });
+    assert_eq!(
+        map.check_coverage(),
+        Ok(()),
+        "the two-owner fixture must cover the keyspace"
+    );
+    map
 }
 
 #[test]
@@ -331,15 +414,15 @@ fn a_throttled_neighbour_does_not_stop_a_keyspace_under_its_cap() {
 fn the_credential_is_checked_before_any_quota_is_charged() {
     let sim = Simulation::new(1);
     // A keyspace that is simultaneously over its storage cap for the incoming
-    // write (five bytes into a four-byte cap) and down to its last write token
-    // (one per second, and virtual time will not advance). Either quota, on its
-    // own, would refuse this write.
+    // write (a large value whose footprint dwarfs the hundred-byte cap) and
+    // down to its last write token (one per second, and virtual time will not
+    // advance). Either quota, on its own, would refuse this write.
     let node = start_authed(
         &sim,
         &[KeyspaceSpec {
             id: 1,
             name: "default",
-            max_storage_bytes: Some(4),
+            max_storage_bytes: Some(100),
             max_reads_per_second: None,
             max_writes_per_second: Some(1),
         }],
@@ -353,7 +436,10 @@ fn the_credential_is_checked_before_any_quota_is_charged() {
     // storage.
     let refused = {
         let node = Arc::clone(&node);
-        sim.block_on(async move { node.set(set("default", "k", b"12345"), false, None).await })
+        sim.block_on(async move {
+            node.set(set("default", "k", &[b'x'; 256]), false, None)
+                .await
+        })
     }
     .expect_err("an unauthenticated write is refused");
     assert!(
@@ -362,9 +448,10 @@ fn the_credential_is_checked_before_any_quota_is_charged() {
     );
 
     // The proof the deny happened before any counter moved: an authenticated
-    // write that fits under the storage cap is admitted, and consumes the one
-    // write token. Had the rejected request spent the token or bumped the
-    // storage figure, this would be refused as ResourceExhausted instead.
+    // write whose footprint fits under the storage cap is admitted, and
+    // consumes the one write token. Had the rejected request spent the token or
+    // bumped the storage figure, this would be refused as ResourceExhausted
+    // instead.
     let credential = bearer("s3cret");
     let admitted = {
         let node = Arc::clone(&node);
@@ -529,4 +616,216 @@ fn a_valid_credential_within_its_caps_reads_and_writes_end_to_end() {
     .expect("a valid, in-budget read is admitted");
     assert!(read.found);
     assert_eq!(read.value, b"hello");
+}
+
+#[test]
+fn the_write_rate_holds_when_forwarded_traffic_converges_on_one_owner() {
+    let sim = Simulation::new(1);
+    // One owner, one write token per second, virtual time frozen so the bucket
+    // never refills within the test.
+    let node = start(
+        &sim,
+        &[KeyspaceSpec {
+            id: 1,
+            name: "default",
+            max_storage_bytes: None,
+            max_reads_per_second: None,
+            max_writes_per_second: Some(1),
+        }],
+    );
+
+    // A write that arrives already forwarded — as if a second ingress node
+    // proxied it here — is charged at the owner, not waved through. This is the
+    // regression: before the fix a forwarded request skipped the rate charge
+    // entirely, so a client could win a fresh bucket from every edge. The first
+    // forwarded write spends the token.
+    {
+        let node = Arc::clone(&node);
+        sim.block_on(async move { node.set(set("default", "a", b"v"), true, None).await })
+    }
+    .expect("the first forwarded write is within the owner's budget");
+
+    // A second forwarded write, as if from yet another ingress node, finds the
+    // owner's bucket empty: fanning the same partition's load through many edges
+    // cannot multiply the budget, because every edge forwards onto this one
+    // meter.
+    let second = {
+        let node = Arc::clone(&node);
+        sim.block_on(async move { node.set(set("default", "b", b"v"), true, None).await })
+    }
+    .expect_err("a second forwarded write in the same instant is over the owner's rate");
+    match second {
+        Error::QuotaExceeded(message) => assert!(
+            message.contains("write rate"),
+            "a forwarded write over the rate is a write-rate refusal, got: {message}"
+        ),
+        other => panic!("expected a quota refusal, got {other:?}"),
+    }
+
+    // And a direct client write draws from the very same owner bucket, so it is
+    // refused too: the meter does not care which path a request took to reach
+    // the owner.
+    let direct = {
+        let node = Arc::clone(&node);
+        sim.block_on(async move { node.set(set("default", "c", b"v"), false, None).await })
+    }
+    .expect_err("a direct write shares the owner's one bucket with the forwarded ones");
+    assert!(
+        matches!(direct, Error::QuotaExceeded(_)),
+        "direct and forwarded traffic converge on one owner meter, got: {direct:?}"
+    );
+}
+
+#[test]
+fn each_owner_enforces_only_its_share_of_a_multi_owner_write_rate() {
+    let sim = Simulation::new(1);
+    // A keyspace-wide rate of two writes/s split across two owners. This owner's
+    // share is one, so it admits one write and refuses the next — even though
+    // the keyspace as a whole is allowed two. The other owner independently
+    // admits its own one, so the aggregate is the configured two, not two per
+    // owner. Both keys fall in this owner's lower half of the range.
+    let node = start_with_map(&sim, two_owner_map(None, Some(2)));
+    {
+        let node = Arc::clone(&node);
+        sim.block_on(async move { node.set(set("default", "a", b"v"), false, None).await })
+    }
+    .expect("this owner's share of the keyspace rate admits its first write");
+
+    let second = {
+        let node = Arc::clone(&node);
+        sim.block_on(async move { node.set(set("default", "k", b"v"), false, None).await })
+    }
+    .expect_err("this owner's one-per-second share is already spent");
+    match second {
+        Error::QuotaExceeded(message) => assert!(
+            message.contains("write rate"),
+            "a per-owner share refusal is still a write-rate refusal, got: {message}"
+        ),
+        other => panic!("expected a quota refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn two_owners_of_one_keyspace_cannot_each_grow_to_the_full_cap() {
+    // A hundred-byte cap held by a single owner: a write whose whole footprint
+    // (key plus value plus framing) is sixty-six bytes fits.
+    let single_sim = Simulation::new(1);
+    let single = start(
+        &single_sim,
+        &[KeyspaceSpec {
+            id: 1,
+            name: "default",
+            max_storage_bytes: Some(100),
+            max_reads_per_second: None,
+            max_writes_per_second: None,
+        }],
+    );
+    {
+        let single = Arc::clone(&single);
+        single_sim.block_on(async move { single.set(set("default", "k", b"v"), false, None).await })
+    }
+    .expect("a 66-byte footprint fits a 100-byte cap when one owner holds the whole cap");
+
+    // The same cap and the same write, but the keyspace is now split across two
+    // owners: this owner's share is fifty bytes, and sixty-six does not fit. If
+    // each owner measured its own bytes against the whole cap, both could grow
+    // to a hundred and the keyspace would hold two hundred — twice its limit.
+    let split_sim = Simulation::new(1);
+    let split = start_with_map(&split_sim, two_owner_map(Some(100), None));
+    let refused = {
+        let split = Arc::clone(&split);
+        split_sim.block_on(async move { split.set(set("default", "k", b"v"), false, None).await })
+    }
+    .expect_err("a 66-byte write exceeds this owner's 50-byte share of the split cap");
+    match refused {
+        Error::QuotaExceeded(message) => assert!(
+            message.contains("storage") || message.contains("share"),
+            "a per-owner storage refusal, got: {message}"
+        ),
+        other => panic!("expected a storage quota refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_set_with_an_empty_value_against_a_zero_byte_cap_is_refused() {
+    let sim = Simulation::new(1);
+    // A zero-byte cap must admit nothing. An empty value is not a free write:
+    // the record still carries a key and framing, which the storage engine
+    // counts and admission must too, so this SET is refused rather than waved
+    // through as costing zero bytes.
+    let node = start(
+        &sim,
+        &[KeyspaceSpec {
+            id: 1,
+            name: "default",
+            max_storage_bytes: Some(0),
+            max_reads_per_second: None,
+            max_writes_per_second: None,
+        }],
+    );
+
+    let refused = {
+        let node = Arc::clone(&node);
+        sim.block_on(async move { node.set(set("default", "k", b""), false, None).await })
+    }
+    .expect_err("an empty value still carries a key and framing past a zero cap");
+    match refused {
+        Error::QuotaExceeded(message) => assert!(
+            message.contains("storage") || message.contains("share"),
+            "an empty-value write over a zero cap is a storage refusal, got: {message}"
+        ),
+        other => panic!("expected a storage quota refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_keyspace_with_a_zero_rate_admits_nothing() {
+    let sim = Simulation::new(1);
+    // `Some(0)` means admit nothing, which is distinct from `None` (unlimited).
+    // Not even the first request after startup slips through on a seed token.
+    let node = start(
+        &sim,
+        &[
+            KeyspaceSpec {
+                id: 1,
+                name: "no-writes",
+                max_storage_bytes: None,
+                max_reads_per_second: None,
+                max_writes_per_second: Some(0),
+            },
+            KeyspaceSpec {
+                id: 2,
+                name: "no-reads",
+                max_storage_bytes: None,
+                max_reads_per_second: Some(0),
+                max_writes_per_second: None,
+            },
+        ],
+    );
+
+    let write = {
+        let node = Arc::clone(&node);
+        sim.block_on(async move { node.set(set("no-writes", "k", b"v"), false, None).await })
+    }
+    .expect_err("a zero write rate admits nothing, not even the first write");
+    match write {
+        Error::QuotaExceeded(message) => assert!(
+            message.contains("write rate"),
+            "a zero write rate is still a write-rate refusal, got: {message}"
+        ),
+        other => panic!("expected a quota refusal, got {other:?}"),
+    }
+
+    let read = {
+        let node = Arc::clone(&node);
+        sim.block_on(async move { node.get(get("no-reads", "k"), false, None).await })
+    }
+    .expect_err("a zero read rate admits nothing, not even the first read");
+    match read {
+        Error::QuotaExceeded(message) => assert!(
+            message.contains("read rate"),
+            "a zero read rate is still a read-rate refusal, got: {message}"
+        ),
+        other => panic!("expected a quota refusal, got {other:?}"),
+    }
 }
