@@ -3,8 +3,8 @@
 # EKS ships a default `gp2` StorageClass, but gp3 is the current-generation
 # volume: cheaper per GiB and with baseline throughput and IOPS that do not
 # scale with size, so a small test volume is not also a slow one. The
-# aws-ebs-csi-driver addon (installed by cluster.yaml) is what provisions these;
-# the in-tree gp2 provisioner would ignore the gp3 type.
+# aws-ebs-csi-driver addon (installed by the Terraform in deploy/eks/terraform)
+# is what provisions these; the in-tree gp2 provisioner would ignore gp3.
 #
 # up.sh applies this and the Helm overlay points leader.persistence.storageClass
 # and worker.persistence.storageClass at it. It is not marked the cluster

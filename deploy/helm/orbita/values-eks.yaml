@@ -12,9 +12,9 @@
 #   ${ORBITA_EKS_REGION}      the region the cluster and bucket live in
 #   ${ORBITA_EKS_BUCKET}      the test bucket name
 #
-# The IRSA role name is fixed at orbita-test-s3 to match cluster.yaml, so it is
-# baked into the ARN below and is not a value you fill. Fill the three tokens by
-# hand if you are not using up.sh.
+# The IRSA role name is fixed at orbita-test-s3 to match the Terraform in
+# deploy/eks/terraform, so it is baked into the ARN below and is not a value you
+# fill. Fill the three tokens by hand if you are not using up.sh.
 #
 # Everything the chart already models for EKS is turned to its AWS position here
 # and nowhere else, so the defaults file stays a laptop-and-MinIO file and this
@@ -33,7 +33,7 @@ serviceAccount:
     # This annotation is the entire IRSA handshake on the Kubernetes side. The
     # EKS pod-identity webhook sees it and injects AWS_WEB_IDENTITY_TOKEN_FILE
     # and AWS_ROLE_ARN into every Orbita pod, which is what credentialSource
-    # web-identity below reads. The role is the one eksctl created, scoped to
+    # web-identity below reads. The role is the one Terraform created, scoped to
     # exactly this service account and exactly the one bucket.
     eks.amazonaws.com/role-arn: arn:aws:iam::${ORBITA_EKS_ACCOUNT_ID}:role/orbita-test-s3
 

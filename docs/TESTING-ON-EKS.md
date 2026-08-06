@@ -20,12 +20,12 @@ document leads with it.
 
 ## Prerequisites
 
-- `aws`, `eksctl`, `kubectl`, `helm`, and `envsubst` on your PATH. `envsubst`
-  ships with GNU gettext (`brew install gettext` on macOS).
+- `aws`, `terraform` (or `tofu`), `kubectl`, `helm`, and `envsubst` on your
+  PATH. `envsubst` ships with GNU gettext (`brew install gettext` on macOS). The
+  scripts accept either Terraform or OpenTofu.
 - AWS credentials with permission to create an EKS cluster, a VPC, IAM roles and
-  an OIDC provider, and an S3 bucket. eksctl drives CloudFormation, so in
-  practice this is a fairly broad role; a personal or sandbox account is the
-  right place, not a shared production one.
+  an OIDC provider, and an S3 bucket. This is a fairly broad set of permissions;
+  a personal or sandbox account is the right place, not a shared production one.
 - The `orbita` container image has to be pullable by the cluster. The chart
   defaults to `ghcr.io/orbita-rocks/orbita` at the chart's appVersion. Set
   `image.tag` in `deploy/helm/orbita/values-eks.yaml` to the build you want to
@@ -44,12 +44,14 @@ export ORBITA_EKS_BUCKET=orbita-test-$USER
 deploy/eks/up.sh
 ```
 
-That creates the bucket, then an EKS cluster with an OIDC provider and an IRSA
-role scoped to exactly that bucket, applies the gp3 StorageClass, and installs
-the chart with the AWS overlay. It takes about fifteen minutes, almost all of it
-the EKS control plane coming up. The overlay's placeholders are filled for you;
-the rendered files land next to the templates as `*.rendered.yaml` and are
-gitignored, because they carry your account id and bucket name.
+That runs Terraform to create a VPC, an EKS cluster with an OIDC provider, an
+IRSA role scoped to exactly that bucket, and the bucket itself; then applies the
+gp3 StorageClass and installs the chart with the AWS overlay. It takes about
+fifteen minutes, almost all of it the EKS control plane coming up. The overlay's
+placeholders are filled for you; the rendered file lands next to the template as
+`values-eks.rendered.yaml` and is gitignored, because it carries your account id
+and bucket name. Terraform state is local, in `deploy/eks/terraform`, and is the
+thing `down.sh` destroys.
 
 ## Smoke check
 
@@ -75,39 +77,49 @@ spawns its own local node and cannot be aimed at a remote endpoint.
 deploy/eks/down.sh
 ```
 
-Uninstalls the release, deletes the cluster — which unwinds the node group, the
-OIDC provider, and the IRSA role with it — and empties and deletes the bucket.
-Each step tolerates the thing already being gone, so a teardown after a
-half-finished bring-up still ends with nothing left running. Run it when you are
-done. The bucket also carries a seven-day expiration lifecycle as a backstop, so
-a cluster you forget stops accruing storage even if you never run this — but the
-control-plane and node bill only stops when the cluster is deleted.
+Uninstalls the release, deletes its persistent volumes so their EBS volumes are
+released, then runs `terraform destroy`, which removes everything AWS in one
+pass: the cluster, the node group, the VPC, the OIDC provider, both IRSA roles,
+and the bucket with everything in it (the bucket has `force_destroy` set, so a
+non-empty bucket does not block the destroy). Each step tolerates the thing
+already being gone, so a teardown after a half-finished bring-up still ends with
+nothing left running. Run it when you are done. The bucket also carries a
+seven-day expiration lifecycle as a backstop, so a cluster you forget stops
+accruing storage even if you never run this — but the control-plane and node
+bill only stops when the cluster is deleted.
 
 ## What it creates
 
-- An S3 bucket (the name you chose), with a seven-day object expiration as a
-  safety net.
-- An EKS cluster named `orbita-test`, its VPC, and one `m5.xlarge` managed node
-  group of three.
-- An IAM OIDC provider for the cluster.
-- An IRSA role, `orbita-test-s3`, whose trust policy names exactly the
+- An S3 bucket (the name you chose), public access blocked, with a seven-day
+  object expiration as a safety net and `force_destroy` so teardown removes it.
+- An EKS cluster named `orbita-test`, its VPC across three AZs with one NAT
+  gateway, and one `m5.xlarge` managed node group of three.
+- The cluster's OIDC provider, and two IRSA roles: the EBS CSI driver's, and
+  `orbita-test-s3` for the workload, whose trust policy names exactly the
   `orbita/orbita` service account and whose permissions are `Get`/`Put`/`Delete`
   and a prefix `List` on the one bucket. No `s3:*`, no second bucket.
 - The `aws-ebs-csi-driver` addon and a `gp3` StorageClass.
 
-## The one decision worth reading: eksctl, not Terraform
+## One tool: Terraform
 
-The repo's other infrastructure — the live-object-store CI role — is Terraform,
-so eksctl here is a deliberate exception. This cluster is disposable, and eksctl
-is built for disposable: one command stands up the VPC, control plane, node
-group, OIDC provider, and IRSA role, and one command removes all of them by
-unwinding the CloudFormation stacks. The same in Terraform means either
-assembling the whole EKS stack by hand or leaning on a large community module,
-and then carrying state for a cluster whose entire purpose is to be thrown away.
-Terraform earns its keep on durable, reviewable infrastructure; a throwaway test
-cluster is the case where it does not. The reasoning is repeated in a comment at
-the top of `deploy/eks/cluster.yaml`, where the next person will be standing when
-they wonder the same thing.
+The AWS layer is Terraform, matching the repo's other infrastructure — the
+live-object-store role in `terraform/` — so there is one infrastructure-as-code
+tool to install, learn, and keep working rather than two. It lives in
+`deploy/eks/terraform` and leans on the maintained `terraform-aws-modules/vpc`
+and `terraform-aws-modules/eks` modules rather than hand-declaring subnets, NAT
+gateways, the control plane, and the OIDC provider; for a disposable cluster,
+reviewing a few module blocks is a better use of attention than the plumbing
+underneath them. State is local and short-lived, and `terraform destroy` — which
+`down.sh` runs — is the normal end of it. The reasoning is repeated in
+`deploy/eks/terraform/README.md`, where the next person will be standing when
+they wonder it.
+
+The Kubernetes layer — the gp3 StorageClass and the Orbita release — is applied
+by the scripts with `kubectl` and `helm` after Terraform, rather than through
+Terraform's Kubernetes and Helm providers. A StorageClass and a chart are
+Kubernetes objects, not AWS ones, and keeping Terraform to the AWS layer avoids
+coupling an apply to a running cluster's kubeconfig and the teardown-ordering
+problems that come with it.
 
 ## What this is not
 

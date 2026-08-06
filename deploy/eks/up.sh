@@ -1,80 +1,67 @@
 #!/usr/bin/env bash
-# Stand up the disposable Orbita test cluster: an S3 bucket, an EKS cluster with
-# OIDC and an IRSA role scoped to that bucket, a gp3 StorageClass, and the chart.
+# Stand up the disposable Orbita test cluster: with Terraform, a VPC, an EKS
+# cluster with OIDC and an IRSA role scoped to one bucket, and the bucket; then a
+# gp3 StorageClass and the chart on top.
 #
 # One command. When it returns, `deploy/eks/smoke.sh` should pass.
 #
 #   ORBITA_EKS_REGION=us-west-2 ORBITA_EKS_BUCKET=orbita-test-you deploy/eks/up.sh
 #
-# Every step is idempotent enough to re-run after a partial failure: the bucket
-# create tolerates an existing bucket, and `eksctl create cluster` refuses a
-# duplicate rather than damaging one. Tear it all down with down.sh, which is
-# the half of this that pays the bill if you forget it.
+# Terraform owns the AWS layer and is re-runnable: a repeat apply after a partial
+# failure converges rather than duplicating. The Kubernetes steps after it are
+# idempotent too. Tear it all down with down.sh, which is the half of this that
+# pays the bill if you forget it.
 set -euo pipefail
 
 # shellcheck source=deploy/eks/_common.sh
 # shellcheck disable=SC1091  # sourced by absolute path resolved at runtime
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
-require_tools aws eksctl kubectl helm envsubst
+require_tools aws kubectl helm envsubst
+TF="$(tf_bin)"
 resolve_config
 
 REPO_ROOT="$(cd "$EKS_DIR/../.." && pwd)"
-RENDERED_CLUSTER="$EKS_DIR/cluster.rendered.yaml"
 RENDERED_VALUES="$EKS_DIR/values-eks.rendered.yaml"
 
 log "account ${ORBITA_EKS_ACCOUNT_ID}, region ${ORBITA_EKS_REGION}, bucket ${ORBITA_EKS_BUCKET}, cluster ${ORBITA_EKS_CLUSTER}"
 
-# 1. The bucket. It has to exist before the IRSA policy can name it, and before
-# the cluster writes a single segment. us-east-1 is the one region whose API
-# rejects a LocationConstraint, so it takes a different call.
-if aws s3api head-bucket --bucket "$ORBITA_EKS_BUCKET" 2>/dev/null; then
-  log "bucket ${ORBITA_EKS_BUCKET} already exists, reusing it"
-else
-  log "creating bucket ${ORBITA_EKS_BUCKET}"
-  if [ "$ORBITA_EKS_REGION" = "us-east-1" ]; then
-    aws s3api create-bucket --bucket "$ORBITA_EKS_BUCKET" --region us-east-1
-  else
-    aws s3api create-bucket --bucket "$ORBITA_EKS_BUCKET" --region "$ORBITA_EKS_REGION" \
-      --create-bucket-configuration "LocationConstraint=$ORBITA_EKS_REGION"
-  fi
-  # A safety net, not the teardown. down.sh empties and deletes the bucket; this
-  # only bounds the damage of a cluster left running past its welcome, so a
-  # forgotten test does not accrue storage forever.
-  aws s3api put-bucket-lifecycle-configuration --bucket "$ORBITA_EKS_BUCKET" \
-    --lifecycle-configuration '{"Rules":[{"ID":"expire-test-data","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":7}}]}'
-fi
+# 1. The AWS layer, in one Terraform pass: the VPC, the cluster, its OIDC
+# provider, both IRSA roles, the EBS CSI addon, and the bucket. Terraform reads
+# AWS credentials from the environment the same way the aws CLI does.
+log "applying Terraform (this takes ~15 minutes on a fresh cluster)"
+"$TF" -chdir="$TF_DIR" init -input=false
+"$TF" -chdir="$TF_DIR" apply -input=false -auto-approve \
+  -var "region=$ORBITA_EKS_REGION" \
+  -var "bucket_name=$ORBITA_EKS_BUCKET" \
+  -var "cluster_name=$ORBITA_EKS_CLUSTER"
 
-# 2. The cluster, its OIDC provider, the IRSA role, and the EBS CSI addon, in one
-# eksctl pass. envsubst fills only the two tokens cluster.yaml carries; the
-# rendered file is gitignored because it is a build artifact, not source.
-log "rendering ${RENDERED_CLUSTER}"
-# shellcheck disable=SC2016  # envsubst wants the literal ${VAR} names, not their values
-envsubst '${ORBITA_EKS_REGION} ${ORBITA_EKS_BUCKET}' \
-  < "$EKS_DIR/cluster.yaml" > "$RENDERED_CLUSTER"
-
-if eksctl get cluster --name "$ORBITA_EKS_CLUSTER" --region "$ORBITA_EKS_REGION" >/dev/null 2>&1; then
-  log "cluster ${ORBITA_EKS_CLUSTER} already exists, skipping create"
-else
-  log "creating cluster ${ORBITA_EKS_CLUSTER} (this takes ~15 minutes)"
-  eksctl create cluster -f "$RENDERED_CLUSTER"
-fi
-
-# kubectl should already point here after eksctl create, but an existing-cluster
-# run needs the kubeconfig written explicitly.
+# Point kubectl at the new cluster. Terraform created it; this writes the
+# kubeconfig entry the Kubernetes steps below need.
+log "writing kubeconfig for ${ORBITA_EKS_CLUSTER}"
 aws eks update-kubeconfig --name "$ORBITA_EKS_CLUSTER" --region "$ORBITA_EKS_REGION" >/dev/null
 
-# 3. The gp3 StorageClass the overlay names. The addon provisions it; this
-# object is what a PersistentVolumeClaim asks for by name.
+# 2. The gp3 StorageClass the overlay names. The addon Terraform installed
+# provisions it; this object is what a PersistentVolumeClaim asks for by name.
 log "applying the gp3 StorageClass"
 kubectl apply -f "$EKS_DIR/storageclass-gp3.yaml"
 
-# 4. The chart, with the AWS overlay. envsubst fills the account id, region, and
-# bucket the overlay carries.
+# 3. The chart, with the AWS overlay. envsubst fills the account id, region, and
+# bucket the overlay carries; the role name in its annotation is fixed and
+# matches the role Terraform just created.
 log "rendering ${RENDERED_VALUES}"
 # shellcheck disable=SC2016  # envsubst wants the literal ${VAR} names, not their values
 envsubst '${ORBITA_EKS_ACCOUNT_ID} ${ORBITA_EKS_REGION} ${ORBITA_EKS_BUCKET}' \
   < "$REPO_ROOT/deploy/helm/orbita/values-eks.yaml" > "$RENDERED_VALUES"
+
+# Sanity check: the role the overlay actually names must be the role Terraform
+# made. Read it straight out of the rendered overlay rather than reconstructing
+# it, so this catches a wrong account or a renamed role however it crept in. A
+# mismatch here is far cheaper to find now than as every pod 403ing on write.
+tf_role_arn="$("$TF" -chdir="$TF_DIR" output -raw irsa_role_arn)"
+overlay_role_arn="$(grep -o 'arn:aws:iam::[0-9]*:role/[^"[:space:]]*' "$RENDERED_VALUES" | head -1)"
+[ "$tf_role_arn" = "$overlay_role_arn" ] \
+  || die "role ARN mismatch: Terraform made ${tf_role_arn}, overlay names ${overlay_role_arn}"
 
 log "installing the orbita chart"
 helm upgrade --install "$ORBITA_EKS_RELEASE" "$REPO_ROOT/deploy/helm/orbita" \

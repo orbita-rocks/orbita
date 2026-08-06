@@ -11,7 +11,7 @@
 #
 #   ORBITA_EKS_REGION     (required) region for the cluster and the bucket
 #   ORBITA_EKS_BUCKET     (required) S3 bucket name, created by up.sh
-#   ORBITA_EKS_CLUSTER    (default: orbita-test) must match cluster.yaml
+#   ORBITA_EKS_CLUSTER    (default: orbita-test) must match the Terraform default
 #   ORBITA_EKS_NAMESPACE  (default: orbita) Kubernetes namespace for the release
 #   ORBITA_EKS_RELEASE    (default: orbita) Helm release name
 
@@ -19,6 +19,8 @@
 # regardless of the caller's working directory.
 EKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export EKS_DIR
+TF_DIR="$EKS_DIR/terraform"
+export TF_DIR
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -34,6 +36,18 @@ require_tools() {
   fi
 }
 
+# Terraform or OpenTofu, whichever is installed. They are drop-in for the
+# commands used here, so a script should not care which an operator has.
+tf_bin() {
+  if command -v terraform >/dev/null 2>&1; then
+    echo terraform
+  elif command -v tofu >/dev/null 2>&1; then
+    echo tofu
+  else
+    die "neither terraform nor tofu is on PATH"
+  fi
+}
+
 resolve_config() {
   : "${ORBITA_EKS_REGION:?set ORBITA_EKS_REGION to the region for the cluster and bucket}"
   : "${ORBITA_EKS_BUCKET:?set ORBITA_EKS_BUCKET to the S3 bucket name}"
@@ -43,7 +57,7 @@ resolve_config() {
 
   # Derived, not asked for: the account id is whatever the current AWS
   # credentials belong to. Asking for it invites a mismatch between the id in
-  # the role ARN and the account eksctl actually builds in.
+  # the role ARN and the account Terraform actually builds in.
   if [ -z "${ORBITA_EKS_ACCOUNT_ID:-}" ]; then
     ORBITA_EKS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)" \
       || die "could not read the AWS account id; is 'aws' configured?"
