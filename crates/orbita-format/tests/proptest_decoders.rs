@@ -18,6 +18,16 @@
 //! truncated). Pure random bytes rarely get past the first length or magic
 //! check; a corrupted-but-plausible object is where the interesting paths live,
 //! and the golden vectors are the most plausible objects there are.
+//!
+//! A bit flip on its own does not go far, though: every checksum in this format
+//! catches it at the first gate, so the pure-mutation properties prove the gate
+//! rejects damage but never exercise the parsing behind it. A panic hiding past
+//! a checksum would go unseen. The checksum-repaired properties close that: they
+//! mutate a valid input and then recompute every enclosing checksum, so the
+//! bytes are corrupt in their meaning yet valid in their integrity fields. That
+//! is exactly what a decoder cannot tell apart from a genuine object, and it is
+//! the input that reaches the offset arithmetic, the entry loop, and the record
+//! body — the code the pure-mutation properties leave untouched.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +35,8 @@ use bytes::Bytes;
 use orbita_core::{Epoch, KeyRange, KeyspaceId, Lamport, PartitionId};
 use orbita_format::record::{ExternalValue, RecordValue};
 use orbita_format::segment::{
-    BuiltSegment, Segment, SegmentBuilder, SegmentFooter, SegmentHeader, SegmentIndex,
+    BuiltSegment, Segment, SegmentBuilder, SegmentFooter, SegmentHeader, SegmentIndex, FOOTER_LEN,
+    HEADER_LEN,
 };
 use orbita_format::{Manifest, SegmentEntry, SegmentRecord};
 use proptest::prelude::*;
@@ -232,6 +243,136 @@ fn manifest_corpus() -> Vec<Vec<u8>> {
     vec![golden_manifest, empty]
 }
 
+// ----- checksum-repaired input strategies ---------------------------------
+//
+// The pure-mutation strategies above stop at the first checksum. These start
+// from a valid input, corrupt it, and then repair the checksums the corruption
+// invalidated, so the bytes clear the integrity gate and the parsing logic
+// behind it is what actually runs.
+
+/// Recomputes a framed record's leading CRC over `length ++ body`, so a body
+/// mutated in place still passes [`SegmentRecord::decode`]'s checksum and lands
+/// in `decode_body`. The frame is `crc32c(u32) | length(u32) | body`, and the
+/// checksum covers everything from the length onwards.
+fn repair_record_frame(frame: &mut [u8]) {
+    if frame.len() < 8 {
+        return;
+    }
+    let length = u32::from_le_bytes(frame[4..8].try_into().expect("four bytes")) as usize;
+    // The framed length decides where the record ends; clamp it so a mutated
+    // length still names a slice that exists, then checksum exactly that slice.
+    let total = (8 + length).min(frame.len());
+    let checksum = crc32c::crc32c(&frame[4..total]);
+    frame[..4].copy_from_slice(&checksum.to_le_bytes());
+}
+
+/// A framed record whose body is corrupted but whose CRC is repaired, so it
+/// flows past the checksum into `decode_body`. Seeded from the same corpus as
+/// the pure-mutation property; a flip in the body leaves the framing length
+/// intact, which is what keeps the repaired checksum reachable.
+fn checksum_repaired_record() -> impl Strategy<Value = Vec<u8>> {
+    (
+        proptest::sample::select(record_corpus()),
+        any::<prop::sample::Index>(),
+        any::<u8>(),
+    )
+        .prop_map(|(mut seed, index, xor)| {
+            if seed.len() > 8 {
+                let at = 8 + index.index(seed.len() - 8);
+                seed[at] ^= xor.max(1);
+            }
+            repair_record_frame(&mut seed);
+            seed
+        })
+}
+
+/// A segment footer with a valid magic, version, and self-checksum, carrying
+/// arbitrary offset, length, and lamport fields. Built by overwriting the
+/// mutable words of a real footer and repairing the footer's own CRC, so the
+/// bytes clear [`SegmentFooter::decode`]'s integrity gate and the offsets reach
+/// `index_range`, where an unchecked add would wrap.
+#[allow(clippy::too_many_arguments)]
+fn checksum_valid_footer(
+    index_offset: u64,
+    index_length: u64,
+    record_count: u64,
+    min_lamport: u64,
+    max_lamport: u64,
+    data_crc32c: u32,
+    index_crc32c: u32,
+) -> Vec<u8> {
+    // The last FOOTER_LEN bytes of the golden segment are a valid footer; reuse
+    // its magic and version rather than restating the private constants here.
+    let segment = golden(GOLDEN_SEGMENT);
+    let mut footer = segment[segment.len() - FOOTER_LEN as usize..].to_vec();
+    footer[0..8].copy_from_slice(&index_offset.to_le_bytes());
+    footer[8..16].copy_from_slice(&index_length.to_le_bytes());
+    footer[16..24].copy_from_slice(&record_count.to_le_bytes());
+    footer[24..32].copy_from_slice(&min_lamport.to_le_bytes());
+    footer[32..40].copy_from_slice(&max_lamport.to_le_bytes());
+    footer[40..44].copy_from_slice(&data_crc32c.to_le_bytes());
+    footer[44..48].copy_from_slice(&index_crc32c.to_le_bytes());
+    // 48..52 is reserved and must stay zero; 56..64 keep the golden version and
+    // magic. The footer's own CRC covers bytes 0..52.
+    let checksum = crc32c::crc32c(&footer[..52]);
+    footer[52..56].copy_from_slice(&checksum.to_le_bytes());
+    footer
+}
+
+/// A built segment with one byte flipped somewhere in its data or index
+/// section and every enclosing checksum repaired: the containing record frame
+/// when the flip lands in the data section, the data-section and index-section
+/// CRCs in the footer, and the footer's own CRC. The result clears every
+/// integrity gate in [`Segment::decode`] and exercises the structural checks
+/// past them on bytes no encoder would ever produce.
+fn checksum_repaired_segment() -> impl Strategy<Value = Vec<u8>> {
+    (arb_segment(), any::<prop::sample::Index>(), any::<u8>()).prop_map(
+        |((_, built), index, xor)| {
+            let mut bytes = built.bytes.to_vec();
+            let footer_at = bytes.len() - FOOTER_LEN as usize;
+            let index_offset =
+                u64::from_le_bytes(bytes[footer_at..footer_at + 8].try_into().expect("eight"))
+                    as usize;
+            let index_length = u64::from_le_bytes(
+                bytes[footer_at + 8..footer_at + 16]
+                    .try_into()
+                    .expect("eight"),
+            ) as usize;
+
+            // Flip a byte anywhere in the data or index sections, which together
+            // span the header end up to the footer.
+            let region = footer_at - HEADER_LEN as usize;
+            if region > 0 {
+                let at = HEADER_LEN as usize + index.index(region);
+                bytes[at] ^= xor.max(1);
+
+                // A flip in the data section breaks the record frame it lands
+                // in; repair that frame so the corruption reaches the record
+                // decoder rather than dying at its checksum.
+                if at < index_offset {
+                    for entry in built.index.entries() {
+                        let start = entry.offset as usize;
+                        let end = start + entry.record_length as usize;
+                        if (start..end).contains(&at) {
+                            repair_record_frame(&mut bytes[start..end]);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Repair the two section checksums and then the footer's own.
+            let data_crc = crc32c::crc32c(&bytes[HEADER_LEN as usize..index_offset]);
+            let index_crc = crc32c::crc32c(&bytes[index_offset..index_offset + index_length]);
+            bytes[footer_at + 40..footer_at + 44].copy_from_slice(&data_crc.to_le_bytes());
+            bytes[footer_at + 44..footer_at + 48].copy_from_slice(&index_crc.to_le_bytes());
+            let checksum = crc32c::crc32c(&bytes[footer_at..footer_at + 52]);
+            bytes[footer_at + 52..footer_at + 56].copy_from_slice(&checksum.to_le_bytes());
+            bytes
+        },
+    )
+}
+
 // ----- SegmentRecord ------------------------------------------------------
 // Decoder: crates/orbita-format/src/record.rs:166 (SegmentRecord::decode)
 
@@ -253,6 +394,16 @@ proptest! {
         // call returns at all rather than panicking.
         let _ = SegmentRecord::decode(&bytes);
     }
+
+    #[test]
+    fn decoding_a_checksum_valid_corrupt_record_never_panics(
+        bytes in checksum_repaired_record()
+    ) {
+        // The body is corrupt but the frame CRC agrees, so this reaches
+        // `decode_body` past the checksum. That is the path the pure-mutation
+        // property cannot reach, because its flip fails the CRC first.
+        let _ = SegmentRecord::decode(&bytes);
+    }
 }
 
 // ----- Segment ------------------------------------------------------------
@@ -272,6 +423,17 @@ proptest! {
     fn decoding_arbitrary_bytes_as_a_segment_never_panics(
         bytes in decoder_input(segment_corpus())
     ) {
+        let _ = Segment::decode(&bytes);
+    }
+
+    #[test]
+    fn decoding_a_checksum_valid_corrupt_segment_never_panics(
+        bytes in checksum_repaired_segment()
+    ) {
+        // Every checksum in the object agrees, so decode clears the data and
+        // index CRCs and the per-record frame CRCs and lands on the structural
+        // checks: index-versus-data agreement, ascending keys, offset math.
+        // Those run only on integrity-valid bytes, which a bit flip never is.
         let _ = Segment::decode(&bytes);
     }
 }
@@ -302,6 +464,35 @@ proptest! {
     }
 
     #[test]
+    fn decoding_a_checksum_valid_footer_never_panics(
+        index_offset in any::<u64>(),
+        index_length in any::<u64>(),
+        record_count in any::<u64>(),
+        min_lamport in any::<u64>(),
+        max_lamport in any::<u64>(),
+        data_crc32c in any::<u32>(),
+        index_crc32c in any::<u32>(),
+        object_bytes in any::<u64>(),
+    ) {
+        // A footer whose magic, version, and self-checksum all agree, so decode
+        // gets past its integrity gate to the min/max-lamport check and, on
+        // success, to `index_range`. The random-bytes property above almost
+        // never assembles a valid checksum, so it rarely reaches here at all.
+        let bytes = checksum_valid_footer(
+            index_offset,
+            index_length,
+            record_count,
+            min_lamport,
+            max_lamport,
+            data_crc32c,
+            index_crc32c,
+        );
+        if let Ok(footer) = SegmentFooter::decode(&bytes) {
+            let _ = footer.index_range(object_bytes);
+        }
+    }
+
+    #[test]
     fn decoding_arbitrary_bytes_as_a_segment_index_never_panics(
         bytes in proptest::collection::vec(any::<u8>(), 0..512),
         index_offset in any::<u64>(),
@@ -312,6 +503,34 @@ proptest! {
         data_crc32c in any::<u32>(),
         index_crc32c in any::<u32>(),
     ) {
+        let footer = SegmentFooter {
+            index_offset,
+            index_length,
+            record_count,
+            min_lamport: Lamport(min_lamport),
+            max_lamport: Lamport(max_lamport),
+            data_crc32c,
+            index_crc32c,
+        };
+        let _ = SegmentIndex::decode(&bytes, &footer);
+    }
+
+    #[test]
+    fn decoding_a_checksum_valid_segment_index_never_panics(
+        bytes in proptest::collection::vec(any::<u8>(), 0..512),
+        index_offset in any::<u64>(),
+        index_length in any::<u64>(),
+        record_count in any::<u64>(),
+        min_lamport in any::<u64>(),
+        max_lamport in any::<u64>(),
+        data_crc32c in any::<u32>(),
+    ) {
+        // Derive `index_crc32c` from the generated bytes so decode agrees at the
+        // checksum and proceeds into the entry loop: the key-length reads, the
+        // ascending-key check, and the count-versus-footer check. The property
+        // with an independently generated checksum returns at the first
+        // comparison and never runs any of that.
+        let index_crc32c = crc32c::crc32c(&bytes);
         let footer = SegmentFooter {
             index_offset,
             index_length,

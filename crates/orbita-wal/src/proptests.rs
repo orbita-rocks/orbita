@@ -22,12 +22,20 @@
 //! messages, then mutated (exact, one bit flipped, truncated). A
 //! plausible-but-broken frame reaches decode paths that pure noise, stopped at
 //! the first length or checksum check, never does.
+//!
+//! A bit flip alone stops at the frame CRC, though, so the pure-mutation
+//! properties prove the CRC rejects damage but never run `decode_body` on a
+//! corrupt-but-checksum-valid frame. The checksum-repaired properties do: they
+//! flip a byte in a frame body and then recompute the frame CRC over
+//! `length ++ body`, so the frame is corrupt in its meaning yet valid in its
+//! checksum. That is the input a decoder cannot tell from a real frame, and it
+//! is what exercises the record decoder past the gate.
 
 use bytes::Bytes;
 use orbita_core::{Epoch, Lamport, PartitionId};
 use proptest::prelude::*;
 
-use crate::format::{self, segment_header, LogRecord, WalEntry, WalOp};
+use crate::format::{self, segment_header, LogRecord, WalEntry, WalOp, FRAME_HEADER_BYTES};
 use crate::wire::{AppendRequest, FenceRequest, StatusRequest, WalResponse};
 
 // ----- value strategies ---------------------------------------------------
@@ -158,6 +166,71 @@ fn decoder_input(corpus: Vec<Vec<u8>>) -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
+/// Recomputes a WAL frame's CRC over `length ++ body`, so a frame whose body
+/// was mutated in place still passes [`format::decode`]'s checksum and reaches
+/// `decode_body`. The frame is `len(u32) | crc(u32) | body`, and the checksum
+/// covers the length bytes followed by the body.
+fn repair_frame(frame: &mut [u8]) {
+    if frame.len() < FRAME_HEADER_BYTES {
+        return;
+    }
+    let len = u32::from_le_bytes(frame[0..4].try_into().expect("four bytes")) as usize;
+    // The length names where the body ends; clamp it so a mutated length still
+    // points inside the buffer, then checksum exactly that span.
+    let end = (FRAME_HEADER_BYTES + len).min(frame.len());
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&frame[0..4]);
+    hasher.update(&frame[FRAME_HEADER_BYTES..end]);
+    frame[4..8].copy_from_slice(&hasher.finalize().to_le_bytes());
+}
+
+/// A frame whose body is corrupted but whose CRC is repaired, so it clears the
+/// checksum and reaches `decode_body`. A flip in the body leaves the length
+/// intact, which is what keeps the repaired checksum the one the decoder reads.
+fn checksum_repaired_frame() -> impl Strategy<Value = Vec<u8>> {
+    (
+        proptest::sample::select(frame_corpus()),
+        any::<proptest::sample::Index>(),
+        any::<u8>(),
+    )
+        .prop_map(|(mut seed, index, xor)| {
+            if seed.len() > FRAME_HEADER_BYTES {
+                let at = FRAME_HEADER_BYTES + index.index(seed.len() - FRAME_HEADER_BYTES);
+                seed[at] ^= xor.max(1);
+            }
+            repair_frame(&mut seed);
+            seed
+        })
+}
+
+/// A single-entry append whose one frame is corrupted in its body and then has
+/// its CRC repaired, so [`AppendRequest::decode`] clears the frame checksum and
+/// runs the record decode behind it rather than rejecting at the CRC.
+fn checksum_repaired_append() -> impl Strategy<Value = Vec<u8>> {
+    (any::<proptest::sample::Index>(), any::<u8>()).prop_map(|(index, xor)| {
+        let entry = sample_entry();
+        let frame = format::encode(&LogRecord::Entry(entry.clone()));
+        let request = AppendRequest {
+            partition: PartitionId(1),
+            epoch: Epoch(2),
+            prev_lamport: Lamport(4),
+            committed: Lamport(3),
+            entries: vec![(entry, frame)],
+        };
+        let mut bytes = request.encode().to_vec();
+        // The fixed header is partition, epoch, prev, committed (four u64s) and
+        // a u32 count, so the one frame begins at byte 36.
+        let frame_start = 4 * 8 + 4;
+        if bytes.len() > frame_start + FRAME_HEADER_BYTES {
+            let body = bytes.len() - frame_start - FRAME_HEADER_BYTES;
+            let at = frame_start + FRAME_HEADER_BYTES + index.index(body);
+            bytes[at] ^= xor.max(1);
+            repair_frame(&mut bytes[frame_start..]);
+        }
+        bytes
+    })
+}
+
 fn sample_entry() -> WalEntry {
     WalEntry {
         lamport: Lamport(5),
@@ -270,6 +343,16 @@ proptest! {
     ) {
         let _ = format::decode(&bytes);
     }
+
+    #[test]
+    fn decoding_a_checksum_valid_corrupt_frame_never_panics(
+        bytes in checksum_repaired_frame()
+    ) {
+        // The body is corrupt but the frame CRC agrees, so this reaches
+        // `decode_body` past the checksum, which the flipped-seed property
+        // cannot: its stale CRC fails first.
+        let _ = format::decode(&bytes);
+    }
 }
 
 // ----- segment header decoder ---------------------------------------------
@@ -305,6 +388,16 @@ proptest! {
     fn decoding_arbitrary_bytes_as_an_append_never_panics(
         bytes in decoder_input(append_corpus())
     ) {
+        let _ = AppendRequest::decode(&Bytes::from(bytes));
+    }
+
+    #[test]
+    fn decoding_a_checksum_valid_corrupt_append_never_panics(
+        bytes in checksum_repaired_append()
+    ) {
+        // The framed entry's CRC agrees over its corrupt body, so decode gets
+        // past the per-frame checksum into the entry decode and the trailing
+        // structural checks rather than stopping at the CRC.
         let _ = AppendRequest::decode(&Bytes::from(bytes));
     }
 }
