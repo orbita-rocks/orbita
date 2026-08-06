@@ -24,7 +24,11 @@ variable "cluster_name" {
 variable "kubernetes_version" {
   description = "EKS control-plane version. Pinned so a bring-up next month is the same cluster."
   type        = string
-  default     = "1.30"
+  # Must be a version EKS still creates. AWS drops older versions out of standard
+  # support and then refuses to create new clusters on them, so this is not a
+  # free-forever pin: it needs a bump when the floor moves. 1.33 is well inside
+  # standard support as of this writing, with room before it ages out.
+  default = "1.33"
 }
 
 # The workload IRSA role. Its name is baked into the Helm overlay's role-arn

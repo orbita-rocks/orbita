@@ -28,16 +28,27 @@ log "tearing down cluster ${ORBITA_EKS_CLUSTER}, region ${ORBITA_EKS_REGION}, bu
 # a helm uninstall on purpose, and each one is backed by an EBS volume Terraform
 # does not know about, so deleting the namespace's PVCs is what lets the CSI
 # driver release those volumes before the cluster that runs the driver is gone.
-# Skip cleanly if kubectl cannot reach a cluster that is already deleted.
-if kubectl cluster-info >/dev/null 2>&1; then
+#
+# Point kubectl at THIS cluster first, explicitly, rather than trusting whatever
+# context happens to be current. An operator who switched contexts after
+# bring-up would otherwise have this uninstall a release and delete PVCs on an
+# unrelated cluster. update-kubeconfig failing means the cluster is already
+# gone, which is the one case where skipping the Kubernetes cleanup is correct.
+if aws eks update-kubeconfig --name "$ORBITA_EKS_CLUSTER" --region "$ORBITA_EKS_REGION" >/dev/null 2>&1; then
   if helm status "$ORBITA_EKS_RELEASE" --namespace "$ORBITA_EKS_NAMESPACE" >/dev/null 2>&1; then
     log "uninstalling the orbita release"
+    # Tolerated: a release that is already gone is not a reason to stop.
     helm uninstall "$ORBITA_EKS_RELEASE" --namespace "$ORBITA_EKS_NAMESPACE" --wait || true
   fi
+  # NOT tolerated. --ignore-not-found already makes an absent PVC a success, so
+  # anything that reaches here is a real failure to release EBS volumes, and
+  # destroying the cluster and its CSI driver on top of that orphans those
+  # volumes to bill silently. Let it stop teardown so an operator deals with it
+  # while the driver that can still delete the volumes is alive.
   log "deleting persistent volume claims so their EBS volumes are released"
-  kubectl delete pvc --all --namespace "$ORBITA_EKS_NAMESPACE" --ignore-not-found --wait || true
+  kubectl delete pvc --all --namespace "$ORBITA_EKS_NAMESPACE" --ignore-not-found --wait
 else
-  log "no reachable cluster, skipping release and volume cleanup"
+  log "cluster ${ORBITA_EKS_CLUSTER} not reachable, skipping release and volume cleanup"
 fi
 
 # 2. Everything AWS, in one Terraform pass. destroy removes the cluster, the node
@@ -47,6 +58,7 @@ fi
 # is the confirmation.
 log "destroying Terraform-managed infrastructure (this takes several minutes)"
 "$TF" -chdir="$TF_DIR" destroy -input=false -auto-approve \
+  -var "namespace=$ORBITA_EKS_NAMESPACE" \
   -var "region=$ORBITA_EKS_REGION" \
   -var "bucket_name=$ORBITA_EKS_BUCKET" \
   -var "cluster_name=$ORBITA_EKS_CLUSTER"

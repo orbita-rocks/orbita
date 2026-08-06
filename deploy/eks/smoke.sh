@@ -60,31 +60,49 @@ printf '%s' "$description" | grep -q "raft leader" \
 printf '%s' "$description" | grep -Eq "0 suspect, 0 dead" \
   || die "cluster reports unhealthy nodes"
 
+# The .oseg object keys currently in the bucket. The segment check below
+# requires a NEW one, so it has to know what was there before this run wrote
+# anything. A leftover segment from an earlier run proves nothing about this
+# write or this run's IRSA access.
+list_segments() {
+  aws s3 ls "s3://${ORBITA_EKS_BUCKET}/" --recursive | awk '{print $4}' | grep '\.oseg$' || true
+}
+segments_before="$(list_segments)"
+
 # 2. A keyspace. Tolerate one already there from a previous smoke run.
 log "creating keyspace ${KEYSPACE}"
 "$ORBITA_BIN" keyspace create "$KEYSPACE" >/dev/null 2>&1 || true
 
-# 3. A write that reads back. This is the client-visible contract in one line.
+# 3. A write that reads back. Retry the write: keyspace creation returns before
+# the workers necessarily open the new partition, so an immediate write can come
+# back Unavailable on a perfectly healthy cluster. That is a propagation delay,
+# not a failure, so retry within a bound rather than let it fail the smoke.
 log "writing and reading back"
-"$ORBITA_BIN" set "$KEYSPACE" "$KEY" "$VALUE" >/dev/null
+wrote=""
+for _ in $(seq 1 15); do
+  if "$ORBITA_BIN" set "$KEYSPACE" "$KEY" "$VALUE" >/dev/null 2>&1; then
+    wrote=yes
+    break
+  fi
+  sleep 2
+done
+[ -n "$wrote" ] || die "write never succeeded; the partition may not have opened"
 got="$("$ORBITA_BIN" get "$KEYSPACE" "$KEY")"
 [ "$got" = "$VALUE" ] || die "read back '${got}', expected '${VALUE}'"
 
-# 4. A segment in the bucket. The flush timer is 30 seconds, so poll for up to
-# two minutes. Finding an .oseg under the keyspace prefix is proof the write
-# reached real S3 through the IRSA credentials, not just a worker's local disk.
-log "waiting for a segment to land in s3://${ORBITA_EKS_BUCKET} (flush timer is 30s)"
-found=""
+# 4. A NEW segment in the bucket. The flush timer is 30 seconds, so poll for up
+# to two minutes for an .oseg that was not there before this run wrote. Requiring
+# a new one is what makes this prove the current write reached real S3 through
+# the IRSA credentials; accepting any historical segment would pass on a broken
+# cluster the moment a previous run had ever succeeded.
+log "waiting for a new segment in s3://${ORBITA_EKS_BUCKET} (flush timer is 30s)"
+new_segment=""
 for _ in $(seq 1 24); do
-  if aws s3 ls "s3://${ORBITA_EKS_BUCKET}/" --recursive | grep -q "\.oseg$"; then
-    found=yes
-    break
-  fi
+  new_segment="$(comm -13 <(printf '%s\n' "$segments_before" | sort -u) <(list_segments | sort -u) | grep -m1 '\.oseg$' || true)"
+  [ -n "$new_segment" ] && break
   sleep 5
 done
-[ -n "$found" ] || die "no segment appeared in the bucket within two minutes"
+[ -n "$new_segment" ] || die "no new segment appeared in the bucket within two minutes"
 
-log "segments in the bucket:"
-aws s3 ls "s3://${ORBITA_EKS_BUCKET}/" --recursive | grep -E "\.(oseg|json)$" >&2 || true
-
-log "smoke passed: quorum formed, keyspace created, write round-tripped, segment in S3."
+log "new segment from this run: ${new_segment}"
+log "smoke passed: quorum formed, keyspace created, write round-tripped, fresh segment in S3."

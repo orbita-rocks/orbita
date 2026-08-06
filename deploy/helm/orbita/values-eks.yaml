@@ -29,6 +29,12 @@ image:
 
 serviceAccount:
   create: true
+  # Fixed, not derived from the release name. The IRSA role Terraform creates
+  # trusts exactly one subject, <namespace>:orbita, so the service account has to
+  # be named orbita whatever the Helm release is called. Left to default, the
+  # name follows the release name, and a release named anything but orbita would
+  # deploy pods that cannot assume the role.
+  name: orbita
   annotations:
     # This annotation is the entire IRSA handshake on the Kubernetes side. The
     # EKS pod-identity webhook sees it and injects AWS_WEB_IDENTITY_TOKEN_FILE

@@ -31,10 +31,16 @@ log "account ${ORBITA_EKS_ACCOUNT_ID}, region ${ORBITA_EKS_REGION}, bucket ${ORB
 # AWS credentials from the environment the same way the aws CLI does.
 log "applying Terraform (this takes ~15 minutes on a fresh cluster)"
 "$TF" -chdir="$TF_DIR" init -input=false
+# The namespace is threaded through because it is half of the IRSA trust subject
+# (<namespace>:orbita). If the operator overrides ORBITA_EKS_NAMESPACE, the role
+# has to trust that namespace or every pod fails to assume it. The service
+# account name is fixed at orbita by the overlay, so it stays Terraform's
+# default and is not passed here.
 "$TF" -chdir="$TF_DIR" apply -input=false -auto-approve \
   -var "region=$ORBITA_EKS_REGION" \
   -var "bucket_name=$ORBITA_EKS_BUCKET" \
-  -var "cluster_name=$ORBITA_EKS_CLUSTER"
+  -var "cluster_name=$ORBITA_EKS_CLUSTER" \
+  -var "namespace=$ORBITA_EKS_NAMESPACE"
 
 # Point kubectl at the new cluster. Terraform created it; this writes the
 # kubeconfig entry the Kubernetes steps below need.

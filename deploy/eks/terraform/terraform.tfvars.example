@@ -12,5 +12,5 @@ bucket_name = "orbita-test-changeme"
 # name and role name are also written into deploy/helm/orbita/values-eks.yaml
 # and the docs, so change them in all three or not at all.
 # cluster_name       = "orbita-test"
-# kubernetes_version = "1.30"
+# kubernetes_version = "1.33"
 # node_instance_type = "m5.xlarge"
