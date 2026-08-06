@@ -27,22 +27,26 @@ split metadata state machine exists, but the operation is deliberately disabled
 until workers can prepare child storage before the parent map entry is retired;
 merge remains unimplemented.
 
-Two things are deliberately staged rather than missing by accident. The control
+One thing is deliberately staged rather than missing by accident: the control
 plane runs its replicated state machine over a single-node consensus log, with
-the `ConsensusLog` trait as the seam where Raft goes. And storage still runs on
-RocksDB while [docs/format/partition-v1.md](docs/format/partition-v1.md)
-specifies the open format that replaces it; the object storage trait exists but
-nothing implements it yet.
+the `ConsensusLog` trait as the seam where Raft goes.
+
+Storage used to be the other one, and is not any more. Partitions run on the
+open format specified in
+[docs/format/partition-v1.md](docs/format/partition-v1.md) over
+`orbita_objectstore::ObjectStore`, with an S3-compatible implementation behind
+the trait and a filesystem one for a node with no bucket. RocksDB is gone, per
+[ADR 0006](docs/adr/0006-partitions-are-an-index-over-immutable-objects.md).
 
 ## v0.1.0: the system, complete enough to mean it
 
 The first release carries everything short of the measurement work. I
-considered cutting a release from what exists today and spreading the rest
+considered cutting a release from what exists now and spreading the rest
 across several minors, but each of those releases would have shipped with a
-caveat that undercuts the pitch: a control plane that dies with one node, a
-storage format that is specified but not implemented, upgrades that cannot run
-unattended. Since nobody is waiting on a tag, the first release should be the
-one that does not need apologizing for.
+caveat that undercuts the pitch: a control plane that dies with one node,
+upgrades that cannot run unattended, and, when this was written, a storage
+format that was specified but not implemented. Since nobody is waiting on a
+tag, the first release should be the one that does not need apologizing for.
 
 The work groups into four themes, and they are roughly the order to build in.
 
@@ -60,32 +64,30 @@ repeatable release path.
 ### The open format and object storage
 
 This makes the storage story true. The requirements claim partitions are an
-index over immutable objects and that the format is specified and open. Today
-that is a specification and a trait with no implementation behind either, and
+index over immutable objects and that the format is specified and open, and
 the product's storage pitch, meaning workers cheap to replace and data
-reachable without Orbita, is unearned until this lands.
+reachable without Orbita, stays unearned for as long as any of that is only
+written down. The engine half is written now: partitions run on partition-v1
+over `orbita_objectstore::ObjectStore`, an S3-compatible store implements the
+trait with the conditional writes manifest swaps depend on, and a worker is
+replaced by hydrating from a bucket rather than copying from a peer. What
+follows is the rest of the theme.
 
-- An S3-compatible implementation of the object storage trait (AWS S3, MinIO,
-  R2), with conditional writes for manifest swaps.
-- Segment write and manifest publication in the partition-v1 format, and
-  hydration of a partition from a bucket, which is what makes replacing a
-  worker a download rather than a peer-to-peer copy.
-- Retiring RocksDB in favor of the memory-resident index over immutable
-  objects per ADR 0006.
 - Golden test vectors checked in as fixture bytes, per the format README's
   planned section, so a third party has something to conform to.
 - A reserved commit timestamp field and intent flag in the record encoding,
   per the Transactions section of the requirements. The transaction work
   itself is post-1.0, but the bytes freeze with this release, and this
   reservation is the only part of that direction with a deadline.
-- musl static builds become worth revisiting once the C++ toolchain dependency
-  goes with RocksDB.
+- musl static builds, which were a project of their own while the build needed
+  a C++ toolchain for the storage engine. That toolchain left with RocksDB, so
+  what is between here and a static binary is build configuration.
 - Resource visibility in `orbita cluster describe`: memory held by the
   partition indexes per node, per-partition size, WAL lag, and quota
-  saturation. This lives in the format theme because the format work creates
-  the need: retiring RocksDB makes the index memory-resident, meaning memory
-  becomes the resource that runs out first, and shipping that change with no
-  way to watch it is exactly the kind of caveat this release exists to avoid.
+  saturation. This lives in the format theme because the format work created
+  the need: retiring RocksDB made the index memory-resident, so memory is now
+  the resource that runs out first, and shipping that change with no way to
+  watch it is exactly the kind of caveat this release exists to avoid.
   The thresholds that turn these numbers into scaling decisions come later;
   the raw signals cannot.
 
