@@ -442,11 +442,23 @@ class Node:
     durability from outside.
     """
 
-    def __init__(self, binary: Path, data_dir: Path, pb2_grpc, log_path: Path):
+    def __init__(
+        self,
+        binary: Path,
+        data_dir: Path,
+        pb2_grpc,
+        log_path: Path,
+        env: dict[str, str] | None = None,
+    ):
         self._binary = binary
         self._pb2_grpc = pb2_grpc
         self.data_dir = data_dir
         self._log_path = log_path
+        # Extra environment for the node process, on top of the inherited one.
+        # This is how a test turns on `require_auth` and names a root
+        # credential (`ORBITA_REQUIRE_AUTH`, `ORBITA_ROOT_CREDENTIAL`) without
+        # the harness having to know anything about authentication.
+        self._env = env
         self._process: subprocess.Popen | None = None
         self._channel: grpc.Channel | None = None
         self._log = None
@@ -466,6 +478,9 @@ class Node:
         # The peer listener takes the port above the client one, so leave a gap.
         self.port = free_port()
         self._log = self._log_path.open("ab")
+        process_env = None
+        if self._env is not None:
+            process_env = {**os.environ, **self._env}
         self._process = subprocess.Popen(
             [
                 str(self._binary),
@@ -480,6 +495,7 @@ class Node:
             cwd=REPO_ROOT,
             stdout=self._log,
             stderr=subprocess.STDOUT,
+            env=process_env,
         )
 
         # Connect twice on purpose, because a channel's maximum message size is
