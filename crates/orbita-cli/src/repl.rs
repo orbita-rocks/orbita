@@ -179,6 +179,35 @@ fn parse_line(line: &str) -> Result<Line> {
     // and help read the way they do from a shell.
     let cli =
         Cli::try_parse_from(std::iter::once("orbita").chain(tokens.iter().map(String::as_str)))?;
+
+    // The session holds one endpoint, one credential, and one resolved config
+    // for its whole life, so a line that tries to change any of them is refused
+    // rather than silently dropped. Silently dropping them is a footgun with
+    // teeth: `get k --endpoint staging` would read the current session's cluster
+    // while reading as if it named staging, and a destructive command is worse.
+    // Output format is the one global safe to vary per line, because it changes
+    // only how a result is printed, not what is done or where.
+    let mut overrides = Vec::new();
+    if cli.global.endpoint.is_some() {
+        overrides.push("--endpoint");
+    }
+    if cli.global.credential.is_some() {
+        overrides.push("--credential");
+    }
+    if cli.global.config.is_some() {
+        overrides.push("--config");
+    }
+    if cli.global.log_level.is_some() {
+        overrides.push("--log-level");
+    }
+    if !overrides.is_empty() {
+        bail!(
+            "{} cannot be set per line: the session's endpoint, credential, and configuration are \
+             fixed when it starts. Leave and restart `orbita repl` with them instead",
+            overrides.join(", ")
+        );
+    }
+
     Ok(Line::Command {
         command: cli.command,
         format: cli.global.output,
@@ -329,11 +358,20 @@ fn split_line(line: &str) -> Result<Vec<String>> {
         match c {
             '\'' => {
                 in_token = true;
+                let mut closed = false;
                 for q in chars.by_ref() {
                     if q == '\'' {
+                        closed = true;
                         break;
                     }
                     current.push(q);
+                }
+                // A line that opens a quote and never closes it is truncated,
+                // not a token: accepting it would let `set demo key 'hello`
+                // execute a write of an unterminated string. Match the
+                // double-quote branch and refuse it.
+                if !closed {
+                    bail!("unterminated ' quote");
                 }
             }
             '"' => {
@@ -565,6 +603,39 @@ mod tests {
         assert_eq!(split_line(r#"'a b'"#).unwrap(), ["a b"]);
         assert_eq!(split_line(r#""a\"b""#).unwrap(), [r#"a"b"#]);
         assert!(split_line(r#""unterminated"#).is_err());
+    }
+
+    #[test]
+    fn an_unterminated_single_quote_is_refused_rather_than_run() {
+        // The P2: a truncated `set demo key 'hello` must not execute a write of
+        // an unterminated string.
+        assert!(split_line("set demo key 'hello").is_err());
+        assert!(parse_line("set demo key 'hello").is_err());
+    }
+
+    #[test]
+    fn a_per_line_connection_override_is_refused_not_silently_dropped() {
+        // The P1: silently keeping only the command would let `get k --endpoint
+        // staging` run against the session's cluster while reading as if it
+        // named another. Every connection- or identity-changing global is
+        // refused per line.
+        for line in [
+            "get demo k --endpoint http://staging:7100",
+            "keyspace list --credential other-secret",
+            "get demo k --config /tmp/other.toml",
+            "get demo k --log-level debug",
+        ] {
+            let error = parse_line(line).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("cannot be set per line"),
+                "{line}: {error:#}"
+            );
+        }
+        // The one global that only affects rendering is still allowed per line.
+        assert!(matches!(
+            parse_line("keyspace list --output json").unwrap(),
+            Line::Command { .. }
+        ));
     }
 
     #[test]
