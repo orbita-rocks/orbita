@@ -11,11 +11,22 @@ user's site.
 # The two binaries
 
 The cluster version a binary speaks is derived from its crate version at
-compile time (`orbita-control::version`). So a binary stamped one minor below
-this one speaks only the previous cluster version, which is exactly the peer
-the compatibility gate exists to judge. `previous_binary` produces that older
-binary; when it cannot, the whole test skips with the reason rather than
-pretending to cover the upgrade.
+compile time (`orbita-control::version`). So a binary one minor below this one
+speaks only the previous cluster version, which is exactly the peer the
+compatibility gate exists to judge. `previous_binary` produces that older side.
+
+By default that old side is the current source restamped one minor down, not a
+prior release: this repository has cut none (no tags, no GitHub releases), and
+every revision carrying the upgrade machinery under test is already at the
+current minor, so no earlier revision both speaks the lower version *and* runs
+this feature. See the note in `harness.previous_binary`. That default shares
+code between the two binaries, so this run covers the compatibility GATE and
+the finalize/lockout sequence end to end, but cannot catch an incompatibility
+introduced *between* releases. Set `ORBITA_PREV_REV` to a real earlier
+implementation (or `ORBITA_PREV_BINARY` to a prior release binary) to make it a
+true cross-version test; the harness validates that side speaks the previous
+minor. When the previous minor is not expressible (a minor-zero workspace) the
+whole test skips with the reason rather than pretending to cover the upgrade.
 
 # The shape
 
@@ -112,14 +123,31 @@ class NodeProc:
             stderr=subprocess.STDOUT,
         )
 
-    def kill(self) -> None:
-        """Stop the process the way a crash would, and wait for the port.
+    def terminate(self, drain_timeout: float = 30.0) -> None:
+        """Stop the process the way a Kubernetes rolling replacement does.
 
-        SIGKILL rather than a drain because durability is supposed to come from
-        the write-ahead log on the data directory, not from a graceful handoff,
-        and because a worker on the old binary drains on SIGTERM and would
-        otherwise linger past the next node's start.
+        A StatefulSet rolling update sends SIGTERM and only escalates to SIGKILL
+        after the termination grace period. That ordering is the point: the
+        version-gated shutdown path runs on SIGTERM and decides Raft stepdown
+        and whether failover is rollback-compatible or a finalized handoff. A
+        straight SIGKILL would bypass that path, so a rollout that hangs or emits
+        the wrong shutdown protocol would still pass this test. So terminate
+        gracefully, and only fall back to SIGKILL if the drain overruns, which is
+        itself a failure of the shutdown path worth surfacing in the log.
         """
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=drain_timeout)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=30)
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+    def kill(self) -> None:
+        """Hard-stop for teardown, where a clean drain no longer matters."""
         if self.proc is not None and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait(timeout=30)
@@ -128,7 +156,9 @@ class NodeProc:
             self._log = None
 
     def roll(self, binary: Path) -> None:
-        self.kill()
+        # Graceful termination, because a rolling update never SIGKILLs a healthy
+        # replica; it drains it so the shutdown path can hand off cleanly.
+        self.terminate()
         # The kernel needs a moment to release the two listeners before the
         # replacement binds the same ports.
         time.sleep(1.0)
@@ -366,6 +396,14 @@ def _read(cluster: Cluster, key: bytes) -> kv_pb2.GetResponse:
 def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
     orbita_binary, previous_binary, tmp_path
 ):
+    # Both versions come from the same parsed workspace version, so a bump to
+    # 0.2.0-dev moves old to 0.1 and new to 0.2 without touching this test. A
+    # hardcoded "0.0"/"0.1" would fail before exercising anything the day the
+    # workspace minor moves, since the old side then bootstraps at the new
+    # previous minor, not 0.0.
+    old_version = harness.previous_cluster_version()
+    new_version = harness.current_cluster_version()
+
     cluster = Cluster(new=orbita_binary, old=previous_binary, workdir=tmp_path)
     try:
         # A cluster bootstrapped entirely on the old binary comes up at the old
@@ -373,7 +411,9 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
         # finalize-upgrade has anything to do.
         cluster.bootstrap()
         cluster.wait_all_ready()
-        assert cluster.cluster_version() == "0.0", "the old binary bootstraps at 0.0"
+        assert cluster.cluster_version() == old_version, (
+            f"the old binary bootstraps at {old_version}"
+        )
 
         # The leader group creates the default keyspace as part of bootstrap, so
         # it is a control-log entry written while the cluster was at 0.0. Once
@@ -386,7 +426,8 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
         # both predate every binary swap below, so reading it back at the end is
         # the observable proof that the new binary read the old control log
         # rather than truncating it (#24's one-way door).
-        sentinel_key, sentinel_value = b"sentinel/pre-upgrade", b"written-at-0.0"
+        sentinel_key = b"sentinel/pre-upgrade"
+        sentinel_value = f"written-at-{old_version}".encode()
         deadline = time.monotonic() + OWNER_TIMEOUT
         while True:
             endpoints = cluster.live_worker_endpoints()
@@ -422,7 +463,7 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
             for node in cluster.leaders:
                 node.roll(cluster.new)
                 cluster.wait_ready(node)
-                assert cluster.cluster_version() == "0.0", (
+                assert cluster.cluster_version() == old_version, (
                     "the cluster version must not move until finalize-upgrade"
                 )
 
@@ -456,13 +497,13 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
         # And the pre-upgrade sentinel survived every leader and worker swap.
         sentinel = _read(cluster, sentinel_key)
         assert sentinel.found and sentinel.value == sentinel_value, (
-            "a value written at 0.0 was lost across the upgrade"
+            f"a value written at {old_version} was lost across the upgrade"
         )
 
         # Now that every live node speaks the new version, finalize advances it.
         finalized = cluster.on_leader("cluster", "finalize-upgrade")
-        assert "advanced from 0.0 to 0.1" in finalized, finalized
-        assert cluster.cluster_version() == "0.1"
+        assert f"advanced from {old_version} to {new_version}" in finalized, finalized
+        assert cluster.cluster_version() == new_version
 
         # The old binary is now locked out. A node that speaks only 0.0 starts,
         # registers, is refused admission by the control plane, and stays not
