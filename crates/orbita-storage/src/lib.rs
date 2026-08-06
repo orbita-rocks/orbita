@@ -117,7 +117,8 @@ mod model_test;
 mod testing;
 
 pub use mutation::{Mutation, MutationOp};
+pub use orbita_format::SweepReport;
 pub use partition::{
     record_footprint, Hydration, Partition, ScanBudget, ScanEntry, ScanPage, WriteOutcome,
-    TOMBSTONE_RETENTION_MILLIS,
+    DEFAULT_SWEEP_GRACE_MILLIS, DEFAULT_SWEEP_SKEW_MILLIS, TOMBSTONE_RETENTION_MILLIS,
 };

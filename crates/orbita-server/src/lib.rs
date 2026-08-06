@@ -164,6 +164,7 @@ pub struct Server {
     peers: PeerListener,
     heartbeat: tokio::task::JoinHandle<()>,
     flusher: tokio::task::JoinHandle<()>,
+    sweeper: tokio::task::JoinHandle<()>,
     /// Present only for a node joined to a leader group.
     reporting: Option<tokio::task::JoinHandle<()>>,
     /// The reporting loop's handle, kept so the server can answer which
@@ -349,6 +350,17 @@ impl Server {
             Arc::downgrade(&node),
             config.flush_interval,
         ));
+        // The orphan sweep rides its own slow cadence rather than the flush
+        // loop, because it lists a whole partition prefix and so must run far
+        // less often than a flush. It is what keeps objects a failed compaction
+        // or an abandoned commit stranded from accumulating forever.
+        let sweeper = tokio::spawn(Self::sweep_loop(
+            Arc::downgrade(&node),
+            config.sweep_interval,
+            config.sweep_grace_millis,
+            config.sweep_skew_millis,
+            config.sweep_dry_run,
+        ));
 
         // Kept before the reporting loop takes ownership of the client, so
         // that an admin call this node cannot answer has somewhere to go.
@@ -518,6 +530,7 @@ impl Server {
             peers,
             heartbeat,
             flusher,
+            sweeper,
             reporting,
             reporter,
             raft,
@@ -556,6 +569,7 @@ impl Server {
         let _ = self.shutdown.send(());
         self.heartbeat.abort();
         self.flusher.abort();
+        self.sweeper.abort();
         if let Some(reporting) = &self.reporting {
             reporting.abort();
         }
@@ -601,6 +615,32 @@ impl Server {
                 return;
             };
             live.flush_owned().await;
+        }
+    }
+
+    /// Sweeps orphaned objects from this node's owned partitions, forever.
+    ///
+    /// The operator-tunable backstop against leaked objects: a failed compaction
+    /// or an abandoned commit strands objects the manifest no longer references,
+    /// and nothing else ever reclaims them. It runs on its own slow cadence
+    /// rather than inside the flush loop because it lists a whole partition
+    /// prefix per pass. The grace period and skew — and whether this only
+    /// reports rather than deletes — come from configuration so an operator can
+    /// look before the sweep acts on a real bucket. A weak reference, so a
+    /// dropped node stops sweeping rather than pinning itself alive.
+    async fn sweep_loop(
+        node: std::sync::Weak<Node<ServerRuntime>>,
+        interval: Duration,
+        grace_millis: u64,
+        skew_millis: u64,
+        dry_run: bool,
+    ) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(live) = node.upgrade() else {
+                return;
+            };
+            live.sweep_owned(grace_millis, skew_millis, dry_run).await;
         }
     }
 
@@ -844,6 +884,7 @@ impl Server {
         self.readiness.clear(ReadinessCondition::AcceptingOwnership);
         self.heartbeat.abort();
         self.flusher.abort();
+        self.sweeper.abort();
         if let Some(reporting) = &self.reporting {
             reporting.abort();
         }

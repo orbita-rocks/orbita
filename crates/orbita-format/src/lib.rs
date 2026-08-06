@@ -62,3 +62,4 @@ pub use segment::{
     FORMAT_VERSION, HEADER_LEN,
 };
 pub use snapshot::{KeyLocation, Snapshot};
+pub use sweep::{sweep_partition, Referenced, SweepReport};
