@@ -44,6 +44,11 @@ raft = { version = "0.7", default-features = false, features = ["prost-codec"] }
 # trait from the same prost the types were generated with. This is not the
 # workspace's protobuf story; orbita-proto has its own.
 prost = "0.11"
+# And orbita-proto's own, under a name of its own because the two prosts are
+# different majors with different traits. This crate already builds the
+# generated admin messages; this is only what lets it encode one, which is
+# what forwarding an admin call to the control leader needs.
+prost-proto = { package = "prost", version = "0.13" }
 # raft insists on a slog logger. It gets slog::Discard, and everything worth
 # saying is said through `tracing` by the driver instead.
 slog = "2"

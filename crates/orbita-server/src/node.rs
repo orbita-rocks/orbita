@@ -8,11 +8,14 @@
 //! # Three decisions the brief asked for
 //!
 //! **Map staleness is repaired lazily.** The cached map is refreshed when a
-//! forwarded request comes back saying the receiver is not the owner, and on
-//! nothing else. Pushing updates from the leader group would make every worker
-//! a subscriber, and polling on a timer spends requests to learn something
-//! that is almost always unchanged. Lazy repair makes exactly the first
-//! request after a failover pay for it, which is the cheapest correct answer.
+//! request finds the map wrong: a forwarded request that comes back saying the
+//! receiver is not the owner, or a keyspace name the map has never heard of.
+//! Pushing updates from the leader group would make every worker a subscriber,
+//! and polling on a timer spends requests to learn something that is almost
+//! always unchanged. Lazy repair makes exactly the first request after a
+//! failover pay for it, which is the cheapest correct answer. The second
+//! trigger is rate limited, because unlike a misroute it can be provoked by a
+//! client that simply keeps asking for a name that does not exist.
 //!
 //! **A forwarded request is never forwarded again.** A node that receives a
 //! proxied request and does not own the partition answers `NotOwner` carrying
@@ -24,6 +27,7 @@
 //! connections rather than accumulating work that will be too late by the time
 //! it runs.
 
+use crate::config::DEFAULT_CONTROL_POLL_INTERVAL;
 use crate::host::{HostSpec, LeasePolicy, PartitionHost, PartitionPaths, Read, WriteAck, WriteOp};
 use crate::lease::DEFAULT_LEASE_MARGIN;
 use crate::map_source::{BoxedMapSource, MapSource};
@@ -116,7 +120,25 @@ pub(crate) struct Node<R: Runtime> {
     /// hold the read side through their acknowledgement, so the final progress
     /// report cannot race an acknowledged write.
     writes: tokio::sync::RwLock<()>,
+    /// When a request last made this node look again for a keyspace its map
+    /// did not know. See [`KEYSPACE_MISS_REPAIR_INTERVAL`].
+    keyspace_miss_repaired_at: AtomicU64,
 }
+
+/// How often a keyspace this node has never heard of may cost a control plane
+/// round trip.
+///
+/// The map is a cache refreshed on a timer, so a keyspace created a moment ago
+/// is absent from it for up to one interval — and `keyspace create` followed
+/// by a write is two consecutive lines of the quickstart, well inside that
+/// window. Looking again before answering "no such keyspace" is the same
+/// repair a misrouted request already triggers.
+///
+/// It is bounded because the data plane must not become a way to generate
+/// control plane load: without a bound, a client looping on a typo would put a
+/// fetch per request onto the leader group. At this interval the worst case is
+/// the traffic this node already sends on its own.
+const KEYSPACE_MISS_REPAIR_INTERVAL: Duration = DEFAULT_CONTROL_POLL_INTERVAL;
 
 /// Where a request has to go.
 enum Hop<R: Runtime> {
@@ -183,6 +205,7 @@ impl<R: Runtime> Node<R> {
             readiness,
             accepting_writes: AtomicBool::new(true),
             writes: tokio::sync::RwLock::new(()),
+            keyspace_miss_repaired_at: AtomicU64::new(0),
         });
         node.reconcile_hosts().await?;
         // Nothing is known to be stranded before a single heartbeat has gone
@@ -444,12 +467,41 @@ impl<R: Runtime> Node<R> {
         Ok(())
     }
 
-    fn keyspace(&self, name: &str) -> Result<KeyspaceInfo> {
+    /// Resolves a keyspace by name, looking again before saying no.
+    ///
+    /// A name absent from the cached map is a cache miss rather than an
+    /// answer, and this node already treats a misroute that way. Rate limited
+    /// by [`KEYSPACE_MISS_REPAIR_INTERVAL`].
+    async fn keyspace(&self, name: &str) -> Result<KeyspaceInfo> {
         validate::keyspace_name(name)?;
+        if let Some(info) = self.map().keyspace_by_name(name).cloned() {
+            return Ok(info);
+        }
+        self.repair_unknown_keyspace().await;
         self.map()
             .keyspace_by_name(name)
             .cloned()
             .ok_or(Error::KeyspaceNotFound)
+    }
+
+    async fn repair_unknown_keyspace(&self) {
+        let now = self.runtime.clock().monotonic_nanos();
+        let last = self.keyspace_miss_repaired_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < KEYSPACE_MISS_REPAIR_INTERVAL.as_nanos() as u64 {
+            return;
+        }
+        // Losing the exchange means another request is already refetching, and
+        // waiting for it would only turn one stale answer into two slow ones.
+        if self
+            .keyspace_miss_repaired_at
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if let Err(error) = self.refresh_map().await {
+            tracing::debug!(%error, "could not refresh the partition map for an unknown keyspace");
+        }
     }
 
     /// Finds the partition owning `key` and decides whether this node can
@@ -572,7 +624,7 @@ impl<R: Runtime> Node<R> {
     }
 
     async fn try_get(&self, request: &GetRequest, forwarded: bool) -> Result<GetResponse> {
-        let keyspace = self.keyspace(&request.keyspace)?;
+        let keyspace = self.keyspace(&request.keyspace).await?;
         validate::key(&request.key)?;
 
         let (owner, partition) = match self.hop(keyspace.id, &request.key, Purpose::Read).await? {
@@ -640,7 +692,7 @@ impl<R: Runtime> Node<R> {
     }
 
     async fn try_set(&self, request: &SetRequest, forwarded: bool) -> Result<SetResponse> {
-        let keyspace = self.keyspace(&request.keyspace)?;
+        let keyspace = self.keyspace(&request.keyspace).await?;
         validate::key(&request.key)?;
         validate::value(&request.value)?;
         if let Some(limit) = keyspace.max_value_bytes {
@@ -715,7 +767,7 @@ impl<R: Runtime> Node<R> {
     }
 
     async fn try_delete(&self, request: &DeleteRequest, forwarded: bool) -> Result<DeleteResponse> {
-        let keyspace = self.keyspace(&request.keyspace)?;
+        let keyspace = self.keyspace(&request.keyspace).await?;
         validate::key(&request.key)?;
 
         match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
@@ -747,7 +799,7 @@ impl<R: Runtime> Node<R> {
     /// the smallest, because a client asking without naming a keyspace is
     /// sizing a connection it intends to reuse, and a connection has to be big
     /// enough for the largest thing that will cross it.
-    pub(crate) fn limits(&self, keyspace: &str) -> Result<GetLimitsResponse> {
+    pub(crate) async fn limits(&self, keyspace: &str) -> Result<GetLimitsResponse> {
         let map = self.map();
 
         let max_value_bytes = if keyspace.is_empty() {
@@ -756,7 +808,8 @@ impl<R: Runtime> Node<R> {
                 .max()
                 .unwrap_or(MAX_VALUE_BYTES as u64)
         } else {
-            self.keyspace(keyspace)?
+            self.keyspace(keyspace)
+                .await?
                 .max_value_bytes
                 .unwrap_or(MAX_VALUE_BYTES as u64)
         }
@@ -806,7 +859,7 @@ impl<R: Runtime> Node<R> {
     }
 
     async fn try_list(&self, request: &ListRequest, forwarded: bool) -> Result<ListResponse> {
-        let keyspace = self.keyspace(&request.keyspace)?;
+        let keyspace = self.keyspace(&request.keyspace).await?;
         validate::prefix(&request.prefix)?;
         let limit = validate::list_limit(request.limit);
 

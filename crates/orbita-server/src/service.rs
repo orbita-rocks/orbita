@@ -69,6 +69,7 @@ impl<R: Runtime> Kv for KvService<R> {
         // its first request depend on a partition being available.
         self.node
             .limits(&request.into_inner().keyspace)
+            .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
     }
