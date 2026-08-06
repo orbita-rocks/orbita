@@ -2859,8 +2859,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Publish a manifest at the same instant. Its own write time is the
-        // sweep's reference now, so the orphan has no measurable age yet.
+        // Publish a manifest at the same instant. The manifest that leaves the
+        // orphan unreferenced has only just been published, so nothing is safe
+        // to delete yet.
         clock.set_millis(1_000);
         p.put(b"a", bytes("v"), None, WriteCondition::None)
             .await
@@ -2870,20 +2871,22 @@ mod tests {
         let report = p.sweep_orphans(5_000, 0, false).await.unwrap();
         assert!(
             report.deleted.is_empty(),
-            "the orphan is too young to sweep"
+            "the dropping manifest has not settled yet"
         );
         assert!(
             store.keys().contains(&orphan),
-            "and so it is still on the store"
+            "and so the orphan is still on the store"
         );
 
-        // A later flush republishes the manifest, advancing the reference now
-        // past the orphan's grace period.
+        // A later flush republishes the manifest; then time advances past the
+        // grace period, so the manifest that dropped the orphan has settled and
+        // the orphan is old in its own right.
         clock.set_millis(10_000);
         p.put(b"b", bytes("v"), None, WriteCondition::None)
             .await
             .unwrap();
         p.flush().await.unwrap();
+        clock.set_millis(20_000);
 
         // A dry run first: it names the orphan without removing it.
         let preview = p.sweep_orphans(5_000, 0, true).await.unwrap();

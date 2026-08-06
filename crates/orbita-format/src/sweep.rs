@@ -37,14 +37,35 @@
 //! reads as the epoch, and treating an unknown time as ancient deletes live
 //! data. See the field's own contract.
 //!
-//! The reference "now" [`sweep_partition`] judges against is the manifest's own
-//! backend write time. It is a real timestamp in the one domain that matters,
-//! costs no probe write, and is only ever *stale* — a manifest is republished
-//! on every flush and compaction, so its time trails the true backend now
-//! rather than leading it. A stale reference now understates every object's
-//! age, which makes the sweep more conservative, never less: the failure it
-//! rules out is deleting something that is not yet safe, and understating age
-//! cannot cause that.
+//! # Grace runs from when an object became garbage, not from when it was born
+//!
+//! An object's *creation* time is the wrong thing to age against. A segment
+//! that was live for months and was dropped a second ago by a fresh compaction
+//! is ancient by creation time, but a reader that opened a snapshot against the
+//! manifest just replaced can still be part way through fetching it. The clock
+//! the grace has to outlast starts when the *dropping* manifest was published —
+//! the moment the object stopped being reachable — because that is when the
+//! last reader that can still want it began to drain.
+//!
+//! [`sweep_partition`] enforces that with two independent waits, and an object
+//! must clear both. The manifest that no longer references the object must
+//! itself have been in effect longer than the grace period: while it has not,
+//! a reader on an earlier manifest may still hold the object. And the object
+//! must be older than the grace period in its own right: an abandoned commit
+//! writes an object before it swaps the manifest that would name it, so a very
+//! recent object may be one an in-flight commit is about to make live. The
+//! grace period exceeds the longest read *and* the longest commit precisely so
+//! one bound covers both.
+//!
+//! # Reading a "now" in the backend's clock domain
+//!
+//! Judging how long the manifest has been settled needs a *current* time in the
+//! backend's domain, and the object store exposes no clock: the only times it
+//! reports are the ones it stamped on writes. So the sweep writes a tiny marker
+//! and reads back the time the store stamped it, then removes it. The marker is
+//! never a partition object and nothing a reader consults will list it, so its
+//! brief existence changes nothing. A store that cannot stamp a time reports
+//! `None`, and the sweep then does nothing rather than guess an age.
 
 use crate::commit::load_manifest;
 use crate::error::Result;
@@ -53,8 +74,15 @@ use crate::paths::{self, PartitionPath};
 use crate::record::{RecordValue, SegmentRecord};
 use crate::segment::Segment;
 
-use orbita_objectstore::{ObjectMeta, ObjectStore};
+use bytes::Bytes;
+use orbita_objectstore::{BackendTime, ObjectMeta, ObjectStore};
 use std::collections::{BTreeSet, HashMap};
+
+/// The relative name of the marker the sweep writes to read the object store's
+/// clock. It is neither a segment nor a value name, so [`paths::parse_object_name`]
+/// rejects it and the sweep never treats it as a candidate, and it sits directly
+/// under the partition prefix so a listing of that prefix finds it.
+const CLOCK_PROBE_NAME: &str = "sweep-clock-probe";
 
 /// Everything the current manifest reaches, by name relative to the partition
 /// directory.
@@ -148,15 +176,25 @@ pub struct SweepReport {
     pub retained: Vec<String>,
 }
 
-/// Deletes the objects a partition no longer references and is done needing, and
-/// leaves everything else alone.
+/// Deletes the objects a partition no longer references and is safely done
+/// needing, and leaves everything else alone.
 ///
 /// This is the whole point of the module: without it, every object a failed
 /// compaction or an abandoned commit strands accumulates forever. It composes
-/// the pure [`Referenced`]/[`unreferenced`] pair with the age gate
-/// [`ObjectMeta::is_safely_older_than`] so that an object is deleted only when
-/// it is *both* unreferenced *and* provably older than `grace_millis` (plus
-/// `max_skew_millis`) in the backend's own clock domain.
+/// the pure [`Referenced`]/[`unreferenced`] pair with two age gates, both built
+/// on [`ObjectMeta::is_safely_older_than`]. An unreferenced object is deleted
+/// only when both hold:
+///
+/// - **The dropping manifest has settled.** The current manifest — the one that
+///   does not reference the object — must itself have been in effect for longer
+///   than the grace period. Until it has, a reader that opened a snapshot
+///   against an earlier manifest may still fetch the object. This is what makes
+///   a months-old segment just dropped by a fresh compaction *wait* rather than
+///   be deleted the instant it is orphaned.
+/// - **The object itself is old enough.** An abandoned commit writes an object
+///   before it swaps the manifest that would name it, so a very recent object
+///   may be one an in-flight commit is about to make live. The object must be
+///   older than the grace period in its own right to rule that out.
 ///
 /// `grace_millis` is a configured bound, not a constant: it must exceed both the
 /// longest read and the longest commit a deployment allows, which this crate has
@@ -165,18 +203,21 @@ pub struct SweepReport {
 /// [`ObjectMeta::is_safely_older_than`], so a sweep that goes through here cannot
 /// mix clock domains or forget skew.
 ///
-/// With `dry_run` set, nothing is deleted and the report names what would have
-/// been. That is the first-run affordance: a real bucket is looked at before it
-/// is touched.
+/// With `dry_run` set, no candidate is deleted and the report names what a real
+/// run would remove. That is the first-run affordance: a real bucket is looked
+/// at before it is acted on. (The clock probe below is still written and removed
+/// in dry-run, because a candidate list is meaningless without a current time to
+/// judge the manifest against; it is never a partition object and deletes
+/// nothing a reader can see.)
 ///
 /// # Fail-closed corners
 ///
 /// - A partition with no manifest has published nothing, so there is no
-///   referenced set to subtract against and no manifest time to judge age by.
-///   The sweep does nothing rather than guess.
-/// - When the manifest carries no backend write time (a store that cannot report
-///   one), there is no reference "now" in the right clock domain, so every
-///   candidate is retained rather than deleted.
+///   referenced set to subtract against. The sweep does nothing rather than
+///   guess.
+/// - When the store cannot stamp a write time — so the clock probe or the
+///   manifest reports `None` — there is no way to establish how long the
+///   manifest has been settled, so every candidate is retained.
 /// - An object whose own write time is `None` is never a candidate, because
 ///   [`ObjectMeta::is_safely_older_than`] refuses it.
 pub async fn sweep_partition<S: ObjectStore + ?Sized>(
@@ -186,9 +227,14 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
     max_skew_millis: u64,
     dry_run: bool,
 ) -> Result<SweepReport> {
+    // A time in the object store's own clock domain, read now. The grace runs
+    // from when the dropping manifest was published, and measuring how long ago
+    // that was needs a current time, not the manifest's own stamp. See the
+    // module docs.
+    let reference_now = probe_backend_now(store, path).await?;
+
     let Some((manifest, _)) = load_manifest(store, path).await? else {
-        // Nothing published: no referenced set, and no manifest whose write
-        // time could stand in for the backend's now. Refuse to act.
+        // Nothing published: no referenced set to subtract against.
         return Ok(SweepReport {
             dry_run,
             ..Default::default()
@@ -198,13 +244,8 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
     let mut referenced = Referenced::of(&manifest);
     let listing = store.list(path.prefix()).await?;
 
-    // The reference "now" is the manifest's own backend write time: the same
-    // clock domain every object's time is in, and only ever stale. See the
-    // module docs for why stale is the safe direction.
-    let reference_now = listing
-        .iter()
-        .find(|object| object.key == path.manifest())
-        .and_then(|object| object.last_modified);
+    let manifest_key = path.manifest();
+    let manifest_meta = listing.iter().find(|object| object.key == manifest_key);
 
     // External values are reached through the records inside live segments, not
     // through the manifest, so a value in use would look unreferenced from the
@@ -225,14 +266,23 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
 
     let candidates = unreferenced(&referenced, path, &listing);
 
-    let Some(reference_now) = reference_now else {
-        // No backend-domain now to judge against: keep everything.
+    // Fail closed if the backend cannot give a current time or a manifest time:
+    // without both, "the manifest has been settled for a grace period" cannot be
+    // established, so nothing is safe to delete.
+    let (Some(reference_now), Some(manifest_meta)) = (reference_now, manifest_meta) else {
         return Ok(SweepReport {
             dry_run,
             deleted: Vec::new(),
             retained: candidates,
         });
     };
+
+    // The manifest that dropped these objects must have been in effect longer
+    // than the grace period, or a reader on an earlier manifest could still hold
+    // one of them. This is a property of the manifest, not of any one object, so
+    // it is evaluated once: while it does not hold, no candidate is safe.
+    let manifest_settled =
+        manifest_meta.is_safely_older_than(reference_now, grace_millis, max_skew_millis);
 
     let meta_by_key: HashMap<&str, &ObjectMeta> = listing
         .iter()
@@ -245,9 +295,13 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
         retained: Vec::new(),
     };
     for key in candidates {
-        let old_enough = meta_by_key.get(key.as_str()).is_some_and(|object| {
-            object.is_safely_older_than(reference_now, grace_millis, max_skew_millis)
-        });
+        // Both waits: the manifest has settled (covers a reader on the prior
+        // manifest) and the object itself is old enough (covers an in-flight
+        // commit that wrote it and has not yet swapped the manifest to name it).
+        let old_enough = manifest_settled
+            && meta_by_key.get(key.as_str()).is_some_and(|object| {
+                object.is_safely_older_than(reference_now, grace_millis, max_skew_millis)
+            });
         if old_enough {
             if !dry_run {
                 store.delete(&key).await?;
@@ -258,6 +312,31 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
         }
     }
     Ok(report)
+}
+
+/// Reads a timestamp in the object store's own clock domain.
+///
+/// The [`ObjectStore`] trait exposes no "what time is it"; the only times it
+/// reports are the ones it stamped on writes. So the sweep writes a marker and
+/// reads the time back off it, then removes it. The marker
+/// ([`CLOCK_PROBE_NAME`]) is never a partition object and nothing a reader
+/// consults will list it, so its brief existence changes nothing a reader can
+/// see. A store that cannot stamp a time reports `None`, which the caller treats
+/// as "do not act".
+async fn probe_backend_now<S: ObjectStore + ?Sized>(
+    store: &S,
+    path: &PartitionPath,
+) -> Result<Option<BackendTime>> {
+    let key = path.object(CLOCK_PROBE_NAME);
+    store
+        .put(&key, Bytes::from_static(b"orbita-sweep-clock-probe"))
+        .await?;
+    let meta = store.head(&key).await?;
+    // Best effort: a probe left behind is harmless — nothing references it and
+    // it is never a deletion candidate — and failing the sweep because cleanup
+    // failed would be the worse outcome.
+    let _ = store.delete(&key).await;
+    Ok(meta.last_modified)
 }
 
 #[cfg(test)]
@@ -426,15 +505,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreferenced_object_too_young_to_be_safe_is_kept() {
+    async fn an_object_dropped_by_a_fresh_manifest_is_kept_until_the_manifest_settles() {
         let clock = HandClock::default();
         clock.set(1_000);
         let store = Arc::new(MemoryStore::with_clock(clock.clone()));
         let w = writer(&store).await;
 
-        // Stranded, as an abandoned commit leaves it, then a live segment and a
-        // manifest that names only the live one. The manifest is written at the
-        // same instant, so it is the reference now.
+        // A stranded object, a live segment, and the manifest that names only
+        // the live one, all at the same instant. The sweep probes the clock at
+        // that same instant, so the dropping manifest has been in effect for no
+        // time at all, let alone a grace period: a reader on an earlier manifest
+        // could still hold the orphan, so it must not go yet.
         let orphan = w.put_segment(&built_segment("a", 1)).await.unwrap();
         let live = w.put_segment(&built_segment("b", 2)).await.unwrap();
         w.commit(|_| plan(vec![live.clone()])).await.unwrap();
@@ -443,11 +524,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(report.deleted.is_empty(), "nothing is old enough yet");
+        assert!(
+            report.deleted.is_empty(),
+            "the dropping manifest has not settled"
+        );
         assert_eq!(report.retained, vec![path().object(&orphan.name)]);
         assert!(
             store.keys().contains(&path().object(&orphan.name)),
-            "the young orphan is still on the store"
+            "the orphan is still on the store"
         );
     }
 
@@ -459,12 +543,13 @@ mod tests {
         let w = writer(&store).await;
 
         let orphan = w.put_segment(&built_segment("a", 1)).await.unwrap();
-        // The manifest is published far enough later that the orphan clears the
-        // grace period against the manifest's own write time.
-        clock.set(10_000);
         let live = w.put_segment(&built_segment("b", 2)).await.unwrap();
         w.commit(|_| plan(vec![live.clone()])).await.unwrap();
 
+        // The manifest that dropped the orphan has now been in effect longer
+        // than the grace period, and the orphan is old in its own right, so it
+        // is finally safe to delete.
+        clock.set(10_000);
         let report = sweep_partition(store.as_ref(), &path(), 5_000, 0, false)
             .await
             .unwrap();
@@ -481,6 +566,52 @@ mod tests {
             "a referenced segment is never swept"
         );
         assert!(keys.contains(&path().manifest()));
+    }
+
+    #[tokio::test]
+    async fn a_months_old_object_just_orphaned_waits_a_full_grace_after_the_manifest() {
+        // The P1 case: an object that is ancient by creation time but was only
+        // just dropped by a fresh manifest must not be deleted until a full
+        // grace interval has elapsed since that manifest, because a reader on the
+        // prior manifest can still be fetching it. Grace runs from the drop, not
+        // from creation.
+        let clock = HandClock::default();
+        let store = Arc::new(MemoryStore::with_clock(clock.clone()));
+        let w = writer(&store).await;
+
+        // Written and published "months" ago.
+        clock.set(1_000);
+        let old = w.put_segment(&built_segment("a", 1)).await.unwrap();
+        w.commit(|_| plan(vec![old.clone()])).await.unwrap();
+
+        // Much later, a fresh compaction replaces it and drops it from the
+        // manifest. The old object is now unreferenced but ancient by creation.
+        let months_later = 1_000_000_000;
+        clock.set(months_later);
+        let replacement = w.put_segment(&built_segment("a", 2)).await.unwrap();
+        w.commit(|_| plan(vec![replacement.clone()])).await.unwrap();
+
+        // Immediately after the dropping manifest: the object is ancient, but
+        // the manifest has not settled, so it must survive.
+        let report = sweep_partition(store.as_ref(), &path(), 5_000, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            report.deleted.is_empty(),
+            "a months-old object just orphaned is not deleted while the manifest is fresh"
+        );
+        assert_eq!(report.retained, vec![path().object(&old.name)]);
+        assert!(store.keys().contains(&path().object(&old.name)));
+
+        // Once the dropping manifest has been in effect for a full grace period,
+        // any reader on the prior manifest has drained, and the object goes.
+        clock.set(months_later + 5_000);
+        let report = sweep_partition(store.as_ref(), &path(), 5_000, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted, vec![path().object(&old.name)]);
+        assert!(!store.keys().contains(&path().object(&old.name)));
+        assert!(store.keys().contains(&path().object(&replacement.name)));
     }
 
     #[tokio::test]
@@ -535,9 +666,11 @@ mod tests {
         let w = writer(&store).await;
 
         let orphan = w.put_segment(&built_segment("a", 1)).await.unwrap();
-        clock.set(10_000);
         let live = w.put_segment(&built_segment("b", 2)).await.unwrap();
         w.commit(|_| plan(vec![live.clone()])).await.unwrap();
+        // Advance past the grace period so the orphan is a genuine candidate the
+        // dry run can report.
+        clock.set(10_000);
 
         let report = sweep_partition(store.as_ref(), &path(), 5_000, 0, true)
             .await
@@ -579,8 +712,9 @@ mod tests {
             })
             .unwrap();
         let live = w.put_segment(&builder.finish().unwrap()).await.unwrap();
-        clock.set(10_000);
         w.commit(|_| plan(vec![live.clone()])).await.unwrap();
+        // Past the grace period, so the stranded value is a candidate.
+        clock.set(10_000);
 
         let report = sweep_partition(store.as_ref(), &path(), 5_000, 0, false)
             .await
