@@ -107,7 +107,7 @@ mod version;
 mod wire;
 
 pub use admin::AdminService;
-pub use client::{ControlClient, LocalControlClient, StatusReportResponse};
+pub use client::{AdminOutcome, ControlClient, LocalControlClient, StatusReportResponse};
 pub use codec::CodecError;
 pub use command::ControlCommand;
 pub use config::ControlConfig;

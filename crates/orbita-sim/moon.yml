@@ -5,6 +5,7 @@ $schema: 'https://moonrepo.dev/schemas/project.json'
 # these are written out by hand rather than inferred.
 dependsOn:
   - 'orbita-core'
+  - 'orbita-objectstore'
   - 'orbita-runtime'
 
 tasks:

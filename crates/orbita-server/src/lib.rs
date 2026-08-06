@@ -86,6 +86,8 @@ mod aws;
 mod config;
 mod control;
 #[cfg(test)]
+mod durability;
+#[cfg(test)]
 mod forwarding;
 mod frame;
 mod fs_store;
@@ -222,15 +224,7 @@ impl Server {
                     .local_addr()
                     .to_string()
             });
-            start_control_plane(
-                &runtime,
-                log,
-                control,
-                &config.leader_group,
-                &config.peers,
-                &local_address,
-            )
-            .await?;
+            start_control_plane(&runtime, log, control, &config, &local_address).await?;
         }
         let store: Arc<dyn ObjectStore> = match config.object_store {
             Some(object_store) => Arc::new(
@@ -316,9 +310,17 @@ impl Server {
             config.flush_interval,
         ));
 
+        // Kept before the reporting loop takes ownership of the client, so
+        // that an admin call this node cannot answer has somewhere to go.
+        let admin_forward = control.clone();
+
         let mut reporter = None;
         let reporting = control.map(|client| {
-            let role = if config.leader_member {
+            // The role reported here is the one the control plane admits
+            // owners by, so a leader group member that also serves partitions
+            // has to report as a worker or it would never be given one. See
+            // `ServerConfig::leader_owns_partitions`.
+            let role = if config.leader_member && !config.leader_owns_partitions {
                 orbita_control::NodeRole::Leader
             } else {
                 orbita_control::NodeRole::Worker
@@ -370,7 +372,21 @@ impl Server {
             .max_decoding_message_size(message_limit)
             .max_encoding_message_size(message_limit);
         let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
-        let admin = controller.map(AdminService::new);
+        // Every node that knows where the control plane is serves the whole
+        // admin surface, whether or not it holds one. A member that is not the
+        // current Raft leader, and a worker that hosts no controller at all,
+        // both forward: an operator cannot be expected to know which node is
+        // leader, since finding that out is what `cluster describe` is for.
+        // Only a node with no control plane at all serves no admin surface,
+        // and that shape exists only in tests over a static map.
+        let admin = match (controller, admin_forward) {
+            (Some(controller), Some(client)) => {
+                Some(AdminService::new(controller).with_forwarding(client))
+            }
+            (Some(controller), None) => Some(AdminService::new(controller)),
+            (None, Some(client)) => Some(AdminService::forwarding(client)),
+            (None, None) => None,
+        };
         let serving = tokio::spawn(async move {
             let shutdown = async {
                 // A dropped sender means the `Server` handle went away, so
@@ -833,11 +849,11 @@ async fn start_control_plane(
     runtime: &ServerRuntime,
     log: &Arc<RaftLog>,
     controller: &Controller<ServerRuntime, RaftLog>,
-    voters: &[orbita_core::NodeId],
-    peers: &[(orbita_core::NodeId, String)],
+    config: &ServerConfig,
     local_address: &str,
 ) -> Result<()> {
-    let client = ControlClient::new(runtime.clone(), voters.to_vec());
+    let voters = &config.leader_group;
+    let client = ControlClient::new(runtime.clone(), voters.clone());
     controller.recover().await?;
     let deadline = runtime.clock().monotonic_nanos() + Duration::from_secs(30).as_nanos() as u64;
     loop {
@@ -851,19 +867,43 @@ async fn start_control_plane(
             }
         }
         if fresh && log.is_leader().await {
-            let leaders = peers
+            let members: Vec<_> = config
+                .peers
                 .iter()
                 .filter(|(node, _)| voters.contains(node))
                 .cloned()
                 .collect();
+            // A voter that also owns partitions is admitted as a worker,
+            // because that is the role the control plane hands ownership to.
+            // Written into the bootstrap rather than left to the first
+            // heartbeat to correct, so `cluster describe` never shows a role
+            // that was true for a quarter of a second.
+            let (leaders, workers) = if config.leader_owns_partitions {
+                (Vec::new(), members)
+            } else {
+                (members, Vec::new())
+            };
+            // The first keyspace is born with the cluster, because a bootstrap
+            // that leaves no keyspace behind means the first write needs an
+            // admin call that the operator did not know to make.
+            let mut wanted = config.keyspaces.iter();
+            let first = wanted.next().map_or_else(
+                || DEFAULT_KEYSPACE.to_string(),
+                |name| name.as_str().to_string(),
+            );
             controller
                 .bootstrap(&BootstrapSpec {
-                    keyspace: DEFAULT_KEYSPACE.to_string(),
+                    keyspace: first,
                     config: KeyspaceConfig::default(),
                     leaders,
-                    workers: Vec::new(),
+                    workers,
                 })
                 .await?;
+            for name in wanted {
+                controller
+                    .create_keyspace(name.as_str(), KeyspaceConfig::default())
+                    .await?;
+            }
             tracing::info!(address = local_address, "bootstrapped the leader group");
             return Ok(());
         }
