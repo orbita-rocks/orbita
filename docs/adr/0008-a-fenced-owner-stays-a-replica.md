@@ -55,6 +55,29 @@ rule in `best_candidate` is untouched: highest reported durable position wins, a
 candidate must have reported at or beyond the map version the fence produced,
 and ties break on node id.
 
+### Gated on cluster-version finalization
+
+The demotion is conditional on the active cluster version being at or above
+0.1, the version that introduces it, and takes effect only once
+`orbita cluster finalize-upgrade` has committed that version. Until then the
+fence drops the deposed owner exactly as it did before, on every member.
+
+This gate is a correctness requirement, not a rollout convenience. The map is a
+replicated state machine: every controller replays the same committed
+`FencePartition` entry, and the guarantee that they all hold identical state
+depends on every member applying that one entry the same way. The two binaries
+present during a rolling upgrade do not agree about this entry on their own — a
+pre-0.1 binary drops the deposed owner, a 0.1 binary keeps it — so deciding on
+the running binary would let a single committed entry produce divergent maps,
+and an old binary elected during the fenced interval could then serve and
+propose from state no other member holds. Per `docs/UPGRADES.md` the active
+cluster version is the one thing every member agrees on regardless of its
+binary, and it moves only at finalization, after every member that cannot speak
+the new version has been refused. Gating on it makes the whole n-1 window apply
+the old rule and switches to the new rule only once every member runs a binary
+that agrees. This follows the pattern the state machine already uses for
+`CompleteFenceDrain`, which is gated on the same version for the same reason.
+
 ### Why this cannot lose an acknowledged write
 
 The guarantee at stake is the one in `docs/REQUIREMENTS.md`: owner failover
@@ -124,6 +147,16 @@ change.
 
 **A partition whose every copy is gone stays unavailable.** Nothing here rescues
 a partition that has lost all three disks, and nothing should.
+
+**The recovery is inactive during a rolling upgrade to 0.1.** Until the cluster
+version finalizes to 0.1 the fence still drops the deposed owner, so the stuck
+state issue #76 describes remains reachable in the upgrade window. That is the
+accepted price of applying one committed entry identically on every member. A
+cluster mid-upgrade is a cluster an operator is already tending, the window is
+bounded by the finalize step, and a divergent map is a worse failure than a
+partition that recovers a finalize later. A cluster that bootstraps fresh on
+0.1 finalizes to 0.1 as it starts, so the gate only defers the behaviour for an
+actual old-to-new upgrade, never for a new install.
 
 **`Controller::transfer_ownership` now re-adds the deposed owner redundantly.**
 It computes its replica list from pre-fence state, so it is correct either way,
