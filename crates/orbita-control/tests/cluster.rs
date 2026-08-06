@@ -3042,6 +3042,33 @@ fn a_worker_reaches_the_leader_group_over_the_transport() {
 }
 
 #[test]
+fn a_node_learns_the_leader_groups_auth_policy_over_the_transport() {
+    // The signal the readiness gate leans on: a node must be able to ask the
+    // leader group whether the cluster requires auth, so it can catch a
+    // half-rolled `require_auth` change instead of trusting its own config in
+    // isolation.
+    for require_auth in [false, true] {
+        let cluster = Cluster::start(21);
+        let leader = cluster.sim.runtime(LEADER);
+        leader.transport().register(
+            ServiceId::Control,
+            ControlService::new(cluster.controller.clone()).require_auth(require_auth),
+        );
+
+        let worker = cluster.sim.runtime(WORKERS[0]);
+        let client = ControlClient::new(worker, vec![LEADER]);
+        let learned = cluster
+            .sim
+            .block_on(async move { client.fetch_auth_policy().await });
+        assert_eq!(
+            learned,
+            Ok(require_auth),
+            "a node reads back exactly the policy the leader advertises"
+        );
+    }
+}
+
+#[test]
 fn the_drain_protocol_distinguishes_progress_from_refusal() {
     let cluster = Cluster::start(13);
     let partition = cluster.only_partition();
@@ -3500,4 +3527,155 @@ fn an_owner_that_cannot_report_a_committed_prefix_leaves_it_unknown() {
         .find(|p| p.info.id == partition)
         .expect("the partition is described");
     assert_eq!(described.committed_lamport, None);
+}
+
+/// Wraps an admin message in a request, optionally carrying a bearer secret.
+fn admin_request<T>(message: T, secret: Option<&str>) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if let Some(secret) = secret {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {secret}")
+                .parse()
+                .expect("a bearer token is a valid header value"),
+        );
+    }
+    request
+}
+
+/// A leader's admin surface with authentication on and a root configured.
+///
+/// Nothing has been created through the credential log, so the only identity
+/// that can pass is the config overlay. This is the bootstrap position.
+fn rooted_admin(
+    seed: u64,
+    root: Option<&str>,
+) -> (Cluster, orbita_control::AdminService<SimRuntime, Log>) {
+    let cluster = Cluster::start(seed);
+    let admin = orbita_control::AdminService::new(cluster.controller.clone())
+        .require_auth(true)
+        .root_credential(root.map(orbita_control::root_secret_hash));
+    (cluster, admin)
+}
+
+#[test]
+fn a_configured_root_bootstraps_admin_before_any_credential_exists() {
+    // The chicken-and-egg: with auth on, creating the first credential needs a
+    // credential, and none exists in the log yet. The config root breaks it.
+    let (cluster, admin) = rooted_admin(90, Some("root-secret"));
+
+    let created = cluster
+        .sim
+        .block_on({
+            let admin = admin.clone();
+            async move {
+                admin
+                    .create_credential(admin_request(
+                        orbita_proto::v1::CreateCredentialRequest {
+                            keyspaces: vec!["default".into()],
+                            permissions: vec![orbita_proto::v1::Permission::Write as i32],
+                            description: "the first real credential".into(),
+                            expires_at_millis: None,
+                        },
+                        Some("root-secret"),
+                    ))
+                    .await
+            }
+        })
+        .expect("the root creates the first credential")
+        .into_inner();
+
+    // The credential the root just minted is a tenant credential: it may write
+    // its own keyspace on the data plane, but it must NOT administer the
+    // cluster. Deriving admin from a per-keyspace write is the cross-tenant
+    // escalation this boundary exists to prevent, so the admin surface refuses
+    // it with PermissionDenied even though it is a real, unexpired credential.
+    let denied = cluster.sim.block_on({
+        let admin = admin.clone();
+        let secret = created.secret.clone();
+        async move {
+            admin
+                .list_keyspaces(admin_request(
+                    orbita_proto::v1::ListKeyspacesRequest::default(),
+                    Some(&secret),
+                ))
+                .await
+        }
+    });
+    assert_eq!(
+        denied
+            .expect_err("a tenant credential cannot administer the cluster")
+            .code(),
+        tonic::Code::PermissionDenied,
+        "a per-keyspace write must not confer cluster administration"
+    );
+
+    // Only the root administers, and it keeps working after minting tenants.
+    let listed = cluster.sim.block_on(async move {
+        admin
+            .list_keyspaces(admin_request(
+                orbita_proto::v1::ListKeyspacesRequest::default(),
+                Some("root-secret"),
+            ))
+            .await
+    });
+    assert!(listed.is_ok(), "the root administers the cluster");
+}
+
+#[test]
+fn a_wrong_root_secret_is_unauthenticated_at_the_admin_surface() {
+    let (cluster, admin) = rooted_admin(91, Some("root-secret"));
+    let denied = cluster.sim.block_on(async move {
+        admin
+            .list_keyspaces(admin_request(
+                orbita_proto::v1::ListKeyspacesRequest::default(),
+                Some("not-the-root"),
+            ))
+            .await
+    });
+    assert_eq!(
+        denied.expect_err("a wrong root secret is refused").code(),
+        tonic::Code::Unauthenticated,
+        "a wrong secret is unauthenticated, the same code as the rest of the path"
+    );
+}
+
+#[test]
+fn without_a_configured_root_admin_is_refused_before_any_credential_exists() {
+    // The overlay exists only when configured. With auth on, no root, and an
+    // empty credential log, admin has nothing to authorize against.
+    let (cluster, admin) = rooted_admin(92, None);
+    let denied = cluster.sim.block_on(async move {
+        admin
+            .list_keyspaces(admin_request(
+                orbita_proto::v1::ListKeyspacesRequest::default(),
+                Some("root-secret"),
+            ))
+            .await
+    });
+    assert_eq!(
+        denied
+            .expect_err("no root means no bootstrap identity")
+            .code(),
+        tonic::Code::Unauthenticated,
+    );
+}
+
+#[test]
+fn auth_disabled_admin_passes_through_regardless_of_root() {
+    // Auth off: the root is irrelevant and a request with no header is served.
+    let cluster = Cluster::start(93);
+    let admin = orbita_control::AdminService::new(cluster.controller.clone());
+    let listed = cluster.sim.block_on(async move {
+        admin
+            .list_keyspaces(admin_request(
+                orbita_proto::v1::ListKeyspacesRequest::default(),
+                None,
+            ))
+            .await
+    });
+    assert!(
+        listed.is_ok(),
+        "with auth off every request passes, root or no root"
+    );
 }

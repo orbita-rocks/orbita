@@ -409,6 +409,11 @@ impl ObjectStore for S3Store {
             key: key.to_string(),
             size,
             etag,
+            // HEAD returns `Last-Modified` as an HTTP-date, a different format
+            // from the ISO 8601 a listing carries. The sweep reads times off
+            // the listing, not off HEAD, so parsing that header would be code
+            // with no caller; report `None` rather than a second parser.
+            last_modified: None,
         })
     }
 
@@ -738,6 +743,7 @@ mod tests {
                 key: "k".to_string(),
                 size: 42,
                 etag: ETag("\"e\"".to_string()),
+                last_modified: None,
             }
         );
     }

@@ -111,6 +111,21 @@ pub struct AdminService<R: Runtime, L: ConsensusLog> {
     /// node in a real cluster. Absent only for a node with no control plane at
     /// all, which is the static-map test configuration.
     forward: Option<ControlClient<R>>,
+    /// Whether a caller must present a credential. Off by default so a cluster
+    /// stays easy to bring up; a node running with authentication on turns it
+    /// on. See [`AdminService::require_auth`].
+    require_auth: bool,
+    /// The config-derived root secret hash, if the operator configured one.
+    ///
+    /// Admin is a cluster-wide privilege, so it is granted only to this root
+    /// identity, never derived from a tenant credential's per-keyspace write
+    /// (see [`crate::CredentialSnapshot::authorize_admin`]). The hash is
+    /// overlaid at authorization time from this node's own configuration, so
+    /// every node — leader or forwarding worker — can check it without any
+    /// credential state from the log. It is only ever this hash and only in
+    /// memory: it is never written to the replicated state. See
+    /// [`crate::root_secret_hash`] for why it exists and its blast radius.
+    root: Option<[u8; 32]>,
 }
 
 impl<R: Runtime, L: ConsensusLog> Clone for AdminService<R, L> {
@@ -118,6 +133,8 @@ impl<R: Runtime, L: ConsensusLog> Clone for AdminService<R, L> {
         Self {
             controller: self.controller.clone(),
             forward: self.forward.clone(),
+            require_auth: self.require_auth,
+            root: self.root,
         }
     }
 }
@@ -133,6 +150,8 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
         Self {
             controller: Some(controller),
             forward: None,
+            require_auth: false,
+            root: None,
         }
     }
 
@@ -143,6 +162,8 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
         Self {
             controller: None,
             forward: Some(client),
+            require_auth: false,
+            root: None,
         }
     }
 
@@ -151,6 +172,30 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
     #[must_use]
     pub fn with_forwarding(mut self, client: ControlClient<R>) -> Self {
         self.forward = Some(client);
+        self
+    }
+
+    /// Configures the bootstrap root credential for this admin surface.
+    ///
+    /// `root` is the SHA-256 of the operator's root secret, or `None` when no
+    /// root is configured. A node hashes the secret once at startup and hands
+    /// the hash here, so the plaintext never reaches this layer. See
+    /// [`crate::root_secret_hash`].
+    #[must_use]
+    pub fn root_credential(mut self, root: Option<[u8; 32]>) -> Self {
+        self.root = root;
+        self
+    }
+
+    /// Turns credential enforcement on for this admin surface.
+    ///
+    /// A cluster with authentication off is an explicit, node-level decision,
+    /// not an accident of a missing credential: the flag is what the server and
+    /// the CLI agree on, so an operator can always tell an open cluster apart
+    /// from one whose caller forgot a token.
+    #[must_use]
+    pub fn require_auth(mut self, require_auth: bool) -> Self {
+        self.require_auth = require_auth;
         self
     }
 
@@ -281,6 +326,45 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
             .as_ref()
             .expect("forwarded() returns None only when this node holds a ready controller")
     }
+
+    /// Authorizes a cluster-wide admin call from the request's bearer token.
+    ///
+    /// Checked here, on the node the operator dialled, rather than after the
+    /// forward to the leader — because the bearer token rides in request
+    /// metadata, and [`AdminService::forwarded`] re-encodes only the protobuf
+    /// body, so the token does not survive the hop. That is safe to do off the
+    /// leader precisely because admin is root-only: the rule is
+    /// [`crate::CredentialSnapshot::authorize_admin`], which grants the cluster
+    /// to the config-derived root identity alone and never to a tenant
+    /// credential's per-keyspace write. Every node carries that root hash from
+    /// its own configuration, so the pass verdict needs no credential state at
+    /// all. When this node hosts the leader, its snapshot is folded in only to
+    /// sharpen the *refusal* — a known tenant credential is told
+    /// `PermissionDenied` rather than `Unauthenticated` — never to widen who
+    /// passes.
+    async fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if !self.require_auth {
+            return Ok(());
+        }
+        let header = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        let secret = crate::bearer_secret(header).map_err(status)?;
+        // A forwarding-only node holds no credential state, so it falls back to
+        // an empty snapshot the root overlay still authorizes against.
+        let (snapshot, now_millis) = match &self.controller {
+            Some(controller) => (
+                controller.credential_snapshot().await,
+                controller.now_millis(),
+            ),
+            None => (crate::CredentialSnapshot::default(), 0),
+        };
+        snapshot
+            .with_root(self.root)
+            .authorize_admin(secret, now_millis)
+            .map_err(status)
+    }
 }
 
 /// What one keyspace's partitions add up to in one observation.
@@ -344,6 +428,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateKeyspaceRequest>,
     ) -> Result<Response<pb::Keyspace>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::CreateKeyspace, &request)
@@ -367,6 +452,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::UpdateKeyspaceRequest>,
     ) -> Result<Response<pb::Keyspace>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::UpdateKeyspace, &request)
@@ -390,6 +476,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::DeleteKeyspaceRequest>,
     ) -> Result<Response<pb::DeleteKeyspaceResponse>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         // The proto asks for the name twice so that a script cannot destroy a
         // keyspace with one careless argument. Checking it here rather than in
@@ -418,6 +505,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::ListKeyspacesRequest>,
     ) -> Result<Response<pb::ListKeyspacesResponse>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self.forwarded(AdminMethod::ListKeyspaces, &request).await? {
             return Ok(Response::new(response));
@@ -440,6 +528,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::CreateCredentialRequest>,
     ) -> Result<Response<pb::CreateCredentialResponse>, Status> {
+        self.authorize(&request).await?;
         // Read before `into_inner` drops the extensions. Present when this call
         // reached the leader by being forwarded; absent when an operator dialled
         // the leader directly, in which case there is no resend to guard against
@@ -502,6 +591,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::RevokeCredentialRequest>,
     ) -> Result<Response<pb::RevokeCredentialResponse>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::RevokeCredential, &request)
@@ -520,6 +610,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::DescribeClusterRequest>,
     ) -> Result<Response<pb::DescribeClusterResponse>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::DescribeCluster, &request)
@@ -623,6 +714,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::FinalizeUpgradeRequest>,
     ) -> Result<Response<pb::FinalizeUpgradeResponse>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::FinalizeUpgrade, &request)
@@ -641,6 +733,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::SplitPartitionRequest>,
     ) -> Result<Response<pb::SplitPartitionResponse>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::SplitPartition, &request)
@@ -658,6 +751,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::MergePartitionsRequest>,
     ) -> Result<Response<pb::MergePartitionsResponse>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::MergePartitions, &request)
@@ -677,6 +771,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         &self,
         request: Request<pb::TransferOwnershipRequest>,
     ) -> Result<Response<pb::TransferOwnershipResponse>, Status> {
+        self.authorize(&request).await?;
         let request = request.into_inner();
         if let Some(response) = self
             .forwarded(AdminMethod::TransferOwnership, &request)

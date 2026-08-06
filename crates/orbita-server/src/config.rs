@@ -243,6 +243,38 @@ pub struct ServerConfig {
     /// Pins the node's randomness so that a production run can be replayed
     /// with the same jitter decisions. Unset draws one at startup.
     pub rng_seed: Option<u64>,
+
+    /// Whether clients must present a credential.
+    ///
+    /// Off by default, because a cluster that refuses its first request before
+    /// anyone has issued a credential is a cluster nobody can bootstrap, and
+    /// the single-node and test shapes have no control plane to issue one at
+    /// all. Turning it on is an explicit operator decision (`ORBITA_REQUIRE_AUTH`)
+    /// that the CLI mirrors: with it off, an unauthenticated request is allowed
+    /// through rather than rejected, so the server is the one place that decides
+    /// whether a credential was required. See [`crate::Server`] and the `auth`
+    /// module for the enforcement path.
+    pub require_auth: bool,
+
+    /// A bootstrap root credential, supplied whole as its plaintext secret.
+    ///
+    /// This exists to resolve the bootstrap chicken-and-egg: with
+    /// [`Self::require_auth`] on, the admin surface itself demands a
+    /// write-capable credential, but the first credential is created *through*
+    /// admin, so a cluster turning auth on has no way to create its first one.
+    /// An operator names a root secret here (`ORBITA_ROOT_CREDENTIAL`); the
+    /// server hashes it at startup and overlays the hash onto enforcement, so a
+    /// request bearing it is authorized as a fully privileged, all-keyspaces,
+    /// write-capable, non-expiring identity before any credential exists in the
+    /// log, and can then create the first real one.
+    ///
+    /// It is a config secret with total blast radius. It is never written to
+    /// the replicated log and never logged. It is the operator's job to rotate
+    /// it and to remove it once real credentials exist: it is a bootstrap key,
+    /// not a standing one. `None` — the default — means no root, and a cluster
+    /// with auth on and no root must create its first credential while auth is
+    /// off.
+    pub root_credential: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -270,6 +302,8 @@ impl Default for ServerConfig {
             keyspaces: vec![KeyspaceName::new(DEFAULT_KEYSPACE).expect("a literal name is valid")],
             lease_duration: DEFAULT_LEASE_DURATION,
             rng_seed: None,
+            require_auth: false,
+            root_credential: None,
         }
     }
 }
@@ -396,6 +430,25 @@ impl ServerConfig {
     #[must_use]
     pub fn with_lease_duration(mut self, duration: Duration) -> Self {
         self.lease_duration = duration;
+        self
+    }
+
+    /// Turns credential enforcement on, so every client request must carry a
+    /// valid `authorization: Bearer <secret>` header.
+    #[must_use]
+    pub fn with_require_auth(mut self, require_auth: bool) -> Self {
+        self.require_auth = require_auth;
+        self
+    }
+
+    /// Sets the bootstrap root credential, as its plaintext secret.
+    ///
+    /// See [`ServerConfig::root_credential`]: the secret is hashed at startup
+    /// and overlaid onto enforcement so it can bootstrap a cluster whose auth
+    /// is on before any credential exists.
+    #[must_use]
+    pub fn with_root_credential(mut self, root_credential: Option<String>) -> Self {
+        self.root_credential = root_credential;
         self
     }
 

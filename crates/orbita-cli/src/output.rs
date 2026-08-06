@@ -1268,6 +1268,19 @@ impl Render for crate::config::Config {
             self.cluster.allow_version_skew.to_string(),
         );
         line(
+            "cluster.require_auth",
+            self.cluster.require_auth.to_string(),
+        );
+        // A bootstrap secret, so its presence is shown but never its value.
+        line(
+            "cluster.root_credential",
+            if self.cluster.root_credential.is_some() {
+                "set".to_owned()
+            } else {
+                "unset".to_owned()
+            },
+        );
+        line(
             "cluster.join_backoff_initial",
             format!("{} ms", self.cluster.join_backoff_initial_millis),
         );
