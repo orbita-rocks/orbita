@@ -45,8 +45,13 @@ pub fn connect(channel: Channel) -> KvClient<Channel> {
 
 /// Reads one key.
 pub async fn get(session: &Session, format: Format, args: GetArgs) -> Result<Outcome> {
-    let (keyspace, key) =
-        resolve_keyed(session.default_keyspace(), args.keyspace, args.key, "get")?;
+    let (keyspace, key) = resolve_keyed(
+        args.keyspace_flag,
+        session.default_keyspace(),
+        args.keyspace,
+        args.key,
+        "get",
+    )?;
     let mut client = connect(session.channel.clone());
     let request = authed(
         &session.config,
@@ -75,6 +80,7 @@ pub async fn get(session: &Session, format: Format, args: GetArgs) -> Result<Out
 /// Writes one key.
 pub async fn set(session: &Session, format: Format, args: SetArgs) -> Result<Outcome> {
     let (keyspace, key, inline_value) = resolve_set(
+        args.keyspace_flag,
         session.default_keyspace(),
         args.keyspace,
         args.key,
@@ -114,6 +120,7 @@ pub async fn set(session: &Session, format: Format, args: SetArgs) -> Result<Out
 /// Removes one key.
 pub async fn delete(session: &Session, format: Format, args: DeleteArgs) -> Result<Outcome> {
     let (keyspace, key) = resolve_keyed(
+        args.keyspace_flag,
         session.default_keyspace(),
         args.keyspace,
         args.key,
@@ -145,7 +152,12 @@ pub async fn delete(session: &Session, format: Format, args: DeleteArgs) -> Resu
 
 /// Lists one page of keys under a prefix.
 pub async fn list(session: &Session, format: Format, args: ListArgs) -> Result<Outcome> {
-    let (keyspace, prefix) = resolve_list(session.default_keyspace(), args.keyspace, args.prefix)?;
+    let (keyspace, prefix) = resolve_list(
+        args.keyspace_flag,
+        session.default_keyspace(),
+        args.keyspace,
+        args.prefix,
+    )?;
     let mut client = connect(session.channel.clone());
     let request = authed(
         &session.config,
@@ -188,19 +200,34 @@ fn no_keyspace(verb: &str) -> anyhow::Error {
     )
 }
 
-/// Resolves the keyspace and key for `get` and `delete` from up to two
-/// positionals and the configured default.
+/// Resolves the keyspace and key for `get` and `delete`.
 ///
-/// The two-argument form always names the keyspace first, so `get demo key`
-/// means the same thing whether or not a default is set: a script never changes
-/// meaning because the environment changed. The default only fills a keyspace
-/// that was not typed, which is what makes the one-argument `get key` work.
+/// `flag` is `--keyspace`, the unambiguous form: when it is set the positionals
+/// are only the key, and it wins over both a leading positional and any default.
+/// Otherwise the two-argument form always names the keyspace first, so
+/// `get demo key` means the same thing whether or not a default is set — a
+/// script never changes meaning because the environment changed — and the
+/// default only fills a keyspace that was not typed, which is what makes the
+/// one-argument `get key` work.
 fn resolve_keyed(
+    flag: Option<String>,
     default: Option<&str>,
     keyspace: Option<String>,
     key: Option<String>,
     verb: &str,
 ) -> Result<(String, String)> {
+    if let Some(flag) = flag {
+        // With an explicit keyspace, the sole positional is the key, so there
+        // is nothing left to misread. A second positional would mean the caller
+        // named the keyspace twice.
+        return match (keyspace, key) {
+            (Some(key), None) => Ok((flag, key)),
+            (Some(_), Some(_)) => {
+                bail!("with --keyspace, give only the key: `{verb} --keyspace <name> <key>`")
+            }
+            (None, _) => bail!("{verb} needs a key"),
+        };
+    }
     match (keyspace, key) {
         (Some(keyspace), Some(key)) => Ok((keyspace, key)),
         (Some(key), None) => match default {
@@ -213,15 +240,26 @@ fn resolve_keyed(
 
 /// Resolves the keyspace and prefix for `list`.
 ///
-/// A single argument is the prefix when a default keyspace exists and the
-/// keyspace otherwise, which keeps the old `list demo` (scan a keyspace) working
-/// with no default and makes `list users/` (scan a prefix of the current
-/// keyspace) work with one.
+/// `flag` is `--keyspace`, after which the single positional is unambiguously
+/// the prefix. Without it, a single argument is the prefix when a default
+/// keyspace exists and the keyspace otherwise, which keeps the old `list demo`
+/// (scan a keyspace) working with no default and makes `list users/` (scan a
+/// prefix of the current keyspace) work with one.
 fn resolve_list(
+    flag: Option<String>,
     default: Option<&str>,
     keyspace: Option<String>,
     prefix: Option<String>,
 ) -> Result<(String, String)> {
+    if let Some(flag) = flag {
+        return match (keyspace, prefix) {
+            (Some(prefix), None) => Ok((flag, prefix)),
+            (None, _) => Ok((flag, String::new())),
+            (Some(_), Some(_)) => {
+                bail!("with --keyspace, give only the prefix: `list --keyspace <name> <prefix>`")
+            }
+        };
+    }
     match (keyspace, prefix) {
         (Some(keyspace), Some(prefix)) => Ok((keyspace, prefix)),
         (Some(one), None) => match default {
@@ -237,16 +275,37 @@ fn resolve_list(
 
 /// Resolves the keyspace, key, and inline value for `set`.
 ///
-/// `set` has three positionals and an optional value, so a two-argument form is
-/// genuinely ambiguous: `set a b` is keyspace-and-key when no default is set,
-/// and key-and-value when one is. The full three-argument form is never
-/// ambiguous, which is why the help tells anyone in doubt to name the keyspace.
+/// `flag` is `--keyspace`, the unambiguous form the help points at for
+/// file- and stdin-backed writes: with it the positionals are only the key and
+/// an optional value, so `set --keyspace prod key` writes the piped or filed
+/// value to `key` in `prod` and can never be misread as key-and-value.
+///
+/// Without it, `set` has three positionals and an optional value, so a
+/// two-argument form is genuinely ambiguous: `set a b` is keyspace-and-key when
+/// no default is set, and key-and-value when one is. That ambiguity is the whole
+/// reason `--keyspace` exists, and the reason a stdin- or file-backed write with
+/// a default keyspace should use it rather than the positional shorthand.
 fn resolve_set(
+    flag: Option<String>,
     default: Option<&str>,
     keyspace: Option<String>,
     key: Option<String>,
     value: Option<String>,
 ) -> Result<(String, String, Option<String>)> {
+    if let Some(flag) = flag {
+        // With an explicit keyspace the positionals collapse to key and an
+        // optional value, and the third slot must be empty.
+        return match (keyspace, key, value) {
+            (Some(key), value, None) => Ok((flag, key, value)),
+            (Some(_), Some(_), Some(_)) => bail!(
+                "with --keyspace, give the key and an optional value only: \
+                 `set --keyspace <name> <key> [value]`"
+            ),
+            (None, _, _) => bail!("set needs a key"),
+            // Unreachable: clap fills positionals left to right.
+            (Some(_), None, Some(_)) => bail!("set needs a key"),
+        };
+    }
     match (keyspace, key, value) {
         // The full three-argument form names the keyspace first and is never
         // ambiguous, whether or not a default is set.
@@ -358,14 +417,21 @@ mod tests {
         // environment must not turn `get demo key` into a read of some other
         // keyspace.
         let with = resolve_keyed(
+            None,
             Some("current"),
             Some("demo".to_owned()),
             Some("key".to_owned()),
             "get",
         )
         .unwrap();
-        let without =
-            resolve_keyed(None, Some("demo".to_owned()), Some("key".to_owned()), "get").unwrap();
+        let without = resolve_keyed(
+            None,
+            None,
+            Some("demo".to_owned()),
+            Some("key".to_owned()),
+            "get",
+        )
+        .unwrap();
         assert_eq!(with, ("demo".to_owned(), "key".to_owned()));
         assert_eq!(with, without);
     }
@@ -373,25 +439,62 @@ mod tests {
     #[test]
     fn a_one_argument_get_uses_the_default_keyspace() {
         let (keyspace, key) =
-            resolve_keyed(Some("current"), Some("key".to_owned()), None, "get").unwrap();
+            resolve_keyed(None, Some("current"), Some("key".to_owned()), None, "get").unwrap();
         assert_eq!((keyspace.as_str(), key.as_str()), ("current", "key"));
     }
 
     #[test]
     fn a_one_argument_get_without_a_default_is_refused_for_want_of_a_keyspace() {
-        let err = resolve_keyed(None, Some("key".to_owned()), None, "get").unwrap_err();
+        let err = resolve_keyed(None, None, Some("key".to_owned()), None, "get").unwrap_err();
         assert!(format!("{err:#}").contains("needs a keyspace"), "{err:#}");
+    }
+
+    #[test]
+    fn an_explicit_keyspace_flag_reads_the_lone_positional_as_the_key() {
+        // The unambiguous form: `get --keyspace demo key` puts the keyspace in
+        // the flag and the key in the one positional, so a default can never
+        // change which key is read.
+        let (keyspace, key) = resolve_keyed(
+            Some("prod".to_owned()),
+            Some("current"),
+            Some("key".to_owned()),
+            None,
+            "get",
+        )
+        .unwrap();
+        assert_eq!((keyspace.as_str(), key.as_str()), ("prod", "key"));
+        // Naming the keyspace twice — flag plus a second positional — is a
+        // mistake, not a silent reinterpretation.
+        assert!(resolve_keyed(
+            Some("prod".to_owned()),
+            None,
+            Some("demo".to_owned()),
+            Some("key".to_owned()),
+            "get",
+        )
+        .is_err());
     }
 
     #[test]
     fn list_reads_a_lone_argument_as_prefix_with_a_default_and_keyspace_without() {
         assert_eq!(
-            resolve_list(Some("current"), Some("users/".to_owned()), None).unwrap(),
+            resolve_list(None, Some("current"), Some("users/".to_owned()), None).unwrap(),
             ("current".to_owned(), "users/".to_owned())
         );
         assert_eq!(
-            resolve_list(None, Some("demo".to_owned()), None).unwrap(),
+            resolve_list(None, None, Some("demo".to_owned()), None).unwrap(),
             ("demo".to_owned(), String::new())
+        );
+        // With the flag the positional is unambiguously the prefix.
+        assert_eq!(
+            resolve_list(
+                Some("prod".to_owned()),
+                None,
+                Some("users/".to_owned()),
+                None
+            )
+            .unwrap(),
+            ("prod".to_owned(), "users/".to_owned())
         );
     }
 
@@ -404,6 +507,7 @@ mod tests {
         );
         assert_eq!(
             resolve_set(
+                None,
                 Some("current"),
                 args.0.clone(),
                 args.1.clone(),
@@ -417,7 +521,7 @@ mod tests {
             )
         );
         assert_eq!(
-            resolve_set(None, args.0, args.1, args.2).unwrap(),
+            resolve_set(None, None, args.0, args.1, args.2).unwrap(),
             (
                 "demo".to_owned(),
                 "key".to_owned(),
@@ -430,6 +534,7 @@ mod tests {
     fn a_two_argument_set_is_key_and_value_only_when_a_default_is_in_effect() {
         assert_eq!(
             resolve_set(
+                None,
                 Some("current"),
                 Some("key".to_owned()),
                 Some("value".to_owned()),
@@ -445,9 +550,48 @@ mod tests {
         // With no default the same two arguments are keyspace and key, and the
         // value falls to stdin, exactly as before this feature existed.
         assert_eq!(
-            resolve_set(None, Some("demo".to_owned()), Some("key".to_owned()), None).unwrap(),
+            resolve_set(
+                None,
+                None,
+                Some("demo".to_owned()),
+                Some("key".to_owned()),
+                None
+            )
+            .unwrap(),
             ("demo".to_owned(), "key".to_owned(), None)
         );
+    }
+
+    #[test]
+    fn an_explicit_keyspace_keeps_a_stdin_or_file_write_pointed_at_the_right_place() {
+        // The P1 the review caught: with a default keyspace, the positional
+        // shorthand turned `set other key` (value from stdin) into a write of
+        // literal "key". The explicit form is proof against that — the keyspace
+        // is the flag, the key is the sole positional, and the value stays
+        // absent so it comes from stdin or --value-file.
+        let (keyspace, key, value) = resolve_set(
+            Some("other".to_owned()),
+            Some("current"),
+            Some("key".to_owned()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(keyspace, "other");
+        assert_eq!(key, "key");
+        assert_eq!(value, None, "the value is left to stdin or --value-file");
+
+        // An explicit value is still allowed alongside the flag.
+        let (keyspace, key, value) = resolve_set(
+            Some("other".to_owned()),
+            Some("current"),
+            Some("key".to_owned()),
+            Some("value".to_owned()),
+            None,
+        )
+        .unwrap();
+        assert_eq!((keyspace.as_str(), key.as_str()), ("other", "key"));
+        assert_eq!(value.as_deref(), Some("value"));
     }
 
     #[test]

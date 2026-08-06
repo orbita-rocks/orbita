@@ -625,6 +625,13 @@ pub struct GetArgs {
     pub keyspace: Option<String>,
     /// The key to read.
     pub key: Option<String>,
+
+    /// Name the keyspace explicitly, ahead of any positional or default.
+    ///
+    /// The unambiguous form: with it, the positionals are only the key, so
+    /// there is never a question of which argument is the keyspace.
+    #[arg(short = 'k', long = "keyspace", value_name = "NAME")]
+    pub keyspace_flag: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -638,8 +645,13 @@ The keyspace comes first: `set demo key value`. It may be left off when a
 default keyspace is in effect (ORBITA_KEYSPACE, `client.keyspace`, or the
 REPL's `:use`), in which case `set key value` writes to the current keyspace.
 Because the value is optional, a two-argument `set a b` is read as keyspace and
-key when no default is set, and as key and value when one is; name the keyspace
-in full to avoid the question.
+key when no default is set, and as key and value when one is.
+
+When the value comes from a file or standard input there is no third argument
+to break the tie, so name the keyspace with --keyspace to be unambiguous:
+`printf secret | orbita set --keyspace prod locks/leader` writes the piped bytes
+to `locks/leader` in `prod`, no matter what default is set. With --keyspace the
+positionals are only the key and an optional value.
 
 Conditions are what make this usable for locks and catalog pointers.
 --if-not-present takes a lock; --if-version swings a pointer only if nobody
@@ -652,6 +664,15 @@ pub struct SetArgs {
     pub key: Option<String>,
     /// The value. Omit it to read the value from standard input.
     pub value: Option<String>,
+
+    /// Name the keyspace explicitly, ahead of any positional or default.
+    ///
+    /// The unambiguous form, and the one to use when the value comes from a
+    /// file or standard input: with it the positionals are only the key and an
+    /// optional value, so `set <keyspace> <key>` can never be misread as
+    /// `set <key> <value>`.
+    #[arg(short = 'k', long = "keyspace", value_name = "NAME")]
+    pub keyspace_flag: Option<String>,
 
     /// Read the value from this file instead.
     #[arg(long, value_name = "PATH")]
@@ -677,6 +698,10 @@ pub struct DeleteArgs {
     /// The key to delete.
     pub key: Option<String>,
 
+    /// Name the keyspace explicitly, ahead of any positional or default.
+    #[arg(short = 'k', long = "keyspace", value_name = "NAME")]
+    pub keyspace_flag: Option<String>,
+
     /// Delete only if the key is at exactly this version.
     #[arg(long, value_name = "VERSION")]
     pub if_version: Option<u64>,
@@ -695,6 +720,12 @@ pub struct ListArgs {
     pub keyspace: Option<String>,
     /// The prefix to match. Empty scans the whole keyspace.
     pub prefix: Option<String>,
+
+    /// Name the keyspace explicitly, ahead of any positional or default.
+    ///
+    /// With it, the single positional is unambiguously the prefix.
+    #[arg(short = 'k', long = "keyspace", value_name = "NAME")]
+    pub keyspace_flag: Option<String>,
 
     /// Continue from the cursor a previous page returned.
     #[arg(long, value_name = "CURSOR")]

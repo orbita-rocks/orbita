@@ -46,6 +46,12 @@ struct Seen {
     keyspace_name: Option<String>,
     set_key: Option<Vec<u8>>,
     set_condition: bool,
+    /// The keyspace a `set` named, so a test can prove an explicit keyspace is
+    /// honoured rather than shadowed by a default.
+    set_keyspace: Option<String>,
+    /// The value bytes a `set` carried, so a test can prove a file- or
+    /// stdin-backed value is not dropped for a positional.
+    set_value: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -267,6 +273,8 @@ impl Kv for Fake {
             let mut seen = self.seen.lock().unwrap();
             seen.set_key = Some(request.key.clone());
             seen.set_condition = request.condition.is_some();
+            seen.set_keyspace = Some(request.keyspace.clone());
+            seen.set_value = Some(request.value.clone());
         }
         Ok(Response::new(SetResponse {
             applied: self.condition_holds,
@@ -654,6 +662,7 @@ async fn a_get_that_found_the_key_exits_zero_and_prints_the_value_first() {
         GetArgs {
             keyspace: Some("demo".to_owned()),
             key: Some("greeting".to_owned()),
+            keyspace_flag: None,
         },
     )
     .await
@@ -675,6 +684,7 @@ async fn a_get_that_missed_exits_with_the_not_found_code_rather_than_failing() {
         GetArgs {
             keyspace: Some("demo".to_owned()),
             key: Some("greeting".to_owned()),
+            keyspace_flag: None,
         },
     )
     .await
@@ -690,6 +700,7 @@ fn set_args() -> SetArgs {
         keyspace: Some("demo".to_owned()),
         key: Some("locks/leader".to_owned()),
         value: Some("node-1".to_owned()),
+        keyspace_flag: None,
         value_file: None,
         ttl: None,
         if_not_present: true,
@@ -708,6 +719,56 @@ async fn a_conditional_write_that_applied_exits_zero() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.set_key.as_deref(), Some(b"locks/leader".as_slice()));
     assert!(seen.set_condition, "the condition did not reach the server");
+}
+
+/// The P1 the review caught, end to end: with a default keyspace in effect, an
+/// explicit `--keyspace` on a file-backed set must write the file's bytes to the
+/// named key in the named keyspace, not misparse the arguments into a literal
+/// value in the default keyspace.
+#[tokio::test]
+async fn a_file_backed_set_with_an_explicit_keyspace_writes_where_it_is_told() {
+    let (mut session, seen) = start(fake()).await;
+    // The dangerous default: without the explicit flag, the positional
+    // shorthand would treat `set other key` as key `other`, value `key`.
+    session.keyspace = Some("current".to_owned());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("value");
+    std::fs::write(&path, b"piped-or-filed-secret").unwrap();
+
+    // The shape clap produces for `set --keyspace other key --value-file <path>`:
+    // the keyspace is the flag, the sole positional is the key, and the value is
+    // absent so it comes from the file.
+    let outcome = data::set(
+        &session,
+        Format::Human,
+        SetArgs {
+            keyspace: Some("key".to_owned()),
+            key: None,
+            value: None,
+            keyspace_flag: Some("other".to_owned()),
+            value_file: Some(path),
+            ttl: None,
+            if_not_present: false,
+            if_version: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.code, 0);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.set_keyspace.as_deref(),
+        Some("other"),
+        "the explicit keyspace must win over the session default"
+    );
+    assert_eq!(seen.set_key.as_deref(), Some(b"key".as_slice()));
+    assert_eq!(
+        seen.set_value.as_deref(),
+        Some(b"piped-or-filed-secret".as_slice()),
+        "the file's bytes must be the value, not a misparsed positional"
+    );
 }
 
 #[tokio::test]
@@ -751,6 +812,7 @@ async fn the_admin_and_data_services_share_one_endpoint() {
         GetArgs {
             keyspace: Some("demo".to_owned()),
             key: Some("k".to_owned()),
+            keyspace_flag: None,
         }
     )
     .await
