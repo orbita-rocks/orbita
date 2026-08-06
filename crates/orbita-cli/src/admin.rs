@@ -34,8 +34,15 @@ use crate::output::{
 };
 
 /// Opens an admin client against the configured endpoint.
+///
+/// Sized to the same ceiling as the data client and the server, so a
+/// describe-cluster response for a large cluster is not refused inside this
+/// client's own gRPC stack.
 pub fn connect(config: &Config) -> Result<AdminClient<Channel>> {
-    Ok(AdminClient::new(channel(config)?))
+    let limit = orbita_server::max_transport_message_bytes();
+    Ok(AdminClient::new(channel(config)?)
+        .max_decoding_message_size(limit)
+        .max_encoding_message_size(limit))
 }
 
 /// Opens a health client against the configured endpoint.

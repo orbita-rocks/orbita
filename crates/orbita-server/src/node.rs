@@ -54,6 +54,33 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
+/// The gRPC message-size ceiling implied by a keyspace whose values may reach
+/// `max_value_bytes`.
+///
+/// This is the one piece of arithmetic behind both halves of the contract: it
+/// is what `GetLimits` publishes as `max_message_bytes`, and, evaluated at the
+/// hard value cap by [`max_transport_message_bytes`], what the transport is
+/// sized to accept. Keeping it a single function is the whole point: a server
+/// that advertised one number and enforced another would let a client send
+/// exactly what it was told to and be refused by the transport before its
+/// request was ever seen.
+pub fn message_bytes_ceiling(max_value_bytes: u64) -> u64 {
+    max_value_bytes.max(MAX_LIST_BYTES) + MESSAGE_OVERHEAD_BYTES
+}
+
+/// The largest message any keyspace on this cluster can make cross the wire.
+///
+/// This sizes the gRPC servers' decode and encode limits and the client
+/// channel. It is [`message_bytes_ceiling`] at [`MAX_VALUE_BYTES`], the hard
+/// cap `GetLimits` clamps every keyspace's value size to, so it is at least as
+/// large as any per-keyspace ceiling a client could be told, and the store
+/// never advertises a size it would then reject.
+pub fn max_transport_message_bytes() -> usize {
+    // The cast cannot lose data: the ceiling is a few megabytes and usize is
+    // at least 32 bits on every target this builds for.
+    message_bytes_ceiling(MAX_VALUE_BYTES as u64) as usize
+}
+
 /// Where a node's data goes.
 ///
 /// The two locations are different layers rather than a style choice: the log
@@ -645,6 +672,11 @@ impl<R: Runtime> Node<R> {
     /// Reports the sizes this cluster accepts, for the named keyspace or for
     /// the whole cluster when none is named.
     ///
+    /// The number this returns as `max_message_bytes` is the same one
+    /// [`message_bytes_ceiling`] produces, so the ceiling a client is told and
+    /// the ceiling the transport is sized to (see
+    /// [`max_transport_message_bytes`]) come from one place and cannot drift.
+    ///
     /// The cluster-wide answer is the largest any keyspace allows rather than
     /// the smallest, because a client asking without naming a keyspace is
     /// sizing a connection it intends to reuse, and a connection has to be big
@@ -674,7 +706,7 @@ impl<R: Runtime> Node<R> {
             // name, and framing. Reporting one number means a client sets its
             // channel once and never has to do this arithmetic or get it
             // slightly wrong.
-            max_message_bytes: max_value_bytes.max(MAX_LIST_BYTES) + MESSAGE_OVERHEAD_BYTES,
+            max_message_bytes: message_bytes_ceiling(max_value_bytes),
         })
     }
 

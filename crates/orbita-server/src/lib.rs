@@ -119,6 +119,7 @@ pub use config::{
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 pub use map_source::{single_node_map, BoxedMapSource, MapSource, StaticMapSource};
+pub use node::{max_transport_message_bytes, message_bytes_ceiling};
 pub use readiness::{ReadinessCondition, ReadinessGate, ReadinessState};
 pub use runtime::ServerRuntime;
 pub use status::to_status;
@@ -359,7 +360,15 @@ impl Server {
             .map_err(|e| Error::Internal(format!("serving on {local_addr}: {e}")))?;
 
         let (shutdown, stop) = tokio::sync::oneshot::channel();
-        let service = KvServer::new(KvService::new(Arc::clone(&node)));
+        // Both message limits come from the same ceiling `GetLimits` publishes,
+        // so the transport accepts exactly what the store tells a client it may
+        // send. Tonic's default decode limit is 4 MiB, below the advertised
+        // ceiling, so a maximum list page or a value at the largest keyspace
+        // cap would be refused by the transport before the handler saw it.
+        let message_limit = node::max_transport_message_bytes();
+        let service = KvServer::new(KvService::new(Arc::clone(&node)))
+            .max_decoding_message_size(message_limit)
+            .max_encoding_message_size(message_limit);
         let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
         let admin = controller.map(AdminService::new);
         let serving = tokio::spawn(async move {
@@ -370,10 +379,14 @@ impl Server {
             };
             let served = match admin {
                 Some(admin) => {
+                    let admin = admin
+                        .into_server()
+                        .max_decoding_message_size(message_limit)
+                        .max_encoding_message_size(message_limit);
                     tonic::transport::Server::builder()
                         .add_service(service)
                         .add_service(health)
-                        .add_service(admin.into_server())
+                        .add_service(admin)
                         .serve_with_incoming_shutdown(incoming, shutdown)
                         .await
                 }

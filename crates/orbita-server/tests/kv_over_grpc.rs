@@ -630,6 +630,62 @@ async fn a_client_can_discover_the_sizes_this_cluster_accepts() {
     server.shutdown().await.unwrap();
 }
 
+/// The published `max_message_bytes` is a promise the transport has to keep: a
+/// client that sizes its channel to it and sends exactly that many bytes must
+/// reach the handler rather than being cut off by the transport first. Before
+/// the servers configured their own limits from this same number, the
+/// advertised ceiling sat above tonic's 4 MiB decode default, so a request at
+/// the advertised size was refused before the service ever saw it.
+#[tokio::test]
+async fn a_request_at_the_advertised_message_size_reaches_the_handler() {
+    use prost::Message as _;
+
+    let dir = DataDir::new("message-limit");
+    let (server, mut client) = start(&dir).await;
+
+    let limits = client
+        .get_limits(orbita_proto::v1::GetLimitsRequest {
+            keyspace: orbita_server::DEFAULT_KEYSPACE.to_string(),
+        })
+        .await
+        .expect("limits are answerable")
+        .into_inner();
+    let target = limits.max_message_bytes as usize;
+
+    // A request whose encoded length is exactly the advertised ceiling. Its
+    // value runs far past the value limit on purpose: a handler that sees it
+    // must refuse it for size, and that application-level refusal -- rather
+    // than a transport message-size error -- is what proves the transport
+    // carried the whole request.
+    let mut request = set("at-the-message-limit", "");
+    request.value = vec![b'x'; target - request.encoded_len()];
+    // Closing the gap in one step is not always enough: the value's own length
+    // varint can widen as the value grows, so adjust until it lands exactly.
+    while request.encoded_len() != target {
+        let delta = target as isize - request.encoded_len() as isize;
+        let len = (request.value.len() as isize + delta) as usize;
+        request.value = vec![b'x'; len];
+    }
+    assert_eq!(
+        request.encoded_len(),
+        target,
+        "the request must be exactly the advertised message size"
+    );
+
+    let refused = client
+        .set(request)
+        .await
+        .expect_err("a value this far over the value limit is refused");
+    assert_eq!(
+        refused.code(),
+        Code::InvalidArgument,
+        "a request at the advertised size must reach the handler and be refused \
+         for its value, not cut off by the transport for its message size"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_single_node_reports_ready_once_it_is_serving() {
     let dir = DataDir::new("readiness");
