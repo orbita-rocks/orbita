@@ -21,28 +21,68 @@
 //! By then the node process has installed its meter provider, so the handles
 //! bind to the real exporter rather than to the startup no-op.
 
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
-use opentelemetry::metrics::{Gauge, Histogram};
+use opentelemetry::metrics::{Histogram, ObservableGauge};
 use opentelemetry::{global, KeyValue};
 use orbita_core::PartitionId;
 
+/// One owned partition's latest gauge readings, as of the heartbeat that
+/// published them.
+///
+/// `partition` is kept pre-widened to the `i64` the attribute wants so the
+/// observable callback, which runs on the exporter's collection thread, does no
+/// arithmetic and only clones the strings a `KeyValue` needs.
+#[derive(Clone)]
+struct OwnedSample {
+    keyspace: String,
+    partition: i64,
+    replicas_behind: u64,
+    replication_lag: u64,
+    /// `None` when the owner could not size the partition this heartbeat, in
+    /// which case its storage series is left unreported rather than pinned at a
+    /// stale or zero value.
+    storage_bytes: Option<u64>,
+}
+
+/// The partitions this node currently owns, republished wholesale by every
+/// heartbeat (see [`publish_owned`]).
+///
+/// The gauge callbacks read this and nothing else, so a partition that stops
+/// being owned — retired, reassigned, or in a keyspace that was deleted — falls
+/// out of the export the first heartbeat it is absent from this set, instead of
+/// a synchronous last-value gauge freezing its final reading and exporting it
+/// forever while quota sums and cardinality keep counting a partition that is
+/// gone.
+fn owned() -> &'static RwLock<Vec<OwnedSample>> {
+    static OWNED: OnceLock<RwLock<Vec<OwnedSample>>> = OnceLock::new();
+    OWNED.get_or_init(|| RwLock::new(Vec::new()))
+}
+
 /// The handles every signal records through, built once from the global meter.
+///
+/// The gauges are observable: they hold no per-partition state of their own and
+/// instead read [`owned`] each collection, so retirement is expressed by a
+/// partition leaving that set rather than by anyone remembering to zero a
+/// series. The instrument handles are kept alive here only so their registered
+/// callbacks are not dropped.
 struct Instruments {
     /// End-to-end request latency, in seconds, labelled by keyspace,
     /// partition, and operation. Whether a request was forwarded to the owner
     /// is left to the spans rather than a metric label: a route label would
     /// double every series, and the hop is exactly what a trace shows well.
     request_duration: Histogram<f64>,
-    /// How many advertised replicas of a partition trail its committed prefix.
-    replicas_behind: Gauge<u64>,
-    /// The largest Lamport distance any replica of a partition trails its
-    /// committed prefix by, which is the WAL replication lag.
-    replication_lag: Gauge<u64>,
-    /// A partition's on-disk size. Summed per keyspace it is that keyspace's
-    /// quota consumption, which is why the keyspace label is carried here even
-    /// though the number is measured per partition.
-    partition_storage_bytes: Gauge<u64>,
+    _replicas_behind: ObservableGauge<u64>,
+    _replication_lag: ObservableGauge<u64>,
+    _partition_storage_bytes: ObservableGauge<u64>,
+}
+
+/// The keyspace and partition labels for one owned sample.
+fn owned_attributes(sample: &OwnedSample) -> [KeyValue; 2] {
+    [
+        KeyValue::new("keyspace", sample.keyspace.clone()),
+        KeyValue::new("partition", sample.partition),
+    ]
 }
 
 fn instruments() -> &'static Instruments {
@@ -55,26 +95,43 @@ fn instruments() -> &'static Instruments {
                 .with_unit("s")
                 .with_description("Client request latency, per keyspace, partition, and operation.")
                 .build(),
-            replicas_behind: meter
-                .u64_gauge("orbita.wal.replicas_behind")
+            _replicas_behind: meter
+                .u64_observable_gauge("orbita.wal.replicas_behind")
                 .with_description(
                     "Advertised replicas of a partition that trail its committed prefix.",
                 )
+                .with_callback(|observer| {
+                    for sample in owned().read().unwrap().iter() {
+                        observer.observe(sample.replicas_behind, &owned_attributes(sample));
+                    }
+                })
                 .build(),
-            replication_lag: meter
-                .u64_gauge("orbita.wal.replication_lag")
+            _replication_lag: meter
+                .u64_observable_gauge("orbita.wal.replication_lag")
                 .with_unit("{lamport}")
                 .with_description(
                     "Largest Lamport distance any replica of a partition trails its committed \
                      prefix by.",
                 )
+                .with_callback(|observer| {
+                    for sample in owned().read().unwrap().iter() {
+                        observer.observe(sample.replication_lag, &owned_attributes(sample));
+                    }
+                })
                 .build(),
-            partition_storage_bytes: meter
-                .u64_gauge("orbita.partition.storage_bytes")
+            _partition_storage_bytes: meter
+                .u64_observable_gauge("orbita.partition.storage_bytes")
                 .with_unit("By")
                 .with_description(
                     "On-disk size of a partition. Summed per keyspace, this is quota consumption.",
                 )
+                .with_callback(|observer| {
+                    for sample in owned().read().unwrap().iter() {
+                        if let Some(bytes) = sample.storage_bytes {
+                            observer.observe(bytes, &owned_attributes(sample));
+                        }
+                    }
+                })
                 .build(),
         }
     })
@@ -118,60 +175,109 @@ pub(crate) fn record_request(
     );
 }
 
-/// Records a partition's replication lag from its owner's point of view.
-pub(crate) fn record_replication_lag(
-    keyspace: &str,
-    partition: PartitionId,
-    lag: orbita_wal::ReplicationLag,
-) {
-    let attributes = [
-        KeyValue::new("keyspace", keyspace.to_owned()),
-        KeyValue::new("partition", partition.get() as i64),
-    ];
-    instruments()
-        .replicas_behind
-        .record(lag.replicas_behind, &attributes);
-    instruments()
-        .replication_lag
-        .record(lag.max_lamports, &attributes);
+/// One owned partition's gauge readings for a single heartbeat.
+pub(crate) struct OwnedMetric {
+    /// The keyspace name the partition's series are grouped under.
+    pub keyspace: String,
+    /// The partition these readings belong to.
+    pub partition: PartitionId,
+    /// Its replication lag from the owner's point of view this heartbeat.
+    pub replication_lag: orbita_wal::ReplicationLag,
+    /// Its on-disk size, or `None` when the owner could not size it this
+    /// heartbeat, so the storage series is left unreported rather than stale.
+    pub storage_bytes: Option<u64>,
 }
 
-/// Records a partition's storage footprint, which is per-keyspace quota
-/// consumption once summed.
-pub(crate) fn record_partition_storage(keyspace: &str, partition: PartitionId, bytes: u64) {
-    instruments().partition_storage_bytes.record(
-        bytes,
-        &[
-            KeyValue::new("keyspace", keyspace.to_owned()),
-            KeyValue::new("partition", partition.get() as i64),
-        ],
-    );
+/// Republishes the full set of partitions this node owns.
+///
+/// Called wholesale each heartbeat rather than per partition, because the whole
+/// point of the observable gauges is that the set they report is exactly the
+/// set passed here: a partition that has been retired is expressed by its
+/// absence from `owned`, and a synchronous per-partition record could never
+/// express absence at all. Building the instruments here as well guarantees the
+/// callbacks are registered against the installed provider even on a node that
+/// has not yet served a client request.
+pub(crate) fn publish_owned(owned_metrics: Vec<OwnedMetric>) {
+    let samples = owned_metrics
+        .into_iter()
+        .map(|metric| OwnedSample {
+            keyspace: metric.keyspace,
+            partition: metric.partition.get() as i64,
+            replicas_behind: metric.replication_lag.replicas_behind,
+            replication_lag: metric.replication_lag.max_lamports,
+            storage_bytes: metric.storage_bytes,
+        })
+        .collect();
+    *owned().write().unwrap() = samples;
+    instruments();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // With no meter provider installed the global meter is a no-op, so these
-    // exercise that every instrument builds and every record path runs without
-    // a provider behind it — which is exactly the state a single-node run or a
+    // With no meter provider installed the global meter is a no-op, so this
+    // exercises that the instruments build and the record path runs without a
+    // provider behind it — which is exactly the state a single-node run or a
     // test is in. A panic here would mean a signal that only works once a
-    // collector is configured, which is the opposite of the intent.
+    // collector is configured, which is the opposite of the intent. The gauge
+    // path is left to the retirement test below so the two do not race over the
+    // shared owned set.
     #[test]
-    fn every_signal_records_without_a_provider_installed() {
+    fn request_latency_records_without_a_provider_installed() {
         let partition = PartitionId(7);
         record_request("tenant", partition, Operation::Get, 0.001);
         record_request("tenant", partition, Operation::Set, 0.002);
         record_request("tenant", partition, Operation::Delete, 0.003);
         record_request("tenant", partition, Operation::List, 0.004);
-        record_replication_lag(
-            "tenant",
-            partition,
-            orbita_wal::ReplicationLag {
-                replicas_behind: 2,
-                max_lamports: 9,
+    }
+
+    // The observable gauges report exactly the set `publish_owned` last handed
+    // them, so a partition that stops being owned has to leave that set — this
+    // is the mechanism that retires its series instead of exporting a frozen
+    // last value forever. Asserts on the live source the callbacks read rather
+    // than standing up a collector to observe them.
+    #[test]
+    fn republishing_owned_metrics_retires_a_partition_that_is_no_longer_owned() {
+        let lag = orbita_wal::ReplicationLag {
+            replicas_behind: 0,
+            max_lamports: 0,
+        };
+        publish_owned(vec![
+            OwnedMetric {
+                keyspace: "tenant".to_owned(),
+                partition: PartitionId(7),
+                replication_lag: lag,
+                storage_bytes: Some(4096),
             },
-        );
-        record_partition_storage("tenant", partition, 4096);
+            OwnedMetric {
+                keyspace: "tenant".to_owned(),
+                partition: PartitionId(8),
+                replication_lag: lag,
+                storage_bytes: None,
+            },
+        ]);
+        let live: Vec<i64> = owned()
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.partition)
+            .collect();
+        assert!(live.contains(&7) && live.contains(&8));
+
+        // A later heartbeat that no longer owns partition 7.
+        publish_owned(vec![OwnedMetric {
+            keyspace: "tenant".to_owned(),
+            partition: PartitionId(8),
+            replication_lag: lag,
+            storage_bytes: None,
+        }]);
+        let live: Vec<i64> = owned()
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.partition)
+            .collect();
+        assert_eq!(live, vec![8]);
     }
 }

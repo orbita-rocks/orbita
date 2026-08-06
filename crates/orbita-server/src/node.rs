@@ -575,13 +575,23 @@ impl<R: Runtime> Node<R> {
     ///
     /// Skipped when the partition did not resolve, because a latency sample no
     /// partition can own is a label an operator cannot act on.
+    ///
+    /// Skipped on a forwarded request, because the ingress node already timed
+    /// the same client operation end to end. Recording it again on the owner
+    /// would double every forwarded op's count and blend end-to-end latency
+    /// with owner-local latency under one label; the owner's work is already
+    /// visible through its spans.
     fn record_latency(
         &self,
         keyspace: &str,
         partition: Option<PartitionId>,
         operation: metrics::Operation,
         started_nanos: u64,
+        forwarded: bool,
     ) {
+        if forwarded {
+            return;
+        }
         let Some(partition) = partition else { return };
         let elapsed = self
             .runtime
@@ -619,6 +629,7 @@ impl<R: Runtime> Node<R> {
             partition,
             metrics::Operation::Get,
             started,
+            forwarded,
         );
         result
     }
@@ -687,6 +698,7 @@ impl<R: Runtime> Node<R> {
             partition,
             metrics::Operation::Set,
             started,
+            forwarded,
         );
         result
     }
@@ -762,6 +774,7 @@ impl<R: Runtime> Node<R> {
             partition,
             metrics::Operation::Delete,
             started,
+            forwarded,
         );
         result
     }
@@ -836,9 +849,15 @@ impl<R: Runtime> Node<R> {
     )]
     pub(crate) async fn list(&self, request: ListRequest, forwarded: bool) -> Result<ListResponse> {
         let started = self.runtime.clock().monotonic_nanos();
-        // A scan is routed by where it resumes; the prefix is where it starts,
-        // which is the partition an operator attributes the first page to.
-        let partition = self.label_partition(&request.keyspace, &request.prefix);
+        // A scan is routed by where it resumes, so telemetry follows the cursor
+        // too: once a scan crosses a partition boundary the later pages belong
+        // to the partition they resume into, not the one the prefix started in.
+        // A malformed cursor falls back to the prefix; `try_list` decodes it
+        // again and turns the failure into the client's error.
+        let route_key = Cursor::decode(&request.cursor, &request.prefix)
+            .map(|resume| resume.route_key)
+            .unwrap_or_else(|_| Bytes::copy_from_slice(&request.prefix));
+        let partition = self.label_partition(&request.keyspace, &route_key);
         if let Some(partition) = partition {
             tracing::Span::current().record("partition", partition.get());
         }
@@ -854,6 +873,7 @@ impl<R: Runtime> Node<R> {
             partition,
             metrics::Operation::List,
             started,
+            forwarded,
         );
         result
     }
@@ -1163,6 +1183,7 @@ impl<R: Runtime> Node<R> {
     /// rather than emitted under an empty label.
     async fn observe_owned_metrics(&self, hosts: &[Arc<PartitionHost<R>>]) {
         let map = self.map();
+        let mut owned = Vec::with_capacity(hosts.len());
         for host in hosts {
             let Some(info) = map.partition(host.id()) else {
                 continue;
@@ -1170,12 +1191,17 @@ impl<R: Runtime> Node<R> {
             let Some(keyspace) = map.keyspace(info.keyspace) else {
                 continue;
             };
-            let name = keyspace.name.as_str();
-            metrics::record_replication_lag(name, host.id(), host.replication_lag());
-            if let Ok(bytes) = host.size_bytes().await {
-                metrics::record_partition_storage(name, host.id(), bytes);
-            }
+            owned.push(metrics::OwnedMetric {
+                keyspace: keyspace.name.as_str().to_owned(),
+                partition: host.id(),
+                replication_lag: host.replication_lag(),
+                storage_bytes: host.size_bytes().await.ok(),
+            });
         }
+        // Republished wholesale: the observable gauges report exactly this set,
+        // so a partition this node no longer owns drops out of the export by
+        // being absent here rather than by anyone retiring its series.
+        metrics::publish_owned(owned);
     }
 
     /// Moves the durability half of readiness to match what the owners here
@@ -1596,6 +1622,62 @@ mod tests {
         assert!(
             gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
             "readiness returns once every partition is open again"
+        );
+
+        drop(node);
+    }
+
+    /// A LIST that has paged across a partition boundary must be attributed to
+    /// the partition it resumes into, not the one its prefix started in.
+    /// Resolves the telemetry partition exactly as [`Node::list`] does — decode
+    /// the cursor, take its route key — and shows the answer follows the cursor
+    /// past the boundary rather than pinning every later page to partition one.
+    #[test]
+    fn a_cross_partition_list_page_is_attributed_to_the_cursor_partition() {
+        let sim = Simulation::new(11);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(MemoryStore::new());
+        let layout = DataLayout {
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            wal_root: "wal".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        };
+        let source = BoxedMapSource::new(StaticMapSource::new(two_partition_map()));
+        let gate = Arc::new(ReadinessGate::new());
+        let node = sim.block_on(async move {
+            Node::start(
+                runtime,
+                NodeId(1),
+                layout,
+                source,
+                crate::DEFAULT_LEASE_DURATION,
+                gate,
+            )
+            .await
+            .expect("the node starts")
+        });
+
+        // The first page has no cursor: its route key is the prefix, which
+        // lives below "m" and so belongs to partition one.
+        let prefix = b"";
+        let first = Cursor::decode(b"", prefix)
+            .map(|resume| resume.route_key)
+            .unwrap();
+        assert_eq!(
+            node.label_partition("default", &first),
+            Some(PartitionId(1)),
+        );
+
+        // A later page resumes past the boundary at "m", which is partition
+        // two; telemetry has to move with it.
+        let boundary = Cursor::at_partition_boundary(Bytes::from_static(b"m")).encode();
+        let resumed = Cursor::decode(&boundary, prefix)
+            .map(|resume| resume.route_key)
+            .unwrap();
+        assert_eq!(
+            node.label_partition("default", &resumed),
+            Some(PartitionId(2)),
+            "a scan that crossed into partition two is reported against it",
         );
 
         drop(node);
