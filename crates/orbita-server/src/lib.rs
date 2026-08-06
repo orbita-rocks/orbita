@@ -121,12 +121,13 @@ mod validate;
 pub use aws::{AssumeRoleConfig, DEFAULT_SESSION_DURATION_SECONDS};
 pub use config::{
     S3CredentialSource, S3StorageConfig, ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL,
-    DEFAULT_FLUSH_INTERVAL, DEFAULT_KEYSPACE, DEFAULT_WAL_SEGMENT_BYTES,
+    DEFAULT_FLUSH_INTERVAL, DEFAULT_KEYSPACE, DEFAULT_SWEEP_INTERVAL, DEFAULT_WAL_SEGMENT_BYTES,
 };
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 pub use map_source::{single_node_map, BoxedMapSource, MapSource, StaticMapSource};
 pub use node::{max_admin_message_bytes, max_transport_message_bytes, message_bytes_ceiling};
+pub use orbita_storage::{DEFAULT_SWEEP_GRACE_MILLIS, DEFAULT_SWEEP_SKEW_MILLIS};
 pub use readiness::{ReadinessCondition, ReadinessGate, ReadinessState};
 pub use runtime::ServerRuntime;
 pub use status::to_status;
@@ -164,6 +165,7 @@ pub struct Server {
     peers: PeerListener,
     heartbeat: tokio::task::JoinHandle<()>,
     flusher: tokio::task::JoinHandle<()>,
+    sweeper: tokio::task::JoinHandle<()>,
     /// Present only for a node joined to a leader group.
     reporting: Option<tokio::task::JoinHandle<()>>,
     /// The reporting loop's handle, kept so the server can answer which
@@ -349,6 +351,21 @@ impl Server {
             Arc::downgrade(&node),
             config.flush_interval,
         ));
+        // The orphan sweep rides its own slow cadence rather than the flush
+        // loop, because it lists a whole partition prefix and so must run far
+        // less often than a flush. It is off unless an operator turns it on:
+        // it deletes from the bucket, so it does not start reclaiming on its
+        // own. When disabled the task exists but returns at once, so the field
+        // stays a plain handle and objects simply accumulate until an operator
+        // opts in — the recoverable failure, not the destructive one.
+        let sweeper = tokio::spawn(Self::sweep_loop(
+            Arc::downgrade(&node),
+            config.sweep_enabled,
+            config.sweep_interval,
+            config.sweep_grace_millis,
+            config.sweep_skew_millis,
+            config.sweep_dry_run,
+        ));
 
         // Kept before the reporting loop takes ownership of the client, so
         // that an admin call this node cannot answer has somewhere to go.
@@ -518,6 +535,7 @@ impl Server {
             peers,
             heartbeat,
             flusher,
+            sweeper,
             reporting,
             reporter,
             raft,
@@ -556,6 +574,7 @@ impl Server {
         let _ = self.shutdown.send(());
         self.heartbeat.abort();
         self.flusher.abort();
+        self.sweeper.abort();
         if let Some(reporting) = &self.reporting {
             reporting.abort();
         }
@@ -601,6 +620,43 @@ impl Server {
                 return;
             };
             live.flush_owned().await;
+        }
+    }
+
+    /// Sweeps orphaned objects from this node's owned partitions, forever.
+    ///
+    /// The operator-tunable backstop against leaked objects: a failed compaction
+    /// or an abandoned commit strands objects the manifest no longer references,
+    /// and nothing else ever reclaims them. It runs on its own slow cadence
+    /// rather than inside the flush loop because it lists a whole partition
+    /// prefix per pass. The grace period and skew — and whether this only
+    /// reports rather than deletes — come from configuration so an operator can
+    /// look before the sweep acts on a real bucket. A weak reference, so a
+    /// dropped node stops sweeping rather than pinning itself alive.
+    async fn sweep_loop(
+        node: std::sync::Weak<Node<ServerRuntime>>,
+        enabled: bool,
+        interval: Duration,
+        grace_millis: u64,
+        skew_millis: u64,
+        dry_run: bool,
+    ) {
+        if !enabled {
+            // Disabled is the default. Nothing is reclaimed until an operator
+            // opts in, which is the safe direction for a loop that deletes.
+            return;
+        }
+        if dry_run {
+            tracing::info!(
+                "orphan sweep is in dry-run mode: it will report candidates, not delete"
+            );
+        }
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(live) = node.upgrade() else {
+                return;
+            };
+            live.sweep_owned(grace_millis, skew_millis, dry_run).await;
         }
     }
 
@@ -844,6 +900,7 @@ impl Server {
         self.readiness.clear(ReadinessCondition::AcceptingOwnership);
         self.heartbeat.abort();
         self.flusher.abort();
+        self.sweeper.abort();
         if let Some(reporting) = &self.reporting {
             reporting.abort();
         }

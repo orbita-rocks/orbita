@@ -51,6 +51,14 @@ tracing-opentelemetry = "0.28"
 orbita-core.workspace = true
 orbita-objectstore = { workspace = true, features = ["s3"] }
 orbita-proto.workspace = true
+# The line editor for `orbita repl`, and the first line-editing dependency in
+# the workspace. rustyline over reedline on purpose: it is smaller and older,
+# pulls fewer transitive crates, and is synchronous, which is the exact shape of
+# the REPL loop (read a line, then block the session's runtime on dispatching
+# it). reedline is built for nushell's async, multi-line, styled prompt and
+# would be weight spent on features a thin operator console does not use. See
+# src/repl.rs for the same reasoning at the call site.
+rustyline = "15"
 # The only thing that uses this is src/node.rs, which is the one place in the
 # crate that starts a server rather than dialing one. It goes through the
 # workspace like every other sibling, because a literal version here is a copy

@@ -454,10 +454,10 @@ class Node:
         self._pb2_grpc = pb2_grpc
         self.data_dir = data_dir
         self._log_path = log_path
-        # Extra environment for the node process, on top of the inherited one.
-        # This is how a test turns on `require_auth` and names a root
-        # credential (`ORBITA_REQUIRE_AUTH`, `ORBITA_ROOT_CREDENTIAL`) without
-        # the harness having to know anything about authentication.
+        # Extra ORBITA_* variables layered onto the inherited environment, so a
+        # test can start a node with, say, authentication required without a new
+        # subcommand. `orbita dev` reads the same env layer every other command
+        # does, so this is the whole knob. None means "inherit and add nothing".
         self._env = env
         self._process: subprocess.Popen | None = None
         self._channel: grpc.Channel | None = None
@@ -478,6 +478,9 @@ class Node:
         # The peer listener takes the port above the client one, so leave a gap.
         self.port = free_port()
         self._log = self._log_path.open("ab")
+        # Inherit the parent environment and overlay any per-node overrides, so
+        # a node started with extra ORBITA_* variables still sees PATH, TMPDIR,
+        # and everything else the build and cargo caches depend on.
         process_env = None
         if self._env is not None:
             process_env = {**os.environ, **self._env}

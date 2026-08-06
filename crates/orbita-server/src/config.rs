@@ -30,6 +30,16 @@ pub const DEFAULT_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// How long acknowledged writes normally wait for cluster-wide durability.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often an owner sweeps its partitions for orphaned objects.
+///
+/// The sweep lists a partition's whole prefix, so it is deliberately far rarer
+/// than a flush: orphans are produced only by a compaction or commit that
+/// failed to clean up after itself, which is rare, and an object stranded for
+/// an extra few minutes costs only its own storage. Ten minutes reclaims
+/// promptly on a healthy cluster without turning the sweep's listing into a
+/// standing tax on the object store.
+pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 /// How large a write-ahead log segment grows before a new one is started.
 ///
 /// This is the granularity truncation works at, and truncation is what bounds
@@ -212,6 +222,57 @@ pub struct ServerConfig {
     /// How often owners publish their applied writes to object storage.
     pub flush_interval: Duration,
 
+    /// Whether the orphan sweep runs at all.
+    ///
+    /// Off by default, and deliberately so: the sweep deletes objects from the
+    /// bucket, and a destructive background loop that turns itself on the moment
+    /// a node starts is the kind of default that reclaims the wrong thing on
+    /// somebody's production data before they knew it existed. An operator opts
+    /// in (`ORBITA_SWEEP_ENABLED=true`) once they have set a grace period they
+    /// trust, and is expected to preview with [`sweep_dry_run`] first. Leaving
+    /// it off costs only leaked space, which is recoverable; leaving it on by
+    /// default could cost data, which is not.
+    ///
+    /// [`sweep_dry_run`]: ServerConfig::sweep_dry_run
+    pub sweep_enabled: bool,
+
+    /// How often an owner runs the orphan sweep over the partitions it holds.
+    ///
+    /// The sweep reclaims objects a failed compaction or an abandoned commit
+    /// stranded; without it they accumulate in the bucket forever. See
+    /// [`DEFAULT_SWEEP_INTERVAL`] for why this cadence is far slower than the
+    /// flush.
+    pub sweep_interval: Duration,
+
+    /// How long the orphan sweep leaves an unreferenced object alone before it
+    /// may delete it, in the object store's own clock domain.
+    ///
+    /// This bound is the safety of the sweep: it has to exceed the longest read
+    /// a client can hold open *and* the longest commit a writer can be part way
+    /// through, because both hold references to objects that are unreferenced by
+    /// the current manifest. See
+    /// [`orbita_storage::DEFAULT_SWEEP_GRACE_MILLIS`] for the full argument. A
+    /// deployment whose reads or commits run longer than the default raises it.
+    pub sweep_grace_millis: u64,
+
+    /// How much the sweep widens the grace period to absorb the object store's
+    /// own worst-case internal clock skew.
+    ///
+    /// Even one backend can stamp two objects from servers whose clocks
+    /// disagree, so the sweep requires an object to clear the grace period *and*
+    /// this allowance before it is touched. See
+    /// [`orbita_storage::DEFAULT_SWEEP_SKEW_MILLIS`].
+    pub sweep_skew_millis: u64,
+
+    /// Whether the sweep only reports what it would delete instead of deleting.
+    ///
+    /// A safety valve for the first runs against a real bucket: with it on, the
+    /// sweep logs the objects it *would* reclaim and touches nothing, so an
+    /// operator can confirm the grace period is set right before trusting it to
+    /// delete. Off by default, because a sweep that never deletes never solves
+    /// the problem it exists for — objects accumulating forever.
+    pub sweep_dry_run: bool,
+
     /// How large a write-ahead log segment grows before it is rolled.
     ///
     /// See [`DEFAULT_WAL_SEGMENT_BYTES`]: this sets how far a replica may lag
@@ -294,6 +355,11 @@ impl Default for ServerConfig {
             data_dir: PathBuf::from("data"),
             object_store: None,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            sweep_enabled: false,
+            sweep_interval: DEFAULT_SWEEP_INTERVAL,
+            sweep_grace_millis: orbita_storage::DEFAULT_SWEEP_GRACE_MILLIS,
+            sweep_skew_millis: orbita_storage::DEFAULT_SWEEP_SKEW_MILLIS,
+            sweep_dry_run: false,
             wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
             map_source: BoxedMapSource::new(StaticMapSource::new(single_node_map(
                 node_id,
@@ -418,6 +484,39 @@ impl ServerConfig {
         self
     }
 
+    /// Turns the orphan sweep on. Off by default; see
+    /// [`ServerConfig::sweep_enabled`] for why a destructive loop does not start
+    /// itself.
+    #[must_use]
+    pub fn with_sweep_enabled(mut self, enabled: bool) -> Self {
+        self.sweep_enabled = enabled;
+        self
+    }
+
+    /// Sets how often an owner sweeps its partitions for orphaned objects.
+    #[must_use]
+    pub fn with_sweep_interval(mut self, interval: Duration) -> Self {
+        self.sweep_interval = interval;
+        self
+    }
+
+    /// Sets the orphan sweep's grace period and skew allowance, in the object
+    /// store's clock domain. See [`ServerConfig::sweep_grace_millis`].
+    #[must_use]
+    pub fn with_sweep_bounds(mut self, grace_millis: u64, skew_millis: u64) -> Self {
+        self.sweep_grace_millis = grace_millis;
+        self.sweep_skew_millis = skew_millis;
+        self
+    }
+
+    /// Puts the orphan sweep in report-only mode, so it names what it would
+    /// delete without deleting. See [`ServerConfig::sweep_dry_run`].
+    #[must_use]
+    pub fn with_sweep_dry_run(mut self, dry_run: bool) -> Self {
+        self.sweep_dry_run = dry_run;
+        self
+    }
+
     /// Sets the write-ahead log segment size, and with it how much replication
     /// lag a partition can absorb before a replica falls off the retention
     /// horizon.
@@ -480,6 +579,20 @@ mod tests {
             map.lookup(keyspace.id, b"anything").unwrap().owner,
             Some(config.node_id),
             "the only node owns everything"
+        );
+    }
+
+    #[test]
+    fn the_orphan_sweep_is_off_in_a_default_configuration() {
+        // The sweep deletes from the bucket, so a default configuration must not
+        // run it: an operator opts in once the grace period is set to something
+        // this deployment can stand behind.
+        let config = ServerConfig::default();
+        assert!(!config.sweep_enabled, "the sweep does not start itself");
+        assert!(!config.sweep_dry_run);
+        assert_eq!(
+            config.sweep_grace_millis,
+            orbita_storage::DEFAULT_SWEEP_GRACE_MILLIS
         );
     }
 
