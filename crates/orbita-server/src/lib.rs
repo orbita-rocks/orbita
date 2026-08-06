@@ -177,11 +177,21 @@ impl Server {
     pub async fn start(config: ServerConfig) -> Result<Self> {
         let runtime = ServerRuntime::new(config.node_id, &config.data_dir, config.rng_seed)
             .with_peer_call_timeout(config.node_id, config.peer_call_timeout);
+        // The config root secret, hashed once here so the plaintext never
+        // travels past this boundary. It is overlaid onto both the data-plane
+        // cache and the admin surface so it bootstraps a cluster whose auth is
+        // on before any credential exists in the log. It is never persisted.
+        let root_credential = config
+            .root_credential
+            .as_deref()
+            .map(orbita_control::root_secret_hash);
         // The credential cache the client edge enforces against. Empty until
-        // the control loop's first fetch; harmless while auth is off, and safe
-        // while it is on, since an empty cache refuses rather than admits.
+        // the control loop's first fetch, apart from the root overlay above;
+        // harmless while auth is off, and safe while it is on, since an empty
+        // cache refuses rather than admits.
         let authenticator = Arc::new(auth::Authenticator::new(
             config.require_auth,
+            root_credential,
             runtime.clock().clone(),
         ));
         for (node, address) in &config.peers {
@@ -389,8 +399,11 @@ impl Server {
             Arc::clone(&authenticator),
         ));
         let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
-        let admin = controller
-            .map(|controller| AdminService::new(controller).require_auth(config.require_auth));
+        let admin = controller.map(|controller| {
+            AdminService::new(controller)
+                .require_auth(config.require_auth)
+                .root_credential(root_credential)
+        });
         let serving = tokio::spawn(async move {
             let shutdown = async {
                 // A dropped sender means the `Server` handle went away, so

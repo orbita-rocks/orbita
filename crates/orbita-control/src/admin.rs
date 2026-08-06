@@ -23,6 +23,14 @@ pub struct AdminService<R: Runtime, L: ConsensusLog> {
     /// stays easy to bring up; a node running with authentication on turns it
     /// on. See [`AdminService::require_auth`].
     require_auth: bool,
+    /// The config-derived root secret hash, if the operator configured one.
+    ///
+    /// Overlaid onto the credential snapshot at authorization time so the root
+    /// identity satisfies the admin rule from configuration, before any
+    /// credential has been created through the log. It is only ever this hash
+    /// and only in memory: it is never written to the replicated state. See
+    /// [`crate::root_secret_hash`] for why it exists and its blast radius.
+    root: Option<[u8; 32]>,
 }
 
 impl<R: Runtime, L: ConsensusLog> Clone for AdminService<R, L> {
@@ -30,6 +38,7 @@ impl<R: Runtime, L: ConsensusLog> Clone for AdminService<R, L> {
         Self {
             controller: self.controller.clone(),
             require_auth: self.require_auth,
+            root: self.root,
         }
     }
 }
@@ -40,7 +49,20 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
         Self {
             controller,
             require_auth: false,
+            root: None,
         }
+    }
+
+    /// Configures the bootstrap root credential for this admin surface.
+    ///
+    /// `root` is the SHA-256 of the operator's root secret, or `None` when no
+    /// root is configured. A node hashes the secret once at startup and hands
+    /// the hash here, so the plaintext never reaches this layer. See
+    /// [`crate::root_secret_hash`].
+    #[must_use]
+    pub fn root_credential(mut self, root: Option<[u8; 32]>) -> Self {
+        self.root = root;
+        self
     }
 
     /// Turns credential enforcement on for this admin surface.
@@ -80,9 +102,12 @@ impl<R: Runtime, L: ConsensusLog> AdminService<R, L> {
             .get("authorization")
             .and_then(|value| value.to_str().ok());
         let secret = crate::bearer_secret(header).map_err(status)?;
+        // The root overlay comes from this node's configuration, not the log,
+        // so it authorizes even before the first credential is created.
         self.controller
             .credential_snapshot()
             .await
+            .with_root(self.root)
             .authorize_admin(secret, self.controller.now_millis())
             .map_err(status)
     }

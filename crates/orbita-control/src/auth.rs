@@ -20,6 +20,28 @@ use crate::model::{hash_secret, Credential, Permission};
 
 use orbita_core::{Error, Result};
 
+/// A config-supplied secret, hashed the way the rest of the path hashes one.
+///
+/// This exists to bootstrap authentication. With auth on, the admin surface
+/// itself demands a write-capable credential (see [`CredentialSnapshot::authorize_admin`]),
+/// so the very first credential cannot be created through the log without one
+/// already existing — a chicken-and-egg. An operator resolves it by naming a
+/// root secret in configuration; the node hashes it here and overlays it onto
+/// every snapshot, so a request bearing it is authorized before any log entry
+/// exists and can then create the first real credential.
+///
+/// Its blast radius is total: a root request satisfies both the data-plane and
+/// the admin rule as a fully privileged, all-keyspaces, write-capable,
+/// non-expiring identity, with no scoping or expiry to fall back on. It is
+/// therefore the operator's job to rotate it and to remove it once real
+/// credentials exist; it is a bootstrap key, not a standing one. It is stored
+/// only as this hash and only in memory, never written to the replicated log,
+/// so a leaked log or snapshot does not hand it out.
+#[must_use]
+pub fn root_secret_hash(secret: &str) -> [u8; 32] {
+    hash_secret(secret)
+}
+
 /// The prefix a bearer token carries in the `authorization` header.
 const BEARER_PREFIX: &str = "Bearer ";
 
@@ -51,13 +73,46 @@ pub fn bearer_secret(header: Option<&str>) -> Result<&str> {
 #[derive(Debug, Clone, Default)]
 pub struct CredentialSnapshot {
     credentials: Vec<Credential>,
+    /// The SHA-256 of the config-supplied root secret, if one is configured.
+    ///
+    /// This is an overlay, not a member of `credentials`: it is derived from a
+    /// node's configuration rather than from the replicated log, so it is
+    /// present before the first log entry exists and is never persisted. It is
+    /// checked ahead of the credential scan so it authorizes on an empty set,
+    /// which is what makes it a bootstrap identity. See [`root_secret_hash`].
+    root: Option<[u8; 32]>,
 }
 
 impl CredentialSnapshot {
     /// Builds a snapshot from the credentials the leader group holds.
     #[must_use]
     pub fn new(credentials: Vec<Credential>) -> Self {
-        Self { credentials }
+        Self {
+            credentials,
+            root: None,
+        }
+    }
+
+    /// Overlays a config-derived root secret hash onto this snapshot.
+    ///
+    /// Applied at the enforcement boundary from a node's configuration, not
+    /// from the log, so the root identity is available before any credential
+    /// has been created and never travels through or is stored in the
+    /// replicated state. `None` leaves the snapshot with no root, which is the
+    /// default and what a cluster without a configured root runs with.
+    #[must_use]
+    pub fn with_root(mut self, root: Option<[u8; 32]>) -> Self {
+        self.root = root;
+        self
+    }
+
+    /// Whether `secret` is the configured root secret.
+    ///
+    /// A plain hash comparison, the same one the credential scan uses, so the
+    /// root is matched by exactly the hashing the rest of the path uses and a
+    /// wrong root secret simply fails to match and falls through to the scan.
+    fn is_root(&self, secret: &str) -> bool {
+        self.root.is_some_and(|hash| hash == hash_secret(secret))
     }
 
     /// The credentials in this snapshot, for the wire path that ships them to a
@@ -92,6 +147,11 @@ impl CredentialSnapshot {
         permission: Permission,
         now_millis: u64,
     ) -> Result<()> {
+        // The root is fully privileged and non-expiring, so it clears any
+        // keyspace and permission. Checked first so it works on an empty set.
+        if self.is_root(secret) {
+            return Ok(());
+        }
         let credential = self.by_secret(secret).ok_or(Error::Unauthenticated)?;
         if credential.allows(keyspace, permission, now_millis) {
             Ok(())
@@ -113,7 +173,20 @@ impl CredentialSnapshot {
     ///
     /// An unknown secret is [`Error::Unauthenticated`]; a known but
     /// insufficient one is [`Error::PermissionDenied`].
+    ///
+    /// This is where the bootstrap chicken-and-egg lives: with auth on, admin
+    /// demands a write-capable credential, but the first credential is created
+    /// through admin. A configured root secret (see [`root_secret_hash`] and
+    /// [`CredentialSnapshot::with_root`]) breaks the cycle: it satisfies this
+    /// rule from configuration, without a log entry, so it can create the
+    /// first real credential.
     pub fn authorize_admin(&self, secret: &str, now_millis: u64) -> Result<()> {
+        // The root is a write-capable, non-expiring identity, so it may
+        // administer the cluster. Checked ahead of the scan so it is the
+        // bootstrap identity that creates the first real credential.
+        if self.is_root(secret) {
+            return Ok(());
+        }
         let credential = self.by_secret(secret).ok_or(Error::Unauthenticated)?;
         if credential.is_expired(now_millis) {
             return Err(Error::PermissionDenied);
@@ -243,6 +316,73 @@ mod tests {
         assert_eq!(
             read_only.authorize_admin("s3cret", 0),
             Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn a_configured_root_authorizes_data_and_admin_on_an_empty_set() {
+        // No credentials created through the log yet: only the config overlay.
+        let snapshot = CredentialSnapshot::default().with_root(Some(hash_secret("root")));
+        assert_eq!(
+            snapshot.authorize("root", "any-keyspace", Permission::Write, 0),
+            Ok(())
+        );
+        assert_eq!(snapshot.authorize_admin("root", 0), Ok(()));
+    }
+
+    #[test]
+    fn a_root_never_expires_and_reaches_every_keyspace() {
+        let snapshot = CredentialSnapshot::default().with_root(Some(hash_secret("root")));
+        // Far past any plausible expiry, and a keyspace no credential names.
+        assert_eq!(
+            snapshot.authorize("root", "locks", Permission::Read, u64::MAX),
+            Ok(())
+        );
+        assert_eq!(snapshot.authorize_admin("root", u64::MAX), Ok(()));
+    }
+
+    #[test]
+    fn a_wrong_root_secret_is_unauthenticated() {
+        let snapshot = CredentialSnapshot::default().with_root(Some(hash_secret("root")));
+        assert_eq!(
+            snapshot.authorize("nope", "catalog", Permission::Read, 0),
+            Err(Error::Unauthenticated)
+        );
+        assert_eq!(
+            snapshot.authorize_admin("nope", 0),
+            Err(Error::Unauthenticated)
+        );
+    }
+
+    #[test]
+    fn without_a_configured_root_an_empty_set_authorizes_nothing() {
+        let snapshot = CredentialSnapshot::default();
+        assert_eq!(
+            snapshot.authorize("root", "catalog", Permission::Read, 0),
+            Err(Error::Unauthenticated)
+        );
+        assert_eq!(
+            snapshot.authorize_admin("root", 0),
+            Err(Error::Unauthenticated)
+        );
+    }
+
+    #[test]
+    fn a_configured_root_coexists_with_a_normal_credential() {
+        let snapshot = snapshot("s3cret").with_root(Some(hash_secret("root")));
+        // The real credential still enforces its own scope,
+        assert_eq!(
+            snapshot.authorize("s3cret", "catalog", Permission::Write, 0),
+            Ok(())
+        );
+        assert_eq!(
+            snapshot.authorize("s3cret", "locks", Permission::Read, 0),
+            Err(Error::PermissionDenied)
+        );
+        // while the root reaches past it.
+        assert_eq!(
+            snapshot.authorize("root", "locks", Permission::Write, 0),
+            Ok(())
         );
     }
 }

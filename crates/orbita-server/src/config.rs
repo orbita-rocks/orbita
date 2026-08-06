@@ -230,6 +230,26 @@ pub struct ServerConfig {
     /// whether a credential was required. See [`crate::Server`] and the `auth`
     /// module for the enforcement path.
     pub require_auth: bool,
+
+    /// A bootstrap root credential, supplied whole as its plaintext secret.
+    ///
+    /// This exists to resolve the bootstrap chicken-and-egg: with
+    /// [`Self::require_auth`] on, the admin surface itself demands a
+    /// write-capable credential, but the first credential is created *through*
+    /// admin, so a cluster turning auth on has no way to create its first one.
+    /// An operator names a root secret here (`ORBITA_ROOT_CREDENTIAL`); the
+    /// server hashes it at startup and overlays the hash onto enforcement, so a
+    /// request bearing it is authorized as a fully privileged, all-keyspaces,
+    /// write-capable, non-expiring identity before any credential exists in the
+    /// log, and can then create the first real one.
+    ///
+    /// It is a config secret with total blast radius. It is never written to
+    /// the replicated log and never logged. It is the operator's job to rotate
+    /// it and to remove it once real credentials exist: it is a bootstrap key,
+    /// not a standing one. `None` — the default — means no root, and a cluster
+    /// with auth on and no root must create its first credential while auth is
+    /// off.
+    pub root_credential: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -256,6 +276,7 @@ impl Default for ServerConfig {
             lease_duration: DEFAULT_LEASE_DURATION,
             rng_seed: None,
             require_auth: false,
+            root_credential: None,
         }
     }
 }
@@ -378,6 +399,17 @@ impl ServerConfig {
     #[must_use]
     pub fn with_require_auth(mut self, require_auth: bool) -> Self {
         self.require_auth = require_auth;
+        self
+    }
+
+    /// Sets the bootstrap root credential, as its plaintext secret.
+    ///
+    /// See [`ServerConfig::root_credential`]: the secret is hashed at startup
+    /// and overlaid onto enforcement so it can bootstrap a cluster whose auth
+    /// is on before any credential exists.
+    #[must_use]
+    pub fn with_root_credential(mut self, root_credential: Option<String>) -> Self {
+        self.root_credential = root_credential;
         self
     }
 

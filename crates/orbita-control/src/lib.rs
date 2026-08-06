@@ -108,7 +108,7 @@ mod version;
 mod wire;
 
 pub use admin::AdminService;
-pub use auth::{bearer_secret, CredentialSnapshot};
+pub use auth::{bearer_secret, root_secret_hash, CredentialSnapshot};
 pub use client::{ControlClient, LocalControlClient, StatusReportResponse};
 pub use codec::CodecError;
 pub use command::ControlCommand;

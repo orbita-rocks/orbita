@@ -34,22 +34,35 @@ pub(crate) struct Authenticator<C: Clock> {
     /// Whether a credential is required at all. Off means allow through.
     enabled: bool,
     clock: C,
+    /// The config-derived root secret hash, if the operator configured one.
+    ///
+    /// This is the bootstrap identity. It is applied to every cached snapshot
+    /// so it is authorized before the first refresh lands and independently of
+    /// what the control plane ships — a worker that has never heard from the
+    /// control plane still honors it, because it comes from this node's own
+    /// configuration rather than from the log. It is only ever this hash and
+    /// only in memory; see [`orbita_control::root_secret_hash`] for why it
+    /// exists and its blast radius.
+    root: Option<[u8; 32]>,
     /// The last credential set fetched from the control plane. Swapped whole on
     /// each refresh; read on every request.
     snapshot: Arc<Mutex<CredentialSnapshot>>,
 }
 
 impl<C: Clock> Authenticator<C> {
-    /// Builds an authenticator that starts with no credentials cached.
+    /// Builds an authenticator that starts with only the config root, if any.
     ///
     /// An enabled authenticator with an empty cache refuses everything until
     /// its first refresh lands, which is the safe direction to fail: a worker
     /// that has never heard from the control plane cannot vouch for anyone.
-    pub(crate) fn new(enabled: bool, clock: C) -> Self {
+    /// The one exception is the configured root, which is overlaid here so it
+    /// works during exactly that window and is what bootstrap depends on.
+    pub(crate) fn new(enabled: bool, root: Option<[u8; 32]>, clock: C) -> Self {
         Self {
             enabled,
             clock,
-            snapshot: Arc::new(Mutex::new(CredentialSnapshot::default())),
+            root,
+            snapshot: Arc::new(Mutex::new(CredentialSnapshot::default().with_root(root))),
         }
     }
 
@@ -57,9 +70,11 @@ impl<C: Clock> Authenticator<C> {
     ///
     /// Called from the control loop after each fetch. Swapping the whole set is
     /// what makes revocation take effect on the next request: the next check
-    /// reads this set, not a verdict cached per connection.
+    /// reads this set, not a verdict cached per connection. The config root is
+    /// re-overlaid onto the incoming set so a refresh never drops it; the log
+    /// never carries the root, so nothing in a fetch would restore it.
     pub(crate) fn refresh(&self, snapshot: CredentialSnapshot) {
-        *self.snapshot.lock().expect("credential cache poisoned") = snapshot;
+        *self.snapshot.lock().expect("credential cache poisoned") = snapshot.with_root(self.root);
     }
 
     /// Authorizes a `permission` on `keyspace` from a request's metadata.
@@ -130,7 +145,7 @@ mod tests {
     }
 
     fn enabled(secret: &str) -> Authenticator<FrozenClock> {
-        let auth = Authenticator::new(true, FrozenClock(0));
+        let auth = Authenticator::new(true, None, FrozenClock(0));
         auth.refresh(CredentialSnapshot::new(vec![credential(secret)]));
         auth
     }
@@ -148,7 +163,7 @@ mod tests {
 
     #[test]
     fn a_disabled_authenticator_allows_a_request_with_no_credential() {
-        let auth = Authenticator::new(false, FrozenClock(0));
+        let auth = Authenticator::new(false, None, FrozenClock(0));
         let empty = MetadataMap::new();
         assert_eq!(auth.authorize(&empty, "catalog", Permission::Write), Ok(()));
     }
@@ -191,7 +206,7 @@ mod tests {
 
     #[test]
     fn a_missing_permission_is_permission_denied() {
-        let auth = Authenticator::new(true, FrozenClock(0));
+        let auth = Authenticator::new(true, None, FrozenClock(0));
         auth.refresh(CredentialSnapshot::new(vec![Credential {
             permissions: vec![Permission::Read],
             ..credential("s3cret")
@@ -219,7 +234,7 @@ mod tests {
 
     #[test]
     fn an_expired_credential_is_permission_denied() {
-        let auth = Authenticator::new(true, FrozenClock(1_000));
+        let auth = Authenticator::new(true, None, FrozenClock(1_000));
         auth.refresh(CredentialSnapshot::new(vec![Credential {
             expires_at_millis: Some(1_000),
             ..credential("s3cret")
@@ -227,6 +242,56 @@ mod tests {
         assert_eq!(
             auth.authorize(&bearer("s3cret"), "catalog", Permission::Read),
             Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn a_configured_root_is_authorized_before_the_first_refresh() {
+        // The bootstrap window on the data plane: auth on, nothing fetched from
+        // the control plane yet, so the cache is empty apart from the overlay.
+        let root = orbita_control::root_secret_hash("root-secret");
+        let auth = Authenticator::new(true, Some(root), FrozenClock(0));
+        assert_eq!(
+            auth.authorize(&bearer("root-secret"), "any-keyspace", Permission::Write),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_refresh_does_not_drop_the_configured_root() {
+        let root = orbita_control::root_secret_hash("root-secret");
+        let auth = Authenticator::new(true, Some(root), FrozenClock(0));
+        // A fetch delivers a set that knows nothing of the root.
+        auth.refresh(CredentialSnapshot::new(vec![credential("s3cret")]));
+        assert_eq!(
+            auth.authorize(&bearer("root-secret"), "locks", Permission::Write),
+            Ok(()),
+            "the root survives a refresh; the log never carries it to restore"
+        );
+        assert_eq!(
+            auth.authorize(&bearer("s3cret"), "catalog", Permission::Write),
+            Ok(()),
+            "and the fetched credentials still enforce their own scope"
+        );
+    }
+
+    #[test]
+    fn a_wrong_root_secret_is_unauthenticated_on_the_data_plane() {
+        let root = orbita_control::root_secret_hash("root-secret");
+        let auth = Authenticator::new(true, Some(root), FrozenClock(0));
+        assert_eq!(
+            auth.authorize(&bearer("not-the-root"), "catalog", Permission::Read),
+            Err(Error::Unauthenticated)
+        );
+    }
+
+    #[test]
+    fn auth_off_ignores_the_root_entirely() {
+        let root = orbita_control::root_secret_hash("root-secret");
+        let auth = Authenticator::new(false, Some(root), FrozenClock(0));
+        assert_eq!(
+            auth.authorize(&MetadataMap::new(), "catalog", Permission::Write),
+            Ok(())
         );
     }
 
