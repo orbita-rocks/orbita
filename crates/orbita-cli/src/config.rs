@@ -126,6 +126,11 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
     ),
     ("ORBITA_ENDPOINT", "client.endpoint"),
     ("ORBITA_CREDENTIAL", "client.credential"),
+    (
+        "ORBITA_KEYSPACE",
+        "client.keyspace, the default keyspace a data command uses when its \
+         leading keyspace argument is omitted",
+    ),
 ];
 
 /// Where the tool looks for a configuration file when it was not told.
@@ -379,6 +384,13 @@ pub struct ClientConfig {
     pub endpoint: String,
     #[serde(skip_serializing)]
     pub credential: Option<String>,
+    /// The keyspace a data command uses when its leading keyspace argument is
+    /// left off. Unset means every data command must name a keyspace, which is
+    /// how the tool behaved before this existed. It is a client-side default
+    /// rather than a server concept: an operator who works in one keyspace all
+    /// day sets it once instead of retyping it, and the REPL's current keyspace
+    /// is the same field set per session. Not a secret, so it serializes.
+    pub keyspace: Option<String>,
 }
 
 /// One source of configuration, before it is merged with the others.
@@ -462,6 +474,7 @@ pub struct TelemetryLayer {
 pub struct ClientLayer {
     pub endpoint: Option<String>,
     pub credential: Option<String>,
+    pub keyspace: Option<String>,
 }
 
 /// Replaces `$target` with `$source` wherever the source has an opinion.
@@ -528,7 +541,7 @@ impl Layer {
             log_level,
             resource_attributes
         );
-        overlay!(self.client, other.client, endpoint, credential);
+        overlay!(self.client, other.client, endpoint, credential, keyspace);
         self
     }
 
@@ -659,6 +672,7 @@ impl Layer {
             client: ClientLayer {
                 endpoint: get("ORBITA_ENDPOINT").map(str::to_owned),
                 credential: get("ORBITA_CREDENTIAL").map(str::to_owned),
+                keyspace: get("ORBITA_KEYSPACE").map(str::to_owned),
             },
         })
     }
@@ -845,6 +859,7 @@ impl Layer {
             client: ClientConfig {
                 endpoint,
                 credential: self.client.credential,
+                keyspace: self.client.keyspace,
             },
         })
     }

@@ -147,6 +147,10 @@ impl GlobalArgs {
             client: ClientLayer {
                 endpoint: self.endpoint.clone(),
                 credential: self.credential.clone(),
+                // The default keyspace is not a global flag: it comes from
+                // ORBITA_KEYSPACE, the config file, or the REPL's `:use`, so a
+                // one-shot command still names its keyspace on the line.
+                keyspace: None,
             },
             telemetry: TelemetryLayer {
                 log_level: self.log_level.clone(),
@@ -245,7 +249,44 @@ ahead of a load test or draining a node before maintenance.")]
         #[command(subcommand)]
         command: ConfigCommand,
     },
+
+    /// Open an interactive session against a cluster.
+    #[command(long_about = "\
+Open one session and type commands into it, instead of paying a fresh process,
+runtime, and connection for every line.
+
+This is a loop, not a second tool. Each line is parsed by the same argument
+parser and printed by the same renderer as the one-shot `orbita` command, so
+anything you can type here you can script, and the reverse. `orbita get demo k`
+on the command line and `get demo k` at the prompt do the same thing.
+
+The session remembers a current keyspace and output format so a data command
+can leave its keyspace off. Set them with the session commands, which start
+with a colon so they can never be confused with a cluster command:
+
+  :use <keyspace>      set the current keyspace (`:use` with no name clears it)
+  :format <human|json> switch output format for the rest of the session
+  :keyspace            show the current keyspace
+  :help                list the session commands
+  :quit                leave (Ctrl-D does the same)
+
+A missed `get` and a lost compare-and-swap have no exit code to land in here,
+so they print their normal output and then a `[not found]` or `[condition not
+met]` note, which is the same answer a script reads from exit code 2 or 3.
+
+serve and dev run a node and block forever, so they are refused here. So is
+reading a `set` value from standard input, because the line editor owns stdin;
+pass the value as an argument instead.")]
+    Repl(ReplArgs),
 }
+
+/// Options for the interactive session.
+///
+/// It is its own args struct, empty today, so that a later flag such as a
+/// startup script or a one-shot `--command` has somewhere to land without
+/// reshaping the command enum.
+#[derive(Debug, Args, Default)]
+pub struct ReplArgs {}
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -567,11 +608,23 @@ not a transfer.")]
 }
 
 #[derive(Debug, Args)]
+#[command(long_about = "\
+Read a key.
+
+The keyspace comes first: `get demo greeting`. It may be left off when a
+default keyspace is in effect, from ORBITA_KEYSPACE, `client.keyspace` in the
+configuration, or `:use` in the REPL, so that `get greeting` reads from the
+current keyspace. Passing both a keyspace and a key always names the keyspace
+first, so a two-argument `get demo greeting` means the same thing no matter
+what the environment holds.
+
+A miss is not an error. The command prints the key as not found and exits 2, so
+a script checking a lock can branch on the code without parsing anything.")]
 pub struct GetArgs {
-    /// The keyspace to read from.
-    pub keyspace: String,
+    /// The keyspace to read from, or the key when a default keyspace is set.
+    pub keyspace: Option<String>,
     /// The key to read.
-    pub key: String,
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -581,20 +634,27 @@ Write a key.
 The value can be an argument, a file, or standard input, because a value is
 bytes and not every byte survives a shell.
 
+The keyspace comes first: `set demo key value`. It may be left off when a
+default keyspace is in effect (ORBITA_KEYSPACE, `client.keyspace`, or the
+REPL's `:use`), in which case `set key value` writes to the current keyspace.
+Because the value is optional, a two-argument `set a b` is read as keyspace and
+key when no default is set, and as key and value when one is; name the keyspace
+in full to avoid the question.
+
 Conditions are what make this usable for locks and catalog pointers.
 --if-not-present takes a lock; --if-version swings a pointer only if nobody
 else moved it first. A condition that is not met is not an error: the command
 exits 3 and reports the version it found instead.")]
 pub struct SetArgs {
-    /// The keyspace to write to.
-    pub keyspace: String,
-    /// The key to write.
-    pub key: String,
+    /// The keyspace to write to, or the key when a default keyspace is set.
+    pub keyspace: Option<String>,
+    /// The key to write, or the value when a default keyspace is set.
+    pub key: Option<String>,
     /// The value. Omit it to read the value from standard input.
     pub value: Option<String>,
 
     /// Read the value from this file instead.
-    #[arg(long, value_name = "PATH", conflicts_with = "value")]
+    #[arg(long, value_name = "PATH")]
     pub value_file: Option<PathBuf>,
 
     /// Expire the key this long after the write commits, such as 30s or 1h.
@@ -612,10 +672,10 @@ pub struct SetArgs {
 
 #[derive(Debug, Args)]
 pub struct DeleteArgs {
-    /// The keyspace to delete from.
-    pub keyspace: String,
+    /// The keyspace to delete from, or the key when a default keyspace is set.
+    pub keyspace: Option<String>,
     /// The key to delete.
-    pub key: String,
+    pub key: Option<String>,
 
     /// Delete only if the key is at exactly this version.
     #[arg(long, value_name = "VERSION")]
@@ -631,11 +691,10 @@ spans several pages is not a point-in-time snapshot of the keyspace, and a
 caller that needs one has to build it. The cursor is printed rather than
 followed automatically so that this stays true and visible.")]
 pub struct ListArgs {
-    /// The keyspace to scan.
-    pub keyspace: String,
+    /// The keyspace to scan, or the prefix when a default keyspace is set.
+    pub keyspace: Option<String>,
     /// The prefix to match. Empty scans the whole keyspace.
-    #[arg(default_value = "")]
-    pub prefix: String,
+    pub prefix: Option<String>,
 
     /// Continue from the cursor a previous page returned.
     #[arg(long, value_name = "CURSOR")]
