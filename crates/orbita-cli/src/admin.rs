@@ -35,11 +35,13 @@ use crate::output::{
 
 /// Opens an admin client against the configured endpoint.
 ///
-/// Sized to the same ceiling as the data client and the server, so a
-/// describe-cluster response for a large cluster is not refused inside this
-/// client's own gRPC stack.
+/// Sized to the Admin ceiling, not the KV one: a describe-cluster response
+/// grows with the number of partitions rather than with any value or list
+/// limit, so the smaller KV ceiling would refuse a valid description of a large
+/// cluster inside this client's own gRPC stack. See
+/// [`orbita_server::max_admin_message_bytes`].
 pub fn connect(config: &Config) -> Result<AdminClient<Channel>> {
-    let limit = orbita_server::max_transport_message_bytes();
+    let limit = orbita_server::max_admin_message_bytes();
     Ok(AdminClient::new(channel(config)?)
         .max_decoding_message_size(limit)
         .max_encoding_message_size(limit))

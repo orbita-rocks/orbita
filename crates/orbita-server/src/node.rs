@@ -87,6 +87,24 @@ pub fn max_transport_message_bytes() -> usize {
     message_bytes_ceiling(MAX_VALUE_BYTES as u64) as usize
 }
 
+/// The message ceiling the Admin surface uses, which is deliberately not the KV
+/// ceiling.
+///
+/// A `DescribeCluster` or `ListKeyspaces` response grows with the shape of the
+/// cluster — one entry per partition, each carrying boundary keys up to
+/// [`MAX_KEY_BYTES`] — not with any keyspace's value or list limit. Sizing it
+/// from the KV ceiling would cap a truthful description of a few hundred
+/// partitions and refuse it with `OUT_OF_RANGE`, a worse failure than the DoS
+/// the cap defends against: the store would be unable to describe itself. This
+/// is a generous fixed bound instead, large enough for thousands of partitions
+/// even at the maximum boundary-key size and far more with the modest
+/// boundaries a real cluster has, and small enough to bound a decoder's memory.
+/// A cluster that outgrows it needs a paginated Admin contract, not a bigger
+/// number here.
+pub fn max_admin_message_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
 /// Where a node's data goes.
 ///
 /// The two locations are different layers rather than a style choice: the log

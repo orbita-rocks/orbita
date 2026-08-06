@@ -121,7 +121,7 @@ pub use config::{
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 pub use map_source::{single_node_map, BoxedMapSource, MapSource, StaticMapSource};
-pub use node::{max_transport_message_bytes, message_bytes_ceiling};
+pub use node::{max_admin_message_bytes, max_transport_message_bytes, message_bytes_ceiling};
 pub use readiness::{ReadinessCondition, ReadinessGate, ReadinessState};
 pub use runtime::ServerRuntime;
 pub use status::to_status;
@@ -393,12 +393,18 @@ impl Server {
                 // stopping is the right answer to that too.
                 let _ = stop.await;
             };
+            // The Admin surface is sized apart from the KV ceiling: a cluster
+            // description scales with the number of partitions, not with any
+            // value or list limit, so the KV ceiling would refuse a valid
+            // description of a few hundred partitions. See
+            // `max_admin_message_bytes`.
+            let admin_limit = node::max_admin_message_bytes();
             let served = match admin {
                 Some(admin) => {
                     let admin = admin
                         .into_server()
-                        .max_decoding_message_size(message_limit)
-                        .max_encoding_message_size(message_limit);
+                        .max_decoding_message_size(admin_limit)
+                        .max_encoding_message_size(admin_limit);
                     tonic::transport::Server::builder()
                         .add_service(service)
                         .add_service(health)
