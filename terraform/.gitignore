@@ -1,0 +1,20 @@
+# Local state holds resource ids and, because cloudflare_api_token is marked
+# sensitive, secret material. It never belongs in git. When this moves to a
+# remote backend (see versions.tf), the state stops being a local file and this
+# line stops mattering, but leaving it costs nothing.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Provider plugins and the lock's working dir. The dependency lock file
+# (.terraform.lock.hcl) is deliberately NOT ignored: it pins provider hashes and
+# should be committed once this is first applied.
+.terraform/
+
+# Real variable values, including account ids and, if an operator ignores the
+# advice in terraform.tfvars.example, the Cloudflare token.
+terraform.tfvars
+*.auto.tfvars
+
+# Saved plans can contain sensitive values in cleartext.
+*.tfplan

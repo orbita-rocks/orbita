@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored; this
+# example is the checked-in template.
+#
+# cloudflare_api_token is a bootstrap secret. Prefer passing it as
+# TF_VAR_cloudflare_api_token in the environment over writing it to a file:
+#
+#   export TF_VAR_cloudflare_api_token=...
+#
+# AWS credentials for the apply come from the usual AWS provider chain
+# (AWS_PROFILE, environment, or an assumed role); they are not a variable here.
+
+aws_region     = "us-east-1"
+s3_bucket_name = "orbita-live-object-store"
+
+cloudflare_account_id = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"
+r2_bucket_name        = "orbita-live-object-store"
+# r2_bucket_location  = "enam"
+
+# Set false if this AWS account already has a GitHub Actions OIDC provider.
+# create_github_oidc_provider = true
+
+# cloudflare_api_token = "prefer TF_VAR_cloudflare_api_token in the environment"

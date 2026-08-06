@@ -16,6 +16,14 @@
 //! [`ControlCommand::TransferOwnership`] is the narrow exception: the old
 //! owner has quiesced writes and leases first, so ownership and the epoch move
 //! in one entry without an unavailable interval.
+//!
+//! What that ordering does *not* say is that a fenced node is finished. It
+//! says a node cannot own a partition at an epoch it has already been fenced
+//! out of, which the epoch bump enforces on its own. A fenced owner therefore
+//! stays in the replica set and can be promoted again at the new epoch, on the
+//! same reported evidence as any other copy; see
+//! [ADR 0008](../../../docs/adr/0008-a-fenced-owner-stays-a-replica.md) for
+//! why that is the safe direction rather than the risky one.
 
 use crate::command::ControlCommand;
 use crate::membership::{NodeHealth, NodeRole};
@@ -48,6 +56,11 @@ pub enum PartitionPhase {
     Serving,
     /// The owner was fenced. Waiting out its read leases before promoting.
     Fenced {
+        /// Who was fenced. Recorded for operators and for the log; the
+        /// promotion rule does not read it, because the fence also demotes
+        /// this node into `replicas` and it is judged there on the same
+        /// reported evidence as every other copy. See
+        /// [ADR 0008](../../../docs/adr/0008-a-fenced-owner-stays-a-replica.md).
         deposed: NodeId,
         /// The map version produced by the fence. Replica reports at or beyond
         /// this version have observed this partition's new epoch.
@@ -217,6 +230,27 @@ impl ClusterState {
     #[must_use]
     pub fn lifecycle_enabled(&self) -> bool {
         self.version_initialized && self.version == crate::version::binary_version()
+    }
+
+    /// Whether the finalized cluster protocol keeps a fenced owner in the
+    /// replica set, per
+    /// [ADR 0008](../../../docs/adr/0008-a-fenced-owner-stays-a-replica.md).
+    ///
+    /// This is gated on the active cluster version for a determinism reason,
+    /// not a feature-flag one. Every controller replays the same committed
+    /// `FencePartition` entry, and the map stays a replicated state machine
+    /// only if every member applies that one entry identically. The two
+    /// binaries in a rolling upgrade do not: a pre-0.1 binary drops the
+    /// deposed owner, a 0.1 binary keeps it. Deciding on the active cluster
+    /// version rather than the running binary is what makes the decision the
+    /// same on every member. Inside the n-1 window the active version is still
+    /// the old one, so both binaries drop the owner and agree; the new rule
+    /// only switches on after `finalize-upgrade`, by which point every member
+    /// runs a binary that keeps it. Without this gate one committed entry
+    /// would produce divergent maps, and an old binary elected during the
+    /// fenced interval could serve and propose from the divergent state.
+    fn fenced_owner_stays_a_replica(&self) -> bool {
+        self.version_initialized && self.version >= PROTOCOL_0_1
     }
 
     /// Applies one command, returning the same result on every member.
@@ -619,7 +653,31 @@ impl ClusterState {
         // have written at.
         info.owner = None;
         info.epoch = info.epoch.next();
-        info.replicas.retain(|r| *r != deposed);
+        // The deposed owner is demoted into the replica set rather than
+        // dropped out of the map, per
+        // [ADR 0008](../../../docs/adr/0008-a-fenced-owner-stays-a-replica.md).
+        // It is a member of every durability quorum it ever counted, so its
+        // disk holds every write this partition has acknowledged; taking it
+        // out of `replicas` threw away the record of the one copy the cluster
+        // is certain about. Keeping it there is what lets the promotion rule
+        // below see it, and what stops a partition whose other copies are gone
+        // from being fenced with nothing named on it at all (issue #76).
+        //
+        // This does not un-fence anything. The epoch above this line is what
+        // stops the deposed owner writing, and it is still bumped in the same
+        // entry; a replica is a node that takes appends from an owner, not a
+        // node that may serve as one.
+        //
+        // The demotion is gated on the active cluster version because it is a
+        // change to how a committed entry is applied, and every member must
+        // apply the same entry the same way or the map diverges. Until
+        // `finalize-upgrade` moves the active version to 0.1 the fence drops
+        // the deposed owner on every member, old binary and new alike; see
+        // `fenced_owner_stays_a_replica` for why that is what keeps the
+        // rolling upgrade window deterministic.
+        if self.fenced_owner_stays_a_replica() && !info.replicas.contains(&deposed) {
+            info.replicas.push(deposed);
+        }
         self.replace_partition(info);
         self.bump_map_version();
         self.phases.insert(
@@ -960,6 +1018,134 @@ mod tests {
                 drain_complete: false,
             })
         );
+    }
+
+    #[test]
+    fn fencing_demotes_the_deposed_owner_into_the_replica_set() {
+        // The map has to keep naming the node that certainly holds the data.
+        // It is a member of every durability quorum it counted, so dropping it
+        // threw away the record of the one copy the cluster is sure about,
+        // which is what left issue #76's partitions unrecoverable. Under the
+        // finalized 0.1 protocol, which is the world this behaviour ships in.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let before = state.map().partitions().next().unwrap().clone();
+        let deposed = before.owner.unwrap();
+
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: before.id,
+                expect_epoch: before.epoch,
+            })
+            .unwrap();
+
+        let after = state.map().partition(before.id).unwrap();
+        assert!(after.replicas.contains(&deposed));
+        for replica in &before.replicas {
+            assert!(after.replicas.contains(replica), "and nothing else moves");
+        }
+    }
+
+    #[test]
+    fn an_unfinalized_cluster_still_drops_the_deposed_owner_when_it_fences() {
+        // The determinism guarantee across a rolling upgrade. The demotion is
+        // a change to how a committed `FencePartition` entry is applied, so it
+        // must not take effect until the active cluster version has finalized
+        // to the protocol that introduced it. Inside the n-1 window the active
+        // version is still the old one, and every member — old binary and new
+        // — has to apply the entry the old way or the map diverges from a
+        // single committed entry. Here the version is left below 0.1, so the
+        // fence drops the deposed owner exactly as a pre-fix binary does.
+        let mut state = bootstrapped();
+        set_version(&mut state, ClusterVersion::ZERO);
+        let before = state.map().partitions().next().unwrap().clone();
+        let deposed = before.owner.unwrap();
+
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: before.id,
+                expect_epoch: before.epoch,
+            })
+            .unwrap();
+
+        let after = state.map().partition(before.id).unwrap();
+        assert!(
+            !after.replicas.contains(&deposed),
+            "an unfinalized cluster applies the pre-0.1 fence, which drops the deposed owner"
+        );
+        assert_eq!(
+            after.replicas, before.replicas,
+            "and the replica set is otherwise untouched"
+        );
+    }
+
+    #[test]
+    fn a_fence_never_leaves_a_partition_with_nothing_named_on_it() {
+        // The route issue #76 was reported through: both replicas are retired
+        // while the owner is still serving, so the fence lands on an empty
+        // set. With an empty set the owner was acknowledging writes on its own
+        // disk alone, which makes it the only node that can be promoted
+        // without losing them.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let before = state.map().partitions().next().unwrap().clone();
+        let deposed = before.owner.unwrap();
+        state
+            .apply(&ControlCommand::SetReplicas {
+                partition: before.id,
+                replicas: vec![],
+                expect_epoch: before.epoch,
+            })
+            .unwrap();
+
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: before.id,
+                expect_epoch: before.epoch,
+            })
+            .unwrap();
+
+        assert_eq!(
+            state.map().partition(before.id).unwrap().replicas,
+            vec![deposed]
+        );
+    }
+
+    #[test]
+    fn a_deposed_owner_can_be_given_the_partition_back_at_the_epoch_that_fenced_it() {
+        // Promotion is not blocked by identity. What stops the old
+        // incarnation writing is the epoch, and the epoch has already moved,
+        // so the same node owning the partition again is a strictly later
+        // incarnation than the one that was fenced. Under the finalized 0.1
+        // protocol the fence leaves it in the replica set, so this exercises
+        // giving the partition back to a node that is standing there as a
+        // candidate.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let before = state.map().partitions().next().unwrap().clone();
+        let deposed = before.owner.unwrap();
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: before.id,
+                expect_epoch: before.epoch,
+            })
+            .unwrap();
+        let fenced_epoch = state.map().partition(before.id).unwrap().epoch;
+
+        state
+            .apply(&ControlCommand::AssignOwner {
+                partition: before.id,
+                owner: deposed,
+                replicas: before.replicas.clone(),
+                expect_epoch: fenced_epoch,
+            })
+            .unwrap();
+
+        let after = state.map().partition(before.id).unwrap();
+        assert_eq!(after.owner, Some(deposed));
+        assert!(after.epoch > before.epoch);
+        assert!(!after.replicas.contains(&deposed));
+        assert_eq!(state.phase(before.id), Some(PartitionPhase::Serving));
     }
 
     #[test]

@@ -14,3 +14,31 @@ dependsOn:
   - 'orbita-wal'
   - id: 'orbita-sim'
     scope: 'development'
+
+tasks:
+  # The long simulation batch for this crate's seeded scenarios.
+  #
+  # orbita-sim's `sim-long` runs `cargo test -p orbita-sim`, so it never reaches
+  # the seeded durability scenario that lives here (src/durability.rs, the
+  # `check_seeds` call that arms one named store fault per seed). Left to the
+  # ordinary `test` gate, that scenario explores only its default 24 seeds even
+  # on a nightly or a release. This task hands it the same 50,000-seed budget
+  # the sim crate gets, via the same `ORBITA_SIM_SEEDS` knob the harness reads.
+  #
+  # The seed count lives here rather than in the workflow so the long batch can
+  # be run by hand exactly as nightly runs it. The nightly/release step invokes
+  # this alongside `orbita-sim:sim-long`. A release profile is a requirement,
+  # not an optimisation: seeds per hour is what decides how much state space a
+  # run covers, and a debug build covers almost none.
+  sim-long:
+    command: 'cargo test -p orbita-server --all-features --release'
+    env:
+      ORBITA_SIM_SEEDS: '50000'
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+      - '@group(manifests)'
+    options:
+      # Deliberately never cached. The point is to explore new seeds on every
+      # run, so "nothing changed since last time" is not a reason to skip it.
+      cache: false
