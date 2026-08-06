@@ -43,8 +43,13 @@ because the bytes are the part another implementation has to agree with.
 
 Still open here: the sweep's grace period, which now has the write time it
 waits on (`orbita_objectstore::ObjectMeta::last_modified`) but not yet the
-period itself, and a store-level fault-injection seam for the simulator (see
-brief 05).
+period itself.
+
+The store-level fault-injection seam this section used to ask for exists. The
+simulator drives `orbita_objectstore::s3::S3Store` through its own
+`HttpTransport` rather than standing a fake `ObjectStore` into the seam, so
+the commit protocol in `commit.rs` is exercised against a store that loses
+responses, refuses uploads, and dies mid-swap. See brief 05.
 
 ## Done when
 

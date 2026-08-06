@@ -215,8 +215,13 @@ jobs:
 
       # Nightly explores far more of the state space, and so does a release,
       # which asks for this batch by name. The seed count lives in the task
-      # definition rather than here, so the long batch can be run by hand
+      # definitions rather than here, so the long batch can be run by hand
       # exactly as the nightly and the release run it.
+      #
+      # Both tasks are named because the seeded scenarios do not all live in one
+      # crate: orbita-sim holds most, but orbita-server carries the durability
+      # scenario, and each `sim-long` task widens the seed budget only for its
+      # own crate's tests.
       - name: Run the long simulation batch
         if: github.event_name == 'schedule' || inputs.long_sim
-        run: moon run orbita-sim:sim-long
+        run: moon run orbita-sim:sim-long orbita-server:sim-long
