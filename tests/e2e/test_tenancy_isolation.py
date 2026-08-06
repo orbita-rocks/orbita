@@ -215,14 +215,18 @@ def test_a_scoped_credential_works_within_its_own_keyspace(two_tenants):
     assert any(entry.key == b"mine" for entry in listed.entries)
 
 
-@pytest.mark.parametrize("verb", ["read", "write", "list"])
+@pytest.mark.parametrize("verb", ["read", "write", "delete", "list"])
 def test_a_credential_cannot_touch_a_neighbours_keyspace(two_tenants, verb):
     """Tenant A's credential is refused every data verb against tenant B.
 
-    A read, a write, and a list are three separate authorization checks on the
-    server, so each is attacked on its own. The secret is valid and known;
-    it simply does not name keyspace B, which the server distinguishes from an
-    unknown secret by answering ``PERMISSION_DENIED`` rather than
+    A read, a write, a delete, and a list are four separate authorization
+    checks on the server — each RPC lifts the bearer header out of its own
+    metadata and runs its own admission path, so an authz regression could
+    leak on one verb while the others hold. Delete in particular carries the
+    risk that A could *destroy* B's data, so it is attacked explicitly rather
+    than assumed to ride along with the write case. The secret is valid and
+    known; it simply does not name keyspace B, which the server distinguishes
+    from an unknown secret by answering ``PERMISSION_DENIED`` rather than
     ``UNAUTHENTICATED``.
     """
     t = two_tenants
@@ -233,6 +237,10 @@ def test_a_credential_cannot_touch_a_neighbours_keyspace(two_tenants, verb):
         ),
         "write": lambda: t.kv.Set(
             kv_pb2.SetRequest(keyspace=t.b_name, key=b"k", value=b"v"),
+            metadata=_bearer(t.a_secret),
+        ),
+        "delete": lambda: t.kv.Delete(
+            kv_pb2.DeleteRequest(keyspace=t.b_name, key=b"k"),
             metadata=_bearer(t.a_secret),
         ),
         "list": lambda: t.kv.List(
@@ -263,6 +271,37 @@ def test_the_reverse_direction_is_symmetric(two_tenants):
             metadata=_bearer(t.b_secret),
         )
     assert caught.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+
+def test_a_cross_tenant_delete_cannot_destroy_a_neighbours_data(two_tenants):
+    """A refused cross-tenant Delete must not touch B's data.
+
+    The parametrized case proves the *status* is PERMISSION_DENIED; this proves
+    the *effect* is nothing. B writes a key, A tries to delete it and is
+    refused, and B reads the key back unchanged. If the admission check ran
+    after the delete reached storage, this is where that would show up as B's
+    data going missing behind a denial.
+    """
+    t = two_tenants
+    t.kv.Set(
+        kv_pb2.SetRequest(keyspace=t.b_name, key=b"precious", value=b"keep-me"),
+        metadata=_bearer(t.b_secret),
+    )
+
+    with pytest.raises(grpc.RpcError) as caught:
+        t.kv.Delete(
+            kv_pb2.DeleteRequest(keyspace=t.b_name, key=b"precious"),
+            metadata=_bearer(t.a_secret),
+        )
+    assert caught.value.code() == grpc.StatusCode.PERMISSION_DENIED
+
+    survived = t.kv.Get(
+        kv_pb2.GetRequest(keyspace=t.b_name, key=b"precious"),
+        metadata=_bearer(t.b_secret),
+    )
+    assert survived.found and survived.value == b"keep-me", (
+        "a denied cross-tenant delete still reached B's data"
+    )
 
 
 # --- Quota refusals stay inside the tenant that caused them -----------------
@@ -382,21 +421,24 @@ def _hammer(kv, keyspace, secret, stop, refusals, errors):
                 errors.append(error)
 
 
-def _steady(kv, keyspace, secret, stop, latencies, failures):
-    """Run a calm, sequential workload against ``keyspace`` and time each call.
+def _measure_steady(kv, keyspace, secret, duration, tag):
+    """Run a calm, sequential workload for ``duration`` and time each call.
 
     One request at a time, so the neighbour never limits itself; anything that
     slows it down or fails it is coming from outside, which is exactly what the
-    isolation claim forbids.
+    isolation claim forbids. Returns ``(latencies, failures)``.
     """
+    latencies: list[float] = []
+    failures: list[grpc.RpcError] = []
+    deadline = time.monotonic() + duration
     i = 0
-    while not stop.is_set():
+    while time.monotonic() < deadline:
         i += 1
         started = time.perf_counter()
         try:
             kv.Set(
                 kv_pb2.SetRequest(
-                    keyspace=keyspace, key=f"calm-{i}".encode(), value=b"v"
+                    keyspace=keyspace, key=f"{tag}-{i}".encode(), value=b"v"
                 ),
                 timeout=5.0,
                 metadata=_bearer(secret),
@@ -404,23 +446,44 @@ def _steady(kv, keyspace, secret, stop, latencies, failures):
             latencies.append(time.perf_counter() - started)
         except grpc.RpcError as error:
             failures.append(error)
-        # A small pace so a full 2s window is a couple hundred requests, not a
-        # spin that competes with the storm for CPU and measures scheduler
-        # noise instead of isolation.
+        # A small pace so the window is a couple hundred requests, not a spin
+        # that competes with the storm for CPU and measures scheduler noise
+        # instead of isolation. The same pace runs in both windows, so it
+        # cancels out of the baseline-vs-pressure comparison.
         time.sleep(0.005)
+    return latencies, failures
+
+
+# How much slower the neighbour's median write may get while the storm rages,
+# relative to its own unloaded baseline, before we call it degraded. Five is
+# generous enough to swallow the CPU contention four hammer threads add on a
+# shared runner, yet an actual isolation leak — a lock or queue the storm holds
+# that the neighbour waits on — turns single-millisecond writes into tens or
+# hundreds of milliseconds, an order of magnitude past this factor.
+NEIGHBOUR_LATENCY_REGRESSION_FACTOR = 5.0
+
+# A floor under the baseline used in the ratio, so a sub-millisecond baseline
+# does not turn ordinary microsecond jitter into a spurious "10x slowdown". At
+# 3ms the allowed band is at least 15ms, well above local write noise and well
+# below the collapse a real leak would cause.
+NEIGHBOUR_LATENCY_BASELINE_FLOOR_SECONDS = 0.003
 
 
 @pytest.mark.parametrize("attempt", range(3))
 def test_a_throttled_tenant_does_not_degrade_its_neighbour(secured_node, attempt):
-    """A storm in one keyspace leaves its neighbour healthy and quick.
+    """A storm in one keyspace leaves its neighbour healthy and about as quick.
 
-    The noisy tenant is capped low on writes and hammered from several threads
-    until the owner is refusing it constantly. The quiet neighbour, under a
-    generous cap, runs a steady workload the whole time. The isolation property
-    is that the neighbour never sees the storm: its success rate stays 100% and
-    its latency stays inside a generous bound. Because #96 gives every keyspace
-    its own limiter behind its own lock, the storm cannot take a lock or a
-    queue the neighbour is waiting on.
+    The neighbour is measured twice against its own behaviour: once in a
+    baseline window with no pressure on the noisy tenant, then again while the
+    noisy tenant is hammered from four threads into constant refusal. The
+    isolation property is that the second window looks like the first — the
+    neighbour keeps succeeding at 100% and its median latency stays within a
+    generous multiple of its own unloaded median. Comparing the neighbour to
+    itself is what makes this able to catch an order-of-magnitude slowdown that
+    an absolute threshold would wave through: +50ms on a single-digit-ms write
+    clears any fixed bound but blows past a ratio. Because #96 gives every
+    keyspace its own limiter behind its own lock, the storm has no lock or
+    queue the neighbour can end up waiting on.
 
     Run several times because a single clean pass of a timing property is weak
     evidence; a flaky isolation guarantee is a broken one.
@@ -444,27 +507,39 @@ def test_a_throttled_tenant_does_not_degrade_its_neighbour(secured_node, attempt
     _wait_until_writable(kv, noisy_ks, noisy_secret)
     _wait_until_writable(kv, quiet_ks, quiet_secret)
 
+    window = 1.5
+
+    # Baseline: the neighbour alone, nobody throttled next door.
+    baseline_latencies, baseline_failures = _measure_steady(
+        kv, quiet_ks, quiet_secret, window, "baseline"
+    )
+    assert baseline_failures == [], (
+        "the neighbour failed with no pressure at all, so the baseline is not a "
+        f"baseline: {[e.code() for e in baseline_failures]}"
+    )
+    assert len(baseline_latencies) > 20, (
+        f"the baseline barely ran ({len(baseline_latencies)} samples)"
+    )
+
+    # During: the neighbour while the noisy tenant is hammered flat out.
     stop = threading.Event()
     refusals: list[int] = []
     noisy_errors: list[grpc.RpcError] = []
-    latencies: list[float] = []
-    quiet_failures: list[grpc.RpcError] = []
-
-    duration = 2.0
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = [
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        hammers = [
             pool.submit(_hammer, kv, noisy_ks, noisy_secret, stop, refusals, noisy_errors)
             for _ in range(4)
         ]
-        futures.append(
-            pool.submit(
-                _steady, kv, quiet_ks, quiet_secret, stop, latencies, quiet_failures
-            )
+        # Let the storm actually saturate before the neighbour starts timing,
+        # so the "during" window is measured against a live throttle rather
+        # than a warming-up one.
+        time.sleep(0.2)
+        during_latencies, during_failures = _measure_steady(
+            kv, quiet_ks, quiet_secret, window, "during"
         )
-        time.sleep(duration)
         stop.set()
-        for future in futures:
-            future.result(timeout=30.0)
+        for hammer in hammers:
+            hammer.result(timeout=30.0)
 
     # The storm has to have been a storm, or the test proves nothing about
     # isolation under pressure.
@@ -477,41 +552,74 @@ def test_a_throttled_tenant_does_not_degrade_its_neighbour(secured_node, attempt
         f"exercise isolation under pressure (saw {len(refusals)} refusals)"
     )
 
-    # The neighbour: unbroken and unhurried.
-    assert quiet_failures == [], (
+    # The neighbour stayed up: not one request refused while its peer drowned.
+    assert during_failures == [], (
         "the quiet neighbour was refused while its noisy peer was throttled, "
         "which is exactly the cross-tenant leak this test exists to catch: "
-        f"{[e.code() for e in quiet_failures]}"
+        f"{[e.code() for e in during_failures]}"
     )
-    assert len(latencies) > 20, (
-        "the neighbour barely ran, so its health is unmeasured "
-        f"({len(latencies)} samples)"
+    assert len(during_latencies) > 20, (
+        f"the neighbour barely ran under pressure ({len(during_latencies)} samples)"
     )
-    # Generous, absolute bounds rather than a tight ratio: the claim is that
-    # the neighbour is not *collapsed*, and a local write is single-digit
-    # milliseconds, so even a loaded CI runner clears these by a wide margin.
-    # A tight bound here would measure the runner, not the isolation.
-    median = statistics.median(latencies)
-    p95 = statistics.quantiles(latencies, n=20)[18]
-    assert median < 0.25, f"neighbour median latency {median:.3f}s is degraded"
-    assert p95 < 1.0, f"neighbour p95 latency {p95:.3f}s is degraded"
-    assert max(latencies) < 2.0, (
-        f"a neighbour request took {max(latencies):.3f}s, which is a stall the "
+
+    # The neighbour stayed quick: its median under pressure is within a
+    # generous multiple of its own unloaded median. This is the comparison that
+    # can see an order-of-magnitude regression an absolute bound would miss.
+    baseline_median = statistics.median(baseline_latencies)
+    during_median = statistics.median(during_latencies)
+    allowed = (
+        max(baseline_median, NEIGHBOUR_LATENCY_BASELINE_FLOOR_SECONDS)
+        * NEIGHBOUR_LATENCY_REGRESSION_FACTOR
+    )
+    assert during_median <= allowed, (
+        f"the neighbour's median write went from {baseline_median * 1e3:.1f}ms "
+        f"unloaded to {during_median * 1e3:.1f}ms under the storm, past the "
+        f"{NEIGHBOUR_LATENCY_REGRESSION_FACTOR:g}x isolation budget "
+        f"({allowed * 1e3:.1f}ms) — the throttle next door reached across"
+    )
+    # A loose absolute stall detector alongside the ratio: no single neighbour
+    # write should ever approach the RPC timeout, however contended the runner.
+    assert max(during_latencies) < 2.0, (
+        f"a neighbour request took {max(during_latencies):.3f}s, a stall the "
         "storm should not have been able to cause"
     )
 
 
-# --- Revocation takes effect on the next request ----------------------------
+# --- Revocation takes effect within a bounded window ------------------------
+
+# The worker does not consult the control plane per request; it enforces
+# against a credential snapshot it refreshes on a timer, the control-poll
+# interval (`DEFAULT_CONTROL_POLL_INTERVAL`, 250ms in
+# `orbita-server/src/config.rs`). So revocation is not literally next-request:
+# it is bounded-eventual — a revoked credential stops working within about one
+# refresh interval of the revoke committing, not on the very next call.
+REFRESH_INTERVAL_SECONDS = 0.25
+
+# The window within which a revoked credential must be refused, and after which
+# it must stay refused. Eight refresh intervals (2s) is deliberately loose: it
+# covers the revoke's own commit latency plus the next refresh tick plus CI
+# jitter, while still being a hard ceiling — the test fails if revocation takes
+# longer than this, or never happens. It is not "poll forever until a refusal";
+# it is "must be refused by here".
+REVOCATION_BOUND_SECONDS = 8 * REFRESH_INTERVAL_SECONDS
 
 
-def test_a_revoked_credential_is_refused_on_its_next_request(secured_node):
-    """Revocation lands on the next request over the same channel, not the next
-    connection.
+def test_a_revoked_credential_stops_working_within_the_refresh_interval(secured_node):
+    """Revocation is bounded-eventual, and this pins the bound.
 
-    The credential is used successfully, revoked, and presented again on the
-    very same stub and channel. That the second request is refused — with no
-    reconnect in between — is the proof that enforcement reads a live cache per
-    request rather than a verdict cached when the connection opened.
+    The credential is used successfully, revoked, and then presented again on
+    the same channel — no reconnect — while we watch for the refusal. Two
+    things have to hold, and a naive "poll until it eventually fails" proves
+    neither: revocation must take effect *within* the bound (so the test fails
+    if the credential stays usable past it, or forever), and once it has, it
+    must *stay* refused (so a single transient failure cannot masquerade as
+    revocation). Enforcement is against a per-timer snapshot, so a revoked
+    secret becomes unknown and the server answers UNAUTHENTICATED.
+
+    This is the honest contract the implementation provides. #95 described it as
+    "next request"; the worker's cached, timer-refreshed enforcement makes the
+    real guarantee "refused within ~one refresh interval," which is what this
+    asserts.
     """
     admin = secured_node.admin
     kv = secured_node.kv
@@ -521,22 +629,8 @@ def test_a_revoked_credential_is_refused_on_its_next_request(secured_node):
     )
     _wait_until_writable(kv, "revocable", secret)
 
-    # Works now, on this channel.
-    kv.Set(
-        kv_pb2.SetRequest(keyspace="revocable", key=b"k", value=b"v"),
-        metadata=_bearer(secret),
-    )
-
-    admin.RevokeCredential(
-        admin_pb2.RevokeCredentialRequest(credential_id=cred_id),
-        timeout=10.0,
-        metadata=_bearer(ROOT_SECRET),
-    )
-
-    # The revoke reaches the worker on the next credential refresh; once it
-    # has, the same channel is refused. A revoked secret is now unknown, so the
-    # server answers UNAUTHENTICATED.
-    def refused():
+    def read():
+        """One read on the same channel; returns the RpcError or None on success."""
         try:
             kv.Get(
                 kv_pb2.GetRequest(keyspace="revocable", key=b"k"),
@@ -547,8 +641,46 @@ def test_a_revoked_credential_is_refused_on_its_next_request(secured_node):
         except grpc.RpcError as error:
             return error
 
-    error = poll_until(refused, timeout=PROPAGATION_TIMEOUT_SECONDS)
-    assert error.code() == grpc.StatusCode.UNAUTHENTICATED, (
-        "a revoked secret is no longer known, so the next request over the "
-        f"same channel is UNAUTHENTICATED, got {error.code()}"
+    # Works now, on this channel.
+    assert read() is None, "the credential should work before it is revoked"
+
+    admin.RevokeCredential(
+        admin_pb2.RevokeCredentialRequest(credential_id=cred_id),
+        timeout=10.0,
+        metadata=_bearer(ROOT_SECRET),
     )
+    revoked_at = time.monotonic()
+
+    # Watch for the refusal, but only until the bound. Successes before the
+    # bound are allowed (revocation is eventual, not instant) and are not
+    # retries-until-pass: the loop is capped at REVOCATION_BOUND_SECONDS, so if
+    # no refusal has landed by then, first_refused stays None and the assertion
+    # below fails. This is the crux of the fix — the test cannot pass merely
+    # because a refusal happened after unbounded polling.
+    first_refused_at = None
+    while time.monotonic() - revoked_at < REVOCATION_BOUND_SECONDS:
+        error = read()
+        if error is not None:
+            assert error.code() == grpc.StatusCode.UNAUTHENTICATED, (
+                "a revoked secret is unknown, so its refusal is UNAUTHENTICATED, "
+                f"got {error.code()}"
+            )
+            first_refused_at = time.monotonic() - revoked_at
+            break
+
+    assert first_refused_at is not None, (
+        "the revoked credential was still usable "
+        f"{REVOCATION_BOUND_SECONDS:.2f}s after the revoke committed; revocation "
+        "either never took effect or exceeded its bound"
+    )
+    assert first_refused_at <= REVOCATION_BOUND_SECONDS
+
+    # And it stays refused: a run of consecutive requests over the same channel
+    # are all UNAUTHENTICATED, so the refusal is the new steady state, not a
+    # blip that happened to coincide with the window.
+    for _ in range(25):
+        error = read()
+        assert error is not None and error.code() == grpc.StatusCode.UNAUTHENTICATED, (
+            "a revoked credential flickered back to usable, so revocation is "
+            f"not stable; got {None if error is None else error.code()}"
+        )
