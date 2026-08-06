@@ -2008,6 +2008,65 @@ fn a_planned_drain_moves_ownership_in_one_epoch_bumping_commit() {
 }
 
 #[test]
+fn a_drain_hands_off_at_the_committed_prefix_not_the_owners_durable_tail() {
+    // The #87 invariant, made explicit. An owner can hold entries on its own
+    // disk that no quorum acknowledged — writes whose clients were told they
+    // failed — so its durable position runs ahead of its committed prefix. The
+    // WAL is never allowed to ship that tail, so a receiver can reach the
+    // prefix but not the durable position. A drain comparing the durable
+    // position would ask for the impossible and refuse a handoff that is in
+    // fact safe. #79's `quiesce` hid this by truncating the owner's tail to
+    // the prefix before the comparison, so the two coincided; this asserts the
+    // drain is correct without leaning on that, by putting every receiver at
+    // the committed prefix and below the owner's durable position and
+    // requiring the handoff to happen anyway.
+    check_seeds(
+        "a_drain_hands_off_at_the_committed_prefix_not_the_owners_durable_tail",
+        16,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let before = cluster.map().partition(partition).unwrap().clone();
+            let owner = before.owner.unwrap();
+
+            // The owner's disk is ahead of its quorum: durable 20, committed
+            // 10. Every replica sits at the committed prefix and is held there,
+            // standing in for a quorum that acknowledged through 10 and no
+            // further. Under the old comparison none of them is caught up
+            // "through 20" and the drain refuses; under the committed-prefix
+            // comparison they are caught up through 10 and one is chosen.
+            cluster.set_progress(owner, 20);
+            cluster.set_committed(owner, Some(10));
+            for replica in &before.replicas {
+                cluster.set_progress(*replica, 10);
+                cluster.set_following(*replica, false);
+            }
+            cluster.set_draining(owner, true);
+            cluster.sim.run_for(Duration::from_secs(1));
+
+            let drained = cluster.request_drain(owner);
+            if drained != Ok(false) {
+                return Err(cluster.sim.failure(format!(
+                    "an owner ahead of its quorum could not hand off to a replica at \
+                     the committed prefix: {drained:?}"
+                )));
+            }
+            let after = cluster.map().partition(partition).unwrap().clone();
+            match after.owner {
+                Some(new_owner) if new_owner != owner && before.replicas.contains(&new_owner) => {}
+                other => {
+                    return Err(cluster.sim.failure(format!(
+                        "handoff landed on {other:?}, not a replica sitting at the \
+                         committed prefix below the owner's durable tail"
+                    )));
+                }
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
 fn a_not_ready_replica_is_never_a_planned_handoff_target() {
     check_seeds(
         "a_not_ready_replica_is_never_a_planned_handoff_target",
