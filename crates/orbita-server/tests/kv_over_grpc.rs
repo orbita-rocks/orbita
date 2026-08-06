@@ -5,7 +5,7 @@
 //! test is: `tonic`'s own `KvClient` against a `Server` on a real port. A test
 //! that called the service type directly would pass while the wire was broken.
 
-use orbita_core::{KeyspaceName, MAX_KEY_BYTES, MAX_VALUE_BYTES};
+use orbita_core::{KeyspaceName, MAX_KEY_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES};
 use orbita_proto::v1::condition::Kind;
 use orbita_proto::v1::kv_client::KvClient;
 use orbita_proto::v1::{
@@ -371,6 +371,94 @@ async fn a_list_page_is_capped_at_the_limit_it_was_asked_for() {
         !page.next_cursor.is_empty(),
         "a short page must say there is more"
     );
+
+    server.shutdown().await.unwrap();
+}
+
+/// A LIST page the store assembles must fit through the same channel the store
+/// advertises. A caller can ask for a thousand entries, and with values at the
+/// maximum size that is a multi-gigabyte response; even a handful of maximum
+/// values overruns the advertised ceiling. The page has to be bounded by the
+/// encoded bytes it will occupy, not only by the count the caller named, and
+/// carry a cursor so the caller can fetch the remainder. Without that bound the
+/// transport refuses the oversized response with `OUT_OF_RANGE` and the caller
+/// cannot read its own data at all.
+#[tokio::test]
+async fn a_list_page_is_bounded_by_bytes_and_pages_the_rest() {
+    use prost::Message as _;
+
+    let dir = DataDir::new("list-byte-bound");
+    let (server, mut client) = start(&dir).await;
+
+    let limits = client
+        .get_limits(orbita_proto::v1::GetLimitsRequest {
+            keyspace: orbita_server::DEFAULT_KEYSPACE.to_string(),
+        })
+        .await
+        .expect("limits are answerable")
+        .into_inner();
+    let ceiling = limits.max_message_bytes as usize;
+
+    // Enough maximum-size values that returning them all in one page would
+    // overrun the advertised ceiling several times over. 17 * 256 KiB alone is
+    // past the 4 MiB list budget, and the caller asks for far more than that.
+    let count = 40u32;
+    let value = vec![b'v'; MAX_VALUE_BYTES];
+    for i in 0..count {
+        let mut request = set(&format!("big/{i:04}"), "");
+        request.value = value.clone();
+        client.set(request).await.unwrap();
+    }
+
+    let mut seen = Vec::new();
+    let mut cursor = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = client
+            .list(list("big/", MAX_LIST_LIMIT, cursor.clone()))
+            .await
+            .expect("a bounded page is answerable")
+            .into_inner();
+        pages += 1;
+        assert!(pages < 100, "pagination is not terminating");
+        assert!(
+            page.encoded_len() <= ceiling,
+            "a page ({} bytes) must fit under the advertised ceiling ({ceiling} bytes)",
+            page.encoded_len(),
+        );
+        let last = page.entries.len();
+        seen.extend(page.entries.into_iter().map(|e| (e.key, e.value)));
+        cursor = page.next_cursor;
+        if cursor.is_empty() {
+            break;
+        }
+        assert!(
+            last > 0,
+            "a page that says there is more must return progress"
+        );
+    }
+
+    assert!(
+        pages > 1,
+        "the byte bound must have forced the scan across more than one page"
+    );
+    assert_eq!(
+        seen.len(),
+        count as usize,
+        "every key is returned across the pages, none lost or duplicated"
+    );
+    for (i, (key, val)) in seen.iter().enumerate() {
+        assert_eq!(
+            key,
+            format!("big/{i:04}").as_bytes(),
+            "keys come back in order"
+        );
+        assert_eq!(
+            val.len(),
+            MAX_VALUE_BYTES,
+            "each value survives paging whole"
+        );
+    }
 
     server.shutdown().await.unwrap();
 }

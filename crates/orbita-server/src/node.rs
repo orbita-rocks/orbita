@@ -52,6 +52,7 @@ use orbita_runtime::{
     join_all, Clock, PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError,
     TransportResult,
 };
+use orbita_storage::ScanBudget;
 use orbita_wal::WalService;
 
 use std::collections::HashMap;
@@ -785,8 +786,21 @@ impl<R: Runtime> Node<R> {
             .await?
         {
             Hop::Local(host, ..) => {
+                // Bound the page by encoded bytes as well as by count. The byte
+                // budget is `MAX_LIST_BYTES`, the same figure the transport
+                // ceiling is built from (see [`message_bytes_ceiling`]), so a
+                // full page always fits under the ceiling the client was told,
+                // and the cursor the scan returns pages the remainder. Values
+                // count toward the budget only when the caller asked for them,
+                // so a keys-only page is not truncated for bytes it will not
+                // send.
+                let budget = ScanBudget {
+                    max_entries: limit,
+                    max_bytes: MAX_LIST_BYTES,
+                    include_values: request.include_values,
+                };
                 let page = host
-                    .scan(&request.prefix, resume.inner.as_deref(), limit)
+                    .scan(&request.prefix, resume.inner.as_deref(), budget)
                     .await?;
                 let entries = page
                     .entries

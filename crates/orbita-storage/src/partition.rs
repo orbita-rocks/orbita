@@ -39,7 +39,7 @@ use crate::mutation::{version_at, Mutation, MutationOp};
 use bytes::Bytes;
 use orbita_core::{
     Epoch, Error, KeyRange, Lamport, Record, Result, Version, WriteCondition, MAX_KEY_BYTES,
-    MAX_LIST_LIMIT, MAX_VALUE_BYTES,
+    MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
 };
 use orbita_format::segment::{Segment, SegmentBuilder};
 use orbita_format::{
@@ -163,6 +163,44 @@ pub struct ScanPage {
     /// Absent when the scan reached the end of the range, which is the only
     /// signal a caller needs to stop paging.
     pub cursor: Option<Bytes>,
+}
+
+/// How much of a range a single [`Partition::scan`] page may return.
+///
+/// A page stops at whichever bound it reaches first: the entry count the caller
+/// asked for, or the byte budget that keeps the encoded response under the
+/// transport ceiling. The byte budget exists because the count alone lets a
+/// caller demand a multi-gigabyte page — a thousand maximum-size values is ten
+/// gigabytes — that the store would assemble in full and then be unable to send.
+/// Bounding the scan itself means the store never materialises more than one
+/// page's worth, and the caller pages the rest through the returned cursor.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanBudget {
+    /// Maximum entries, `1..=MAX_LIST_LIMIT`.
+    pub max_entries: u32,
+    /// Maximum bytes of returned payload: keys always, and values when
+    /// `include_values`. This mirrors [`orbita_core::MAX_LIST_BYTES`]; the
+    /// per-entry protobuf framing is left to
+    /// [`orbita_core::MESSAGE_OVERHEAD_BYTES`] of headroom, so a full page still
+    /// fits under the advertised message ceiling.
+    pub max_bytes: u64,
+    /// Whether values count toward `max_bytes`. It mirrors whether the caller
+    /// will put them on the wire: a keys-only page must not be truncated early
+    /// for values it is not going to send.
+    pub include_values: bool,
+}
+
+impl ScanBudget {
+    /// A page bounded only by an entry count, using the default list byte
+    /// budget and returning values. This is the shape a plain `LIST` uses and
+    /// the one tests reach for when the byte bound is not what they exercise.
+    pub fn of_entries(max_entries: u32) -> Self {
+        Self {
+            max_entries,
+            max_bytes: MAX_LIST_BYTES,
+            include_values: true,
+        }
+    }
 }
 
 /// One entry as the partition holds it, in the mutable table or a segment.
@@ -456,7 +494,13 @@ impl<R: Runtime> Partition<R> {
     /// consistent view of the partition even while writes wait. Consistency
     /// does not extend across pages, which the product requirements state
     /// outright.
-    pub async fn scan(&self, prefix: &[u8], cursor: Option<&[u8]>, limit: u32) -> Result<ScanPage> {
+    pub async fn scan(
+        &self,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        budget: ScanBudget,
+    ) -> Result<ScanPage> {
+        let limit = budget.max_entries;
         if limit == 0 || limit > MAX_LIST_LIMIT {
             return Err(Error::InvalidArgument(format!(
                 "scan limit must be between 1 and {MAX_LIST_LIMIT}"
@@ -489,6 +533,7 @@ impl<R: Runtime> Partition<R> {
         let mut flushed = state.index.range::<[u8], _>(from).peekable();
 
         let mut entries = Vec::new();
+        let mut used_bytes = 0u64;
         let mut exhausted = true;
         loop {
             // The next key is the smaller of the two heads, and the mutable
@@ -525,6 +570,23 @@ impl<R: Runtime> Partition<R> {
                 exhausted = false;
                 break;
             }
+            // The byte budget bounds a page that the count alone would let grow
+            // past what the transport can carry. The first entry is always
+            // returned, however large, so a single value over the budget pages
+            // rather than wedging the scan; every entry after it must fit. The
+            // entry is left unconsumed for the next page — the cursor resumes
+            // strictly after the last entry returned, which sits before it.
+            let entry_bytes = key.len() as u64
+                + if budget.include_values {
+                    record.value.len() as u64
+                } else {
+                    0
+                };
+            if !entries.is_empty() && used_bytes + entry_bytes > budget.max_bytes {
+                exhausted = false;
+                break;
+            }
+            used_bytes += entry_bytes;
             entries.push(ScanEntry { key, record });
         }
 
@@ -1369,7 +1431,10 @@ mod tests {
             .unwrap();
         }
 
-        let page = p.scan(b"k", None, 100).await.unwrap();
+        let page = p
+            .scan(b"k", None, ScanBudget::of_entries(100))
+            .await
+            .unwrap();
         let mut versions: Vec<Version> = page.entries.iter().map(|e| e.record.version).collect();
         let count = versions.len();
         versions.sort_unstable();
@@ -1833,7 +1898,7 @@ mod tests {
         .unwrap();
 
         clock.set_millis(10);
-        let page = p.scan(b"", None, 10).await.unwrap();
+        let page = p.scan(b"", None, ScanBudget::of_entries(10)).await.unwrap();
         assert_eq!(
             page.entries
                 .iter()
@@ -1969,7 +2034,10 @@ mod tests {
                 .unwrap();
         }
 
-        let page = p.scan(b"a/", None, 10).await.unwrap();
+        let page = p
+            .scan(b"a/", None, ScanBudget::of_entries(10))
+            .await
+            .unwrap();
         assert_eq!(
             page.entries
                 .iter()
@@ -1993,7 +2061,10 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<Bytes> = None;
         loop {
-            let page = p.scan(b"k", cursor.as_deref(), 4).await.unwrap();
+            let page = p
+                .scan(b"k", cursor.as_deref(), ScanBudget::of_entries(4))
+                .await
+                .unwrap();
             seen.extend(page.entries.iter().map(|e| e.key.clone()));
             match page.cursor {
                 Some(next) => cursor = Some(next),
@@ -2019,7 +2090,7 @@ mod tests {
             .unwrap();
         }
 
-        let first = p.scan(b"k", None, 5).await.unwrap();
+        let first = p.scan(b"k", None, ScanBudget::of_entries(5)).await.unwrap();
         assert_eq!(first.entries.len(), 5);
 
         // Rewrite a key already returned, delete one not yet reached, and add
@@ -2035,7 +2106,10 @@ mod tests {
         let mut seen: Vec<Bytes> = first.entries.iter().map(|e| e.key.clone()).collect();
         let mut cursor = first.cursor;
         while let Some(c) = cursor {
-            let page = p.scan(b"k", Some(&c), 5).await.unwrap();
+            let page = p
+                .scan(b"k", Some(&c), ScanBudget::of_entries(5))
+                .await
+                .unwrap();
             seen.extend(page.entries.iter().map(|e| e.key.clone()));
             cursor = page.cursor;
         }
@@ -2063,7 +2137,10 @@ mod tests {
             .unwrap();
         }
 
-        let page = p.scan(b"k", None, 10).await.unwrap();
+        let page = p
+            .scan(b"k", None, ScanBudget::of_entries(10))
+            .await
+            .unwrap();
         p.put(b"k5", bytes("changed"), None, WriteCondition::None)
             .await
             .unwrap();
@@ -2089,7 +2166,10 @@ mod tests {
         }
 
         let stale = Cursor::new(bytes("a"), b"").encode();
-        let page = p.scan(b"", Some(&stale), 10).await.unwrap();
+        let page = p
+            .scan(b"", Some(&stale), ScanBudget::of_entries(10))
+            .await
+            .unwrap();
         assert_eq!(
             page.entries
                 .iter()
@@ -2109,7 +2189,10 @@ mod tests {
             .unwrap();
 
         let stale = Cursor::new(bytes("z"), b"").encode();
-        let page = p.scan(b"", Some(&stale), 10).await.unwrap();
+        let page = p
+            .scan(b"", Some(&stale), ScanBudget::of_entries(10))
+            .await
+            .unwrap();
         assert!(page.entries.is_empty());
         assert_eq!(page.cursor, None, "there is nothing left to page through");
     }
@@ -2128,19 +2211,126 @@ mod tests {
             "a key outside the range is not ours to write"
         );
 
-        let page = p.scan(b"", None, 10).await.unwrap();
+        let page = p.scan(b"", None, ScanBudget::of_entries(10)).await.unwrap();
         assert_eq!(page.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_scan_page_stops_at_the_byte_budget_and_resumes_after_the_last_entry() {
+        let p = owner().await;
+        // Four values of a kilobyte each. A budget under two of them must cut
+        // the page after the first, and the count bound is left slack so it is
+        // plainly the bytes that stopped it.
+        let value = bytes(&"v".repeat(1024));
+        for i in 0..4 {
+            p.put(
+                format!("k{i}").as_bytes(),
+                value.clone(),
+                None,
+                WriteCondition::None,
+            )
+            .await
+            .unwrap();
+        }
+        let budget = ScanBudget {
+            max_entries: 10,
+            max_bytes: 1500,
+            include_values: true,
+        };
+        let first = p.scan(b"k", None, budget).await.unwrap();
+        assert_eq!(
+            first.entries.len(),
+            1,
+            "a value past the remaining budget starts the next page instead"
+        );
+        let cursor = first.cursor.expect("a truncated page carries a cursor");
+
+        // The remainder pages out in full, in order, nothing dropped for the
+        // entry the first page stopped before.
+        let mut seen: Vec<_> = first.entries.iter().map(|e| e.key.clone()).collect();
+        let mut cursor = Some(cursor);
+        while let Some(c) = cursor.take() {
+            let page = p.scan(b"k", Some(&c), budget).await.unwrap();
+            assert!(!page.entries.is_empty(), "a cursor must make progress");
+            seen.extend(page.entries.iter().map(|e| e.key.clone()));
+            cursor = page.cursor;
+        }
+        let expected: Vec<Bytes> = (0..4).map(|i| Bytes::from(format!("k{i}"))).collect();
+        assert_eq!(seen, expected, "every key returned once, in order");
+    }
+
+    #[tokio::test]
+    async fn a_scan_returns_a_first_entry_larger_than_the_whole_budget() {
+        let p = owner().await;
+        let value = bytes(&"v".repeat(4096));
+        p.put(b"big", value, None, WriteCondition::None)
+            .await
+            .unwrap();
+        // A budget smaller than the one value must still return it: a hard cap
+        // below a single value would make the scan unable to move past the key.
+        let page = p
+            .scan(
+                b"",
+                None,
+                ScanBudget {
+                    max_entries: 10,
+                    max_bytes: 8,
+                    include_values: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(page.cursor.is_none(), "the only key is the last one");
+    }
+
+    #[tokio::test]
+    async fn a_keys_only_scan_does_not_count_values_against_the_budget() {
+        let p = owner().await;
+        let value = bytes(&"v".repeat(4096));
+        for i in 0..4 {
+            p.put(
+                format!("k{i}").as_bytes(),
+                value.clone(),
+                None,
+                WriteCondition::None,
+            )
+            .await
+            .unwrap();
+        }
+        // Small keys, large values. With values excluded the whole set fits a
+        // budget far below one value, so a keys-only page is not truncated for
+        // bytes it will never send.
+        let page = p
+            .scan(
+                b"k",
+                None,
+                ScanBudget {
+                    max_entries: 10,
+                    max_bytes: 64,
+                    include_values: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.entries.len(),
+            4,
+            "keys alone stay well under the budget"
+        );
+        assert!(page.cursor.is_none());
     }
 
     #[tokio::test]
     async fn a_scan_limit_outside_the_allowed_range_is_rejected() {
         let p = owner().await;
         assert!(matches!(
-            p.scan(b"", None, 0).await,
+            p.scan(b"", None, ScanBudget::of_entries(0)).await,
             Err(Error::InvalidArgument(_))
         ));
         assert!(matches!(
-            p.scan(b"", None, MAX_LIST_LIMIT + 1).await,
+            p.scan(b"", None, ScanBudget::of_entries(MAX_LIST_LIMIT + 1))
+                .await,
             Err(Error::InvalidArgument(_))
         ));
     }
@@ -2455,7 +2645,7 @@ mod tests {
             bytes("new"),
             "the memtable shadows the segment"
         );
-        let page = p.scan(b"", None, 10).await.unwrap();
+        let page = p.scan(b"", None, ScanBudget::of_entries(10)).await.unwrap();
         let keys: Vec<Bytes> = page.entries.iter().map(|e| e.key.clone()).collect();
         assert_eq!(keys, vec![bytes("a"), bytes("b"), bytes("c")]);
         assert_eq!(page.entries[0].record.value, bytes("new"));
