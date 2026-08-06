@@ -92,6 +92,7 @@
 #![forbid(unsafe_code)]
 
 mod admin;
+mod auth;
 mod client;
 mod codec;
 mod command;
@@ -107,7 +108,8 @@ mod version;
 mod wire;
 
 pub use admin::AdminService;
-pub use client::{ControlClient, LocalControlClient, StatusReportResponse};
+pub use auth::{bearer_secret, root_secret_hash, CredentialSnapshot};
+pub use client::{AdminOutcome, ControlClient, LocalControlClient, StatusReportResponse};
 pub use codec::CodecError;
 pub use command::ControlCommand;
 pub use config::ControlConfig;

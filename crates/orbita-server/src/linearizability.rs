@@ -46,8 +46,11 @@ const KEY: &[u8] = b"register";
 /// Where a simulated partition persists.
 ///
 /// An in-memory store per node, so a run touches no real filesystem and stays
-/// deterministic. Store-level fault injection is the simulator's to grow into
-/// now that the seam exists.
+/// deterministic. These scenarios are about the read and write paths rather
+/// than about durability, so a store that never fails is the right one: a
+/// flush failing here would be noise. The store failing on purpose is
+/// [`crate::durability`], which drives the real `S3Store` over the
+/// simulator's fault-injecting transport.
 fn partition_paths() -> PartitionPaths {
     PartitionPaths {
         store: Arc::new(MemoryStore::new()),
@@ -284,6 +287,14 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
     };
     let source = BoxedMapSource::new(StaticMapSource::new(owner_and_replica_map()));
     sim.block_on(async move {
+        // Authentication off: this suite drives the read path directly, so
+        // admission passes every request through to it.
+        let authenticator = Arc::new(crate::auth::Authenticator::new(
+            false,
+            None,
+            std::time::Duration::from_secs(86_400),
+            runtime.clock().clone(),
+        ));
         Node::start(
             runtime,
             node,
@@ -291,6 +302,7 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
             source,
             lease,
             Arc::new(crate::ReadinessGate::new()),
+            authenticator,
         )
         .await
         .expect("the node starts")
@@ -349,6 +361,7 @@ fn a_replica_serving_reads_never_answers_with_a_value_a_write_has_replaced() {
                                     condition: None,
                                 },
                                 false,
+                                None,
                             )
                             .await;
                         match written {
@@ -387,6 +400,7 @@ fn a_replica_serving_reads_never_answers_with_a_value_a_write_has_replaced() {
                                     key: KEY.to_vec(),
                                 },
                                 false,
+                                None,
                             )
                             .await;
                         match found {

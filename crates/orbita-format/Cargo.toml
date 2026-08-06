@@ -21,6 +21,9 @@ testing = []
 [dependencies]
 orbita-core.workspace = true
 orbita-objectstore.workspace = true
+# The in-memory store stamps write times from the runtime clock, not the wall
+# clock, so a simulated run drives the orphan-sweep grace period deterministically.
+orbita-runtime.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true

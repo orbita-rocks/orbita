@@ -9,10 +9,12 @@
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::membership::NodeStatus;
+use crate::model::Credential;
 use crate::version::{ClusterVersion, CompatibilityRefusal};
 use crate::wire::{
-    ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest, METHOD_DRAIN_NODE,
-    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
+    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest,
+    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
     METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
     METHOD_REPORT_STATUS_V5,
 };
@@ -21,6 +23,20 @@ use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
 use orbita_runtime::{PeerCall, Runtime, ServiceId, Transport, TransportError};
 
 use std::sync::Mutex;
+
+/// What the control leader answered a forwarded admin call with.
+///
+/// A refusal is an outcome rather than an error because the two mean opposite
+/// things to the operator holding the terminal: `Failed` is the leader's own
+/// considered answer and must reach them intact, while an `Err` from
+/// [`ControlClient::admin_call`] means nobody was able to consider it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminOutcome {
+    /// The encoded protobuf response, to be handed back untouched.
+    Ok(bytes::Bytes),
+    /// A `tonic::Code` discriminant and the leader's message.
+    Failed { code: u32, message: String },
+}
 
 /// The leader group's answer to a version-aware status report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +117,42 @@ impl<R: Runtime> ControlClient<R> {
         }
     }
 
+    /// Every live credential, so a worker can enforce authentication locally.
+    ///
+    /// A worker calls this on the same timer as its map. The credentials carry
+    /// secret hashes, never secrets, and are exactly what the leader group
+    /// already replicates, so caching them widens no trust boundary. Enforcing
+    /// from the cache is what keeps authentication off the control plane: a
+    /// control plane outage leaves a worker checking the last set it fetched
+    /// rather than failing every request closed.
+    pub async fn fetch_credentials(&self) -> Result<Vec<Credential>> {
+        match self
+            .call(METHOD_FETCH_CREDENTIALS, bytes::Bytes::new())
+            .await?
+        {
+            ControlResponse::Credentials(credentials) => Ok(credentials),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Whether the leader group requires authentication.
+    ///
+    /// A node checks this against its own `require_auth` before reporting
+    /// ready, so a half-rolled change to the setting cannot leave an
+    /// auth-disabled node accepting unauthenticated requests behind the load
+    /// balancer while its peers reject them. An `Err` — including from a leader
+    /// too old to serve the method — means the policy could not be determined,
+    /// and the caller does not gate on it rather than guessing.
+    pub async fn fetch_auth_policy(&self) -> Result<bool> {
+        match self
+            .call(METHOD_FETCH_AUTH_POLICY, bytes::Bytes::new())
+            .await?
+        {
+            ControlResponse::AuthPolicy(require_auth) => Ok(require_auth),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// The current leader's committed control-command index.
     ///
     /// A voter compares this authority with its own log and applied state
@@ -151,6 +203,41 @@ impl<R: Runtime> ControlClient<R> {
         status: NodeStatus,
     ) -> Result<StatusReportResponse> {
         self.send_status(node, status, true).await
+    }
+
+    /// Runs one `Admin` gRPC call on whichever member is currently the leader.
+    ///
+    /// This is the only thing in this file that is called on a request rather
+    /// than on a timer, and it is safe to be: an admin call is an operator
+    /// action, not data plane traffic, so a control plane outage makes it fail
+    /// rather than making a worker fail. What it buys is that an operator may
+    /// point `orbita` at any node in the cluster, which is the same promise
+    /// the KV path already makes.
+    ///
+    /// `op_id` names this invocation so that a resend the transport makes after
+    /// an ambiguous loss is recognisable as the same operation on the leader,
+    /// rather than a fresh one. The caller mints it once and passes the same
+    /// value into every retry; regenerating it per attempt would defeat the
+    /// point.
+    pub async fn admin_call(
+        &self,
+        method: u32,
+        op_id: u128,
+        payload: bytes::Bytes,
+    ) -> Result<AdminOutcome> {
+        let request = AdminCallRequest {
+            method,
+            op_id,
+            payload,
+        }
+        .encode();
+        match self.call(METHOD_ADMIN_CALL, request).await? {
+            ControlResponse::AdminOk(payload) => Ok(AdminOutcome::Ok(payload)),
+            ControlResponse::AdminFailed { code, message } => {
+                Ok(AdminOutcome::Failed { code, message })
+            }
+            other => Err(unexpected(&other)),
+        }
     }
 
     /// Asks the leader to transfer every partition this node still owns.

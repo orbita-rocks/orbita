@@ -8,9 +8,10 @@
 
 use crate::config::SimConfig;
 use crate::harness::Failure;
+use crate::objectstore::SimBucket;
 use crate::runtime::SimRuntime;
 use crate::trace::Trace;
-use crate::world::SimCore;
+use crate::world::{BucketState, SimCore};
 
 use orbita_core::NodeId;
 use orbita_runtime::Rng;
@@ -93,50 +94,27 @@ impl Simulation {
     /// tails are enabled the last record may survive in pieces, which is what
     /// a real crash mid-append leaves behind.
     pub fn crash(&self, node: NodeId) {
-        self.core.kill_node_tasks(node);
-        let mut state = self.core.state();
-        state.last_fault_nanos = Some(state.now);
-        let torn = self.core.config.disk.torn_tail_on_crash;
-        let mut torn_bytes = Vec::new();
-        if let Some(entry) = state.nodes.get_mut(&node) {
-            entry.up = false;
-            for (path, file) in entry.files.iter_mut() {
-                let unsynced = file.visible.len().saturating_sub(file.durable.len());
-                let keep = if torn && unsynced > 1 {
-                    // A prefix of the unsynced tail reached the platter. How
-                    // much is arbitrary, which is the point.
-                    self.core.fault_below(unsynced as u64) as usize
-                } else {
-                    0
-                };
-                if keep > 0 {
-                    torn_bytes.push((path.clone(), keep));
-                }
-                let end = file.durable.len() + keep;
-                file.visible.truncate(end);
-                file.durable.clear();
-                file.durable.extend_from_slice(&file.visible);
+        self.core.crash_node(node);
+    }
+
+    /// A bucket in the simulated object store, addressed by name.
+    ///
+    /// Two calls with one name hand back handles onto the same objects,
+    /// because a bucket is shared infrastructure and the interesting failures
+    /// are the ones where two writers reach it at once. Nothing here dials
+    /// anything: the handle is an [`orbita_objectstore::s3::HttpTransport`],
+    /// so the S3 store under test is the same code production runs.
+    pub fn bucket(&self, name: &str) -> Arc<SimBucket> {
+        {
+            let mut state = self.core.state();
+            if !state.buckets.contains_key(name) {
+                state
+                    .buckets
+                    .insert(name.to_string(), BucketState::default());
+                state.record(format!("bucket {name} created"));
             }
         }
-        // Removed handlers are collected and dropped after the lock is
-        // released, the same rule task futures and re-registered handlers
-        // follow: a handler's destructor can reach back into the world, for
-        // example by waking the task that owned the other end of a channel.
-        let mut doomed = Vec::new();
-        state.handlers.retain(|(owner, _), handler| {
-            if *owner == node {
-                doomed.push(handler.clone());
-                false
-            } else {
-                true
-            }
-        });
-        for (path, keep) in torn_bytes {
-            state.record(format!("torn tail node={node} path={path} bytes={keep}"));
-        }
-        state.record(format!("node {node} crashed"));
-        drop(state);
-        drop(doomed);
+        Arc::new(SimBucket::new(self.core.clone(), name.to_string()))
     }
 
     /// Brings a node back, with or without its data.

@@ -1,8 +1,23 @@
-//! Integration tests against a live S3-compatible server, MinIO in practice.
+//! Integration tests against a live S3-compatible server.
 //!
-//! Ignored by default because most laptops have no bucket to talk to. CI runs
-//! them on every pull request via `moon run orbita-objectstore:test-live-s3`,
-//! against the MinIO digest pinned in `.github/workflows/ci.yml`.
+//! Ignored by default because most laptops have no bucket to talk to. Nothing
+//! in here names a backend: the endpoint and its addressing style come from the
+//! environment, so the same two tests are the evidence behind every backend
+//! this store claims to support.
+//!
+//! - MinIO, on every pull request, via `moon run orbita-objectstore:test-live-s3`
+//!   against the digest pinned in `.github/workflows/ci.yml`.
+//! - AWS S3 and Cloudflare R2, weekly, via
+//!   `.github/workflows/live-object-store.yml`. Those two are the reason the
+//!   file reads its configuration rather than hard-coding it. A backend that
+//!   accepts `If-Match` and ignores it passes every mocked test in this crate
+//!   and loses the deposed-writer race in production, so reading the vendor's
+//!   documentation is not evidence.
+//!
+//! GCS is deliberately absent. Its XML interoperability layer ignores these
+//! headers and wants `x-goog-if-generation-match` instead, so it needs its own
+//! `ObjectStore` rather than this one pointed somewhere else. See the module
+//! docs in `src/s3/mod.rs`.
 //!
 //! To run them by hand, stand a server up, point the environment at it, and
 //! use the same task CI uses:
@@ -20,6 +35,12 @@
 //! export ORBITA_S3_TEST_SECRET_KEY=orbita-ci-secret
 //! moon run orbita-objectstore:test-live-s3
 //! ```
+//!
+//! Three more variables are optional. `ORBITA_S3_TEST_REGION` defaults to
+//! `us-east-1`, which suits MinIO and needs to be `auto` for R2 and the real
+//! region for AWS. `ORBITA_S3_TEST_FORCE_PATH_STYLE` defaults to true and has
+//! to be false for AWS. `ORBITA_S3_TEST_SESSION_TOKEN` is for temporary
+//! credentials.
 //!
 //! The conditional-write tests need a MinIO recent enough to implement
 //! conditional PUT, which is early 2025 or later. An older server does not
@@ -41,6 +62,18 @@ fn store_from_env() -> S3Store {
         std::env::var(name)
             .unwrap_or_else(|_| panic!("{name} must be set to run the live S3 tests"))
     };
+    let optional = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    // Same spelling of a boolean the server config accepts, so an operator who
+    // has already set ORBITA_OBJECT_STORE_FORCE_PATH_STYLE does not have to
+    // learn a second one here.
+    let flag = |name: &str, default: bool| match optional(name) {
+        None => default,
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => panic!("{name} must be true or false, got {other:?}"),
+        },
+    };
     S3Store::connect(S3Config {
         endpoint: var("ORBITA_S3_TEST_ENDPOINT"),
         bucket: var("ORBITA_S3_TEST_BUCKET"),
@@ -48,9 +81,18 @@ fn store_from_env() -> S3Store {
         credentials: Credentials {
             access_key_id: var("ORBITA_S3_TEST_ACCESS_KEY"),
             secret_access_key: var("ORBITA_S3_TEST_SECRET_KEY"),
-            session_token: None,
+            // Only set when the caller signed in with temporary credentials.
+            // Static keys in a secret store are the easy path today, but this
+            // means a workflow can swap in role-assumed credentials without
+            // anyone touching this file.
+            session_token: optional("ORBITA_S3_TEST_SESSION_TOKEN"),
         },
-        force_path_style: true,
+        // Path style is the default because MinIO cannot do anything else
+        // without wildcard DNS in front of it, and MinIO is what runs on every
+        // pull request. AWS needs this turned off: it addresses buckets as
+        // `bucket.s3.<region>.amazonaws.com`, and path style is on a
+        // deprecation path there. R2 serves both and is left on the default.
+        force_path_style: flag("ORBITA_S3_TEST_FORCE_PATH_STYLE", true),
     })
     .expect("valid live-test configuration")
 }

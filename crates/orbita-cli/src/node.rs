@@ -35,14 +35,22 @@
 //!   with a single partition covering the whole range, so `keyspace create` is
 //!   the only step and there is no "now create a partition" to forget.
 //!
-//! `orbita dev` shortcuts all of it. One node with an empty peer list is its
-//! own leader group, which means a Raft configuration of one member that is
-//! committed the moment it is written, and the same node also serves
-//! partitions. There is no quorum to wait for and no second process. It also
-//! creates a keyspace on startup so the first write does not need a second
-//! command. This path exists because the first ten minutes decide whether
-//! there is an eleventh, and a bootstrap that needs a paragraph of explanation
-//! has already lost.
+//! `orbita dev` shortcuts all of it. There is no peer list to write down, so
+//! this module writes the only one that could be true: a leader group whose
+//! single member is this node. That is a Raft configuration of one, which
+//! elects itself after one election timeout and commits everything it writes,
+//! and the same node is also admitted as the worker that owns the partitions.
+//! There is no quorum to wait for and no second process. It also creates a
+//! keyspace on startup so the first write does not need a second command.
+//! This path exists because the first ten minutes decide whether there is an
+//! eleventh, and a bootstrap that needs a paragraph of explanation has already
+//! lost.
+//!
+//! The membership is written out rather than left implied, because leaving it
+//! implied is what issue #88 was: an empty list meant the node skipped the
+//! configuration that carries its role, came up as a worker with no control
+//! plane, and answered `Unimplemented` to the `keyspace create` printed in its
+//! own help text.
 //!
 //! # Version skew
 //!
@@ -167,6 +175,18 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
         }
         signal = shutdown_signal() => {
             signal?;
+            // A development cluster is one node, so there is nobody to hand a
+            // partition to and a drain would spend its whole budget waiting
+            // for a receiver that cannot exist before shutting down anyway.
+            // Ctrl-C on a laptop should be immediate.
+            if options.dev {
+                server
+                    .shutdown()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .context("stopping the node")?;
+                return Ok(());
+            }
             eprintln!("orbita: draining");
             server
                 .drain(Duration::from_millis(config.cluster.drain_timeout_millis))
@@ -216,7 +236,9 @@ fn server_config(
         .with_node_id(NodeId(config.node.id))
         .with_listen_addr(listen)
         .with_peer_listen_addr(peer_listen)
-        .with_peer_advertise_addr(config.node.peer_advertise.clone());
+        .with_peer_advertise_addr(config.node.peer_advertise.clone())
+        .with_require_auth(config.cluster.require_auth)
+        .with_root_credential(config.cluster.root_credential.clone());
 
     let peers = parse_leader_peers(&config.cluster.leader_peers)?;
     if !peers.is_empty() {
@@ -225,6 +247,21 @@ fn server_config(
             .with_peers(peers)
             .with_leader_group(voters)
             .with_leader_member(config.node.role == Role::Leader);
+    } else if options.dev {
+        // A development node has nobody to list, and an empty list used to
+        // mean this whole block was skipped, so the node came up as a worker
+        // with no control plane and every admin call answered Unimplemented.
+        // The membership of a leader group of one is this node, written out
+        // rather than inferred from the empty list, so that the shape the dev
+        // path runs is the shape production runs.
+        let local = NodeId(config.node.id);
+        server_config = server_config
+            .with_peers(vec![(local, config.node.peer_advertise.clone())])
+            .with_leader_group(vec![local])
+            .with_leader_member(true)
+            // And its own worker, or the one node in the cluster would be
+            // barred from owning the partition it is the only candidate for.
+            .with_leader_owns_partitions(true);
     }
 
     if let Some(endpoint) = &config.object_store.endpoint {
@@ -985,6 +1022,60 @@ mod tests {
         layer.node.peer_advertise = Some("leader-1:7101".to_owned());
         let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
         assert!(format!("{error:#}").contains("needs at least 3"));
+    }
+
+    #[test]
+    fn dev_forms_a_leader_group_of_one_so_there_is_a_control_plane_to_serve_admin_from() {
+        // The bug this protects against was invisible from the configuration:
+        // the role resolved to Leader correctly and was then dropped, because
+        // an empty peer list skipped the block that carries it through. Every
+        // admin RPC answered Unimplemented as a result, so the second line of
+        // the quickstart failed on a node that reported itself healthy.
+        let dev = NodeOptions {
+            create_keyspace: Some("default".to_owned()),
+            dev: true,
+        };
+        let config = config(Role::Leader, &[], "127.0.0.1:7100");
+
+        let server = server_config(
+            &config,
+            &dev,
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:7101".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            server.leader_member,
+            "no leader membership means no controller, and no controller means no Admin service"
+        );
+        assert_eq!(server.leader_group, vec![NodeId(config.node.id)]);
+        assert!(
+            server.leader_owns_partitions,
+            "the only node has to be an eligible owner, or the cluster serves no partition at all"
+        );
+        assert_eq!(
+            server.peers,
+            vec![(NodeId(config.node.id), config.node.peer_advertise.clone())],
+            "the group's own membership has to name an address, or the bootstrap registers nobody"
+        );
+    }
+
+    #[test]
+    fn a_worker_with_no_peer_list_still_hosts_no_control_plane() {
+        // The dev exemption above is exactly that. A node that is not `orbita
+        // dev` and has nothing to join stays a worker with a static map, which
+        // is what the tests and the ephemeral single-node path rely on.
+        let server = server_config(
+            &config(Role::Worker, &[], "127.0.0.1:7100"),
+            &options(),
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:7101".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert!(!server.leader_member);
+        assert!(server.leader_group.is_empty());
     }
 
     #[test]

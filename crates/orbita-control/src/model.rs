@@ -124,10 +124,20 @@ impl Credential {
     /// `now_millis`.
     #[must_use]
     pub fn allows(&self, keyspace: &str, permission: Permission, now_millis: u64) -> bool {
-        if self.expires_at_millis.is_some_and(|at| now_millis >= at) {
+        if self.is_expired(now_millis) {
             return false;
         }
         self.keyspaces.iter().any(|k| k == keyspace) && self.permissions.contains(&permission)
+    }
+
+    /// Whether this credential's expiry has passed at `now_millis`.
+    ///
+    /// Expiry is inclusive of the deadline: a credential is dead at exactly its
+    /// `expires_at_millis`, not one millisecond after, so a caller and the
+    /// server never disagree about the boundary instant.
+    #[must_use]
+    pub fn is_expired(&self, now_millis: u64) -> bool {
+        self.expires_at_millis.is_some_and(|at| now_millis >= at)
     }
 
     pub(crate) fn encode(&self, w: &mut Writer) {

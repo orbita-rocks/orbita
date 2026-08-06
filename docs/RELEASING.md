@@ -73,10 +73,18 @@ the tag does not help anybody.
 
 Pushing the tag starts the **Release** workflow, which verifies the tag against
 the tree, reruns the full test suite with the nightly simulation batch,
-builds binaries for four targets, builds and signs a multi-architecture image,
+builds binaries for six targets, builds and signs a multi-architecture image,
 publishes the chart if its version moved, and creates the GitHub release. The
 publishing jobs sit behind the `release` environment, so there is a second
 approval between a pushed tag and a public artifact.
+
+Four of those six targets are Linux, because both architectures are built
+against glibc and against musl. The musl artifacts are fully static, meaning no
+interpreter and no dynamic section, so they run on a host whose libc nobody
+checked first. That is the whole single-binary pitch, and it is worth two extra
+matrix legs to keep it honest. They share runners with their glibc
+counterparts, so the cost is build minutes rather than machines. The only thing
+the musl legs need beyond the usual is `musl-tools`, for ring's C.
 
 Afterwards the **Post-release** workflow opens a pull request merging `main`
 back into `develop` and setting the version to `0.2.0-dev`. It looks like
@@ -157,7 +165,7 @@ are internal libraries, and publishing them would be a semver promise about
 `orbita-core`'s types that is not worth making before 1.0. The product is the
 binary and the image.
 
-There are no musl builds. The image builds RocksDB from source with a C++
-toolchain, and static linking against musl is a project of its own. It becomes
-much cheaper if the storage engine stops needing C++, and is worth revisiting
-then.
+The image is not built on musl. The static binaries exist, so a `scratch` or
+distroless base is now possible, but that is a separate decision about the
+image's attack surface and debuggability rather than a free consequence of this
+one.
