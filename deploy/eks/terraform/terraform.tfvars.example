@@ -1,0 +1,16 @@
+# Copy to terraform.tfvars and fill in, or pass these with -var on the command
+# line the way deploy/eks/up.sh does. Only region and bucket are required; the
+# rest default to values that match the Helm overlay and the docs.
+#
+# AWS credentials come from the environment or your AWS profile, the same as the
+# other Terraform in this repo. Nothing here holds a secret.
+
+region      = "us-west-2"
+bucket_name = "orbita-test-changeme"
+
+# Defaults, shown so they are discoverable. Uncomment to change, but the cluster
+# name and role name are also written into deploy/helm/orbita/values-eks.yaml
+# and the docs, so change them in all three or not at all.
+# cluster_name       = "orbita-test"
+# kubernetes_version = "1.33"
+# node_instance_type = "m5.xlarge"

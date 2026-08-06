@@ -1,0 +1,4 @@
+# Rendered from the committed templates by up.sh. Build artifacts, not source:
+# they carry a real account id and bucket name, and regenerate on every run.
+cluster.rendered.yaml
+values-eks.rendered.yaml
