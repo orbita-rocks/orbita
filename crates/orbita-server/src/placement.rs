@@ -32,6 +32,7 @@ use orbita_core::{
 };
 use orbita_format::testing::MemoryStore;
 use orbita_proto::v1::{GetRequest, SetRequest};
+use orbita_runtime::Runtime;
 use orbita_sim::{harness, SimRuntime, Simulation};
 
 use std::sync::Arc;
@@ -118,6 +119,14 @@ fn start_node_reporting(
     let source = BoxedMapSource::new(source.clone());
     let gate = Arc::clone(gate);
     sim.block_on(async move {
+        // Authentication off: placement is about ownership and catch-up, so
+        // admission lets every request through to the routing under test.
+        let authenticator = Arc::new(crate::auth::Authenticator::new(
+            false,
+            None,
+            std::time::Duration::from_secs(86_400),
+            runtime.clock().clone(),
+        ));
         Node::start(
             runtime,
             node,
@@ -125,6 +134,7 @@ fn start_node_reporting(
             source,
             Duration::from_millis(150),
             gate,
+            authenticator,
         )
         .await
         .expect("the node starts")
@@ -166,6 +176,7 @@ fn write_keys(
                         condition: None,
                     },
                     false,
+                    None,
                 )
                 .await;
             outcomes.push(matches!(outcome, Ok(response) if response.applied));
@@ -186,6 +197,7 @@ fn is_visible(sim: &Simulation, node: &Arc<Node<SimRuntime>>, key: &str) -> bool
                 key: key.into_bytes(),
             },
             false,
+            None,
         )
         .await
         .map(|response| response.found)
@@ -236,6 +248,7 @@ fn a_replica_placed_after_the_last_write_is_caught_up_without_another_write() {
                                 condition: None,
                             },
                             false,
+                            None,
                         )
                         .await
                         .expect("the owner accepts a write");
@@ -322,6 +335,7 @@ fn a_placed_replica_that_is_already_current_is_not_walked_backwards() {
                                 condition: None,
                             },
                             false,
+                            None,
                         )
                         .await
                         .expect("the owner accepts a write");

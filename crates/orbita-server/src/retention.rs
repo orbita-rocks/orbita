@@ -184,7 +184,15 @@ fn start_node(
     let started = {
         let gate = Arc::clone(&gate);
         sim.block_on(async move {
-            Node::start(runtime, node, layout, source, lease, gate)
+            // Authentication off: retention is about expiry and compaction, not
+            // the credential gate, so admission passes every request through.
+            let authenticator = Arc::new(crate::auth::Authenticator::new(
+                false,
+                None,
+                std::time::Duration::from_secs(86_400),
+                runtime.clock().clone(),
+            ));
+            Node::start(runtime, node, layout, source, lease, gate, authenticator)
                 .await
                 .expect("the node starts")
         })
@@ -223,7 +231,7 @@ fn write_all(
             condition: None,
         };
         let acknowledged = sim.block_on(async move {
-            matches!(owner.set(request, false).await, Ok(response) if response.applied)
+            matches!(owner.set(request, false, None).await, Ok(response) if response.applied)
         });
         applied += u64::from(acknowledged);
     }
@@ -240,7 +248,7 @@ fn read(sim: &Simulation, node: &Arc<Node<SimRuntime>>, n: u64) -> Option<Vec<u8
         key: key(n).into_bytes(),
     };
     sim.block_on(async move {
-        match node.get(request, false).await {
+        match node.get(request, false, None).await {
             Ok(response) if response.found => Some(response.value),
             _ => None,
         }

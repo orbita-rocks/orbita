@@ -104,6 +104,9 @@ mod pending;
 #[cfg(test)]
 mod placement;
 mod proxy;
+mod quota;
+#[cfg(test)]
+mod quotas;
 mod readiness;
 mod replication;
 #[cfg(test)]
@@ -307,6 +310,7 @@ impl Server {
             map_source,
             config.lease_duration,
             Arc::clone(&readiness),
+            Arc::clone(&authenticator),
         )
         .await?;
 
@@ -424,10 +428,7 @@ impl Server {
             .map_err(|e| Error::Internal(format!("serving on {local_addr}: {e}")))?;
 
         let (shutdown, stop) = tokio::sync::oneshot::channel();
-        let service = KvServer::new(KvService::new(
-            Arc::clone(&node),
-            Arc::clone(&authenticator),
-        ));
+        let service = KvServer::new(KvService::new(Arc::clone(&node)));
         let health = HealthServer::new(HealthService::new(Arc::clone(&readiness)));
         // Every node that knows where the control plane is serves the whole
         // admin surface, whether or not it holds one. A member that is not the

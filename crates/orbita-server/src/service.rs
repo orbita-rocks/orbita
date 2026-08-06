@@ -2,16 +2,22 @@
 //!
 //! This layer is thin on purpose. It turns a tonic request into the node's
 //! request, and an `orbita_core::Error` into a status through the one mapping
-//! in [`crate::status`]. Everything else, meaning routing, conditions, and the
-//! read path, belongs to the node so that a request that arrives over the peer
-//! transport takes exactly the same path as one that arrives over gRPC.
+//! in [`crate::status`]. Everything else, meaning routing, conditions, the
+//! credential rule, and the rate and storage limits, belongs to the node so
+//! that a request that arrives over the peer transport takes exactly the same
+//! path as one that arrives over gRPC, and so a request is admitted once,
+//! against a single keyspace resolution, rather than in two layers.
+//!
+//! The only thing this layer knows that the node does not is the gRPC metadata,
+//! so its whole job for admission is to lift the `authorization` header out of
+//! that metadata and hand it to the node as a plain `Option<&str>`. The node's
+//! admission boundary does the rest, in order: credential, then rate, then —
+//! for a write, at the owner — storage.
 
-use crate::auth::Authenticator;
 use crate::node::Node;
 use crate::readiness::{ReadinessCondition, ReadinessGate, ReadinessState};
 use crate::status::to_status;
 
-use orbita_control::Permission;
 use orbita_proto::v1::health_server::Health;
 use orbita_proto::v1::kv_server::Kv;
 use orbita_proto::v1::{
@@ -21,60 +27,49 @@ use orbita_proto::v1::{
 use orbita_runtime::Runtime;
 
 use std::sync::Arc;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
 pub(crate) struct KvService<R: Runtime> {
     node: Arc<Node<R>>,
-    /// Checks the credential every request before it can reach a partition.
-    /// Held here rather than in the node so a request over the peer transport,
-    /// which is already an authenticated node, does not re-run the client-edge
-    /// check.
-    auth: Arc<Authenticator<R::Clock>>,
 }
 
 impl<R: Runtime> KvService<R> {
-    pub(crate) fn new(node: Arc<Node<R>>, auth: Arc<Authenticator<R::Clock>>) -> Self {
-        Self { node, auth }
+    pub(crate) fn new(node: Arc<Node<R>>) -> Self {
+        Self { node }
     }
+}
 
-    /// Refuses a request whose credential does not permit `permission` on
-    /// `keyspace`, before any partition work happens.
-    ///
-    /// The keyspace comes from the request body and the permission from the
-    /// method, so a read cannot borrow a write scope or vice versa.
-    ///
-    /// The large-`Err` lint is allowed because the `Err` is a `tonic::Status`,
-    /// the same type every handler here already returns; boxing it just for
-    /// this helper would make the call sites unwrap a box the trait then
-    /// re-wraps.
-    #[allow(clippy::result_large_err)]
-    fn authorize<T>(
-        &self,
-        request: &Request<T>,
-        keyspace: &str,
-        permission: Permission,
-    ) -> Result<(), Status> {
-        self.auth
-            .authorize(request.metadata(), keyspace, permission)
-            .map_err(|e| to_status(&e))
-    }
+/// The raw `authorization` header value, if the request carried one that is
+/// representable as text, owned so the request body can be moved on into the
+/// node while the credential outlives the borrow of the metadata.
+///
+/// A binary or absent header reads as `None`, which the node's authenticator
+/// turns into `Unauthenticated` when authentication is on and ignores when it
+/// is off. Lifting it here keeps the node — and its admission boundary — free
+/// of any dependency on `tonic`.
+fn credential(metadata: &MetadataMap) -> Option<String> {
+    metadata
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 #[tonic::async_trait]
 impl<R: Runtime> Kv for KvService<R> {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        self.authorize(&request, &request.get_ref().keyspace, Permission::Read)?;
+        let credential = credential(request.metadata());
         self.node
-            .get(request.into_inner(), false)
+            .get(request.into_inner(), false, credential.as_deref())
             .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
     }
 
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
-        self.authorize(&request, &request.get_ref().keyspace, Permission::Write)?;
+        let credential = credential(request.metadata());
         self.node
-            .set(request.into_inner(), false)
+            .set(request.into_inner(), false, credential.as_deref())
             .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
@@ -84,9 +79,9 @@ impl<R: Runtime> Kv for KvService<R> {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        self.authorize(&request, &request.get_ref().keyspace, Permission::Write)?;
+        let credential = credential(request.metadata());
         self.node
-            .delete(request.into_inner(), false)
+            .delete(request.into_inner(), false, credential.as_deref())
             .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
@@ -109,9 +104,9 @@ impl<R: Runtime> Kv for KvService<R> {
     }
 
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        self.authorize(&request, &request.get_ref().keyspace, Permission::Read)?;
+        let credential = credential(request.metadata());
         self.node
-            .list(request.into_inner(), false)
+            .list(request.into_inner(), false, credential.as_deref())
             .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
