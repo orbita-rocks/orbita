@@ -1,7 +1,7 @@
 //! Parsing the one XML response the store reads: `ListObjectsV2`.
 
 use crate::s3::time::parse_iso8601_millis;
-use crate::{ETag, ObjectError, ObjectMeta, ObjectResult};
+use crate::{BackendTime, ETag, ObjectError, ObjectMeta, ObjectResult};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -90,7 +90,10 @@ pub(crate) fn parse_list_page(body: &[u8]) -> ObjectResult<ListPage> {
                         key: std::mem::take(&mut key),
                         size,
                         etag: ETag(std::mem::take(&mut etag)),
-                        last_modified: parse_iso8601_millis(&last_modified),
+                        // The parsed instant is the S3 server's clock, so it is
+                        // stamped as a `BackendTime` to keep it out of any
+                        // comparison against the host clock.
+                        last_modified: parse_iso8601_millis(&last_modified).map(BackendTime),
                     });
                     last_modified.clear();
                 }
@@ -165,8 +168,9 @@ mod tests {
                     key: "p/a".to_string(),
                     size: 3,
                     etag: ETag("\"abc\"".to_string()),
-                    // Wired through from the entry's LastModified.
-                    last_modified: Some(1_767_225_600_000),
+                    // Wired through from the entry's LastModified, in the S3
+                    // server's clock domain.
+                    last_modified: Some(BackendTime(1_767_225_600_000)),
                 },
                 ObjectMeta {
                     key: "p/b&c".to_string(),

@@ -9,7 +9,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use orbita_objectstore::{ETag, ObjectError, ObjectMeta, ObjectResult, ObjectStore, Precondition};
+use orbita_objectstore::{
+    BackendTime, ETag, ObjectError, ObjectMeta, ObjectResult, ObjectStore, Precondition,
+};
 use orbita_runtime::Clock;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -46,8 +48,10 @@ impl fmt::Debug for MemoryStore {
 #[derive(Debug, Default)]
 struct State {
     /// Each object is its bytes, its current tag, and the write time the store
-    /// stamped, which is `None` unless the store was built with a clock.
-    objects: BTreeMap<String, (Bytes, ETag, Option<u64>)>,
+    /// stamped, which is `None` unless the store was built with a clock. The
+    /// stamp is a [`BackendTime`] because this store's clock stands in for the
+    /// backend's own clock domain, the one the orphan sweep must reason within.
+    objects: BTreeMap<String, (Bytes, ETag, Option<BackendTime>)>,
     /// Entity tags are never reused, including for an object that was deleted
     /// and written again, so a compare-and-swap cannot succeed against a
     /// version that no longer means what the holder thinks.
@@ -87,9 +91,10 @@ impl MemoryStore {
     }
 
     /// The write time the configured clock would stamp right now, or `None`
-    /// when no clock was configured.
-    fn stamp(&self) -> Option<u64> {
-        self.clock.as_ref().map(|clock| clock())
+    /// when no clock was configured. It is a [`BackendTime`]: to a caller this
+    /// store is the backend, so its clock is the backend's clock domain.
+    fn stamp(&self) -> Option<BackendTime> {
+        self.clock.as_ref().map(|clock| BackendTime(clock()))
     }
 
     /// Every key currently held, for a test that wants to assert about orphans.
@@ -330,11 +335,25 @@ mod tests {
         store.put("p/b", Bytes::from_static(b"y")).await.unwrap();
 
         let listed = store.list("p/").await.unwrap();
-        let times: Vec<Option<u64>> = listed.iter().map(|m| m.last_modified).collect();
-        assert_eq!(times, vec![Some(1_000), Some(5_000)]);
+        let times: Vec<Option<BackendTime>> = listed.iter().map(|m| m.last_modified).collect();
+        assert_eq!(
+            times,
+            vec![Some(BackendTime(1_000)), Some(BackendTime(5_000))]
+        );
         // The same stamp is reachable through head, which is where a caller
         // that already knows the key looks.
-        assert_eq!(store.head("p/a").await.unwrap().last_modified, Some(1_000));
+        assert_eq!(
+            store.head("p/a").await.unwrap().last_modified,
+            Some(BackendTime(1_000))
+        );
+
+        // The stamp comes from the controllable runtime clock, so a sweep can
+        // reason about age entirely within that one domain: an object written
+        // at 1_000 is not yet old at a same-domain now of 3_000 against a
+        // 2_500ms grace, but is old once the clock reaches 5_000.
+        let object = store.head("p/a").await.unwrap();
+        assert!(!object.is_safely_older_than(BackendTime(3_000), 2_500, 0));
+        assert!(object.is_safely_older_than(BackendTime(5_000), 2_500, 0));
     }
 
     #[tokio::test]
@@ -346,5 +365,10 @@ mod tests {
         store.put("p/a", Bytes::from_static(b"x")).await.unwrap();
         assert_eq!(store.head("p/a").await.unwrap().last_modified, None);
         assert_eq!(store.list("p/").await.unwrap()[0].last_modified, None);
+
+        // And with no write time, the object is never a deletion candidate, no
+        // matter how far the reference clock has advanced.
+        let object = store.head("p/a").await.unwrap();
+        assert!(!object.is_safely_older_than(BackendTime(u64::MAX), 0, 0));
     }
 }

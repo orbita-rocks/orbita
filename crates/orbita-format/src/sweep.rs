@@ -22,10 +22,15 @@
 //! the objects themselves, but the write time it will need is reachable on each
 //! listing entry, and the caller supplies the grace period.
 //!
-//! That timestamp is an `Option`, and the sweep that #100 adds must treat
-//! `None` as "do not touch". A backend that cannot report a write time reports
-//! `None` rather than a zero, because zero reads as the epoch, and treating an
-//! unknown time as ancient deletes live data. See the field's own contract.
+//! That write time is in the *backend's* clock domain, not the host clock's,
+//! and it is an `Option`. The sweep that #100 adds must not compare it against
+//! `orbita_runtime::Clock::now_millis()`; it must judge age with
+//! [`ObjectMeta::is_safely_older_than`](orbita_objectstore::ObjectMeta::is_safely_older_than),
+//! which takes a reference "now" from the same backend domain, folds in a skew
+//! allowance, and treats a `None` write time as "do not touch". A backend that
+//! cannot report a write time reports `None` rather than a zero, because zero
+//! reads as the epoch, and treating an unknown time as ancient deletes live
+//! data. See the field's own contract.
 
 use crate::manifest::Manifest;
 use crate::paths::{self, PartitionPath};
@@ -112,7 +117,7 @@ mod tests {
 
     use bytes::Bytes;
     use orbita_core::{Epoch, KeyRange, KeyspaceId, Lamport, PartitionId};
-    use orbita_objectstore::ETag;
+    use orbita_objectstore::{BackendTime, ETag};
 
     fn path() -> PartitionPath {
         PartitionPath::new("orbita", KeyspaceId(1), PartitionId(7))
@@ -123,7 +128,7 @@ mod tests {
             key: path().object(relative),
             size: 1024,
             etag: ETag("etag".to_string()),
-            last_modified: Some(1_000),
+            last_modified: Some(BackendTime(1_000)),
         }
     }
 
@@ -200,7 +205,7 @@ mod tests {
                 key: "somewhere/else.oseg".to_string(),
                 size: 1,
                 etag: ETag("etag".to_string()),
-                last_modified: Some(1_000),
+                last_modified: Some(BackendTime(1_000)),
             },
         ];
         assert!(unreferenced(&referenced, &path(), &listing).is_empty());
