@@ -20,6 +20,9 @@ orbita-proto.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# The API crate only, for the split and merge activity counters. A no-op until
+# the node process installs an exporter.
+opentelemetry.workspace = true
 tonic = "0.12"
 async-trait = "0.1"
 crc32fast = "1.5.0"

@@ -32,6 +32,7 @@ use crate::config::DEFAULT_CONTROL_POLL_INTERVAL;
 use crate::host::{HostSpec, LeasePolicy, PartitionHost, PartitionPaths, Read, WriteAck, WriteOp};
 use crate::lease::DEFAULT_LEASE_MARGIN;
 use crate::map_source::{BoxedMapSource, MapSource};
+use crate::metrics;
 use crate::proxy;
 use crate::quota::{Admission, Direction};
 use crate::readiness::{ReadinessCondition, ReadinessGate};
@@ -636,6 +637,13 @@ impl<R: Runtime> Node<R> {
         }
     }
 
+    /// Forwards a request to the partition's owner over the peer transport.
+    ///
+    /// Spanned because this is the intra-cluster hop whose cost is otherwise
+    /// invisible: a client sees one latency, but it is split across two nodes,
+    /// and only a span that brackets the peer call attributes the difference to
+    /// the hop rather than to the owner.
+    #[tracing::instrument(name = "kv.forward", skip(self, request), fields(peer = to.get(), method))]
     async fn forward<Req, Res>(&self, to: NodeId, method: u16, request: &Req) -> Result<Res>
     where
         Req: prost::Message,
@@ -655,22 +663,92 @@ impl<R: Runtime> Node<R> {
         proxy::decode_reply::<Res>(&reply)
     }
 
+    /// The partition a key routes to right now, for a metric or span label.
+    ///
+    /// A read of the cached map, nothing more: it names where the request is
+    /// headed, which is the label an operator groups latency by, without paying
+    /// for the routing decision a second time. `None` when the keyspace or the
+    /// key does not resolve, in which case the request is about to error and
+    /// there is nothing to attribute latency to.
+    fn label_partition(&self, keyspace: &str, key: &[u8]) -> Option<PartitionId> {
+        let map = self.map();
+        let id = map.keyspace_by_name(keyspace)?.id;
+        map.lookup(id, key).map(|info| info.id)
+    }
+
+    /// Records a request's latency against the partition it routed to.
+    ///
+    /// Skipped when the partition did not resolve, because a latency sample no
+    /// partition can own is a label an operator cannot act on.
+    ///
+    /// Skipped on a forwarded request, because the ingress node already timed
+    /// the same client operation end to end. Recording it again on the owner
+    /// would double every forwarded op's count and blend end-to-end latency
+    /// with owner-local latency under one label; the owner's work is already
+    /// visible through its spans.
+    fn record_latency(
+        &self,
+        keyspace: &str,
+        partition: Option<PartitionId>,
+        operation: metrics::Operation,
+        started_nanos: u64,
+        forwarded: bool,
+    ) {
+        if forwarded {
+            return;
+        }
+        let Some(partition) = partition else { return };
+        let elapsed = self
+            .runtime
+            .clock()
+            .monotonic_nanos()
+            .saturating_sub(started_nanos);
+        metrics::record_request(
+            keyspace,
+            partition,
+            operation,
+            elapsed as f64 / 1_000_000_000.0,
+        );
+    }
+
+    #[tracing::instrument(
+        name = "kv.get",
+        skip_all,
+        fields(keyspace = %request.keyspace, forwarded, partition = tracing::field::Empty)
+    )]
     pub(crate) async fn get(
         &self,
         request: GetRequest,
         forwarded: bool,
         credential: Option<&str>,
     ) -> Result<GetResponse> {
+        // Timed from before admission so the sample covers the whole of the
+        // work this node does for the request, auth and routing included. A
+        // request admit rejects returns below without a sample: nothing was
+        // served, so there is no work latency to attribute.
+        let started = self.runtime.clock().monotonic_nanos();
         let keyspace = self
             .admit(credential, &request.keyspace, Access::Read, forwarded)
             .await?;
-        match self.try_get(&request, forwarded, &keyspace).await {
+        let partition = self.label_partition(&request.keyspace, &request.key);
+        if let Some(partition) = partition {
+            tracing::Span::current().record("partition", partition.get());
+        }
+        let result = match self.try_get(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
                 self.try_get(&request, forwarded, &keyspace).await
             }
             other => other,
-        }
+        };
+        self.record_latency(
+            &request.keyspace,
+            partition,
+            metrics::Operation::Get,
+            started,
+            forwarded,
+        );
+        result
     }
 
     async fn try_get(
@@ -721,23 +799,41 @@ impl<R: Runtime> Node<R> {
         self.forward(owner, proxy::METHOD_GET, request).await
     }
 
+    #[tracing::instrument(
+        name = "kv.set",
+        skip_all,
+        fields(keyspace = %request.keyspace, forwarded, partition = tracing::field::Empty)
+    )]
     pub(crate) async fn set(
         &self,
         request: SetRequest,
         forwarded: bool,
         credential: Option<&str>,
     ) -> Result<SetResponse> {
+        let started = self.runtime.clock().monotonic_nanos();
         let keyspace = self
             .admit(credential, &request.keyspace, Access::Write, forwarded)
             .await?;
+        let partition = self.label_partition(&request.keyspace, &request.key);
+        if let Some(partition) = partition {
+            tracing::Span::current().record("partition", partition.get());
+        }
         let _permit = self.write_permit().await?;
-        match self.try_set(&request, forwarded, &keyspace).await {
+        let result = match self.try_set(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
                 self.try_set(&request, forwarded, &keyspace).await
             }
             other => other,
-        }
+        };
+        self.record_latency(
+            &request.keyspace,
+            partition,
+            metrics::Operation::Set,
+            started,
+            forwarded,
+        );
+        result
     }
 
     async fn try_set(
@@ -804,23 +900,41 @@ impl<R: Runtime> Node<R> {
         }
     }
 
+    #[tracing::instrument(
+        name = "kv.delete",
+        skip_all,
+        fields(keyspace = %request.keyspace, forwarded, partition = tracing::field::Empty)
+    )]
     pub(crate) async fn delete(
         &self,
         request: DeleteRequest,
         forwarded: bool,
         credential: Option<&str>,
     ) -> Result<DeleteResponse> {
+        let started = self.runtime.clock().monotonic_nanos();
         let keyspace = self
             .admit(credential, &request.keyspace, Access::Write, forwarded)
             .await?;
+        let partition = self.label_partition(&request.keyspace, &request.key);
+        if let Some(partition) = partition {
+            tracing::Span::current().record("partition", partition.get());
+        }
         let _permit = self.write_permit().await?;
-        match self.try_delete(&request, forwarded, &keyspace).await {
+        let result = match self.try_delete(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
                 self.try_delete(&request, forwarded, &keyspace).await
             }
             other => other,
-        }
+        };
+        self.record_latency(
+            &request.keyspace,
+            partition,
+            metrics::Operation::Delete,
+            started,
+            forwarded,
+        );
+        result
     }
 
     async fn try_delete(
@@ -898,22 +1012,48 @@ impl<R: Runtime> Node<R> {
         })
     }
 
+    #[tracing::instrument(
+        name = "kv.list",
+        skip_all,
+        fields(keyspace = %request.keyspace, forwarded, partition = tracing::field::Empty)
+    )]
     pub(crate) async fn list(
         &self,
         request: ListRequest,
         forwarded: bool,
         credential: Option<&str>,
     ) -> Result<ListResponse> {
+        let started = self.runtime.clock().monotonic_nanos();
         let keyspace = self
             .admit(credential, &request.keyspace, Access::Read, forwarded)
             .await?;
-        match self.try_list(&request, forwarded, &keyspace).await {
+        // A scan is routed by where it resumes, so telemetry follows the cursor
+        // too: once a scan crosses a partition boundary the later pages belong
+        // to the partition they resume into, not the one the prefix started in.
+        // A malformed cursor falls back to the prefix; `try_list` decodes it
+        // again and turns the failure into the client's error.
+        let route_key = Cursor::decode(&request.cursor, &request.prefix)
+            .map(|resume| resume.route_key)
+            .unwrap_or_else(|_| Bytes::copy_from_slice(&request.prefix));
+        let partition = self.label_partition(&request.keyspace, &route_key);
+        if let Some(partition) = partition {
+            tracing::Span::current().record("partition", partition.get());
+        }
+        let result = match self.try_list(&request, forwarded, &keyspace).await {
             Err(error) if self.should_repair(&error, forwarded) => {
                 self.repair().await;
                 self.try_list(&request, forwarded, &keyspace).await
             }
             other => other,
-        }
+        };
+        self.record_latency(
+            &request.keyspace,
+            partition,
+            metrics::Operation::List,
+            started,
+            forwarded,
+        );
+        result
     }
 
     async fn try_list(
@@ -1440,12 +1580,48 @@ impl<R: Runtime> Node<R> {
             .filter(|host| host.is_owner())
             .cloned()
             .collect();
-        for host in hosts {
+        for host in &hosts {
             host.renew_leases().await;
         }
         // The heartbeat is also how an owner learns where each replica's log
-        // ends, so this is the moment its verdict can have changed.
+        // ends, so this is the moment its verdict can have changed, and the
+        // moment replication lag and storage size are freshest to report.
+        self.observe_owned_metrics(&hosts).await;
         self.report_replica_recoverability().await;
+    }
+
+    /// Emits the per-partition WAL-lag and storage signals for every partition
+    /// this node owns.
+    ///
+    /// Driven from the lease heartbeat rather than a timer of its own, for the
+    /// same reason [`Node::report_replica_recoverability`] is: the heartbeat is
+    /// what refreshes an owner's picture of its replicas, so reading the lag
+    /// off any other clock would only add a window where the metric disagreed
+    /// with the readiness the same evidence drives. The keyspace name is
+    /// resolved from the cached map so the signal is labelled the way an
+    /// operator groups it, and a partition whose keyspace has gone is skipped
+    /// rather than emitted under an empty label.
+    async fn observe_owned_metrics(&self, hosts: &[Arc<PartitionHost<R>>]) {
+        let map = self.map();
+        let mut owned = Vec::with_capacity(hosts.len());
+        for host in hosts {
+            let Some(info) = map.partition(host.id()) else {
+                continue;
+            };
+            let Some(keyspace) = map.keyspace(info.keyspace) else {
+                continue;
+            };
+            owned.push(metrics::OwnedMetric {
+                keyspace: keyspace.name.as_str().to_owned(),
+                partition: host.id(),
+                replication_lag: host.replication_lag(),
+                storage_bytes: host.size_bytes().await.ok(),
+            });
+        }
+        // Republished wholesale: the observable gauges report exactly this set,
+        // so a partition this node no longer owns drops out of the export by
+        // being absent here rather than by anyone retiring its series.
+        metrics::publish_owned(owned);
     }
 
     /// Moves the durability half of readiness to match what the owners here
@@ -1502,15 +1678,23 @@ struct ProxyService<R: Runtime> {
 }
 
 impl<R: Runtime> PeerHandler for ProxyService<R> {
-    async fn handle(&self, _from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
+    async fn handle(&self, from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
         let Some(node) = self.node.upgrade() else {
             return Err(TransportError::NoHandler(ServiceId::Proxy));
         };
-        Ok(dispatch(&node, call).await)
+        Ok(dispatch(&node, from, call).await)
     }
 }
 
-async fn dispatch<R: Runtime>(node: &Node<R>, call: PeerCall) -> Bytes {
+/// Runs a request another node forwarded here.
+///
+/// The receiving half of the forwarding hop, spanned so the owner's own work on
+/// a proxied request shows up as a span rather than being folded into the
+/// caller's peer call. Trace context does not yet cross the peer frame, so this
+/// is a local root rather than a child; the span still isolates the owner's
+/// share of a forwarded request's latency.
+#[tracing::instrument(name = "proxy.dispatch", skip_all, fields(from = from.get(), method = call.method))]
+async fn dispatch<R: Runtime>(node: &Node<R>, from: NodeId, call: PeerCall) -> Bytes {
     /// Runs one forwarded call, encoding whichever way it went.
     macro_rules! run {
         ($request:ty, $method:ident) => {
@@ -1865,6 +2049,69 @@ mod tests {
         assert!(
             gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
             "readiness returns once every partition is open again"
+        );
+
+        drop(node);
+    }
+
+    /// A LIST that has paged across a partition boundary must be attributed to
+    /// the partition it resumes into, not the one its prefix started in.
+    /// Resolves the telemetry partition exactly as [`Node::list`] does — decode
+    /// the cursor, take its route key — and shows the answer follows the cursor
+    /// past the boundary rather than pinning every later page to partition one.
+    #[test]
+    fn a_cross_partition_list_page_is_attributed_to_the_cursor_partition() {
+        let sim = Simulation::new(11);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(MemoryStore::new());
+        let layout = DataLayout {
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            wal_root: "wal".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        };
+        let source = BoxedMapSource::new(StaticMapSource::new(two_partition_map()));
+        let gate = Arc::new(ReadinessGate::new());
+        let node = sim.block_on(async move {
+            let authenticator = Arc::new(Authenticator::new(
+                false,
+                None,
+                std::time::Duration::from_secs(86_400),
+                runtime.clock().clone(),
+            ));
+            Node::start(
+                runtime,
+                NodeId(1),
+                layout,
+                source,
+                crate::DEFAULT_LEASE_DURATION,
+                gate,
+                authenticator,
+            )
+            .await
+            .expect("the node starts")
+        });
+
+        // The first page has no cursor: its route key is the prefix, which
+        // lives below "m" and so belongs to partition one.
+        let prefix = b"";
+        let first = Cursor::decode(b"", prefix)
+            .map(|resume| resume.route_key)
+            .unwrap();
+        assert_eq!(
+            node.label_partition("default", &first),
+            Some(PartitionId(1)),
+        );
+
+        // A later page resumes past the boundary at "m", which is partition
+        // two; telemetry has to move with it.
+        let boundary = Cursor::at_partition_boundary(Bytes::from_static(b"m")).encode();
+        let resumed = Cursor::decode(&boundary, prefix)
+            .map(|resume| resume.route_key)
+            .unwrap();
+        assert_eq!(
+            node.label_partition("default", &resumed),
+            Some(PartitionId(2)),
+            "a scan that crossed into partition two is reported against it",
         );
 
         drop(node);

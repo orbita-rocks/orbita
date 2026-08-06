@@ -741,6 +741,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         {
             return Ok(Response::new(response));
         }
+        crate::metrics::record_split(crate::metrics::Outcome::Unimplemented);
         Err(Status::unimplemented(
             "partition split is disabled until child storage preparation is implemented",
         ))
@@ -758,6 +759,7 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         {
             return Ok(Response::new(response));
         }
+        crate::metrics::record_merge(crate::metrics::Outcome::Unimplemented);
         // Answering with a clear refusal rather than a half-built merge. See
         // the crate documentation for what a correct one has to guarantee.
         Err(Status::unimplemented(

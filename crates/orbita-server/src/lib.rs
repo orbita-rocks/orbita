@@ -99,6 +99,7 @@ mod lease;
 #[cfg(test)]
 mod linearizability;
 mod map_source;
+mod metrics;
 mod node;
 mod pending;
 #[cfg(test)]

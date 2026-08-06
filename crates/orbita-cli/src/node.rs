@@ -116,6 +116,11 @@ pub struct NodeOptions {
 /// a change to this one function rather than to twenty.
 ///
 pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
+    // Installed here, inside the runtime, rather than in `main`: the OTLP
+    // exporters spawn background tasks, so they need a runtime to build on. The
+    // guard is held for the whole run so its final `Drop` flushes whatever the
+    // exporters were still holding when the node stops.
+    let _telemetry = crate::telemetry::install_node(config)?;
     preflight(config, options)?;
     prepare_data_dir(&config.node.data_dir, false)?;
 

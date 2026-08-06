@@ -80,7 +80,12 @@ fn run(cli: Cli) -> Result<Outcome> {
         _ => config::load(config_path.as_deref(), &env, global)?,
     };
 
-    telemetry::install_logging(&config)?;
+    // A node installs its telemetry inside its own runtime, because the OTLP
+    // exporters need one to spawn on; see `node::run_node`. Every other command
+    // is a short-lived client, so stderr logging is installed here and now.
+    if !matches!(cli.command, Command::Serve(_) | Command::Dev(_)) {
+        telemetry::install_logging(&config)?;
+    }
 
     match cli.command {
         Command::Serve(args) => serve(&config, &args),
@@ -140,9 +145,11 @@ fn serve(config: &Config, args: &ServeArgs) -> Result<Outcome> {
         dev: false,
     };
     if args.allow_version_skew {
-        tracing::warn!(
-            "--allow-version-skew does nothing. Compatibility is a cluster version window now, \
-             and no node checks a version yet"
+        // Written to stderr rather than through `tracing`, because the node's
+        // subscriber is not installed until `run_node` is inside its runtime.
+        eprintln!(
+            "orbita: --allow-version-skew does nothing. Compatibility is a cluster version window \
+             now, and no node checks a version yet"
         );
     }
     node::preflight(config, &options)?;

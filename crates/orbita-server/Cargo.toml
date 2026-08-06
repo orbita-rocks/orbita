@@ -36,6 +36,10 @@ crc32c.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# The API crate only. Instruments come from the global meter, which is a no-op
+# until orbita-cli installs an exporter, so this adds no collector connection to
+# a test or a single-node run that never configures one.
+opentelemetry.workspace = true
 prost = "0.13"
 tonic = "0.12"
 

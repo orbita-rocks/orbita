@@ -121,7 +121,15 @@ data:
     force_path_style = false
 
     [telemetry]
+    # The OTLP collector to push traces and metrics to. Orbita exports rather
+    # than being scraped, so setting this is the whole switch: uncomment it and
+    # the node ships spans and per-keyspace, per-partition metrics to the
+    # collector, which fans them out to Prometheus, Tempo, or wherever. Left
+    # commented, export is off and logs still go to stderr, because a node that
+    # cannot reach a collector still has to start.
     # otlp_endpoint = "http://otel-collector.observability:4317"
+    # The fraction of traces to sample, decided once at the node that starts the
+    # trace. A forwarded hop inherits that decision rather than re-rolling it.
     trace_sample_ratio = 1.0
     service_name = "orbita"
     log_level = "info"

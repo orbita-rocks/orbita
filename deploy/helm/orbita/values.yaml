@@ -204,9 +204,16 @@ objectStore:
   secretAccessKey: ""
 
 telemetry:
-  # Empty disables trace and metric export. Logs still go to stdout, because a
-  # node that cannot reach a collector still has to be debuggable.
+  # The OTLP collector to push traces and metrics to. Orbita exports rather than
+  # being scraped, so this is the whole switch: set it and the node ships spans
+  # and per-keyspace, per-partition metrics to the collector on this endpoint,
+  # which fans them out to Prometheus, Tempo, or wherever. Empty disables export
+  # entirely; logs still go to stderr, because a node that cannot reach a
+  # collector still has to start and still has to be debuggable.
   otlpEndpoint: ""
+  # The fraction of traces to sample, decided once at the node that starts each
+  # trace. 1.0 keeps everything, which is right until the trace volume says
+  # otherwise.
   traceSampleRatio: 1.0
   serviceName: orbita
   logLevel: info

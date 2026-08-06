@@ -37,6 +37,14 @@ orbita-sim = { path = "crates/orbita-sim" }
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
+# OpenTelemetry API only. The crates that emit signals depend on this and
+# nothing heavier: instruments come from the global meter, which is a no-op
+# until the node process installs an exporter, so a library never drags the SDK
+# or a collector connection into a test or a one-shot CLI call. The SDK and the
+# OTLP exporter live in orbita-cli, the one place a node is actually started.
+# Pinned to the 0.27 line because that is the series built against tonic 0.12
+# and prost 0.13, which is what the rest of the workspace already resolves.
+opentelemetry = "0.27"
 # CRC32C, the Castagnoli polynomial the format specifies. This crate uses the
 # hardware instruction where there is one and falls back to a table otherwise,
 # which is the whole reason the format picked that polynomial.

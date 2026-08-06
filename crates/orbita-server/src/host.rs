@@ -642,6 +642,18 @@ impl<R: Runtime> PartitionHost<R> {
         self.log.retained_from().await
     }
 
+    /// How far this owner's advertised replicas trail its committed prefix.
+    ///
+    /// The WAL replication-lag signal, per partition. Empty on a replica, which
+    /// has no committed prefix of its own to measure against. See
+    /// [`orbita_wal::Wal::replication_lag`].
+    pub(crate) fn replication_lag(&self) -> orbita_wal::ReplicationLag {
+        self.wal
+            .as_ref()
+            .map(|wal| wal.replication_lag())
+            .unwrap_or_default()
+    }
+
     /// How much disk this partition is using, which is what the control plane
     /// compares against the split threshold.
     pub(crate) async fn size_bytes(&self) -> Result<u64> {
