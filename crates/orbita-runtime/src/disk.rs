@@ -1,10 +1,13 @@
 //! Local durable storage.
 //!
 //! This covers the write-ahead log, which is the file Orbita's durability
-//! claim rests on. It deliberately does not cover RocksDB, which does its own
-//! I/O below this layer. See the crate docs on that limit, and
-//! `docs/plan/05-sim.md` for what the simulator can and cannot fault-inject as
-//! a result.
+//! claim rests on. Per
+//! [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md)
+//! the storage engine persists through `orbita_objectstore::ObjectStore`
+//! rather than doing file I/O of its own, so every byte Orbita keeps crosses
+//! this trait or that one and nothing writes underneath either. That is what
+//! puts the whole system inside the simulator's reach rather than just the
+//! distributed layer.
 
 use bytes::Bytes;
 use std::future::Future;
