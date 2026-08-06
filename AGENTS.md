@@ -6,9 +6,10 @@ Guidance for coding agents working in this repository.
 
 Orbita is a strongly consistent, multitenant, range-partitioned distributed KV
 store written in Rust. It holds the locks, leases, epochs, catalogs, and
-control-plane state a platform coordinates on. It is not production-ready:
-single-node works end to end, multi-node worker registration and the Admin
-service are unimplemented.
+control-plane state a platform coordinates on. It is not production-ready, but
+single node and multi node both work end to end: workers register, writes
+replicate, and the Admin service is served by every node and forwarded to the
+control plane's leader. Partition split and merge are the notable holes.
 
 ## Required reading order
 

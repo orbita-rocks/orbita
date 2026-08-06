@@ -1,17 +1,24 @@
 //! The leader group's side of the worker protocol.
 //!
-//! Registered against `ServiceId::Control`. It answers two questions and takes
-//! no decisions of its own, so a slow or hostile worker can waste a leader's
-//! time but cannot move the cluster.
+//! Registered against `ServiceId::Control`. It answers a handful of questions
+//! and takes no decisions of its own, so a slow or hostile worker can waste a
+//! leader's time but cannot move the cluster.
+//!
+//! One of those questions is an `Admin` call another node forwarded here.
+//! That belongs on this service rather than on one of its own because the
+//! leader readiness gate below is exactly the check a forwarded admin call
+//! needs, and because [`crate::ControlClient`] already turns "somebody in this
+//! group" into "the member that is currently leader".
 
+use crate::admin::AdminService;
 use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::controller::RegistrationOutcome;
 use crate::wire::{
-    ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest, METHOD_DRAIN_NODE,
-    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
-    METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest,
+    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_CREDENTIALS,
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
 };
 
 use bytes::Bytes;
@@ -20,12 +27,17 @@ use orbita_runtime::{NodeId, PeerCall, PeerHandler, Runtime, TransportResult};
 /// Serves inbound control traffic for one leader group node.
 pub struct ControlService<R: Runtime, L: ConsensusLog> {
     controller: Controller<R, L>,
+    /// The admin surface a forwarded call runs against. Local-only by
+    /// construction, so a call that arrived here can never be sent on again
+    /// and two members mid-election cannot bounce one between them.
+    admin: AdminService<R, L>,
 }
 
 impl<R: Runtime, L: ConsensusLog> Clone for ControlService<R, L> {
     fn clone(&self) -> Self {
         Self {
             controller: self.controller.clone(),
+            admin: self.admin.clone(),
         }
     }
 }
@@ -33,7 +45,10 @@ impl<R: Runtime, L: ConsensusLog> Clone for ControlService<R, L> {
 impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
     #[must_use]
     pub fn new(controller: Controller<R, L>) -> Self {
-        Self { controller }
+        Self {
+            admin: AdminService::new(controller.clone()),
+            controller,
+        }
     }
 
     async fn dispatch(&self, call: PeerCall) -> ControlResponse {
@@ -143,6 +158,24 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable drain request: {e}")),
+            },
+            METHOD_ADMIN_CALL => match AdminCallRequest::decode(&call.payload) {
+                Ok(request) => match self
+                    .admin
+                    .invoke(request.method, request.op_id, &request.payload)
+                    .await
+                {
+                    Ok(payload) => ControlResponse::AdminOk(payload),
+                    // The leader's own status code travels back rather than
+                    // being flattened into an error string, because "no such
+                    // keyspace" and "the leader is gone" are the two answers
+                    // an operator most needs to tell apart.
+                    Err(status) => ControlResponse::AdminFailed {
+                        code: status.code() as u32,
+                        message: status.message().to_string(),
+                    },
+                },
+                Err(e) => ControlResponse::Error(format!("undecodable admin call: {e}")),
             },
             METHOD_FETCH_NODES => ControlResponse::Nodes(self.controller.node_addresses().await),
             METHOD_FETCH_CREDENTIALS => ControlResponse::Credentials(

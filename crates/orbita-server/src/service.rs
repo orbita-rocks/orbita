@@ -103,6 +103,7 @@ impl<R: Runtime> Kv for KvService<R> {
         // sizes this cluster will accept.
         self.node
             .limits(&request.into_inner().keyspace)
+            .await
             .map(Response::new)
             .map_err(|e| to_status(&e))
     }
