@@ -144,6 +144,13 @@ a second `ObjectStore` rather than this one with a different endpoint.
 
 ### Configuration an operator has to create
 
+The buckets, the AWS IAM role, and the S3 lifecycle rules all come from the
+Terraform in [`terraform/`](../terraform/), so most of this is `terraform apply`
+rather than console clicks. `terraform/README.md` is the full bootstrapping
+guide: what an operator needs before the first apply, what state backend it
+uses, and which outputs map to which repository settings. What follows is the
+result, so the workflow's side is documented next to the workflow.
+
 These live on the repository. Everything that identifies an account or
 authenticates to one is a secret. The region is a variable, because GitHub
 masks secret values wherever they appear in a log, and masking a string as
@@ -152,55 +159,44 @@ failure harder to read rather than easier.
 
 | Name | Kind | Holds |
 | --- | --- | --- |
-| `LIVE_S3_REGION` | variable | The region the AWS test bucket lives in. The endpoint is derived from it. |
-| `LIVE_S3_BUCKET` | secret | The AWS test bucket name. It must already exist. |
-| `LIVE_S3_ACCESS_KEY_ID` | secret | Access key id for the IAM principal below. |
-| `LIVE_S3_SECRET_ACCESS_KEY` | secret | Its secret access key. |
+| `LIVE_S3_REGION` | variable | The region the AWS test bucket lives in. The endpoint is derived from it. From the `aws_region` Terraform output. |
+| `LIVE_S3_BUCKET` | secret | The AWS test bucket name. From the `aws_s3_bucket` output. |
+| `LIVE_S3_ROLE_ARN` | secret | ARN of the IAM role the workflow assumes via OIDC. From the `aws_role_arn` output. A secret only because it embeds the AWS account id. |
 | `LIVE_R2_ACCOUNT_ID` | secret | Cloudflare account id. It is in the R2 endpoint hostname, which is why it is not a variable. |
-| `LIVE_R2_BUCKET` | secret | The R2 test bucket name. It must already exist. |
-| `LIVE_R2_ACCESS_KEY_ID` | secret | R2 API token access key id, scoped to Object Read and Write on that one bucket. |
+| `LIVE_R2_BUCKET` | secret | The R2 test bucket name. From the `r2_bucket` output. |
+| `LIVE_R2_ACCESS_KEY_ID` | secret | R2 API token access key id, scoped to Object Read and Write on that one bucket. Created by hand; see below. |
 | `LIVE_R2_SECRET_ACCESS_KEY` | secret | Its secret access key. |
 
-Both buckets should be dedicated to this and nothing else, and both want a
+There is no `LIVE_S3_ACCESS_KEY_ID` or `LIVE_S3_SECRET_ACCESS_KEY` any more. AWS
+moved to GitHub OIDC: the workflow assumes `LIVE_S3_ROLE_ARN` at run time and
+gets short-lived credentials, so there is no standing AWS key to leak or rotate.
+The Rust test needed no change for this, because it already read an optional
+`ORBITA_S3_TEST_SESSION_TOKEN`; the workflow feeds it the assumed-role session
+token through that variable.
+
+Both buckets are dedicated to this and nothing else, and Terraform gives both a
 lifecycle rule expiring objects under `orbita-it/` after a day. The tests clean
 up after themselves on the happy path, but the run that fails is the run that
 leaves an object behind, and that is also the run you least want to be doing
 bucket housekeeping during.
 
-The AWS key needs nothing beyond the prefix the tests write to. Every key is
-created under `orbita-it/`, so:
+The IAM role's policy reaches no further than the prefix the tests write to.
+Every key is created under `orbita-it/`, so the role can `s3:GetObject`,
+`s3:PutObject`, and `s3:DeleteObject` under `orbita-it/*` and `s3:ListBucket`
+scoped to that prefix, and nothing else. `s3:GetObject` covers `HeadObject` and
+ranged reads as well as whole-object reads, and conditional PUT needs no
+permission of its own beyond `s3:PutObject`. There is no `s3:*` and there should
+not be: the blast radius of the role being assumed by something it should not be
+is one prefix in one bucket. The exact policy is in `terraform/aws.tf`; its
+trust policy scopes the assumption to this repository and this one workflow
+file.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ListOnlyTheTestPrefix",
-      "Effect": "Allow",
-      "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::REPLACE-WITH-BUCKET",
-      "Condition": { "StringLike": { "s3:prefix": "orbita-it/*" } }
-    },
-    {
-      "Sid": "ObjectsUnderTheTestPrefix",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::REPLACE-WITH-BUCKET/orbita-it/*"
-    }
-  ]
-}
-```
-
-`s3:GetObject` covers `HeadObject` and ranged reads as well as whole-object
-reads, and conditional PUT needs no permission of its own beyond
-`s3:PutObject`. There is no `s3:*` here and there should not be: this key sits
-in a CI secret store, and the blast radius of it leaking should be one prefix
-in one bucket.
-
-Long-lived keys are the easy path, not the good one. The tests already read an
-optional `ORBITA_S3_TEST_SESSION_TOKEN`, so the AWS half can move to GitHub's
-OIDC provider and a role with the policy above without anyone touching Rust.
-That is worth doing and is not done yet.
+Cloudflare has no AWS-style OIDC role assumption for R2, so R2 keeps a scoped,
+long-lived API token. Terraform creates the R2 bucket but not that token,
+because the provider exposes no resource that returns R2's S3-compatible key
+pair. Create it in the Cloudflare dashboard under R2 > Manage R2 API Tokens,
+scoped to Object Read and Write on the one bucket; `terraform/README.md` has the
+steps. That token is `LIVE_R2_ACCESS_KEY_ID` and `LIVE_R2_SECRET_ACCESS_KEY`.
 
 ### When the configuration is absent
 
