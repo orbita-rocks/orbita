@@ -222,6 +222,20 @@ pub struct ServerConfig {
     /// How often owners publish their applied writes to object storage.
     pub flush_interval: Duration,
 
+    /// Whether the orphan sweep runs at all.
+    ///
+    /// Off by default, and deliberately so: the sweep deletes objects from the
+    /// bucket, and a destructive background loop that turns itself on the moment
+    /// a node starts is the kind of default that reclaims the wrong thing on
+    /// somebody's production data before they knew it existed. An operator opts
+    /// in (`ORBITA_SWEEP_ENABLED=true`) once they have set a grace period they
+    /// trust, and is expected to preview with [`sweep_dry_run`] first. Leaving
+    /// it off costs only leaked space, which is recoverable; leaving it on by
+    /// default could cost data, which is not.
+    ///
+    /// [`sweep_dry_run`]: ServerConfig::sweep_dry_run
+    pub sweep_enabled: bool,
+
     /// How often an owner runs the orphan sweep over the partitions it holds.
     ///
     /// The sweep reclaims objects a failed compaction or an abandoned commit
@@ -341,6 +355,7 @@ impl Default for ServerConfig {
             data_dir: PathBuf::from("data"),
             object_store: None,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            sweep_enabled: false,
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             sweep_grace_millis: orbita_storage::DEFAULT_SWEEP_GRACE_MILLIS,
             sweep_skew_millis: orbita_storage::DEFAULT_SWEEP_SKEW_MILLIS,
@@ -469,6 +484,15 @@ impl ServerConfig {
         self
     }
 
+    /// Turns the orphan sweep on. Off by default; see
+    /// [`ServerConfig::sweep_enabled`] for why a destructive loop does not start
+    /// itself.
+    #[must_use]
+    pub fn with_sweep_enabled(mut self, enabled: bool) -> Self {
+        self.sweep_enabled = enabled;
+        self
+    }
+
     /// Sets how often an owner sweeps its partitions for orphaned objects.
     #[must_use]
     pub fn with_sweep_interval(mut self, interval: Duration) -> Self {
@@ -555,6 +579,20 @@ mod tests {
             map.lookup(keyspace.id, b"anything").unwrap().owner,
             Some(config.node_id),
             "the only node owns everything"
+        );
+    }
+
+    #[test]
+    fn the_orphan_sweep_is_off_in_a_default_configuration() {
+        // The sweep deletes from the bucket, so a default configuration must not
+        // run it: an operator opts in once the grace period is set to something
+        // this deployment can stand behind.
+        let config = ServerConfig::default();
+        assert!(!config.sweep_enabled, "the sweep does not start itself");
+        assert!(!config.sweep_dry_run);
+        assert_eq!(
+            config.sweep_grace_millis,
+            orbita_storage::DEFAULT_SWEEP_GRACE_MILLIS
         );
     }
 
