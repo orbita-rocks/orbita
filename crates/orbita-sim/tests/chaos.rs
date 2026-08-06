@@ -3,6 +3,7 @@
 //! making.
 
 use orbita_core::NodeId;
+use orbita_objectstore::{ObjectStore, Precondition};
 use orbita_runtime::{
     Clock, Disk, File, OpenOptions, PeerCall, PeerHandler, Runtime, ServiceId, Transport,
     TransportError,
@@ -15,13 +16,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Appends what it is sent to its own log, so a run exercises the disk and the
-/// network at once.
+/// Appends what it is sent to its own log and publishes it to a shared
+/// bucket, so a run exercises the disk, the network, and the object store at
+/// once.
 #[derive(Clone, Default)]
 struct Logger {
     /// Absent for a node that only has to answer, which keeps the warmup test
     /// from having to stand up a disk it does not use.
     rt: Option<SimRuntime>,
+    /// Absent for the same reason. Present, it makes every delivered message
+    /// cost a conditional write, which is where the store's own draws enter
+    /// the run.
+    store: Option<Arc<dyn ObjectStore>>,
     applied: Arc<AtomicU64>,
 }
 
@@ -33,6 +39,7 @@ impl PeerHandler for Logger {
     ) -> impl Future<Output = Result<Bytes, TransportError>> + Send {
         let applied = self.applied.clone();
         let rt = self.rt.clone();
+        let store = self.store.clone();
         async move {
             if let Some(rt) = rt {
                 let file = rt
@@ -42,8 +49,20 @@ impl PeerHandler for Logger {
                     .map_err(|e| TransportError::Remote(e.to_string()))?;
                 // Both of these can fail under a hostile disk, and the point
                 // is that the run stays reproducible either way.
-                let _ = file.append(call.payload).await;
+                let _ = file.append(call.payload.clone()).await;
                 let _ = file.sync().await;
+            }
+            if let Some(store) = store {
+                // A read then a conditional write, which is the shape of a
+                // manifest swap and the shape a lost response is worst for.
+                let held = store.get("chaos/current").await.ok();
+                let precondition = match &held {
+                    Some((_, etag)) => Precondition::Match(etag.clone()),
+                    None => Precondition::NotExists,
+                };
+                let _ = store
+                    .put_if("chaos/current", call.payload, precondition)
+                    .await;
             }
             applied.fetch_add(1, Ordering::Relaxed);
             Ok(Bytes::new())
@@ -56,6 +75,10 @@ impl PeerHandler for Logger {
 fn chaotic_run(config: SimConfig) -> (String, u64) {
     let sim = Simulation::with_config(config);
     let applied = Arc::new(AtomicU64::new(0));
+    // One bucket for all three, because that is what a bucket is, and because
+    // three writers racing one key is where a store fault does the most
+    // damage.
+    let bucket = sim.bucket("chaos");
 
     for id in 1..=3u64 {
         let rt = sim.add_node(NodeId(id));
@@ -63,6 +86,7 @@ fn chaotic_run(config: SimConfig) -> (String, u64) {
             ServiceId::Wal,
             Logger {
                 rt: Some(rt.clone()),
+                store: Some(bucket.store()),
                 applied: applied.clone(),
             },
         );
@@ -117,6 +141,14 @@ fn determinism_holds_with_every_fault_turned_on() {
         assert!(
             first_faults > 0,
             "seed {seed} injected nothing, so this proves nothing"
+        );
+        // Named specifically, because the object store draws from the same
+        // stream as everything else and is the newest thing in it. A seed
+        // that faulted only the disk would leave that untested and still pass
+        // the check above.
+        assert!(
+            first.contains("store fault"),
+            "seed {seed} never faulted the object store"
         );
     }
 }
