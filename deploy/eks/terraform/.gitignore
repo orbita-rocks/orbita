@@ -1,0 +1,15 @@
+# Terraform state and local files. State is local for this disposable cluster
+# (see versions.tf), so it must never be committed: it holds resource ids and is
+# per-operator.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.tfstate.lock.info
+terraform.tfvars
+*.auto.tfvars
+*.tfplan
+
+# The lock file is kept on purpose, the same call terraform/.gitignore makes:
+# it pins the provider and module versions an apply resolved, so two operators
+# get the same graph.
+!.terraform.lock.hcl
