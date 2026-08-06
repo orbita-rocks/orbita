@@ -67,12 +67,21 @@ struct Bucket {
 
 impl Bucket {
     fn new(rate_per_sec: u32, now_nanos: u64) -> Self {
-        let capacity_milli = u64::from(rate_per_sec).max(1) * MILLI;
+        // No `.max(1)`: a rate of zero is a genuine zero-capacity bucket that
+        // admits nothing, ever. The old floor of one token handed a keyspace
+        // configured for zero one free op after every startup and every
+        // limiter rebuild, which is exactly the traffic a zero rate forbids.
+        // `Some(0)` means "admit nothing" and `None` means "unlimited"; the two
+        // are distinct and only `None` is unbounded. A refill of `elapsed * 0`
+        // is always zero, so a zero bucket never accrues a token no matter how
+        // much time passes.
+        let capacity_milli = u64::from(rate_per_sec) * MILLI;
         Self {
             rate_per_sec,
             capacity_milli,
             // Starts full, so a keyspace that has just been configured is not
-            // punished for traffic that arrived before the bucket existed.
+            // punished for traffic that arrived before the bucket existed. For
+            // a zero rate "full" is empty, which is the point.
             tokens_milli: capacity_milli,
             last_nanos: now_nanos,
         }
@@ -348,6 +357,30 @@ mod tests {
             None,
             "a sample older than the freshness window forces a remeasure"
         );
+    }
+
+    #[test]
+    fn a_zero_rate_bucket_admits_nothing_now_or_ever() {
+        let admission = Admission::new();
+        // A rate of zero is not "one op then throttled": it is nothing, at the
+        // first instant and after any amount of time has passed. The old `.max(1)`
+        // floor handed a zero-rate keyspace one seed token at startup.
+        assert!(!admission.admit_rate(ks(1), Direction::Write, Some(0), 0));
+        assert!(!admission.admit_rate(ks(1), Direction::Write, Some(0), SECOND));
+        assert!(!admission.admit_rate(ks(1), Direction::Write, Some(0), 10 * SECOND));
+        // Distinct from an unset rate, which is unlimited.
+        assert!(admission.admit_rate(ks(2), Direction::Write, None, 0));
+    }
+
+    #[test]
+    fn reconfiguring_to_zero_rebuilds_a_bucket_that_admits_nothing() {
+        let admission = Admission::new();
+        // A live limiter with budget, then reconfigured down to zero. The
+        // rebuild must not reseed a token: a keyspace throttled to zero admits
+        // nothing even though it admitted a moment ago.
+        assert!(admission.admit_rate(ks(1), Direction::Write, Some(5), 0));
+        assert!(!admission.admit_rate(ks(1), Direction::Write, Some(0), 0));
+        assert!(!admission.admit_rate(ks(1), Direction::Write, Some(0), SECOND));
     }
 
     #[test]
