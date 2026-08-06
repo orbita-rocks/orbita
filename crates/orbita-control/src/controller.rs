@@ -52,22 +52,14 @@ pub struct BootstrapSpec {
     pub leaders: Vec<(NodeId, String)>,
     /// Workers to admit before the first partition is placed, so that the
     /// keyspace is born with an owner rather than born unavailable.
+    ///
+    /// Admitted ready, which is what makes that sentence true: ownership goes
+    /// only to a ready node, so admitting these as not-ready would create the
+    /// keyspace with no owner and leave it unservable until a heartbeat and a
+    /// placement sweep had both happened. Whoever writes this list is starting
+    /// these nodes in the same breath, and any of them that turns out not to
+    /// be ready says so on its first heartbeat, a fraction of a second later.
     pub workers: Vec<(NodeId, String)>,
-}
-
-impl BootstrapSpec {
-    /// A single-node development cluster: one process that is both the leader
-    /// group and the only worker.
-    #[must_use]
-    pub fn dev(node: NodeId, address: impl Into<String>) -> Self {
-        let address = address.into();
-        Self {
-            keyspace: "default".into(),
-            config: KeyspaceConfig::default(),
-            leaders: vec![(node, address.clone())],
-            workers: vec![(node, address)],
-        }
-    }
 }
 
 /// A node as an operator sees it.
@@ -637,7 +629,9 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 role: NodeRole::Worker,
                 address: address.clone(),
                 speaks: binary_speaks(),
-                ready: false,
+                // See `BootstrapSpec::workers`: not-ready here means the
+                // keyspace created below is born with no owner.
+                ready: true,
                 draining: false,
             })
             .await?;
@@ -709,14 +703,28 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// credentials. That is the one place in this crate that does not go
     /// through the runtime seam, and it is safe to except because nothing
     /// about a simulated run depends on which secret was issued.
+    ///
+    /// The credential id is derived from `op_id`, the caller's stable name for
+    /// this invocation, rather than freshly randomised on each apply. That is
+    /// what makes a forwarded creation retry-safe: the peer transport resends
+    /// after an ambiguous connection loss even when the leader already applied
+    /// the first copy, and a fresh random id per attempt would let that resend
+    /// commit a second credential and orphan the first one's one-time secret.
+    /// A derived id makes the resend land on the same id, where the replicated
+    /// duplicate check refuses it — so the operation commits exactly once even
+    /// across a leader change, because the check reads replicated state rather
+    /// than a leader's memory. The refusal comes back as `AlreadyExists`; the
+    /// secret cannot be shown a second time, so the honest answer to a replay
+    /// is to say so rather than to invent a new credential.
     pub async fn create_credential(
         &self,
         keyspaces: Vec<String>,
         permissions: Vec<Permission>,
         description: String,
         expires_at_millis: Option<u64>,
+        op_id: u128,
     ) -> Result<(String, String)> {
-        let id = format!("cred-{}", random_hex(8)?);
+        let id = format!("cred-{op_id:032x}");
         let secret = random_hex(32)?;
         let credential = Credential {
             id: id.clone(),

@@ -1222,7 +1222,12 @@ fn bootstrapping_a_cluster_that_already_has_state_changes_nothing() {
     let before = cluster.map();
 
     let controller = cluster.controller.clone();
-    let spec = BootstrapSpec::dev(LEADER, "10.0.0.1:7000");
+    let spec = BootstrapSpec {
+        keyspace: "default".to_string(),
+        config: KeyspaceConfig::default(),
+        leaders: Vec::new(),
+        workers: vec![(LEADER, "10.0.0.1:7000".to_string())],
+    };
     let created = cluster
         .sim
         .block_on(async move { controller.bootstrap(&spec).await });
@@ -2161,6 +2166,7 @@ fn a_credential_round_trips_through_the_replicated_log() {
                         vec![orbita_control::Permission::Read],
                         "a reader".into(),
                         None,
+                        0x1234_5678_9abc_def0,
                     )
                     .await
             }
