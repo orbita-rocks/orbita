@@ -34,7 +34,9 @@ use orbita_format::testing::MemoryStore;
 use orbita_proto::v1::{GetRequest, SetRequest};
 use orbita_sim::{harness, SimRuntime, Simulation};
 
-use std::sync::Arc;
+use orbita_runtime::{Clock, Runtime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const KEYSPACE: &str = "default";
@@ -95,6 +97,39 @@ fn map_with(
 
 fn start_node(sim: &Simulation, node: NodeId, source: &StaticMapSource) -> Arc<Node<SimRuntime>> {
     start_node_reporting(sim, node, source, &Arc::new(crate::ReadinessGate::new()))
+}
+
+/// Starts a node whose storage lives in a store the caller controls, so a
+/// scenario can give every node the same bucket. Production runs one object
+/// store for the whole cluster; a per-node store hides every bug that only
+/// appears when a promoted node reopens over a manifest a different node
+/// published.
+fn start_node_on_store(
+    sim: &Simulation,
+    node: NodeId,
+    source: &StaticMapSource,
+    store: Arc<MemoryStore>,
+) -> Arc<Node<SimRuntime>> {
+    let runtime = sim.add_node(node);
+    let layout = DataLayout {
+        store,
+        wal_root: "wal".to_string(),
+        wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+    };
+    let source = BoxedMapSource::new(source.clone());
+    let gate = Arc::new(crate::ReadinessGate::new());
+    sim.block_on(async move {
+        Node::start(
+            runtime,
+            node,
+            layout,
+            source,
+            Duration::from_millis(150),
+            gate,
+        )
+        .await
+        .expect("the node starts")
+    })
 }
 
 /// The same, with the readiness gate the node reports through handed in, so a
@@ -612,6 +647,149 @@ fn a_write_that_failed_on_the_old_owner_is_not_visible_after_the_handoff() {
             if kept_visible.iter().any(|found| !found) {
                 return Err(sim.failure(format!(
                     "an acknowledged write did not survive the handoff: {kept_visible:?}",
+                )));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_write_acknowledged_while_a_handoff_is_in_flight_survives_it() {
+    harness::check_seeds(
+        "placement::a_write_acknowledged_while_a_handoff_is_in_flight_survives_it",
+        400,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let source = StaticMapSource::new(placed_on_both());
+            // One bucket, as production runs it, so the promoted node reopens
+            // over the manifest the old owner published.
+            let store = Arc::new(MemoryStore::new());
+            let owner = start_node_on_store(&sim, OWNER, &source, Arc::clone(&store));
+            let first = start_node_on_store(&sim, FIRST, &source, Arc::clone(&store));
+            let second = start_node_on_store(&sim, SECOND, &source, Arc::clone(&store));
+            poll_maps(&sim, &[&owner, &first, &second], 1);
+
+            // FIRST is cut off for the first stretch and a flusher runs, which
+            // is the load the issue calls for: it keeps batches in flight to a
+            // reachable replica long enough that the drain below can start
+            // truncating the log while one of their acknowledgements is still
+            // on the wire. That race is the bug.
+            sim.partition(OWNER, FIRST);
+
+            // A writer and a flusher run against the owner concurrently with
+            // the drain, rather than being quiesced before it. The hazard is a
+            // write that is acknowledged to its client by a batch whose reply
+            // lands while the drain is giving up the uncommitted tail: without
+            // the fix the drain drops it from the log and the acknowledgement
+            // is handed out anyway, so the new owner never sees it.
+            let acked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let writer_runtime = sim.runtime(OWNER);
+            let writing = Arc::clone(&owner);
+            let acked_writer = Arc::clone(&acked);
+            let stop_writer = Arc::clone(&stop);
+            sim.spawn(async move {
+                let mut i = 0u64;
+                while !stop_writer.load(Ordering::Relaxed) {
+                    let key = format!("drain-{i}");
+                    let outcome = writing
+                        .set(
+                            SetRequest {
+                                keyspace: KEYSPACE.to_string(),
+                                key: key.clone().into_bytes(),
+                                value: i.to_be_bytes().to_vec(),
+                                ttl_millis: None,
+                                condition: None,
+                            },
+                            false,
+                        )
+                        .await;
+                    if matches!(outcome, Ok(response) if response.applied) {
+                        acked_writer.lock().unwrap().push(key);
+                    }
+                    i += 1;
+                    writer_runtime
+                        .clock()
+                        .sleep(Duration::from_micros(200))
+                        .await;
+                }
+            });
+
+            let flusher_runtime = sim.runtime(OWNER);
+            let flushing = Arc::clone(&owner);
+            let stop_flusher = Arc::clone(&stop);
+            sim.spawn(async move {
+                while !stop_flusher.load(Ordering::Relaxed) {
+                    flushing.flush_owned().await;
+                    flusher_runtime
+                        .clock()
+                        .sleep(Duration::from_micros(500))
+                        .await;
+                }
+            });
+
+            // Let the write/flush pipeline get going, with the map still at its
+            // starting shape.
+            sim.run_for(Duration::from_millis(5));
+
+            // The link heals, so the owner can carry FIRST up. With the log
+            // checkpointed by the flusher, that catch-up closes the gap out of
+            // the bucket rather than out of any log.
+            sim.heal_all();
+
+            // Close write admission and let replication settle, then confirm
+            // FIRST is caught up to the owner exactly as the control plane
+            // requires before it will hand a partition over. Only then is a
+            // lost write a reopen bug rather than the promotion of a replica
+            // that never had it.
+            stop.store(true, Ordering::Relaxed);
+            let syncing = Arc::clone(&owner);
+            sim.block_on(async move { syncing.prepare_handoff().await });
+            sim.run_until_idle();
+            let owner_at = sim.block_on(durable(Arc::clone(&owner)));
+            let first_at = sim.block_on(durable(Arc::clone(&first)));
+            if first_at < owner_at {
+                return Err(sim.failure(format!(
+                    "FIRST is at {first_at:?} while the owner holds {owner_at:?}, so this seed \
+                     promotes a replica the control plane would have refused",
+                )));
+            }
+
+            // The handoff: a caught-up replica takes the partition at a higher
+            // epoch and reopens as owner, then republishes its manifest.
+            source.set(map_with(
+                MapVersion(3),
+                FIRST,
+                Epoch(2),
+                vec![OWNER, SECOND],
+            ));
+            poll_maps(&sim, &[&first, &second, &owner], 2);
+            let republishing = Arc::clone(&first);
+            sim.block_on(async move { republishing.flush_owned().await });
+            sim.run_until_idle();
+
+            // Every write the client was told succeeded has to be readable from
+            // the new owner. A write the drain dropped must never have been
+            // acknowledged, so it is never in this list; the bug was a write
+            // that was both dropped and acknowledged.
+            let acked = std::mem::take(&mut *acked.lock().unwrap());
+            let missing: Vec<String> = acked
+                .iter()
+                .filter(|key| !is_visible(&sim, &first, key))
+                .cloned()
+                .collect();
+            drop(owner);
+            drop(first);
+            drop(second);
+
+            if !missing.is_empty() {
+                return Err(sim.failure(format!(
+                    "{} acknowledged write(s) went missing across an in-flight handoff, \
+                     e.g. {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(5)],
                 )));
             }
             Ok(())
