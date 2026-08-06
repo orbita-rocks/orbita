@@ -105,11 +105,18 @@ fn run(cli: Cli) -> Result<Outcome> {
         // A one-shot session is built, used once, and dropped. The endpoint is
         // named on the failure path, because "connection refused" without an
         // address is the least useful error a CLI can produce.
+        //
+        // The session is built *inside* `block_on`, not before it. Dialing a
+        // channel — even a lazy one — needs a Tokio reactor in scope, and
+        // constructing it out here panicked every network command with "there
+        // is no reactor running" before it could report a real error.
         command => {
             let endpoint = config.client.endpoint.clone();
-            let session = Session::new(config, format, false)?;
-            block_on(session::dispatch(&session, format, command))
-                .with_context(|| format!("while talking to {endpoint}"))
+            block_on(async move {
+                let session = Session::new(config, format, false)?;
+                session::dispatch(&session, format, command).await
+            })
+            .with_context(|| format!("while talking to {endpoint}"))
         }
     }
 }

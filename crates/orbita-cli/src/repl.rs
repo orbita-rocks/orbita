@@ -53,7 +53,13 @@ pub fn run(config: Config, format: Format) -> Result<Outcome> {
         .enable_all()
         .build()
         .context("could not start the runtime for the interactive session")?;
-    let mut session = Session::new(config, format, true)?;
+    // Build the session inside the runtime: dialing a channel, even a lazy one,
+    // needs a reactor in scope, and constructing it outside `block_on` panicked
+    // the session on startup. It is built in its own `block_on` rather than
+    // under a held `enter` guard, because `block_on` cannot be called again
+    // while an enter guard for the same runtime is active, and the loop below
+    // calls it once per line.
+    let mut session = runtime.block_on(async { Session::new(config, format, true) })?;
 
     let mut editor =
         DefaultEditor::new().context("could not start the line editor for interactive mode")?;
