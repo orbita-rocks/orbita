@@ -187,6 +187,16 @@ impl Server {
             .root_credential
             .as_deref()
             .map(orbita_control::root_secret_hash);
+        // How long the credential cache may go unrefreshed before it stops
+        // being trusted. Tied to the poll cadence rather than a bare wall-clock
+        // constant so that raising `control_poll_interval` cannot make the
+        // bound smaller than a single poll and trip on ordinary jitter: it is a
+        // budget of missed polls. At the default 250ms poll that is 10s, which
+        // bounds how long a credential revoked during a control-plane outage
+        // can keep authorizing. See `auth::Authenticator`.
+        const CREDENTIAL_CACHE_STALENESS_POLLS: u32 = 40;
+        let credential_cache_max_staleness =
+            config.control_poll_interval * CREDENTIAL_CACHE_STALENESS_POLLS;
         // The credential cache the client edge enforces against. Empty until
         // the control loop's first fetch, apart from the root overlay above;
         // harmless while auth is off, and safe while it is on, since an empty
@@ -194,6 +204,7 @@ impl Server {
         let authenticator = Arc::new(auth::Authenticator::new(
             config.require_auth,
             root_credential,
+            credential_cache_max_staleness,
             runtime.clock().clone(),
         ));
         for (node, address) in &config.peers {
