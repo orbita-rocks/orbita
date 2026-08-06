@@ -132,7 +132,13 @@ async fn two_of_three_configured_leaders_form_replicate_and_restart() {
         .await
         .contains(&"replicated".to_string()));
 
-    let mut split_refused = false;
+    // Split is wired to the real worker-prepared protocol now, not stubbed out
+    // with Unimplemented. This leader group runs no workers, so the bootstrap
+    // partition has no owner to prepare child storage, and the honest refusal
+    // is a well-formed request that cannot proceed — InvalidArgument, never
+    // Unimplemented. A cluster with a worker splits for real; this asserts the
+    // wire reaches the protocol rather than a stub.
+    let mut split_reached_the_protocol = false;
     for server in [&one, &two] {
         let mut client = AdminClient::connect(format!("http://{}", server.local_addr()))
             .await
@@ -157,14 +163,19 @@ async fn two_of_three_configured_leaders_form_replicate_and_restart() {
                 split_key: b"m".to_vec(),
             })
             .await
-            .expect_err("partition split remains disabled at the wire");
-        assert_eq!(error.code(), Code::Unimplemented);
-        split_refused = true;
+            .expect_err("a partition with no owner cannot prepare child storage");
+        assert_ne!(
+            error.code(),
+            Code::Unimplemented,
+            "split is no longer stubbed; it runs the worker-prepared protocol"
+        );
+        assert_eq!(error.code(), Code::InvalidArgument);
+        split_reached_the_protocol = true;
         break;
     }
     assert!(
-        split_refused,
-        "the control leader must refuse partition split"
+        split_reached_the_protocol,
+        "the control leader must run the split protocol"
     );
 
     two.shutdown().await.expect("the second voter stops");

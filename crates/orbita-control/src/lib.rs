@@ -2,7 +2,9 @@
 //!
 //! The nodes that hold the cluster's authoritative metadata: the partition
 //! map, worker membership, keyspace definitions and quotas, and ownership
-//! epochs. It detects dead workers and fences and replaces partition owners.
+//! epochs. It detects dead workers, fences and replaces partition owners, and
+//! drives the worker-prepared partition split that has workers ready child
+//! storage before a parent's map entry retires.
 //!
 //! Nothing here is on the data path. Workers cache what they need and keep
 //! serving reads while the leader group is unavailable, which is deliberate: a

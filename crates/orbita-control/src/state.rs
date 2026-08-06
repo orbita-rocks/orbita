@@ -35,9 +35,41 @@ use orbita_core::{
     PartitionInfo, PartitionMap, Result,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const PROTOCOL_0_1: ClusterVersion = ClusterVersion::new(0, 1);
+
+/// A split that has begun but not finished.
+///
+/// While one of these exists the parent keeps its whole range and keeps
+/// serving; this only records the intent and tracks which holders have
+/// prepared storage for the children. The parent's map entry is retired only
+/// once `prepared` covers `required`, which is the prepare-before-retire
+/// ordering [PR #53](https://github.com/anomalyco/orbita/pull/53) closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingSplit {
+    /// The boundary key. Kept rather than the derived ranges so the completion
+    /// entry recomputes them against the parent as it stands then, which is
+    /// the same range unless a merge landed in between — and a merge cannot,
+    /// because a pending split blocks the parent's replica set from moving.
+    pub at: bytes::Bytes,
+    pub lower: PartitionId,
+    pub upper: PartitionId,
+    /// The parent's epoch when the split began. A failover bumps it, which is
+    /// what makes every later entry in this split fail closed rather than act
+    /// on a parent the cluster has already moved out from under the split.
+    pub epoch: Epoch,
+    /// The map version the opening entry produced. A holder whose last report
+    /// is at or beyond it has seen the split and had the chance to prepare;
+    /// that is the evidence the controller turns into a `MarkSplitPrepared`.
+    pub begin_map_version: MapVersion,
+    /// The owner and replicas that held the parent when the split began. Every
+    /// one must prepare, because any of them can be the child owner or a
+    /// replica a later failover promotes.
+    pub required: Vec<NodeId>,
+    /// Which of `required` have acknowledged preparation.
+    pub prepared: BTreeSet<NodeId>,
+}
 
 /// Where a partition is in its ownership lifecycle.
 ///
@@ -107,6 +139,9 @@ pub struct ClusterState {
     keyspaces: BTreeMap<KeyspaceId, Keyspace>,
     phases: BTreeMap<PartitionId, PartitionPhase>,
     nodes: BTreeMap<NodeId, NodeRecord>,
+    /// Splits in flight, keyed by the parent being divided. A parent has at
+    /// most one, because a second split is refused while the first is open.
+    pending_splits: BTreeMap<PartitionId, PendingSplit>,
     handoffs: BTreeMap<NodeId, BTreeMap<PartitionId, HandoffCheckpoint>>,
     credentials: BTreeMap<String, Credential>,
     next_keyspace_id: u64,
@@ -174,6 +209,19 @@ impl ClusterState {
     #[must_use]
     pub fn phase(&self, partition: PartitionId) -> Option<PartitionPhase> {
         self.phases.get(&partition).copied()
+    }
+
+    /// The splits in flight, for the controller's driver to advance.
+    pub(crate) fn pending_splits(&self) -> impl Iterator<Item = (PartitionId, &PendingSplit)> {
+        self.pending_splits.iter().map(|(id, split)| (*id, split))
+    }
+
+    /// Whether `partition` is the parent of a split that has begun and not
+    /// finished. Exposed for the coverage the acceptance test reads: a child
+    /// id must never appear in the map while its parent is still pending.
+    #[must_use]
+    pub fn is_splitting(&self, partition: PartitionId) -> bool {
+        self.pending_splits.contains_key(&partition)
     }
 
     /// True when nothing has ever been created, which is the condition
@@ -312,6 +360,26 @@ impl ClusterState {
                 upper,
                 expect_epoch,
             } => self.split_partition(*parent, at.clone(), *lower, *upper, *expect_epoch),
+            ControlCommand::BeginSplit {
+                parent,
+                at,
+                lower,
+                upper,
+                expect_epoch,
+            } => self.begin_split(*parent, at.clone(), *lower, *upper, *expect_epoch),
+            ControlCommand::MarkSplitPrepared {
+                parent,
+                node,
+                expect_epoch,
+            } => self.mark_split_prepared(*parent, *node, *expect_epoch),
+            ControlCommand::CompleteSplit {
+                parent,
+                expect_epoch,
+            } => self.complete_split(*parent, *expect_epoch),
+            ControlCommand::AbortSplit {
+                parent,
+                expect_epoch,
+            } => self.abort_split(*parent, *expect_epoch),
             ControlCommand::SetClusterVersion { version, expect } => {
                 self.set_cluster_version(*version, *expect)
             }
@@ -323,15 +391,34 @@ impl ClusterState {
             && self.version_initialized
             && self.version >= PROTOCOL_0_1
         {
+            // The old one-entry split. Still applied on replay of a historical
+            // log, but never accepted as a new proposal once the safe protocol
+            // is speakable, because it retires the parent before any child has
+            // storage. The worker-prepared protocol below is the replacement.
             return Err(Error::Unavailable(
-                "partition split is disabled until child storage preparation is implemented".into(),
+                "the single-entry partition split is superseded by the worker-prepared protocol; \
+                 use BeginSplit"
+                    .into(),
             ));
         }
-        if matches!(command, ControlCommand::CompleteFenceDrain { .. })
-            && (!self.version_initialized || self.version < PROTOCOL_0_1)
-        {
+        // The protocol-0.1 commands. Refused below the active version that
+        // introduced them so a historical log never carries a tag a pre-0.1
+        // binary cannot decode, and a rolling upgrade never sees one member
+        // apply an entry another cannot. `finalize-upgrade` is what turns them
+        // on, by which point every member speaks 0.1.
+        let is_protocol_0_1 = matches!(
+            command,
+            ControlCommand::CompleteFenceDrain { .. }
+                | ControlCommand::BeginSplit { .. }
+                | ControlCommand::MarkSplitPrepared { .. }
+                | ControlCommand::CompleteSplit { .. }
+                | ControlCommand::AbortSplit { .. }
+        );
+        if is_protocol_0_1 && (!self.version_initialized || self.version < PROTOCOL_0_1) {
             return Err(Error::Unavailable(
-                "replicated fence-drain completion requires active cluster protocol 0.1".into(),
+                "the worker-prepared split and replicated fence-drain require active cluster \
+                 protocol 0.1"
+                    .into(),
             ));
         }
         Ok(())
@@ -566,6 +653,7 @@ impl ClusterState {
             .collect();
         for partition in doomed {
             self.phases.remove(&partition);
+            self.pending_splits.remove(&partition);
         }
         // `PartitionMap` can add a keyspace but not remove one, so the map is
         // rebuilt from the tables this crate owns. See the note in the crate
@@ -678,6 +766,12 @@ impl ClusterState {
         if self.fenced_owner_stays_a_replica() && !info.replicas.contains(&deposed) {
             info.replicas.push(deposed);
         }
+        // A fence moves the epoch and the ownership out from under any split in
+        // progress, so the split can no longer be completed against them.
+        // Dropping it here is the cleanup; the epoch bump alone already makes
+        // every remaining split entry fail closed, so this only stops a dead
+        // pending record from lingering.
+        self.pending_splits.remove(&partition);
         self.replace_partition(info);
         self.bump_map_version();
         self.phases.insert(
@@ -787,6 +881,17 @@ impl ClusterState {
         expect_epoch: Epoch,
     ) -> Result<()> {
         let mut info = self.check_epoch(partition, expect_epoch)?;
+        // The replica set is the snapshot a pending split's `required` was
+        // taken from, and a holder added now would never be asked to prepare
+        // yet could be a child owner after completion. Freezing the set for the
+        // duration of the split keeps `required` equal to who actually holds
+        // the parent.
+        if self.pending_splits.contains_key(&partition) {
+            return Err(Error::InvalidArgument(format!(
+                "partition {partition} is splitting; its replica set cannot change until the \
+                 split completes or aborts"
+            )));
+        }
         if info.owner.is_some_and(|o| replicas.contains(&o)) {
             return Err(Error::InvalidArgument(
                 "the owner must not also be listed as a replica".into(),
@@ -853,6 +958,193 @@ impl ClusterState {
             .next_partition_id
             .max(lower.get() + 1)
             .max(upper.get() + 1);
+        self.bump_map_version();
+        Ok(())
+    }
+
+    /// Opens a worker-prepared split without moving any key.
+    ///
+    /// The parent stays in the map with its whole range and keeps serving. All
+    /// this does is record the intent and snapshot the holders that must
+    /// prepare. The map version bumps so those holders notice, which is the
+    /// only signal a worker gets to start building child storage while the
+    /// partition table still says the parent owns everything.
+    fn begin_split(
+        &mut self,
+        parent: PartitionId,
+        at: bytes::Bytes,
+        lower: PartitionId,
+        upper: PartitionId,
+        expect_epoch: Epoch,
+    ) -> Result<()> {
+        let info = self.check_epoch(parent, expect_epoch)?;
+        if self.pending_splits.contains_key(&parent) {
+            return Err(Error::InvalidArgument(format!(
+                "partition {parent} is already splitting"
+            )));
+        }
+        // A partition with no owner has no node holding its data, so there is
+        // nobody to prepare the children. It becomes splittable the moment it
+        // is placed; until then the honest answer is that it is unavailable.
+        let Some(owner) = info.owner else {
+            return Err(Error::InvalidArgument(format!(
+                "partition {parent} has no owner to prepare child storage; place it first"
+            )));
+        };
+        if lower == upper || self.child_id_in_use(lower) || self.child_id_in_use(upper) {
+            return Err(Error::InvalidArgument(
+                "a child partition id is already in use".into(),
+            ));
+        }
+        // Validate the boundary against the parent's range without mutating
+        // anything. The clone is cheap and keeps `at` for the pending record,
+        // which the completion entry re-splits against the range as it stands
+        // then rather than trusting ranges computed a whole protocol ago.
+        info.range.clone().split_at(at.clone()).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "the split key is not inside partition {parent}'s range"
+            ))
+        })?;
+
+        let mut required = vec![owner];
+        required.extend(info.replicas.iter().copied());
+        // Reserve the child ids so a concurrent keyspace creation cannot take
+        // one before the split completes, the same way every other id is never
+        // reused.
+        self.next_partition_id = self
+            .next_partition_id
+            .max(lower.get() + 1)
+            .max(upper.get() + 1);
+        // Bump first, then read: the version stored on the pending split is the
+        // one holders will report once they have seen the split begin.
+        self.bump_map_version();
+        self.pending_splits.insert(
+            parent,
+            PendingSplit {
+                at,
+                lower,
+                upper,
+                epoch: info.epoch,
+                begin_map_version: self.map.version(),
+                required,
+                prepared: BTreeSet::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Whether `id` is spoken for as a live partition or as another split's
+    /// pending child.
+    fn child_id_in_use(&self, id: PartitionId) -> bool {
+        self.phases.contains_key(&id)
+            || self
+                .pending_splits
+                .values()
+                .any(|split| split.lower == id || split.upper == id)
+    }
+
+    /// Records that one holder has prepared storage for a pending split's
+    /// children.
+    fn mark_split_prepared(
+        &mut self,
+        parent: PartitionId,
+        node: NodeId,
+        expect_epoch: Epoch,
+    ) -> Result<()> {
+        self.check_epoch(parent, expect_epoch)?;
+        let split = self.pending_splits.get_mut(&parent).ok_or_else(|| {
+            Error::InvalidArgument(format!("partition {parent} is not splitting"))
+        })?;
+        if !split.required.contains(&node) {
+            return Err(Error::InvalidArgument(format!(
+                "node {node} does not hold partition {parent} and cannot prepare its split"
+            )));
+        }
+        split.prepared.insert(node);
+        Ok(())
+    }
+
+    /// Retires the parent and installs both children, but only once every
+    /// holder has prepared.
+    ///
+    /// This is the entry the whole protocol exists to gate. Refusing it until
+    /// `prepared` covers `required` is what guarantees no child ever appears in
+    /// the map before a node has storage for it, and doing the swap in a single
+    /// entry is what keeps coverage unbroken across the retirement.
+    fn complete_split(&mut self, parent: PartitionId, expect_epoch: Epoch) -> Result<()> {
+        let info = self.check_epoch(parent, expect_epoch)?;
+        let split = self.pending_splits.get(&parent).ok_or_else(|| {
+            Error::InvalidArgument(format!("partition {parent} is not splitting"))
+        })?;
+        let unprepared: Vec<NodeId> = split
+            .required
+            .iter()
+            .copied()
+            .filter(|node| !split.prepared.contains(node))
+            .collect();
+        if !unprepared.is_empty() {
+            // Unavailable rather than InvalidArgument: the request is well
+            // formed and will succeed once the named holders prepare, which is
+            // a wait, not a mistake.
+            return Err(Error::Unavailable(format!(
+                "partition {parent} cannot retire until these holders prepare child storage: \
+                 {unprepared:?}"
+            )));
+        }
+        let (at, lower, upper) = (split.at.clone(), split.lower, split.upper);
+        let (low_range, high_range) = info.range.clone().split_at(at).ok_or_else(|| {
+            // The range was validated at begin and the pending split blocks the
+            // replica set from moving, so a parent whose range no longer holds
+            // the key is an internal inconsistency rather than a caller error.
+            Error::Internal(format!(
+                "the boundary of the split on partition {parent} left its range"
+            ))
+        })?;
+
+        // Both children start one epoch above the parent so a write the old
+        // owner had in flight against the parent is fenced by the split rather
+        // than landing in whichever child holds its key. The keys keep their
+        // versions: a split does not merge two sequences, so no key's Lamport
+        // moves and none is reissued, which is what ADR 0002 requires.
+        let epoch = info.epoch.next();
+        let start = info.range.start().to_vec();
+        self.pending_splits.remove(&parent);
+        self.map.remove_partition(info.keyspace, &start);
+        for (id, range) in [(lower, low_range), (upper, high_range)] {
+            self.map.insert_partition(PartitionInfo {
+                id,
+                keyspace: info.keyspace,
+                range,
+                owner: info.owner,
+                epoch,
+                replicas: info.replicas.clone(),
+            });
+            self.phases.insert(
+                id,
+                if info.owner.is_some() {
+                    PartitionPhase::Serving
+                } else {
+                    PartitionPhase::Unowned
+                },
+            );
+        }
+        self.phases.remove(&parent);
+        self.next_partition_id = self
+            .next_partition_id
+            .max(lower.get() + 1)
+            .max(upper.get() + 1);
+        self.bump_map_version();
+        Ok(())
+    }
+
+    /// Abandons a pending split, leaving the parent exactly as it was.
+    fn abort_split(&mut self, parent: PartitionId, expect_epoch: Epoch) -> Result<()> {
+        self.check_epoch(parent, expect_epoch)?;
+        if self.pending_splits.remove(&parent).is_none() {
+            return Err(Error::InvalidArgument(format!(
+                "partition {parent} is not splitting"
+            )));
+        }
         self.bump_map_version();
         Ok(())
     }
@@ -1288,6 +1580,401 @@ mod tests {
 
         assert!(matches!(result, Err(Error::Unavailable(_))));
         assert_eq!(state.map(), &before);
+    }
+
+    /// Everyone that holds a splitting parent, owner first.
+    fn holders(info: &PartitionInfo) -> Vec<NodeId> {
+        let mut all = vec![info.owner.expect("an owner")];
+        all.extend(info.replicas.iter().copied());
+        all
+    }
+
+    #[test]
+    fn a_begin_split_keeps_the_parent_serving_its_whole_range() {
+        // The heart of the fix: opening a split changes no key's owner. The
+        // parent still covers everything and neither child is in the map, so
+        // there is no instant where a key is owned by a partition that has no
+        // storage behind it.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        let ks = parent.keyspace;
+
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(10),
+                upper: PartitionId(11),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+
+        assert_eq!(state.map().check_coverage(), Ok(()));
+        assert!(state.is_splitting(parent.id));
+        assert_eq!(state.map().lookup(ks, b"a").unwrap().id, parent.id);
+        assert_eq!(state.map().lookup(ks, b"zzz").unwrap().id, parent.id);
+        assert!(state.map().partition(PartitionId(10)).is_none());
+        assert!(state.map().partition(PartitionId(11)).is_none());
+        // The parent's epoch has not moved, so a write in flight against it is
+        // still accepted while the children are being prepared.
+        assert_eq!(
+            state.map().partition(parent.id).unwrap().epoch,
+            parent.epoch
+        );
+    }
+
+    #[test]
+    fn a_split_retires_the_parent_only_after_every_holder_prepares_child_storage() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        let ks = parent.keyspace;
+        let holders = holders(&parent);
+
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(10),
+                upper: PartitionId(11),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+
+        // Completing before anyone has prepared is refused, and the map is
+        // left exactly as it was.
+        let before = state.map().clone();
+        assert!(matches!(
+            state.apply(&ControlCommand::CompleteSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            }),
+            Err(Error::Unavailable(_))
+        ));
+        assert_eq!(state.map(), &before);
+
+        // Preparing every holder but the last still does not let it complete.
+        for holder in &holders[..holders.len() - 1] {
+            state
+                .apply(&ControlCommand::MarkSplitPrepared {
+                    parent: parent.id,
+                    node: *holder,
+                    expect_epoch: parent.epoch,
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            state.apply(&ControlCommand::CompleteSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            }),
+            Err(Error::Unavailable(_))
+        ));
+        assert!(
+            state.map().partition(parent.id).is_some(),
+            "the parent must not retire while a holder is unprepared"
+        );
+
+        // The last holder prepares, and only now does the parent retire.
+        state
+            .apply(&ControlCommand::MarkSplitPrepared {
+                parent: parent.id,
+                node: *holders.last().unwrap(),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::CompleteSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+
+        assert_eq!(state.map().check_coverage(), Ok(()));
+        assert!(
+            state.map().partition(parent.id).is_none(),
+            "the parent is gone once its children own its range"
+        );
+        assert!(!state.is_splitting(parent.id));
+        assert_eq!(state.map().lookup(ks, b"a").unwrap().id, PartitionId(10));
+        assert_eq!(state.map().lookup(ks, b"m").unwrap().id, PartitionId(11));
+        assert_eq!(state.map().lookup(ks, b"zzz").unwrap().id, PartitionId(11));
+    }
+
+    #[test]
+    fn a_completed_split_puts_both_children_one_epoch_above_the_parent() {
+        // The Lamport constraint from ADR 0002 sits on this: the children keep
+        // the parent's data and continue its sequence, and the epoch bump
+        // fences a write the old owner had in flight against the parent rather
+        // than letting it land in whichever child holds its key. No key's
+        // version is reissued or moved backwards by the split.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+
+        for child in [PartitionId(10), PartitionId(11)] {
+            assert_eq!(
+                state.map().partition(child).unwrap().epoch,
+                parent.epoch.next()
+            );
+            assert_eq!(state.map().partition(child).unwrap().owner, parent.owner);
+        }
+    }
+
+    #[test]
+    fn the_worker_prepared_split_needs_protocol_0_1_so_old_logs_still_replay() {
+        // A 0.0 cluster, and every mid-rollout member behaving as one, refuses
+        // the new commands. That is what keeps a historical log free of tags a
+        // pre-0.1 binary cannot decode and keeps a rolling upgrade applying
+        // every committed entry identically on both binaries.
+        let mut state = bootstrapped();
+        set_version(&mut state, ClusterVersion::ZERO);
+        let parent = state.map().partitions().next().unwrap().clone();
+        let before = state.map().clone();
+
+        assert!(matches!(
+            state.apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(10),
+                upper: PartitionId(11),
+                expect_epoch: parent.epoch,
+            }),
+            Err(Error::Unavailable(_))
+        ));
+        assert!(!state.is_splitting(parent.id));
+        assert_eq!(state.map(), &before);
+    }
+
+    #[test]
+    fn a_split_cannot_reuse_a_partition_id_that_is_already_live() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        let refused = state.apply(&ControlCommand::BeginSplit {
+            parent: parent.id,
+            at: Bytes::from_static(b"m"),
+            lower: parent.id,
+            upper: PartitionId(11),
+            expect_epoch: parent.epoch,
+        });
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+        assert!(!state.is_splitting(parent.id));
+    }
+
+    #[test]
+    fn a_begin_split_with_a_key_outside_the_range_is_refused() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+
+        // "z" is above the lower child's upper bound of "m".
+        let refused = state.apply(&ControlCommand::BeginSplit {
+            parent: lower.id,
+            at: Bytes::from_static(b"z"),
+            lower: PartitionId(12),
+            upper: PartitionId(13),
+            expect_epoch: lower.epoch,
+        });
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+        assert_eq!(state.map().check_coverage(), Ok(()));
+    }
+
+    #[test]
+    fn a_second_split_of_a_partition_already_splitting_is_refused() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(10),
+                upper: PartitionId(11),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        let refused = state.apply(&ControlCommand::BeginSplit {
+            parent: parent.id,
+            at: Bytes::from_static(b"n"),
+            lower: PartitionId(12),
+            upper: PartitionId(13),
+            expect_epoch: parent.epoch,
+        });
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn a_split_of_an_unowned_partition_is_refused_because_nobody_can_prepare() {
+        let mut state = ClusterState::new();
+        state
+            .apply(&ControlCommand::SetClusterVersion {
+                version: PROTOCOL_0_1,
+                expect: ClusterVersion::ZERO,
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::CreateKeyspace {
+                id: KeyspaceId(1),
+                name: "default".into(),
+                config: KeyspaceConfig::default(),
+                created_at_millis: 1,
+                first_partition: PartitionId(1),
+                owner: None,
+                replicas: vec![],
+            })
+            .unwrap();
+
+        let refused = state.apply(&ControlCommand::BeginSplit {
+            parent: PartitionId(1),
+            at: Bytes::from_static(b"m"),
+            lower: PartitionId(10),
+            upper: PartitionId(11),
+            expect_epoch: Epoch(1),
+        });
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn fencing_a_splitting_parent_abandons_the_split() {
+        // A failover has to be free to fence a partition mid-split, and doing
+        // so must leave no way to complete the split against the old epoch.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(10),
+                upper: PartitionId(11),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: parent.id,
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+
+        assert!(
+            !state.is_splitting(parent.id),
+            "the fence dropped the split"
+        );
+        // The old epoch is gone, so both remaining split entries fail closed.
+        assert!(matches!(
+            state.apply(&ControlCommand::MarkSplitPrepared {
+                parent: parent.id,
+                node: parent.owner.unwrap(),
+                expect_epoch: parent.epoch,
+            }),
+            Err(Error::StaleEpoch { .. })
+        ));
+        assert!(matches!(
+            state.apply(&ControlCommand::CompleteSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            }),
+            Err(Error::StaleEpoch { .. })
+        ));
+        assert_eq!(state.map().check_coverage(), Ok(()));
+    }
+
+    #[test]
+    fn an_aborted_split_leaves_the_parent_exactly_as_it_was() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        let before_partition = state.map().partition(parent.id).unwrap().clone();
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(10),
+                upper: PartitionId(11),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::AbortSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+
+        assert!(!state.is_splitting(parent.id));
+        assert_eq!(state.map().partition(parent.id).unwrap(), &before_partition);
+        // The child ids were reserved and are not reused, so a fresh split
+        // takes new numbers rather than the abandoned ones.
+        assert!(state.next_partition_id().get() > 11);
+    }
+
+    #[test]
+    fn a_splitting_partitions_replica_set_is_frozen_until_the_split_resolves() {
+        // `required` is a snapshot of the holders at begin, so letting the
+        // replica set move mid-split could name a child owner that never
+        // prepared. The set is frozen until the split completes or aborts.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(10),
+                upper: PartitionId(11),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+
+        let refused = state.apply(&ControlCommand::SetReplicas {
+            partition: parent.id,
+            replicas: vec![],
+            expect_epoch: parent.epoch,
+        });
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+    }
+
+    /// Runs a split all the way through: open it, prepare every holder, retire
+    /// the parent. Used by the tests that care about the result rather than the
+    /// ordering that produced it.
+    fn drive_split_to_completion(
+        state: &mut ClusterState,
+        parent: &PartitionInfo,
+        at: &'static [u8],
+        lower: PartitionId,
+        upper: PartitionId,
+    ) {
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(at),
+                lower,
+                upper,
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        for holder in holders(parent) {
+            state
+                .apply(&ControlCommand::MarkSplitPrepared {
+                    parent: parent.id,
+                    node: holder,
+                    expect_epoch: parent.epoch,
+                })
+                .unwrap();
+        }
+        state
+            .apply(&ControlCommand::CompleteSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission
 use crate::state::{ClusterState, NodeRecord, PartitionPhase};
 use crate::version::{binary_speaks, ClusterVersion, CompatibilityRefusal};
 
+use bytes::Bytes;
 use orbita_core::{
     Epoch, Error, Lamport, MapVersion, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
 };
@@ -31,6 +32,7 @@ use orbita_runtime::{Clock, Runtime, Transport};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// What the leader has heard from one node, and when.
@@ -841,6 +843,172 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         .await
     }
 
+    /// Splits a partition at `at`, or at a boundary derived from the range
+    /// when `at` is `None`, and returns the two children once they are live.
+    ///
+    /// This is the manual-split surface, and it drives the whole four-entry
+    /// worker-prepared protocol to completion before it returns. The ordering
+    /// is the point: it opens the split, waits until every holder of the parent
+    /// has prepared storage for the children, and only then retires the parent.
+    /// There is no committed state in which a child partition exists but the
+    /// node named as its owner has nowhere to put its keys, which is the window
+    /// [PR #53](https://github.com/anomalyco/orbita/pull/53) closed by disabling
+    /// the old one-entry split outright.
+    ///
+    /// "Prepared" is evidenced the same way every other ownership decision in
+    /// this file is: a holder that has reported routing on the map version the
+    /// opening entry produced has seen the split and had the chance to build
+    /// the child indexes, which per
+    /// [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md)
+    /// is a range restriction of the index it already holds over the same
+    /// immutable objects, not a copy of any bytes. The controller turns that
+    /// evidence into the replicated `MarkSplitPrepared` acknowledgements the
+    /// completion entry checks.
+    pub async fn split_partition(
+        &self,
+        partition: PartitionId,
+        at: Option<Bytes>,
+    ) -> Result<(PartitionId, PartitionId)> {
+        let (lower, upper, begin) = {
+            let inner = self.inner.lock().await;
+            let info = inner
+                .state
+                .map()
+                .partition(partition)
+                .ok_or_else(|| Error::InvalidArgument(format!("no partition {partition}")))?
+                .clone();
+            let at = match at {
+                Some(at) => at,
+                None => suggested_split_key(&info).ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "no split key was given and none could be derived from the range".into(),
+                    )
+                })?,
+            };
+            let lower = inner.state.next_partition_id();
+            let upper = lower.next();
+            (
+                lower,
+                upper,
+                ControlCommand::BeginSplit {
+                    parent: partition,
+                    at,
+                    lower,
+                    upper,
+                    expect_epoch: info.epoch,
+                },
+            )
+        };
+        self.submit(begin).await?;
+
+        // Drive preparation and completion. The background sweep does the same
+        // work through `tick`, so a split still finishes if this future is
+        // dropped; driving it here as well is what lets the manual call return
+        // the live children rather than a promise of them, including on a
+        // controller whose sweep is not running, such as the admin unit tests.
+        //
+        // The bound is generous because the only thing being waited on is a
+        // holder's next heartbeat carrying the post-begin map version; a split
+        // that misses it repeatedly means a holder is not making progress, and
+        // failing with that is better than blocking an operator forever.
+        let deadline = self.runtime.clock().monotonic_nanos()
+            + (self.config.convergence_bound() + Duration::from_secs(5)).as_nanos() as u64;
+        loop {
+            self.advance_pending_splits().await?;
+            {
+                let inner = self.inner.lock().await;
+                let map = inner.state.map();
+                if map.partition(lower).is_some() && map.partition(upper).is_some() {
+                    return Ok((lower, upper));
+                }
+                if !inner.state.is_splitting(partition) {
+                    // The pending record is gone but the children are not here,
+                    // so a fence or an abort took the split down rather than
+                    // completing it. An operator has to know it did not happen.
+                    return Err(Error::Unavailable(format!(
+                        "the split of partition {partition} was abandoned before it completed; \
+                         re-read the map and retry"
+                    )));
+                }
+            }
+            if self.runtime.clock().monotonic_nanos() >= deadline {
+                return Err(Error::Unavailable(format!(
+                    "the split of partition {partition} did not complete: not every holder \
+                     prepared child storage in time"
+                )));
+            }
+            self.runtime.clock().sleep(self.config.sweep_interval).await;
+        }
+    }
+
+    /// Advances every split in flight: acknowledges the holders that have
+    /// prepared, and completes a split once all of them have.
+    ///
+    /// Called from both the manual path and the sweep, so it must tolerate
+    /// racing itself and a fence landing mid-flight. Every refusal a lost race
+    /// produces — a stale epoch, a split another pass already completed, a
+    /// completion that is not ready yet — is swallowed here, because the next
+    /// pass re-derives the same intent from committed state.
+    async fn advance_pending_splits(&self) -> Result<()> {
+        let (prepares, completes) = {
+            let inner = self.inner.lock().await;
+            let mut prepares = Vec::new();
+            let mut completes = Vec::new();
+            for (parent, split) in inner.state.pending_splits() {
+                let mut all_prepared = true;
+                for node in &split.required {
+                    if split.prepared.contains(node) {
+                        continue;
+                    }
+                    if holder_has_prepared(&inner, *node, split.begin_map_version) {
+                        prepares.push(ControlCommand::MarkSplitPrepared {
+                            parent,
+                            node: *node,
+                            expect_epoch: split.epoch,
+                        });
+                    } else {
+                        all_prepared = false;
+                    }
+                }
+                if all_prepared {
+                    completes.push(ControlCommand::CompleteSplit {
+                        parent,
+                        expect_epoch: split.epoch,
+                    });
+                }
+            }
+            (prepares, completes)
+        };
+
+        for command in prepares {
+            match self.submit(command).await {
+                Ok(()) | Err(Error::StaleEpoch { .. } | Error::InvalidArgument(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Completions run after the acknowledgements they depend on have
+        // committed, because `submit` awaits each in turn. A completion whose
+        // holders are not all prepared yet comes back `Unavailable`, which is a
+        // wait rather than an error, so it is swallowed alongside the races.
+        for command in completes {
+            let parent = match &command {
+                ControlCommand::CompleteSplit { parent, .. } => *parent,
+                _ => continue,
+            };
+            match self.submit(command).await {
+                Ok(()) => {
+                    tracing::info!(%parent, "retired a split parent; its children own its range");
+                    crate::metrics::record_split(crate::metrics::Outcome::Committed);
+                }
+                Err(
+                    Error::StaleEpoch { .. } | Error::InvalidArgument(_) | Error::Unavailable(_),
+                ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Transfers every partition owned by a draining worker to a ready,
     /// caught-up replica. It never expands a replica set or rebalances ranges.
     pub async fn drain_node(&self, node: NodeId) -> Result<bool> {
@@ -1061,6 +1229,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.refresh_health().await?;
         self.fence_dead_owners().await?;
         self.promote_drained_partitions().await?;
+        self.advance_pending_splits().await?;
         self.place_unowned_partitions().await?;
         self.repair_replica_sets().await?;
         Ok(())
@@ -1426,6 +1595,52 @@ fn best_candidate(
         })
         .min()
         .copied()
+}
+
+/// Whether a holder of a splitting parent has had the chance to prepare its
+/// children.
+///
+/// The evidence is the same shape promotion and planned handoff use: the node
+/// is eligible for ownership and its last report is on the map version the
+/// split's opening entry produced. A holder routing on that version has seen
+/// the split begin, and per
+/// [ADR 0006](../../../docs/adr/0006-partitions-are-an-index-over-immutable-objects.md)
+/// a child index is a range restriction of the parent index it already holds
+/// over the same objects, so seeing the split is all it needs to be able to
+/// serve the children. A report from before the split, or from a node that is
+/// not eligible to own, is an unknown rather than a yes, so it fails closed.
+fn holder_has_prepared(inner: &Inner, node: NodeId, begin: MapVersion) -> bool {
+    inner.state.new_ownership_eligibility(node).is_ok()
+        && inner
+            .observations
+            .get(&node)
+            .is_some_and(|observation| observation.status.map_version >= begin)
+}
+
+/// A boundary key derived from the range alone, used only when the caller did
+/// not supply one.
+///
+/// This is a poor split point and it is meant to be: it exists so a manual
+/// split with no key does something rather than failing. A good boundary comes
+/// from the owner, which is the only node that knows how the keys are
+/// distributed inside the range; choosing one from the range bounds alone
+/// would routinely produce two lopsided halves and a second split right after.
+fn suggested_split_key(info: &PartitionInfo) -> Option<Bytes> {
+    let start = info.range.start();
+    match info.range.end() {
+        // An unbounded range has no midpoint to compute, so the split point is
+        // one byte past the start, which at least produces two legal ranges.
+        None => {
+            let mut key = start.to_vec();
+            key.push(0);
+            Some(Bytes::from(key))
+        }
+        Some(end) => {
+            let mut key = start.to_vec();
+            key.push(0);
+            (key.as_slice() < end).then(|| Bytes::from(key))
+        }
+    }
 }
 
 /// Splits an ordered candidate list into an owner and a replica set.

@@ -741,10 +741,30 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         {
             return Ok(Response::new(response));
         }
-        crate::metrics::record_split(crate::metrics::Outcome::Unimplemented);
-        Err(Status::unimplemented(
-            "partition split is disabled until child storage preparation is implemented",
-        ))
+        // Empty means "pick a boundary", so it travels as `None` rather than as
+        // a zero-length key, which is a different request the range split would
+        // reject.
+        let at = if request.split_key.is_empty() {
+            None
+        } else {
+            Some(Bytes::from(request.split_key))
+        };
+        let split = self
+            .leader()
+            .split_partition(PartitionId(request.partition_id), at)
+            .await;
+        let (lower, upper) = match split {
+            Ok(children) => children,
+            Err(error) => {
+                crate::metrics::record_split(crate::metrics::Outcome::Failed);
+                return Err(status(error));
+            }
+        };
+        let map = self.leader().partition_map().await;
+        Ok(Response::new(pb::SplitPartitionResponse {
+            lower: map.partition(lower).map(partition_message),
+            upper: map.partition(upper).map(partition_message),
+        }))
     }
 
     async fn merge_partitions(
