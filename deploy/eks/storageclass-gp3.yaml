@@ -1,0 +1,32 @@
+# A gp3 StorageClass for the test cluster.
+#
+# EKS ships a default `gp2` StorageClass, but gp3 is the current-generation
+# volume: cheaper per GiB and with baseline throughput and IOPS that do not
+# scale with size, so a small test volume is not also a slow one. The
+# aws-ebs-csi-driver addon (installed by cluster.yaml) is what provisions these;
+# the in-tree gp2 provisioner would ignore the gp3 type.
+#
+# up.sh applies this and the Helm overlay points leader.persistence.storageClass
+# and worker.persistence.storageClass at it. It is not marked the cluster
+# default on purpose: making it default would silently change where every other
+# workload's volumes land, and this cluster's only real workload names it
+# explicitly anyway.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+provisioner: ebs.csi.aws.com
+# Wait for the pod to be scheduled before creating the volume, so the volume is
+# provisioned in the same Availability Zone as the node that will mount it. With
+# Immediate binding a volume can land in an AZ the pod cannot reach, and the pod
+# wedges Pending forever. A StatefulSet with topology spread across AZs makes
+# this not hypothetical.
+volumeBindingMode: WaitForFirstConsumer
+# Let a PersistentVolumeClaim grow without recreating the pod. Cheap to allow,
+# and the alternative is a rebuild to resize.
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  # Encrypt at rest. It costs nothing on EBS and a test cluster that writes real
+  # data to real disks should not be the exception to that habit.
+  encrypted: "true"
