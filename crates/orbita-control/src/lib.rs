@@ -2,11 +2,15 @@
 //!
 //! The nodes that hold the cluster's authoritative metadata: the partition
 //! map, worker membership, keyspace definitions and quotas, and ownership
-//! epochs. It detects dead workers and fences and replaces partition owners.
-//! It also carries the replicated vocabulary of a worker-prepared partition
-//! split — the state machine refuses to retire a parent until every holder has
-//! prepared child storage — but split execution is disabled at the operator
-//! surface until the worker side that prepares that storage exists.
+//! epochs. It detects dead workers, fences and replaces partition owners, and
+//! drives the worker-prepared partition split. The state machine refuses to
+//! retire a parent until every holder has *durably* prepared child storage and
+//! reported it — the prepare-before-retire ordering of ADR 0009 — and the
+//! controller turns those acknowledgements into the completion. The data-plane
+//! side that builds the child storage lives in `orbita-storage`
+//! (`Partition::prepare_child_partitions`, which shares the parent's segments in
+//! place with no copy); the worker task that runs it on a live cluster is the
+//! remaining wiring between the two.
 //!
 //! Nothing here is on the data path. Workers cache what they need and keep
 //! serving reads while the leader group is unavailable, which is deliberate: a

@@ -40,11 +40,11 @@ pub struct ControlConfig {
     /// owner. Three gives the two-of-three durability quorum the WAL assumes.
     pub replication_factor: usize,
 
-    /// Reserved size threshold for worker-prepared splits. The control-plane
-    /// split protocol exists in the state machine, but split execution is
-    /// disabled at the operator surface until workers can durably prepare child
-    /// storage and the parent can be quiesced. Kept here so the number and its
-    /// reasoning live with the rest of the control-plane timing.
+    /// Size at which a partition becomes a candidate for an automatic split.
+    /// The worker-prepared split protocol executes on demand through the Admin
+    /// API; triggering one from this threshold without an operator in the loop
+    /// is the automatic-split work tracked by issue #39. Kept here so the number
+    /// and its reasoning live with the rest of the control-plane timing.
     pub split_threshold_bytes: u64,
 }
 
