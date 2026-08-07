@@ -552,6 +552,21 @@ impl<R: Runtime> PartitionHost<R> {
         self.storage.prepare_child_partitions(children).await
     }
 
+    /// Prepares child storage over the parent's segments *without* quiescing —
+    /// no admission close, no log settle — so a test can show why the quiesce is
+    /// load-bearing: a write acknowledged after the horizon this captures lands
+    /// in the parent's still-live log, which no child inherits, and is lost when
+    /// the parent retires. Only the real
+    /// [`quiesce_and_prepare_children`](Self::quiesce_and_prepare_children) is
+    /// used in production.
+    #[cfg(test)]
+    pub(crate) async fn prepare_children_without_quiescing(
+        &self,
+        children: &[ChildSpec],
+    ) -> Result<Lamport> {
+        self.storage.prepare_child_partitions(children).await
+    }
+
     /// Reopens write admission, for a split that was abandoned before it
     /// completed. A completed split retires this partition instead, so this is
     /// only reached on an abort.
@@ -832,7 +847,7 @@ impl<R: Runtime> PartitionHost<R> {
                 self.id
             )));
         }
-        let _admission = self.write_barrier.read().await;
+        let admission = self.write_barrier.read().await;
         if !self
             .admitting_writes
             .load(std::sync::atomic::Ordering::Acquire)
@@ -905,6 +920,13 @@ impl<R: Runtime> PartitionHost<R> {
                 if queued {
                     let _ = resolved.send(Some(mutation_of_op(lamport, &key, &wal_op)));
                 }
+                // The write is durable at quorum by here, so its Lamport is in
+                // the committed prefix a split would capture: releasing the
+                // admission guard now still keeps a concurrent quiesce from
+                // capturing a horizon below this write, while not holding the
+                // guard across the coherence wait, which can take a lease
+                // interval and would otherwise stall a racing split on it.
+                drop(admission);
                 // Durable is not enough to answer the client. Every replica
                 // that could still serve a read has to have the invalidation
                 // too, or the client would be told about a value another node

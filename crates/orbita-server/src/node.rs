@@ -1771,6 +1771,13 @@ impl<R: Runtime> Node<R> {
         prepared
     }
 
+    /// The host for one partition this node holds, for a test that drives the
+    /// split's data-plane steps directly.
+    #[cfg(test)]
+    pub(crate) async fn host(&self, id: PartitionId) -> Option<Arc<PartitionHost<R>>> {
+        self.hosts.read().await.get(&id).cloned()
+    }
+
     /// Whether both of a split's child manifests are durably published in the
     /// shared bucket, which is what makes it safe to acknowledge preparation.
     async fn child_manifests_exist(

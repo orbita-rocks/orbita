@@ -114,6 +114,8 @@ mod replication;
 mod retention;
 mod runtime;
 mod service;
+#[cfg(test)]
+mod split;
 mod status;
 mod transport;
 mod validate;
