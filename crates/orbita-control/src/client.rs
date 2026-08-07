@@ -60,6 +60,28 @@ pub struct ControlClient<R: Runtime> {
     preferred: std::sync::Arc<Mutex<Option<NodeId>>>,
 }
 
+/// A control call's private transport/protocol outcome.
+///
+/// Old leaders can express an unsupported method only through a fixed error
+/// string. It is decoded once at this boundary so compatibility callers never
+/// have to recover protocol meaning from [`Error::Internal`].
+#[derive(Debug)]
+enum CallError {
+    UnsupportedMethod(u16),
+    Failed(Error),
+}
+
+impl CallError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::UnsupportedMethod(method) => Error::Internal(format!(
+                "the leader group does not support control method {method}"
+            )),
+            Self::Failed(error) => error,
+        }
+    }
+}
+
 impl<R: Runtime> Clone for ControlClient<R> {
     fn clone(&self) -> Self {
         Self {
@@ -99,7 +121,7 @@ impl<R: Runtime> ControlClient<R> {
     /// often enough to matter affordable.
     pub async fn fetch_map_if_newer(&self, have: MapVersion) -> Result<Option<PartitionMap>> {
         let payload = FetchMapRequest { have }.encode();
-        match self.call(METHOD_FETCH_MAP, payload).await? {
+        match self.call_required(METHOD_FETCH_MAP, payload).await? {
             ControlResponse::Map(map) => Ok(map),
             other => Err(unexpected(&other)),
         }
@@ -112,7 +134,10 @@ impl<R: Runtime> ControlClient<R> {
     /// that id into an address, so without it a node can route a request and
     /// still not be able to send it.
     pub async fn fetch_nodes(&self) -> Result<Vec<(NodeId, String)>> {
-        match self.call(METHOD_FETCH_NODES, bytes::Bytes::new()).await? {
+        match self
+            .call_required(METHOD_FETCH_NODES, bytes::Bytes::new())
+            .await?
+        {
             ControlResponse::Nodes(nodes) => Ok(nodes),
             other => Err(unexpected(&other)),
         }
@@ -128,7 +153,7 @@ impl<R: Runtime> ControlClient<R> {
     /// rather than failing every request closed.
     pub async fn fetch_credentials(&self) -> Result<Vec<Credential>> {
         match self
-            .call(METHOD_FETCH_CREDENTIALS, bytes::Bytes::new())
+            .call_required(METHOD_FETCH_CREDENTIALS, bytes::Bytes::new())
             .await?
         {
             ControlResponse::Credentials(credentials) => Ok(credentials),
@@ -146,7 +171,7 @@ impl<R: Runtime> ControlClient<R> {
     /// and the caller does not gate on it rather than guessing.
     pub async fn fetch_auth_policy(&self) -> Result<bool> {
         match self
-            .call(METHOD_FETCH_AUTH_POLICY, bytes::Bytes::new())
+            .call_required(METHOD_FETCH_AUTH_POLICY, bytes::Bytes::new())
             .await?
         {
             ControlResponse::AuthPolicy(require_auth) => Ok(require_auth),
@@ -161,7 +186,7 @@ impl<R: Runtime> ControlClient<R> {
     /// voter has the decisions that leader may need for the next quorum.
     pub async fn fetch_commit_index(&self) -> Result<crate::LogIndex> {
         match self
-            .call(METHOD_FETCH_COMMIT_INDEX, bytes::Bytes::new())
+            .call_required(METHOD_FETCH_COMMIT_INDEX, bytes::Bytes::new())
             .await?
         {
             ControlResponse::CommitIndex(index) => Ok(index),
@@ -232,7 +257,7 @@ impl<R: Runtime> ControlClient<R> {
             payload,
         }
         .encode();
-        match self.call(METHOD_ADMIN_CALL, request).await? {
+        match self.call_required(METHOD_ADMIN_CALL, request).await? {
             ControlResponse::AdminOk(payload) => Ok(AdminOutcome::Ok(payload)),
             ControlResponse::AdminFailed { code, message } => {
                 Ok(AdminOutcome::Failed { code, message })
@@ -245,7 +270,7 @@ impl<R: Runtime> ControlClient<R> {
     /// Returns whether every receiver has acknowledged its handoff map.
     pub async fn drain_node(&self, node: NodeId) -> Result<bool> {
         match self
-            .call(METHOD_DRAIN_NODE, DrainNodeRequest { node }.encode())
+            .call_required(METHOD_DRAIN_NODE, DrainNodeRequest { node }.encode())
             .await?
         {
             ControlResponse::DrainProgress { complete, .. } => Ok(complete),
@@ -258,16 +283,26 @@ impl<R: Runtime> ControlClient<R> {
     /// Polled beside the map. The intents cannot ride the map — a frozen
     /// contract that carries only live partitions — so a pending split's
     /// children reach the worker through this instead. See ADR 0009.
+    ///
+    /// This is the one control method a leader group is allowed not to serve.
+    /// A leader binary without the split vocabulary cannot be holding a split
+    /// intent, so "no such method" and "no active intents" are the same fact,
+    /// and answering the empty set is what lets a new worker boot against an
+    /// old leader mid-rollout. Every other refusal — including an unreachable
+    /// group — is still an error, because those say nothing about whether a
+    /// split is in flight.
     pub async fn fetch_split_intents(&self, node: NodeId) -> Result<Vec<WireSplitIntent>> {
         match self
             .call(
                 METHOD_FETCH_SPLIT_INTENTS,
                 FetchSplitIntentsRequest { node }.encode(),
             )
-            .await?
+            .await
         {
-            ControlResponse::SplitIntents(intents) => Ok(intents),
-            other => Err(unexpected(&other)),
+            Ok(ControlResponse::SplitIntents(intents)) => Ok(intents),
+            Err(CallError::UnsupportedMethod(METHOD_FETCH_SPLIT_INTENTS)) => Ok(Vec::new()),
+            Ok(other) => Err(unexpected(&other)),
+            Err(error) => Err(error.into_error()),
         }
     }
 
@@ -275,7 +310,7 @@ impl<R: Runtime> ControlClient<R> {
     /// of `parent`. This is the real acknowledgement the completion waits on.
     pub async fn report_split_prepared(&self, node: NodeId, parent: PartitionId) -> Result<()> {
         match self
-            .call(
+            .call_required(
                 METHOD_REPORT_SPLIT_PREPARED,
                 ReportSplitPreparedRequest { node, parent }.encode(),
             )
@@ -330,10 +365,10 @@ impl<R: Runtime> ControlClient<R> {
                 Ok(StatusReportResponse::Incompatible(refusal))
             }
             Ok(other) => Err(unexpected(&other)),
-            Err(Error::Internal(message)) if message.contains("unknown control method") => {
+            Err(CallError::UnsupportedMethod(METHOD_REPORT_STATUS_V5)) => {
                 self.send_status_v4(node, status, lifecycle).await
             }
-            Err(e) => Err(e),
+            Err(error) => Err(error.into_error()),
         }
     }
 
@@ -361,14 +396,14 @@ impl<R: Runtime> ControlClient<R> {
                 Ok(StatusReportResponse::Incompatible(refusal))
             }
             Ok(other) => Err(unexpected(&other)),
-            Err(Error::Internal(message)) if message.contains("unknown control method") => {
+            Err(CallError::UnsupportedMethod(METHOD_REPORT_STATUS_V4)) => {
                 if lifecycle {
                     self.send_status_v3(node, status).await
                 } else {
                     self.send_status_v2(node, status).await
                 }
             }
-            Err(e) => Err(e),
+            Err(error) => Err(error.into_error()),
         }
     }
 
@@ -394,14 +429,10 @@ impl<R: Runtime> ControlClient<R> {
                 Ok(StatusReportResponse::Incompatible(refusal))
             }
             Ok(other) => Err(unexpected(&other)),
-            // "The leader considered this and said no" here means it does not
-            // serve the method at all, which only a v0.0.1 leader says. The
-            // string match is on our own private protocol's fixed refusal, so
-            // it cannot drift without this crate changing both sides.
-            Err(Error::Internal(message)) if message.contains("unknown control method") => {
+            Err(CallError::UnsupportedMethod(METHOD_REPORT_STATUS_V3)) => {
                 self.send_status_v2(node, status).await
             }
-            Err(e) => Err(e),
+            Err(error) => Err(error.into_error()),
         }
     }
 
@@ -426,9 +457,9 @@ impl<R: Runtime> ControlClient<R> {
             Ok(ControlResponse::Incompatible(refusal)) => {
                 Ok(StatusReportResponse::Incompatible(refusal))
             }
-            Err(Error::Internal(message)) if message.contains("unknown control method") => {
+            Err(CallError::UnsupportedMethod(METHOD_REPORT_STATUS_V2)) => {
                 let payload = ReportStatusRequest { node, status }.encode_legacy();
-                match self.call(METHOD_REPORT_STATUS, payload).await? {
+                match self.call_required(METHOD_REPORT_STATUS, payload).await? {
                     ControlResponse::Accepted {
                         map_version,
                         cluster_version,
@@ -440,8 +471,21 @@ impl<R: Runtime> ControlClient<R> {
                 }
             }
             Ok(other) => Err(unexpected(&other)),
-            Err(error) => Err(error),
+            Err(error) => Err(error.into_error()),
         }
+    }
+
+    /// Calls a method the leader group is required to serve.
+    ///
+    /// This is the default. An unsupported method becomes an ordinary error
+    /// here, so only the handful of callers that deliberately match on
+    /// [`CallError::UnsupportedMethod`] can degrade instead of failing — a
+    /// method going missing is otherwise a real fault, not a compatibility
+    /// event.
+    async fn call_required(&self, method: u16, payload: bytes::Bytes) -> Result<ControlResponse> {
+        self.call(method, payload)
+            .await
+            .map_err(CallError::into_error)
     }
 
     /// Tries the member that answered last, then the rest, following one
@@ -450,7 +494,11 @@ impl<R: Runtime> ControlClient<R> {
     /// Unreachable members are skipped and the next one is tried, because a
     /// leader group is expected to be missing a member from time to time and
     /// that is not something the caller should have to handle.
-    async fn call(&self, method: u16, payload: bytes::Bytes) -> Result<ControlResponse> {
+    async fn call(
+        &self,
+        method: u16,
+        payload: bytes::Bytes,
+    ) -> std::result::Result<ControlResponse, CallError> {
         let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::new();
         if let Some(preferred) = *self.preferred.lock().expect("control client lock poisoned") {
             queue.push_back(preferred);
@@ -461,9 +509,9 @@ impl<R: Runtime> ControlClient<R> {
             }
         }
         if queue.is_empty() {
-            return Err(Error::Unavailable(
+            return Err(CallError::Failed(Error::Unavailable(
                 "no leader group members are configured".into(),
-            ));
+            )));
         }
 
         let mut last: Option<Error> = None;
@@ -488,7 +536,14 @@ impl<R: Runtime> ControlClient<R> {
                 Ok(ControlResponse::Error(message)) => {
                     // The leader considered the request and refused it. Trying
                     // another member would get the same answer.
-                    return Err(Error::Internal(message));
+                    //
+                    // The refusal is only a compatibility signal when it names
+                    // the very method we just sent. Anything else is a refusal
+                    // whose text merely resembles one, and must stay opaque.
+                    if legacy_unsupported_method(&message) == Some(method) {
+                        return Err(CallError::UnsupportedMethod(method));
+                    }
+                    return Err(CallError::Failed(Error::Internal(message)));
                 }
                 Ok(ControlResponse::Unavailable(message)) => {
                     last = Some(Error::Unavailable(message));
@@ -501,7 +556,9 @@ impl<R: Runtime> ControlClient<R> {
             }
         }
 
-        Err(last.unwrap_or_else(|| Error::Unavailable("the leader group did not answer".into())))
+        Err(CallError::Failed(last.unwrap_or_else(|| {
+            Error::Unavailable("the leader group did not answer".into())
+        })))
     }
 
     async fn call_one(
@@ -590,6 +647,16 @@ fn transport_error(e: TransportError) -> Error {
     }
 }
 
+/// Decodes the only unsupported-method shape a pre-versioned leader can send.
+/// Exact parsing matters: a leader's unrelated refusal may contain the words
+/// "unknown control method" without being this compatibility signal.
+fn legacy_unsupported_method(message: &str) -> Option<u16> {
+    message
+        .strip_prefix("unknown control method ")?
+        .parse()
+        .ok()
+}
+
 fn unexpected(response: &ControlResponse) -> Error {
     Error::Internal(format!(
         "the leader group answered a different question: {response:?}"
@@ -658,6 +725,86 @@ mod tests {
             }),
             "the report must land through the legacy method, with no version learned"
         );
+    }
+
+    #[test]
+    fn a_pre_split_leader_makes_split_intents_an_unsupported_optional_method() {
+        let sim = Simulation::new(13);
+        let leader = sim.add_node(NodeId(1));
+        let worker = sim.add_node(NodeId(2));
+        orbita_runtime::Transport::register(leader.transport(), ServiceId::Control, V001Leader);
+        let client = ControlClient::new(worker, vec![NodeId(1)]);
+
+        let typed = sim.block_on({
+            let client = client.clone();
+            async move {
+                client
+                    .call(
+                        METHOD_FETCH_SPLIT_INTENTS,
+                        FetchSplitIntentsRequest { node: NodeId(2) }.encode(),
+                    )
+                    .await
+            }
+        });
+        assert!(matches!(
+            typed,
+            Err(CallError::UnsupportedMethod(METHOD_FETCH_SPLIT_INTENTS))
+        ));
+        assert_eq!(
+            sim.block_on(async move { client.fetch_split_intents(NodeId(2)).await }),
+            Ok(Vec::new()),
+            "a leader without split vocabulary cannot hold an active split"
+        );
+    }
+
+    /// The empty-set degradation is the one place a control refusal is not an
+    /// error, so it has to stay pinned to the single refusal that means the
+    /// leader has no split vocabulary at all.
+    #[test]
+    fn split_intent_fetch_keeps_other_refusals_and_unreachable_leaders_fatal() {
+        struct RefusingLeader(&'static str);
+        impl PeerHandler for RefusingLeader {
+            async fn handle(
+                &self,
+                _from: orbita_runtime::NodeId,
+                call: PeerCall,
+            ) -> TransportResult<bytes::Bytes> {
+                assert_eq!(call.method, METHOD_FETCH_SPLIT_INTENTS);
+                Ok(ControlResponse::Error(self.0.into()).encode())
+            }
+        }
+
+        let sim = Simulation::new(14);
+        let worker = sim.add_node(NodeId(2));
+        // A refusal that is about split state itself, and one whose text is
+        // the compatibility shape but names a method we did not call. Neither
+        // says anything about whether a split is in flight, so neither may be
+        // read as "no intents".
+        for (id, message) in [
+            (NodeId(1), "split state is unavailable"),
+            (NodeId(3), "unknown control method 9"),
+        ] {
+            let refusing = sim.add_node(id);
+            orbita_runtime::Transport::register(
+                refusing.transport(),
+                ServiceId::Control,
+                RefusingLeader(message),
+            );
+            let client = ControlClient::new(worker.clone(), vec![id]);
+            assert!(
+                matches!(
+                    sim.block_on(async move { client.fetch_split_intents(NodeId(2)).await }),
+                    Err(Error::Internal(refusal)) if refusal == message
+                ),
+                "the refusal {message:?} must reach the caller unchanged"
+            );
+        }
+
+        let unreachable = ControlClient::new(worker, vec![NodeId(99)]);
+        assert!(matches!(
+            sim.block_on(async move { unreachable.fetch_split_intents(NodeId(2)).await }),
+            Err(Error::Unavailable(_))
+        ));
     }
 
     #[test]

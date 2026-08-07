@@ -312,6 +312,12 @@ impl Server {
         // Split lifecycle state is fetched before hosts enter routing. A
         // restarted parent must never be published with write, maintenance, or
         // lease gates open while its children already capture an older horizon.
+        //
+        // Failing start on an error is deliberate: booting blind to a split we
+        // cannot rule out is what the gates exist to prevent. The one refusal
+        // that is not blindness is a leader that predates the method at all,
+        // and `fetch_split_intents` already answers that with the empty set,
+        // so an old-binary leader does not crash-loop a new worker.
         let initial_split_intents = match &control {
             Some(client) => client.fetch_split_intents(config.node_id).await?,
             None => Vec::new(),

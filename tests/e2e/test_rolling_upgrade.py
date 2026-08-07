@@ -27,6 +27,10 @@ implementation (or `ORBITA_PREV_BINARY` to a prior release binary) to make it a
 true cross-version test; the harness validates that side speaks the previous
 minor. When the previous minor is not expressible (a minor-zero workspace) the
 whole test skips with the reason rather than pretending to cover the upgrade.
+In particular, the synthetic old binary already knows split-intent method 13,
+so it cannot reproduce that method's legacy unknown-method response. The exact
+pre-split service integration in `orbita-server/tests/multi_node.rs` covers that
+wire compatibility case.
 
 # The shape
 
@@ -455,26 +459,26 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
                 time.sleep(0.1)
             assert writer.acknowledged, "the cluster never accepted a write before the roll"
 
-            # Roll every node one at a time, leaders first so the control plane
-            # stays a quorum throughout, then workers. Each step waits for the
-            # replaced node's readiness before the next, which is the gate a
-            # rolling update enforces and the thing that keeps a second replica
-            # from going down while the first is still catching up.
-            for node in cluster.leaders:
+            # Roll every node one at a time, workers first. The first replacement
+            # is therefore a new worker against an entirely old leader group,
+            # which is the documented worker-first upgrade order. Each step
+            # waits for readiness before the next, so one replacement cannot
+            # hide a crash loop or a failed compatibility handshake.
+            for node in cluster.workers:
                 node.roll(cluster.new)
                 cluster.wait_ready(node)
                 assert cluster.cluster_version() == old_version, (
                     "the cluster version must not move until finalize-upgrade"
                 )
 
+            for node in cluster.leaders:
+                node.roll(cluster.new)
+                cluster.wait_ready(node)
+
             # The old control log, written by 0.0 leaders, has now been
             # recovered by three new-binary leaders in turn. If any of them had
             # truncated it, the keyspace created above would be gone.
             assert KS in cluster.on_leader("keyspace", "list")
-
-            for node in cluster.workers:
-                node.roll(cluster.new)
-                cluster.wait_ready(node)
 
             before = len(writer.acknowledged)
             deadline = time.monotonic() + 15.0
