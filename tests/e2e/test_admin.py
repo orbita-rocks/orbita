@@ -22,12 +22,9 @@ from conftest import DEFAULT_KEYSPACE, poll_until
 ADMIN_SERVICE = admin_pb2.DESCRIPTOR.services_by_name["Admin"]
 METHODS = [method.name for method in ADMIN_SERVICE.methods]
 
-# The two RPCs the server refuses on purpose. Partition split and merge move
-# data and change a partition's Lamport sequence, and a half-built one would be
-# worse than none; `orbita-control` and ADR 0002 have the argument. They are
-# named here so that an RPC becoming unimplemented by accident is a failure and
-# these two are not.
-DELIBERATELY_UNIMPLEMENTED = {"SplitPartition", "MergePartitions"}
+# Merge remains deliberately unavailable. Split is exercised over the real
+# public API in test_split.py.
+DELIBERATELY_UNIMPLEMENTED = {"MergePartitions"}
 
 
 def test_the_proto_still_declares_the_admin_surface_we_expect():
@@ -264,12 +261,12 @@ def test_transferring_ownership_to_a_node_that_does_not_exist_is_refused(node):
 
 
 @pytest.mark.parametrize("method_name", sorted(DELIBERATELY_UNIMPLEMENTED))
-def test_partition_split_and_merge_refuse_and_say_why(node, method_name):
-    """These are unimplemented on purpose, and the refusal has to explain.
+def test_deliberately_unimplemented_admin_calls_refuse_and_say_why(node, method_name):
+    """The remaining unimplemented call refuses with an explanation.
 
     Kept as its own test rather than folded into the descriptor walk so that
     the list of deliberate refusals is somewhere a reader will find it. When
-    one of them lands, this test is where the deletion goes.
+    When it lands, this test is where the deletion goes.
     """
     method = ADMIN_SERVICE.methods_by_name[method_name]
     request = message_factory.GetMessageClass(method.input_type)()
