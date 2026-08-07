@@ -12,14 +12,15 @@ use crate::membership::NodeStatus;
 use crate::model::Credential;
 use crate::version::{ClusterVersion, CompatibilityRefusal};
 use crate::wire::{
-    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest,
-    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
-    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
-    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
-    METHOD_REPORT_STATUS_V5,
+    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, FetchSplitIntentsRequest,
+    ReportSplitPreparedRequest, ReportStatusRequest, WireSplitIntent, METHOD_ADMIN_CALL,
+    METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
+    METHOD_REPORT_SPLIT_PREPARED, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
 };
 
-use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
+use orbita_core::{Error, MapVersion, NodeId, PartitionId, PartitionMap, Result};
 use orbita_runtime::{PeerCall, Runtime, ServiceId, Transport, TransportError};
 
 use std::sync::Mutex;
@@ -248,6 +249,39 @@ impl<R: Runtime> ControlClient<R> {
             .await?
         {
             ControlResponse::DrainProgress { complete, .. } => Ok(complete),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Fetches the splits `node` must prepare child storage for.
+    ///
+    /// Polled beside the map. The intents cannot ride the map — a frozen
+    /// contract that carries only live partitions — so a pending split's
+    /// children reach the worker through this instead. See ADR 0009.
+    pub async fn fetch_split_intents(&self, node: NodeId) -> Result<Vec<WireSplitIntent>> {
+        match self
+            .call(
+                METHOD_FETCH_SPLIT_INTENTS,
+                FetchSplitIntentsRequest { node }.encode(),
+            )
+            .await?
+        {
+            ControlResponse::SplitIntents(intents) => Ok(intents),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Reports that `node` has durably prepared its child storage for the split
+    /// of `parent`. This is the real acknowledgement the completion waits on.
+    pub async fn report_split_prepared(&self, node: NodeId, parent: PartitionId) -> Result<()> {
+        match self
+            .call(
+                METHOD_REPORT_SPLIT_PREPARED,
+                ReportSplitPreparedRequest { node, parent }.encode(),
+            )
+            .await?
+        {
+            ControlResponse::SplitPrepared => Ok(()),
             other => Err(unexpected(&other)),
         }
     }

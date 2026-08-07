@@ -15,11 +15,12 @@ use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::controller::RegistrationOutcome;
 use crate::wire::{
-    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, ReportStatusRequest,
-    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
-    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
-    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
-    METHOD_REPORT_STATUS_V5,
+    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, FetchSplitIntentsRequest,
+    ReportSplitPreparedRequest, ReportStatusRequest, WireSplitIntent, METHOD_ADMIN_CALL,
+    METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
+    METHOD_REPORT_SPLIT_PREPARED, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
 };
 
 use bytes::Bytes;
@@ -197,6 +198,32 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     },
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable admin call: {e}")),
+            },
+            METHOD_FETCH_SPLIT_INTENTS => match FetchSplitIntentsRequest::decode(&call.payload) {
+                Ok(request) => ControlResponse::SplitIntents(
+                    self.controller
+                        .pending_split_intents_for(request.node)
+                        .await
+                        .into_iter()
+                        .map(|intent| WireSplitIntent {
+                            parent: intent.parent,
+                            at: intent.at,
+                            lower: intent.lower,
+                            upper: intent.upper,
+                        })
+                        .collect(),
+                ),
+                Err(e) => ControlResponse::Error(format!("undecodable split intents fetch: {e}")),
+            },
+            METHOD_REPORT_SPLIT_PREPARED => match ReportSplitPreparedRequest::decode(&call.payload)
+            {
+                Ok(request) => {
+                    self.controller
+                        .record_split_prepared(request.node, request.parent)
+                        .await;
+                    ControlResponse::SplitPrepared
+                }
+                Err(e) => ControlResponse::Error(format!("undecodable split-prepared report: {e}")),
             },
             METHOD_FETCH_NODES => ControlResponse::Nodes(self.controller.node_addresses().await),
             METHOD_FETCH_CREDENTIALS => ControlResponse::Credentials(

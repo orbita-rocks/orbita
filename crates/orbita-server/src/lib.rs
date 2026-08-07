@@ -800,6 +800,27 @@ impl Server {
             if let Err(error) = live.refresh_map().await {
                 tracing::debug!(%error, "could not refresh the partition map");
             }
+            // Prepare durable child storage for any split this node holds the
+            // parent of, and acknowledge the ones it finished. This is the
+            // worker half of the ADR 0009 split: the owner quiesces the parent
+            // and publishes both child manifests over its segments, then this
+            // reports the ack the leader's completion waits on. Run even when
+            // there are no intents, so a partition quiesced for a split the
+            // leader later abandoned has its writes reopened.
+            match client.fetch_split_intents(node_id).await {
+                Ok(intents) => {
+                    for parent in live.prepare_pending_splits(&intents).await {
+                        if let Err(error) = client.report_split_prepared(node_id, parent).await {
+                            tracing::debug!(
+                                %error,
+                                partition = parent.get(),
+                                "could not report split preparation to the leader group"
+                            );
+                        }
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "could not fetch split intents"),
+            }
             if !convergence_logged && readiness.is_ready() {
                 let map = live.map();
                 let held_partitions = map.held_by(node_id).count();

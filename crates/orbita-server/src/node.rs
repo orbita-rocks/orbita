@@ -41,12 +41,13 @@ use crate::validate;
 
 use bytes::Bytes;
 use orbita_control::Permission;
+use orbita_control::WireSplitIntent;
 use orbita_core::{
     Error, KeyspaceId, KeyspaceInfo, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
     Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
     MESSAGE_OVERHEAD_BYTES,
 };
-use orbita_format::PartitionPath;
+use orbita_format::{load_manifest, PartitionPath};
 use orbita_objectstore::ObjectStore;
 use orbita_proto::v1::{
     DeleteRequest, DeleteResponse, GetLimitsResponse, GetRequest, GetResponse, ListEntry,
@@ -56,10 +57,10 @@ use orbita_runtime::{
     join_all, Clock, PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError,
     TransportResult,
 };
-use orbita_storage::ScanBudget;
+use orbita_storage::{ChildSpec, ScanBudget};
 use orbita_wal::WalService;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
@@ -1681,6 +1682,113 @@ impl<R: Runtime> Node<R> {
     /// A failed sweep is logged and skipped, not retried here: an orphan that
     /// survives one pass is reclaimed on the next, and a store that is refusing
     /// deletes has a louder problem than leaked space.
+    /// Prepares durable child storage for every split this node holds the
+    /// parent of, and returns the parents it has fully prepared so the caller
+    /// can acknowledge them.
+    ///
+    /// This is the worker's half of the ADR 0009 split. The owner quiesces the
+    /// parent and publishes both child manifests over its segments with no
+    /// copy; a replica has no writes to quiesce and reaches the same manifests
+    /// through the shared bucket. A parent is reported prepared only once both
+    /// child manifests are durable, which is the real acknowledgement the
+    /// leader's completion waits on — never a mere observation that a map moved.
+    ///
+    /// A split that is no longer pending — because a required holder died and
+    /// the leader aborted it — is detected by its parent being absent from the
+    /// intents, and any parent this node had quiesced for it has its writes
+    /// reopened here rather than being left stuck closed.
+    pub(crate) async fn prepare_pending_splits(
+        &self,
+        intents: &[WireSplitIntent],
+    ) -> Vec<PartitionId> {
+        let map = self.map();
+        let pending: HashSet<PartitionId> = intents.iter().map(|intent| intent.parent).collect();
+
+        // Reopen writes on any partition we quiesced for a split that is no
+        // longer pending. A completed split retires the parent instead, so this
+        // only fires on an abort.
+        for host in self.hosts.read().await.values() {
+            if host.is_owner() && !host.is_admitting_writes() && !pending.contains(&host.id()) {
+                host.resume_write_admission();
+                tracing::info!(
+                    partition = host.id().get(),
+                    "reopened writes; the split was abandoned before it completed"
+                );
+            }
+        }
+
+        let mut prepared = Vec::new();
+        for intent in intents {
+            let Some(parent) = map.partition(intent.parent) else {
+                continue;
+            };
+            let is_owner = parent.owner == Some(self.node_id);
+            let is_replica = parent.replicas.contains(&self.node_id);
+            if !is_owner && !is_replica {
+                continue;
+            }
+            let Some((low_range, high_range)) = parent.range.clone().split_at(intent.at.clone())
+            else {
+                // An impossible boundary the leader will never complete against.
+                continue;
+            };
+            let child_epoch = parent.epoch.next();
+
+            if is_owner {
+                let host = self.hosts.read().await.get(&intent.parent).cloned();
+                let Some(host) = host else { continue };
+                let specs = [
+                    ChildSpec {
+                        id: intent.lower,
+                        epoch: child_epoch,
+                        range: low_range,
+                    },
+                    ChildSpec {
+                        id: intent.upper,
+                        epoch: child_epoch,
+                        range: high_range,
+                    },
+                ];
+                if let Err(error) = host.quiesce_and_prepare_children(&specs).await {
+                    tracing::warn!(
+                        partition = intent.parent.get(),
+                        %error,
+                        "could not prepare split children; will retry"
+                    );
+                    continue;
+                }
+            }
+
+            // Acknowledge only once both child manifests are durable — the
+            // owner just published them, a replica waits for that publish.
+            if self
+                .child_manifests_exist(parent.keyspace, intent.lower, intent.upper)
+                .await
+            {
+                prepared.push(intent.parent);
+            }
+        }
+        prepared
+    }
+
+    /// Whether both of a split's child manifests are durably published in the
+    /// shared bucket, which is what makes it safe to acknowledge preparation.
+    async fn child_manifests_exist(
+        &self,
+        keyspace: KeyspaceId,
+        lower: PartitionId,
+        upper: PartitionId,
+    ) -> bool {
+        for id in [lower, upper] {
+            let paths = self.layout.paths(keyspace, id);
+            match load_manifest(paths.store.as_ref(), &paths.path).await {
+                Ok(Some(_)) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     pub(crate) async fn sweep_owned(&self, grace_millis: u64, skew_millis: u64, dry_run: bool) {
         let hosts: Vec<Arc<PartitionHost<R>>> = self.hosts.read().await.values().cloned().collect();
 

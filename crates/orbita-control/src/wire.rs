@@ -80,6 +80,20 @@ pub const METHOD_FETCH_CREDENTIALS: u16 = 11;
 /// them. A leader too old to serve this returns an error, which the caller
 /// reads as "cannot determine" and does not gate on — the documented residual.
 pub const METHOD_FETCH_AUTH_POLICY: u16 = 12;
+/// Asks the leader group which splits this node must prepare child storage for.
+///
+/// A worker polls this beside the map. The split intent cannot ride the map,
+/// which is a frozen contract that carries only live partitions; a pending
+/// split's children are not live until the parent retires, so the intent needs
+/// its own channel. See [ADR 0009](../../../docs/adr/0009-a-split-shares-the-parents-segments.md).
+pub const METHOD_FETCH_SPLIT_INTENTS: u16 = 13;
+/// Reports that this node has durably prepared its child storage for a split.
+///
+/// This is the real acknowledgement the completion waits on: a worker calls it
+/// only after both child manifests are on the object store, so the leader's
+/// `MarkSplitPrepared` reflects storage that exists rather than a map version a
+/// node happened to observe.
+pub const METHOD_REPORT_SPLIT_PREPARED: u16 = 14;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -94,6 +108,8 @@ const STATUS_ADMIN_OK: u8 = 9;
 const STATUS_ADMIN_FAILED: u8 = 10;
 const STATUS_CREDENTIALS: u8 = 11;
 const STATUS_AUTH_POLICY: u8 = 12;
+const STATUS_SPLIT_INTENTS: u8 = 13;
+const STATUS_SPLIT_PREPARED: u8 = 14;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -269,6 +285,64 @@ impl DrainNodeRequest {
     }
 }
 
+/// Which node is asking for the splits it must prepare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FetchSplitIntentsRequest {
+    pub node: NodeId,
+}
+
+impl FetchSplitIntentsRequest {
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new().u64(self.node.get()).finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
+/// A node's report that it has durably prepared child storage for a split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportSplitPreparedRequest {
+    pub node: NodeId,
+    pub parent: PartitionId,
+}
+
+impl ReportSplitPreparedRequest {
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new()
+            .u64(self.node.get())
+            .u64(self.parent.get())
+            .finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+            parent: PartitionId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
+/// One split a worker must prepare: which parent, at what boundary, into which
+/// two child ids. The worker derives the child ranges and epoch from the map it
+/// already caches, so only the fields it cannot compute travel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireSplitIntent {
+    pub parent: PartitionId,
+    pub at: Bytes,
+    pub lower: PartitionId,
+    pub upper: PartitionId,
+}
+
 /// The one response shape both methods share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlResponse {
@@ -333,6 +407,10 @@ pub(crate) enum ControlResponse {
     Unavailable(String),
     Incompatible(CompatibilityRefusal),
     Error(String),
+    /// The splits a node must prepare child storage for.
+    SplitIntents(Vec<WireSplitIntent>),
+    /// A split-preparation report was accepted.
+    SplitPrepared,
 }
 
 impl ControlResponse {
@@ -405,6 +483,18 @@ impl ControlResponse {
             ControlResponse::Unavailable(message) => {
                 w.u8(STATUS_UNAVAILABLE).str(message);
             }
+            ControlResponse::SplitIntents(intents) => {
+                w.u8(STATUS_SPLIT_INTENTS);
+                w.seq(intents, |w, intent| {
+                    w.u64(intent.parent.get())
+                        .bytes(&intent.at)
+                        .u64(intent.lower.get())
+                        .u64(intent.upper.get());
+                });
+            }
+            ControlResponse::SplitPrepared => {
+                w.u8(STATUS_SPLIT_PREPARED);
+            }
         }
         w.finish()
     }
@@ -452,6 +542,15 @@ impl ControlResponse {
             STATUS_COMMIT_INDEX => ControlResponse::CommitIndex(r.u64()?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
             STATUS_UNAVAILABLE => ControlResponse::Unavailable(r.string()?),
+            STATUS_SPLIT_INTENTS => ControlResponse::SplitIntents(r.seq(|r| {
+                Ok(WireSplitIntent {
+                    parent: PartitionId(r.u64()?),
+                    at: r.bytes()?,
+                    lower: PartitionId(r.u64()?),
+                    upper: PartitionId(r.u64()?),
+                })
+            })?),
+            STATUS_SPLIT_PREPARED => ControlResponse::SplitPrepared,
             tag => {
                 return Err(CodecError::UnknownTag {
                     what: "control response",
@@ -648,12 +747,42 @@ mod tests {
             },
             ControlResponse::AuthPolicy(true),
             ControlResponse::AuthPolicy(false),
+            ControlResponse::SplitIntents(vec![
+                WireSplitIntent {
+                    parent: PartitionId(7),
+                    at: Bytes::from_static(b"m"),
+                    lower: PartitionId(20),
+                    upper: PartitionId(21),
+                },
+                WireSplitIntent {
+                    parent: PartitionId(8),
+                    at: Bytes::new(),
+                    lower: PartitionId(22),
+                    upper: PartitionId(23),
+                },
+            ]),
+            ControlResponse::SplitIntents(Vec::new()),
+            ControlResponse::SplitPrepared,
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),
                 Ok(response.clone())
             );
         }
+    }
+
+    #[test]
+    fn the_split_wire_requests_round_trip() {
+        let fetch = FetchSplitIntentsRequest { node: NodeId(4) };
+        assert_eq!(FetchSplitIntentsRequest::decode(&fetch.encode()), Ok(fetch));
+        let report = ReportSplitPreparedRequest {
+            node: NodeId(4),
+            parent: PartitionId(7),
+        };
+        assert_eq!(
+            ReportSplitPreparedRequest::decode(&report.encode()),
+            Ok(report)
+        );
     }
 
     #[test]

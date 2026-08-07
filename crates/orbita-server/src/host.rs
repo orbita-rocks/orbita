@@ -41,7 +41,9 @@ use orbita_core::{
 use orbita_format::PartitionPath;
 use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
-use orbita_storage::{Mutation, Partition, ScanBudget, ScanPage, TOMBSTONE_RETENTION_MILLIS};
+use orbita_storage::{
+    ChildSpec, Mutation, Partition, ScanBudget, ScanPage, TOMBSTONE_RETENTION_MILLIS,
+};
 use orbita_wal::{CatchUpPass, Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
@@ -198,6 +200,18 @@ pub(crate) struct PartitionHost<R: Runtime> {
     applying: tokio::sync::Mutex<()>,
     /// Serializes segment publication with the WAL checkpoint it permits.
     flushing: Arc<tokio::sync::Mutex<()>>,
+    /// Whether this owner is still admitting writes. Closed for the duration of
+    /// a split so the committed prefix the children inherit is final: no
+    /// acknowledged write can land above it after the children are published.
+    /// Per-partition rather than the node-wide drain gate, because a split
+    /// quiesces one partition while the rest of the node keeps serving. See
+    /// [`PartitionHost::quiesce_and_prepare_children`].
+    admitting_writes: std::sync::atomic::AtomicBool,
+    /// Held for a write's whole duration as a read guard; a split takes the
+    /// write guard to wait for every already-admitted write to resolve before
+    /// it settles the log to the committed prefix. This is the same close-then-
+    /// drain shape the node-wide handoff drain uses, scoped to one partition.
+    write_barrier: tokio::sync::RwLock<()>,
 }
 
 impl<R: Runtime> PartitionHost<R> {
@@ -380,6 +394,8 @@ impl<R: Runtime> PartitionHost<R> {
             withheld: Mutex::new(VecDeque::new()),
             applying: tokio::sync::Mutex::new(()),
             flushing,
+            admitting_writes: std::sync::atomic::AtomicBool::new(true),
+            write_barrier: tokio::sync::RwLock::new(()),
         })
     }
 
@@ -495,6 +511,60 @@ impl<R: Runtime> PartitionHost<R> {
             Some(wal) => wal.quiesce().await.map(|_| ()),
             None => Ok(()),
         }
+    }
+
+    /// Quiesces this partition and durably prepares both split children over
+    /// its segments, returning the committed prefix the children inherit.
+    ///
+    /// This is the worker's half of the ADR 0009 split, and the ordering is the
+    /// write-loss guard. It closes write admission, waits for every already
+    /// admitted write to resolve, then `quiesce`s the log — dropping the
+    /// uncommitted tail whose clients were told `Unavailable`, exactly as a
+    /// handoff drain does (#79/#87), so the position it settles to is the
+    /// committed prefix and never the owner's local durable tail. It waits for
+    /// the applier to carry storage up to that prefix, then prepares the
+    /// children over it with no copy. Nothing above the returned horizon can be
+    /// in the children, and nothing above it can be admitted afterwards, so no
+    /// acknowledged write is lost across the split.
+    ///
+    /// Idempotent and safe to repeat: a re-run re-quiesces a quiesced log for
+    /// free and re-publishes child manifests that already exist as a no-op.
+    /// Only the owner runs it; a replica has no writes to quiesce and reaches
+    /// the same child manifests through the shared bucket.
+    pub(crate) async fn quiesce_and_prepare_children(
+        &self,
+        children: &[ChildSpec],
+    ) -> Result<Lamport> {
+        if self.wal.is_none() {
+            return Err(Error::NotOwner {
+                partition: self.id,
+                owner: None,
+            });
+        }
+        // Close admission, then take the barrier to wait out in-flight writes.
+        self.admitting_writes
+            .store(false, std::sync::atomic::Ordering::Release);
+        let _barrier = self.write_barrier.write().await;
+        // Give up the uncommitted tail so the log settles to the committed
+        // prefix, then let the applier carry storage up to it before capturing.
+        self.quiesce().await?;
+        self.wait_for_applies().await;
+        self.storage.prepare_child_partitions(children).await
+    }
+
+    /// Reopens write admission, for a split that was abandoned before it
+    /// completed. A completed split retires this partition instead, so this is
+    /// only reached on an abort.
+    pub(crate) fn resume_write_admission(&self) {
+        self.admitting_writes
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this owner is currently admitting writes. False while a split is
+    /// quiescing it.
+    pub(crate) fn is_admitting_writes(&self) -> bool {
+        self.admitting_writes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether this node might answer a read for `key` without asking the
@@ -746,6 +816,32 @@ impl<R: Runtime> PartitionHost<R> {
                 owner: None,
             });
         };
+
+        // A split quiesces this partition by closing admission and draining
+        // in-flight writes. Checking before the barrier turns away a write that
+        // arrives after the close; holding the barrier read guard for the
+        // write's whole duration is what lets the quiesce wait for the ones
+        // already admitted. Re-checking after acquiring closes the race where
+        // the close landed between the two.
+        if !self
+            .admitting_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(format!(
+                "partition {} is splitting and is not admitting writes",
+                self.id
+            )));
+        }
+        let _admission = self.write_barrier.read().await;
+        if !self
+            .admitting_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(format!(
+                "partition {} is splitting and is not admitting writes",
+                self.id
+            )));
+        }
 
         let guard = self.submit.lock().await;
         let now = self.runtime.clock().now_millis();

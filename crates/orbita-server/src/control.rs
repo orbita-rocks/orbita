@@ -20,7 +20,7 @@ use orbita_control::{
     binary_speaks, binary_version, ClusterVersion, CompatibilityRefusal, ControlClient, NodeRole,
     NodeStatus, PartitionProgress, StatusReportResponse,
 };
-use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
+use orbita_core::{Error, MapVersion, NodeId, PartitionId, PartitionMap, Result};
 use orbita_runtime::Runtime;
 
 use std::sync::{Arc, Mutex};
@@ -277,5 +277,16 @@ impl<R: Runtime> StatusReporter<R> {
     /// Requests one control-plane drain pass for this node.
     pub async fn drain_node(&self) -> Result<bool> {
         self.client.drain_node(self.node).await
+    }
+
+    /// The splits this node must prepare child storage for. See ADR 0009.
+    pub async fn fetch_split_intents(&self) -> Result<Vec<orbita_control::WireSplitIntent>> {
+        self.client.fetch_split_intents(self.node).await
+    }
+
+    /// Reports that this node has durably prepared its child storage for the
+    /// split of `parent`.
+    pub async fn report_split_prepared(&self, parent: PartitionId) -> Result<()> {
+        self.client.report_split_prepared(self.node, parent).await
     }
 }
