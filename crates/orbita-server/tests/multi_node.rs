@@ -30,7 +30,8 @@
 
 use orbita_control::{
     binary_speaks, BootstrapSpec, ClusterVersion, ControlCommand, ControlConfig, ControlService,
-    Controller, KeyspaceConfig, SingleNodeLog, METHOD_FETCH_SPLIT_INTENTS, METHOD_REPORT_STATUS_V5,
+    Controller, KeyspaceConfig, SingleNodeLog, METHOD_FETCH_SPLIT_INTENTS,
+    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS_V5,
 };
 use orbita_core::{NodeId, PartitionMap};
 use orbita_proto::v1::kv_client::KvClient;
@@ -91,18 +92,33 @@ struct LeaderGroup {
 /// worker still has to boot.
 struct PreSplitControl {
     inner: ControlService<ServerRuntime, SingleNodeLog<ServerRuntime>>,
-    split_error: String,
+    split_fetch: SplitFetchResponse,
     refuse_version: bool,
     split_calls: Arc<AtomicU64>,
     status_calls: Arc<AtomicU64>,
 }
 
+enum SplitFetchResponse {
+    UnknownMethod,
+    Refuse(String),
+}
+
 impl PeerHandler for PreSplitControl {
     async fn handle(&self, from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
         match call.method {
-            METHOD_FETCH_SPLIT_INTENTS => {
-                self.split_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(legacy_control_error(&self.split_error))
+            METHOD_FETCH_SPLIT_INTENTS | METHOD_FETCH_SPLIT_INTENTS_V2 => {
+                // Startup fetches split state before its first status report.
+                // Count that exchange only, not later control-loop polls.
+                if self.status_calls.load(Ordering::Relaxed) == 0 {
+                    self.split_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                let message = match &self.split_fetch {
+                    SplitFetchResponse::UnknownMethod => {
+                        format!("unknown control method {}", call.method)
+                    }
+                    SplitFetchResponse::Refuse(message) => message.clone(),
+                };
+                Ok(legacy_control_error(&message))
             }
             METHOD_REPORT_STATUS_V5 if self.refuse_version => {
                 self.status_calls.fetch_add(1, Ordering::Relaxed);
@@ -179,7 +195,7 @@ async fn start_leader_group(config: ControlConfig) -> LeaderGroup {
 }
 
 async fn start_pre_split_leader_group(
-    split_error: &str,
+    split_fetch: SplitFetchResponse,
     refuse_version: bool,
 ) -> (LeaderGroup, Arc<AtomicU64>, Arc<AtomicU64>) {
     let dir = DataDir::new("pre-split-leader");
@@ -194,7 +210,7 @@ async fn start_pre_split_leader_group(
         ServiceId::Control,
         PreSplitControl {
             inner: ControlService::new(controller.clone()),
-            split_error: split_error.to_string(),
+            split_fetch,
             refuse_version,
             split_calls: Arc::clone(&split_calls),
             status_calls: Arc::clone(&status_calls),
@@ -282,20 +298,18 @@ impl Worker {
 /// worker would crash-loop instead of coming up not-ready.
 #[tokio::test]
 async fn a_worker_boots_against_a_leader_that_does_not_know_the_split_intent_method() {
-    let (group, split_calls, status_calls) = start_pre_split_leader_group(
-        &format!("unknown control method {METHOD_FETCH_SPLIT_INTENTS}"),
-        true,
-    )
-    .await;
+    let (group, split_calls, status_calls) =
+        start_pre_split_leader_group(SplitFetchResponse::UnknownMethod, true).await;
     let mut worker = start_worker(WORKERS[0], &group.address, BUDGET).await;
 
     let deadline = Instant::now() + BUDGET;
     while status_calls.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(
-        split_calls.load(Ordering::Relaxed) > 0,
-        "startup asked the old leader for optional split state"
+    assert_eq!(
+        split_calls.load(Ordering::Relaxed),
+        2,
+        "startup falls back from the unknown V2 method to the unknown V1 method"
     );
     assert!(
         status_calls.load(Ordering::Relaxed) > 0,
@@ -315,8 +329,11 @@ async fn a_worker_boots_against_a_leader_that_does_not_know_the_split_intent_met
 /// out an in-flight split, which is exactly what the restart gates need.
 #[tokio::test]
 async fn a_non_compatibility_split_fetch_refusal_still_fails_worker_startup() {
-    let (group, split_calls, _) =
-        start_pre_split_leader_group("split state is unavailable", false).await;
+    let (group, split_calls, _) = start_pre_split_leader_group(
+        SplitFetchResponse::Refuse("split state is unavailable".into()),
+        false,
+    )
+    .await;
     let dir = DataDir::new("refused-split-fetch-worker");
     let config = ServerConfig::single_node(&dir.0)
         .with_node_id(WORKERS[0])
