@@ -45,6 +45,7 @@ new binary must read the old control log, not truncate it.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import threading
@@ -63,6 +64,7 @@ from conftest import DEFAULT_KEYSPACE as KS
 LEADER_IDS = (1, 2, 3)
 WORKER_IDS = (4, 5, 6)
 REJOIN_ID = 7
+JOIN_ID = 8
 
 # A rolling upgrade of six processes plus two-binary bring-up is not a
 # sub-second test, so every wait is generous. A slow machine should make this
@@ -198,17 +200,38 @@ class Cluster:
             return port
         raise RuntimeError("could not find a disjoint client/peer port pair")
 
-    def bootstrap(self) -> None:
+    def bootstrap(self, worker_ids: tuple[int, ...] = WORKER_IDS) -> None:
+        """Start a whole cluster on the old binary.
+
+        The worker set is a parameter because one scenario needs the cluster
+        to start short of its replication factor: a partition that already has
+        every copy it wants has no placement to give a joining worker, so a
+        test of whether a join is placed would pass on a cluster that never
+        had a decision to make.
+        """
         leader_ports = {nid: self.free_pair() for nid in LEADER_IDS}
         self.leader_peers = ",".join(
             f"{nid}=127.0.0.1:{port + 1}" for nid, port in leader_ports.items()
         )
         for nid in LEADER_IDS:
             self.leaders.append(self._make(nid, "leader", leader_ports[nid]))
-        for nid in WORKER_IDS:
+        for nid in worker_ids:
             self.workers.append(self._make(nid, "worker", self.free_pair()))
         for node in self.leaders + self.workers:
             node.start(self.old)
+
+    def join_worker(self, node_id: int, binary: Path) -> NodeProc:
+        """Add a worker to a running cluster, on whichever binary is asked for.
+
+        This is growing a cluster, which is a different act from replacing a
+        node in place: the joining process has no data directory and no prior
+        registration, so everything the control plane knows about it comes
+        from its first heartbeat.
+        """
+        node = self._make(node_id, "worker", self.free_pair())
+        self.workers.append(node)
+        node.start(binary)
+        return node
 
     def _make(self, node_id: int, role: str, client_port: int) -> NodeProc:
         return NodeProc(
@@ -297,6 +320,42 @@ class Cluster:
                     return last
             time.sleep(0.25)
         raise AssertionError(f"no leader served {args!r}: {last}")
+
+    def describe(self) -> dict:
+        """`cluster describe` as data, so an assertion reads a field rather
+        than a rendered column that exists to be read by a person."""
+        last = ""
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            for node in self.leaders:
+                result = subprocess.run(
+                    [
+                        str(self.new),
+                        "--endpoint",
+                        node.endpoint,
+                        "cluster",
+                        "describe",
+                        "--output",
+                        "json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                last = result.stdout + result.stderr
+                if result.returncode == 0 and "not the leader" not in last:
+                    return json.loads(result.stdout)
+            time.sleep(0.25)
+        raise AssertionError(f"no leader served a describe: {last}")
+
+    def holders(self) -> set[int]:
+        """Every node the map names as an owner or a replica of anything."""
+        described = self.describe()
+        held: set[int] = set()
+        for partition in described["partitions"]:
+            if partition["owner_node_id"]:
+                held.add(partition["owner_node_id"])
+            held.update(replica["node_id"] for replica in partition["replicas"])
+        return held
 
     def cluster_version(self) -> str:
         described = self.on_leader("cluster", "describe")
@@ -545,5 +604,62 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
         assert re.search(rf"\n\s+{REJOIN_ID}\s+", described) is None, (
             f"the refused old node must not appear as a member:\n{described}"
         )
+    finally:
+        cluster.teardown()
+
+
+def test_a_new_binary_worker_joining_an_old_leader_cluster_is_given_a_partition(
+    orbita_binary, previous_binary, tmp_path
+):
+    """Growing a cluster mid-upgrade puts the new node to work.
+
+    The test above replaces nodes in place, which is the path a StatefulSet
+    rolling update takes and the only path issue #60 could cover. This is the
+    other thing an operator does during an upgrade: add capacity while the
+    leader group is still on the old binary. Issue #105 is that the new worker
+    joined, reported healthy, and was never placed, with nothing anywhere
+    saying why — the worst of the three available outcomes, because idle
+    capacity that looks fine is capacity nobody goes looking for.
+
+    The cluster starts one worker short of its replication factor so there is
+    a placement genuinely waiting to be made. What the joining worker receives
+    is therefore a decision the control plane had to take about it, not a
+    partition it was handed at bootstrap.
+    """
+    old_version = harness.previous_cluster_version()
+
+    cluster = Cluster(new=orbita_binary, old=previous_binary, workdir=tmp_path)
+    try:
+        cluster.bootstrap(worker_ids=(4, 5))
+        cluster.wait_all_ready()
+        assert cluster.cluster_version() == old_version, (
+            f"the old binary bootstraps at {old_version}"
+        )
+        cluster.wait_partition_owner()
+
+        before = cluster.holders()
+        assert JOIN_ID not in before
+
+        # A brand new worker on the new binary, joining a cluster whose leader
+        # group is entirely old. Nothing about the cluster moves to meet it:
+        # the active version stays where it was, which is exactly the state in
+        # which the two binaries have to agree about what a heartbeat means.
+        joined = cluster.join_worker(JOIN_ID, cluster.new)
+        cluster.wait_ready(joined)
+        assert cluster.cluster_version() == old_version, (
+            "joining a newer worker must not move the cluster version; only "
+            "finalize-upgrade does that"
+        )
+
+        deadline = time.monotonic() + OWNER_TIMEOUT
+        while time.monotonic() < deadline:
+            if JOIN_ID in cluster.holders():
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError(
+                "the joined worker never received a partition; it is in "
+                f"membership and owns nothing:\n{json.dumps(cluster.describe(), indent=2)}"
+            )
     finally:
         cluster.teardown()

@@ -125,7 +125,8 @@ pub use raft::RaftLog;
 pub use service::ControlService;
 pub use state::{ClusterState, NodeRecord, PartitionPhase};
 pub use version::{
-    binary_speaks, binary_version, ClusterVersion, CompatibilityRefusal, VersionRange,
+    binary_speaks, binary_version, lifecycle_protocol_active, ClusterVersion, CompatibilityRefusal,
+    VersionRange, PROTOCOL_0_1,
 };
 pub use wire::{
     METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES,

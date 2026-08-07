@@ -17,8 +17,8 @@
 use crate::map_source::MapSource;
 
 use orbita_control::{
-    binary_speaks, binary_version, ClusterVersion, CompatibilityRefusal, ControlClient, NodeRole,
-    NodeStatus, PartitionProgress, StatusReportResponse,
+    binary_speaks, lifecycle_protocol_active, ClusterVersion, CompatibilityRefusal, ControlClient,
+    NodeRole, NodeStatus, PartitionProgress, StatusReportResponse,
 };
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
 use orbita_runtime::Runtime;
@@ -189,9 +189,24 @@ impl<R: Runtime> StatusReporter<R> {
     }
 
     /// Whether this worker may use the finalized lifecycle protocol.
+    ///
+    /// The question is whether the *cluster* has finalized onto a version that
+    /// carries lifecycle state, not whether the cluster happens to be on this
+    /// binary's own version. Those coincide only for a node whose binary is
+    /// exactly the finalized one, which during a rolling upgrade is precisely
+    /// the node this does not describe. Asking the narrower question is issue
+    /// \#105: a new-binary worker joining a cluster still on the old version
+    /// withheld its `ready` claim, its old-binary leader was still applying
+    /// the lifecycle rule, and the worker stayed in membership without ever
+    /// being placed. `lifecycle_protocol_active` is the same predicate the
+    /// state machine gates on, so both ends of the heartbeat now agree from
+    /// the one version they share.
     #[must_use]
     pub fn can_handoff(&self) -> bool {
-        self.role == NodeRole::Worker && self.active_cluster_version() == Some(binary_version())
+        self.role == NodeRole::Worker
+            && self
+                .active_cluster_version()
+                .is_some_and(lifecycle_protocol_active)
     }
 
     /// Sends one report, carrying how far this node has got on every partition
@@ -277,5 +292,75 @@ impl<R: Runtime> StatusReporter<R> {
     /// Requests one control-plane drain pass for this node.
     pub async fn drain_node(&self) -> Result<bool> {
         self.client.drain_node(self.node).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbita_control::binary_version;
+    use orbita_sim::Simulation;
+
+    /// A reporter that has been told `active` is the cluster's version.
+    ///
+    /// The transport is never used: `can_handoff` is a pure decision about
+    /// two version numbers, and it is the decision, not the round trip, that
+    /// issue #105 got wrong.
+    fn reporter_told(active: Option<ClusterVersion>) -> StatusReporter<orbita_sim::SimRuntime> {
+        let sim = Simulation::new(1);
+        let runtime = sim.runtime(NodeId(1));
+        let reporter = StatusReporter::new(
+            ControlClient::new(runtime, vec![NodeId(2)]),
+            NodeId(1),
+            "10.0.0.1:7000",
+        );
+        *reporter.active.lock().expect("active version poisoned") = active;
+        reporter
+    }
+
+    #[test]
+    fn a_worker_claims_lifecycle_state_whenever_the_active_version_carries_it() {
+        // The half of #105 that lives on the worker. A binary that is not the
+        // one the cluster finalized on must still speak the protocol the
+        // cluster finalized, because its leader is judging it by that
+        // protocol. Asking whether the active version is *this binary's*
+        // version says no for every node in the n-1 window, which is every
+        // node a rolling upgrade has just replaced.
+        let own = binary_version();
+        let ahead = ClusterVersion::new(own.major, own.minor + 1);
+        assert!(
+            reporter_told(Some(ahead)).can_handoff(),
+            "a cluster past 0.1 carries lifecycle state whatever this binary's own version is"
+        );
+        assert!(reporter_told(Some(orbita_control::PROTOCOL_0_1)).can_handoff());
+    }
+
+    #[test]
+    fn a_worker_makes_no_lifecycle_claim_before_the_protocol_carries_one() {
+        // The other side of the same rule, and the one that makes the fix
+        // safe: on a cluster still below 0.1 nobody claims readiness, so no
+        // leader is entitled to demand it. That is what lets a new-binary
+        // worker be placed by an old-binary leader.
+        assert!(!reporter_told(Some(ClusterVersion::ZERO)).can_handoff());
+        assert!(
+            !reporter_told(None).can_handoff(),
+            "a node that has not heard an active version yet assumes nothing"
+        );
+    }
+
+    #[test]
+    fn a_leader_group_node_never_claims_worker_lifecycle_state() {
+        let reporter = StatusReporter::new_with_role(
+            ControlClient::new(Simulation::new(1).runtime(NodeId(1)), vec![NodeId(2)]),
+            NodeId(1),
+            NodeRole::Leader,
+            "10.0.0.1:7000",
+        );
+        *reporter.active.lock().expect("active version poisoned") =
+            Some(orbita_control::PROTOCOL_0_1);
+        assert!(
+            !reporter.can_handoff(),
+            "a voter owns no partitions to hand"
+        );
     }
 }
