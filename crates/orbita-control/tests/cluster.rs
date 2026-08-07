@@ -484,6 +484,9 @@ impl Cluster {
                             .expect("draining lock poisoned")
                             .get(&node)
                             .unwrap_or(&false),
+                        voter_eligible: false,
+                        failure_domain: String::new(),
+                        node_identity: String::new(),
                         partitions,
                     };
                     match wiring {
@@ -650,6 +653,9 @@ impl Cluster {
                             speaks,
                             ready: true,
                             draining: false,
+                            voter_eligible: false,
+                            failure_domain: String::new(),
+                            node_identity: String::new(),
                             partitions: vec![],
                         },
                     )
@@ -1934,6 +1940,9 @@ fn a_new_control_leader_does_not_repeat_a_completed_lease_drain() {
                         speaks: binary_speaks(),
                         ready: true,
                         draining: false,
+                        voter_eligible: false,
+                        failure_domain: String::new(),
+                        node_identity: String::new(),
                         partitions: vec![PartitionProgress {
                             partition,
                             durable_lamport: Lamport(1),
@@ -2665,6 +2674,9 @@ fn incompatible_joins_are_rejected_under_deterministic_simulation() {
                             speaks: too_new,
                             ready: false,
                             draining: false,
+                            voter_eligible: false,
+                            failure_domain: String::new(),
+                            node_identity: String::new(),
                             partitions: vec![],
                         },
                     )
@@ -2713,6 +2725,9 @@ fn rolling_upgrade_ranges_are_accepted_under_deterministic_simulation() {
                             speaks: rolling,
                             ready: false,
                             draining: false,
+                            voter_eligible: false,
+                            failure_domain: String::new(),
+                            node_identity: String::new(),
                             partitions: vec![],
                         },
                     )
@@ -3261,6 +3276,9 @@ fn a_worker_reaches_the_leader_group_over_the_transport() {
                         speaks: orbita_control::binary_speaks(),
                         ready: true,
                         draining: false,
+                        voter_eligible: false,
+                        failure_domain: String::new(),
+                        node_identity: String::new(),
                         partitions: vec![],
                     },
                 )

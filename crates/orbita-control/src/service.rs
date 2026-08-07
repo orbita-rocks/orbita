@@ -19,7 +19,7 @@ use crate::wire::{
     METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
     METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
     METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
-    METHOD_REPORT_STATUS_V5,
+    METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
 };
 
 use bytes::Bytes;
@@ -153,7 +153,24 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
             },
-            METHOD_REPORT_STATUS_V5 => match ReportStatusRequest::decode(&call.payload) {
+            METHOD_REPORT_STATUS_V5 => match ReportStatusRequest::decode_v5(&call.payload) {
+                Ok(request) => match self
+                    .controller
+                    .record_status(request.node, request.status)
+                    .await
+                {
+                    Ok(RegistrationOutcome::Accepted(map_version)) => ControlResponse::Accepted {
+                        map_version,
+                        cluster_version: Some(self.controller.cluster_version().await),
+                    },
+                    Ok(RegistrationOutcome::Incompatible(refusal)) => {
+                        ControlResponse::Incompatible(refusal)
+                    }
+                    Err(e) => ControlResponse::Error(e.to_string()),
+                },
+                Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
+            },
+            METHOD_REPORT_STATUS_V6 => match ReportStatusRequest::decode(&call.payload) {
                 Ok(request) => match self
                     .controller
                     .record_status(request.node, request.status)

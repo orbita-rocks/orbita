@@ -189,10 +189,12 @@ to the design doc.
 
 ### Topology
 
-A cluster is a leader group plus workers, all running the same binary in
-different roles.
+A cluster is three or more combined nodes. Every node serves the worker data
+path, while an automatically managed subset of three or five nodes votes in
+Raft. See [ADR 0009](adr/0009-combined-nodes-form-one-automatically-managed-voter-set.md).
 
-- **The leader group** is 3 or more nodes running Raft. It owns the partition
+- **The voters** are three nodes by default, or five when configured. One voter
+  is the elected Raft leader. The group owns the partition
   map, worker membership, keyspace metadata, split and merge decisions, and
   failover. I considered object-store CAS election and an external
   coordinator, but a Raft group is the battle-tested pattern here and gives
@@ -200,7 +202,7 @@ different roles.
   raft-rs) rather than building our own; Orbita owns the storage and network
   traits underneath it, which is exactly the seam deterministic simulation
   needs anyway.
-- **Workers** own partitions. Each partition has one owning worker that
+- **Workers** are the data-path capability every node has. Each partition has one owning worker that
   serializes all writes, plus two full replicas.
 
 ### Partitioning
@@ -435,12 +437,12 @@ them by exceeding one.
 
 ## Operations
 
-- **One static binary.** The same `orbita` binary runs as leader or worker by
-  configuration. A laptop cluster is one command. This is a deliberate
+- **One static binary.** The same `orbita` process serves worker traffic and may
+  also be a Raft voter. A laptop cluster is one command. This is a deliberate
   adoption lever, not a convenience.
 - **Distribution.** A Docker image built and published on every release,
   Kubernetes manifests and a Helm chart, and a Docker Compose quickstart that
-  stands up a leader group, workers, and MinIO for local evaluation.
+  stands up three combined nodes and MinIO for local evaluation.
 - **Admin surface.** An admin gRPC API with a CLI wrapping it: keyspace CRUD,
   credential management, partition map inspection, and manual split, merge,
   and rebalance triggers.

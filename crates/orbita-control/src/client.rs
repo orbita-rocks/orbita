@@ -16,7 +16,7 @@ use crate::wire::{
     METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
     METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS,
     METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
-    METHOD_REPORT_STATUS_V5,
+    METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
@@ -297,6 +297,36 @@ impl<R: Runtime> ControlClient<R> {
             status: status.clone(),
         }
         .encode();
+        match self.call(METHOD_REPORT_STATUS_V6, payload).await {
+            Ok(ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            }) => Ok(StatusReportResponse::Accepted {
+                map_version,
+                cluster_version,
+            }),
+            Ok(ControlResponse::Incompatible(refusal)) => {
+                Ok(StatusReportResponse::Incompatible(refusal))
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(Error::Internal(message)) if message.contains("unknown control method") => {
+                self.send_status_v5(node, status, lifecycle).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn send_status_v5(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+        lifecycle: bool,
+    ) -> Result<StatusReportResponse> {
+        let payload = ReportStatusRequest {
+            node,
+            status: status.clone(),
+        }
+        .encode_v5();
         match self.call(METHOD_REPORT_STATUS_V5, payload).await {
             Ok(ControlResponse::Accepted {
                 map_version,
@@ -312,7 +342,7 @@ impl<R: Runtime> ControlClient<R> {
             Err(Error::Internal(message)) if message.contains("unknown control method") => {
                 self.send_status_v4(node, status, lifecycle).await
             }
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         }
     }
 
@@ -579,7 +609,7 @@ fn unexpected(response: &ControlResponse) -> Error {
 mod tests {
     use super::*;
     use crate::membership::{NodeRole, NodeStatus};
-    use crate::wire::{METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5};
+    use crate::wire::{METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V6};
 
     use orbita_runtime::{PeerCall, PeerHandler, ServiceId, TransportResult};
     use orbita_sim::Simulation;
@@ -770,7 +800,7 @@ mod tests {
                 call: PeerCall,
             ) -> TransportResult<bytes::Bytes> {
                 let response = match call.method {
-                    METHOD_REPORT_STATUS_V5 => ControlResponse::Error("no".into()),
+                    METHOD_REPORT_STATUS_V6 => ControlResponse::Error("no".into()),
                     other => panic!("an older method must not be tried, got {other}"),
                 };
                 Ok(response.encode())

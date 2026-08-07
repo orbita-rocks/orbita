@@ -138,6 +138,9 @@ pub struct StatusReporter<R: Runtime> {
     node: NodeId,
     role: NodeRole,
     address: String,
+    voter_eligible: bool,
+    failure_domain: String,
+    node_identity: String,
     /// The active cluster version, as of the last heartbeat that landed.
     ///
     /// This is the value version-dependent behaviour gates on: a node speaks
@@ -153,6 +156,9 @@ impl<R: Runtime> Clone for StatusReporter<R> {
             node: self.node,
             role: self.role,
             address: self.address.clone(),
+            voter_eligible: self.voter_eligible,
+            failure_domain: self.failure_domain.clone(),
+            node_identity: self.node_identity.clone(),
             active: Arc::clone(&self.active),
         }
     }
@@ -177,8 +183,25 @@ impl<R: Runtime> StatusReporter<R> {
             node,
             role,
             address: address.into(),
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             active: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Supplies the durable attributes used when the control leader repairs voters.
+    #[must_use]
+    pub fn with_voter_attributes(
+        mut self,
+        eligible: bool,
+        failure_domain: impl Into<String>,
+        node_identity: impl Into<String>,
+    ) -> Self {
+        self.voter_eligible = eligible;
+        self.failure_domain = failure_domain.into();
+        self.node_identity = node_identity.into();
+        self
     }
 
     /// The active cluster version, from the last heartbeat the leader group
@@ -262,6 +285,9 @@ impl<R: Runtime> StatusReporter<R> {
             speaks: binary_speaks(),
             ready,
             draining,
+            voter_eligible: self.voter_eligible,
+            failure_domain: self.failure_domain.clone(),
+            node_identity: self.node_identity.clone(),
             partitions,
         };
         let response = if self.can_handoff() {

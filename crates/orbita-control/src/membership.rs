@@ -158,6 +158,12 @@ pub struct NodeStatus {
     /// A draining node remains healthy and serves its current ownership, but
     /// must not receive another assignment.
     pub draining: bool,
+    /// Whether this node may be selected for the Raft voter set.
+    pub voter_eligible: bool,
+    /// Operator-reported placement domain used to spread Raft voters.
+    pub failure_domain: String,
+    /// Durable random identity used to break ties across reused numeric ids.
+    pub node_identity: String,
     pub partitions: Vec<PartitionProgress>,
 }
 
@@ -173,6 +179,9 @@ impl NodeStatus {
             speaks: crate::version::binary_speaks(),
             ready: false,
             draining: false,
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             partitions: Vec::new(),
         }
     }
@@ -186,6 +195,14 @@ impl NodeStatus {
     }
 
     pub(crate) fn encode(&self, w: &mut Writer) {
+        self.encode_v5(w);
+        w.u8(u8::from(self.voter_eligible))
+            .str(&self.failure_domain)
+            .str(&self.node_identity);
+    }
+
+    /// The encoding that predates combined-node voter placement attributes.
+    pub(crate) fn encode_v5(&self, w: &mut Writer) {
         self.encode_head(w);
         self.speaks.encode(w);
         w.u8(u8::from(self.ready)).u8(u8::from(self.draining));
@@ -210,6 +227,9 @@ impl NodeStatus {
             speaks: VersionRange::decode(r)?,
             ready: r.u8()? != 0,
             draining: r.u8()? != 0,
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             partitions: r.seq(PartitionProgress::decode_v4)?,
         })
     }
@@ -254,6 +274,15 @@ impl NodeStatus {
     }
 
     pub(crate) fn decode(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let mut status = Self::decode_v5(r)?;
+        status.voter_eligible = r.u8()? != 0;
+        status.failure_domain = r.string()?;
+        status.node_identity = r.string()?;
+        Ok(status)
+    }
+
+    /// Decodes the status shape used before combined-node voter placement.
+    pub(crate) fn decode_v5(r: &mut Reader<'_>) -> CodecResult<Self> {
         let (role, address, map_version) = Self::decode_head(r)?;
         Ok(Self {
             role,
@@ -262,6 +291,9 @@ impl NodeStatus {
             speaks: VersionRange::decode(r)?,
             ready: r.u8()? != 0,
             draining: r.u8()? != 0,
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             partitions: r.seq(PartitionProgress::decode)?,
         })
     }
@@ -276,6 +308,9 @@ impl NodeStatus {
             speaks: VersionRange::decode(r)?,
             ready: r.u8()? != 0,
             draining: r.u8()? != 0,
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             partitions: r.seq(PartitionProgress::decode_v3)?,
         })
     }
@@ -291,6 +326,9 @@ impl NodeStatus {
             speaks: VersionRange::decode(r)?,
             ready: false,
             draining: false,
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             partitions: r.seq(PartitionProgress::decode_v3)?,
         })
     }
@@ -309,6 +347,9 @@ impl NodeStatus {
             speaks: VersionRange::exactly(crate::version::ClusterVersion::ZERO),
             ready: false,
             draining: false,
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             partitions: r.seq(PartitionProgress::decode_v3)?,
         })
     }
@@ -344,6 +385,9 @@ mod tests {
             ),
             ready: true,
             draining: false,
+            voter_eligible: true,
+            failure_domain: "zone-a".into(),
+            node_identity: "node-4".into(),
             partitions: vec![PartitionProgress {
                 partition: PartitionId(3),
                 durable_lamport: Lamport(90),
@@ -375,6 +419,9 @@ mod tests {
             speaks: crate::version::binary_speaks(),
             ready: true,
             draining: true,
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             partitions: vec![PartitionProgress {
                 partition: PartitionId(3),
                 durable_lamport: Lamport(90),
@@ -419,6 +466,9 @@ mod tests {
             speaks: crate::version::binary_speaks(),
             ready: true,
             draining: false,
+            voter_eligible: false,
+            failure_domain: String::new(),
+            node_identity: String::new(),
             partitions: vec![
                 PartitionProgress {
                     partition: PartitionId(3),

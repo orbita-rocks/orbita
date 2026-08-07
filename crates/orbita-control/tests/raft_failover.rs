@@ -101,6 +101,9 @@ impl Group {
                             speaks: binary_speaks(),
                             ready: true,
                             draining: false,
+                            voter_eligible: false,
+                            failure_domain: String::new(),
+                            node_identity: String::new(),
                             partitions: vec![],
                         },
                     )
@@ -336,6 +339,9 @@ fn pre_finalization_raft_log_remains_readable_by_the_previous_binary() {
                     speaks: binary_speaks(),
                     ready: true,
                     draining: true,
+                    voter_eligible: false,
+                    failure_domain: String::new(),
+                    node_identity: String::new(),
                     partitions: vec![],
                 },
             )

@@ -84,6 +84,7 @@
 
 mod auth;
 mod aws;
+mod bootstrap;
 mod config;
 mod control;
 #[cfg(test)]
@@ -173,6 +174,7 @@ pub struct Server {
     reporter: Option<StatusReporter<ServerRuntime>>,
     raft: Option<Arc<RaftLog>>,
     control: Option<tokio::task::JoinHandle<()>>,
+    _control_executor: Option<runtime::ControlExecutor>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     serving: tokio::task::JoinHandle<()>,
 }
@@ -183,7 +185,7 @@ impl Server {
     /// Returns once the socket is bound and every partition the map says this
     /// node holds is open and recovered, so a caller that gets a `Server` back
     /// can send it a request immediately.
-    pub async fn start(config: ServerConfig) -> Result<Self> {
+    pub async fn start(mut config: ServerConfig) -> Result<Self> {
         let runtime = ServerRuntime::new(config.node_id, &config.data_dir, config.rng_seed)
             .with_peer_call_timeout(config.node_id, config.peer_call_timeout);
         // The config root secret, hashed once here so the plaintext never
@@ -214,16 +216,75 @@ impl Server {
             credential_cache_max_staleness,
             runtime.clock().clone(),
         ));
+        let store: Arc<dyn ObjectStore> = match config.object_store.clone() {
+            Some(object_store) => Arc::new(
+                connect_object_store(&runtime, object_store)
+                    .map_err(|e| Error::Internal(format!("configuring object storage: {e}")))?,
+            ),
+            None if config.automatic_cluster => {
+                return Err(Error::InvalidArgument(
+                    "combined clustered nodes require a shared object store for safe bootstrap"
+                        .into(),
+                ));
+            }
+            None => {
+                let storage_root = config.data_dir.join("storage");
+                std::fs::create_dir_all(&storage_root).map_err(|e| {
+                    Error::Internal(format!("creating {}: {e}", storage_root.display()))
+                })?;
+                Arc::new(fs_store::FsStore::new(storage_root))
+            }
+        };
+        let mut node_identity = String::new();
+        if config.automatic_cluster {
+            let address = config.peer_advertise_addr.as_deref().ok_or_else(|| {
+                Error::InvalidArgument(
+                    "combined clustered nodes need a peer advertise address".into(),
+                )
+            })?;
+            let certificate = bootstrap::bootstrap(
+                Arc::clone(&store),
+                &config.data_dir,
+                &config.cluster_name,
+                config.node_id,
+                address,
+                &config.failure_domain,
+                config.voter_eligible,
+            )
+            .await?;
+            tracing::info!(cluster_identity = %certificate.cluster_identity, "joined the durable cluster identity");
+            node_identity = certificate.node_identity.clone();
+            config.peers = certificate.voters.clone();
+            config.leader_group = certificate.voters.iter().map(|(node, _)| *node).collect();
+            // Every combined node hosts a dormant Raft state machine. A worker
+            // has to be reachable as a learner before the current voters can
+            // catch it up and promote it.
+            config.leader_member = true;
+            config.leader_owns_partitions = true;
+        }
         for (node, address) in &config.peers {
             runtime.transport().set_peer(*node, address.clone());
         }
+        let control_executor = config
+            .leader_member
+            .then(runtime::ControlExecutor::start)
+            .transpose()?;
+        let control_runtime = control_executor.as_ref().map_or_else(
+            || runtime.clone(),
+            |executor| runtime.for_control(executor.handle()),
+        );
         let mut raft = None;
         let mut controller = None;
         if config.leader_member {
-            let log = RaftLog::open(&runtime, &config.leader_group).await?;
+            let log = RaftLog::open(&control_runtime, &config.leader_group).await?;
+            let mut control_config =
+                ControlConfig::default().with_voter_target(config.voter_target)?;
+            if config.automatic_cluster {
+                control_config = control_config.with_voter_management();
+            }
             let control =
-                Controller::new(runtime.clone(), Arc::clone(&log), ControlConfig::default());
-            runtime.transport().register(
+                Controller::new(control_runtime.clone(), Arc::clone(&log), control_config);
+            control_runtime.transport().register(
                 ServiceId::Control,
                 ControlService::new(control.clone()).require_auth(config.require_auth),
             );
@@ -260,22 +321,10 @@ impl Server {
                     .local_addr()
                     .to_string()
             });
-            start_control_plane(&runtime, log, control, &config, &local_address).await?;
-        }
-        let store: Arc<dyn ObjectStore> = match config.object_store {
-            Some(object_store) => Arc::new(
-                connect_object_store(&runtime, object_store)
-                    .map_err(|e| Error::Internal(format!("configuring object storage: {e}")))?,
-            ),
-            None => {
-                // The local adapter keeps `orbita dev` self-contained.
-                let storage_root = config.data_dir.join("storage");
-                std::fs::create_dir_all(&storage_root).map_err(|e| {
-                    Error::Internal(format!("creating {}: {e}", storage_root.display()))
-                })?;
-                Arc::new(fs_store::FsStore::new(storage_root))
+            if !config.automatic_cluster || config.leader_group.contains(&config.node_id) {
+                start_control_plane(&runtime, log, control, &config, &local_address).await?;
             }
-        };
+        }
         let layout = DataLayout {
             store,
             wal_root: "wal".to_string(),
@@ -387,6 +436,11 @@ impl Server {
                 config.node_id,
                 role,
                 peer_advertise_addr,
+            )
+            .with_voter_attributes(
+                config.voter_eligible,
+                config.failure_domain.clone(),
+                node_identity.clone(),
             );
             // The server keeps a handle so version-dependent behaviour can
             // ask which cluster version is active without joining the loop.
@@ -434,7 +488,12 @@ impl Server {
         });
         let control_task = controller.as_ref().map(|controller| {
             let controller = controller.clone();
-            tokio::spawn(async move { controller.run().await })
+            match &control_executor {
+                Some(executor) => executor
+                    .handle()
+                    .spawn(async move { controller.run().await }),
+                None => tokio::spawn(async move { controller.run().await }),
+            }
         });
 
         let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -540,6 +599,7 @@ impl Server {
             reporter,
             raft,
             control: control_task,
+            _control_executor: control_executor,
             shutdown,
             serving,
         })

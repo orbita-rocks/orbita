@@ -1,16 +1,13 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "orbita.fullname" . }}-worker
+  name: {{ include "orbita.fullname" . }}
   labels:
     {{- include "orbita.labels" . | nindent 4 }}
-    app.kubernetes.io/component: worker
+    app.kubernetes.io/component: node
 spec:
-  serviceName: {{ include "orbita.fullname" . }}-worker
-  replicas: {{ .Values.worker.replicas }}
-  # Workers own partitions on their own disks, so they need a stable name and a
-  # stable volume. They can all start at once, because a worker that finds no
-  # leader group yet retries rather than failing.
+  serviceName: {{ include "orbita.fullname" . }}-nodes
+  replicas: {{ .Values.node.replicas }}
   podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
@@ -18,12 +15,12 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "orbita.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: worker
+      app.kubernetes.io/component: node
   template:
     metadata:
       labels:
         {{- include "orbita.labels" . | nindent 8 }}
-        app.kubernetes.io/component: worker
+        app.kubernetes.io/component: node
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -40,12 +37,8 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      # Long enough for this worker to hand each partition to a caught-up
-      # replica before the process goes away. A rolling restart of three
-      # workers is an ordinary weekly event and must not cost three separate
-      # failover windows.
-      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
-      {{- if .Values.worker.topologySpreadEnabled }}
+      terminationGracePeriodSeconds: {{ .Values.node.terminationGracePeriodSeconds }}
+      {{- if .Values.node.topologySpreadEnabled }}
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
@@ -54,13 +47,13 @@ spec:
             matchLabels:
               app.kubernetes.io/name: {{ include "orbita.name" . }}
               app.kubernetes.io/instance: {{ .Release.Name }}
-              app.kubernetes.io/component: worker
+              app.kubernetes.io/component: node
       {{- end }}
-      {{- with .Values.worker.nodeSelector }}
+      {{- with .Values.node.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.worker.tolerations }}
+      {{- with .Values.node.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -70,23 +63,24 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          # Worker ids start at 101 so that a worker id and a leader id can
-          # never collide, however either group is scaled.
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
               ordinal="${HOSTNAME##*-}"
-              fqdn="${HOSTNAME}.{{ include "orbita.fullname" . }}-worker.{{ .Release.Namespace }}.svc.cluster.local"
-              export ORBITA_NODE_ID="$((101 + ordinal))"
+              fqdn="${HOSTNAME}.{{ include "orbita.fullname" . }}-nodes.{{ .Release.Namespace }}.svc.cluster.local"
+              export ORBITA_NODE_ID="$((1 + ordinal))"
               export ORBITA_ADVERTISE="${fqdn}:{{ .Values.service.port }}"
-              # Peers reach this worker here, to replicate to it and to forward
-              # requests for the partitions it owns.
               export ORBITA_PEER_ADVERTISE="${fqdn}:{{ .Values.service.peerPort }}"
-              exec /usr/local/bin/orbita serve --role worker
+              export ORBITA_FAILURE_DOMAIN="${NODE_NAME}"
+              exec /usr/local/bin/orbita serve --role node
           env:
             - name: ORBITA_CONFIG
               value: /etc/orbita/orbita.toml
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             {{- with (include "orbita.objectStoreEnv" . | trim) }}
             {{- . | nindent 12 }}
             {{- end }}
@@ -95,14 +89,9 @@ spec:
               containerPort: {{ .Values.service.port }}
             - name: peer
               containerPort: {{ .Values.service.peerPort }}
-          # The startup budget is deliberately long. A worker that starts
-          # before the leader group retries until it can join, and killing it
-          # for that would turn an ordinary rollout into a crash loop. It is
-          # bounded by cluster.joinTimeout on the other side, so a worker that
-          # will never join still fails rather than hanging.
-          {{- include "orbita.probes" (dict "root" . "startupFailureThreshold" .Values.probes.startup.workerFailureThreshold) | nindent 10 }}
+          {{- include "orbita.probes" (dict "root" . "startupFailureThreshold" .Values.probes.startup.nodeFailureThreshold) | nindent 10 }}
           resources:
-            {{- toYaml .Values.worker.resources | nindent 12 }}
+            {{- toYaml .Values.node.resources | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /etc/orbita
@@ -117,20 +106,20 @@ spec:
             name: {{ include "orbita.fullname" . }}
         - name: tmp
           emptyDir: {}
-        {{- if not .Values.worker.persistence.enabled }}
+        {{- if not .Values.node.persistence.enabled }}
         - name: data
           emptyDir: {}
         {{- end }}
-  {{- if .Values.worker.persistence.enabled }}
+  {{- if .Values.node.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
-        {{- with .Values.worker.persistence.storageClass }}
+        {{- with .Values.node.persistence.storageClass }}
         storageClassName: {{ . | quote }}
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.worker.persistence.size }}
+            storage: {{ .Values.node.persistence.size }}
   {{- end }}

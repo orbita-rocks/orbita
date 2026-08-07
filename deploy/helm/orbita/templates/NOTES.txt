@@ -1,10 +1,10 @@
-Orbita is starting: {{ .Values.leader.replicas }} leader group members and {{ .Values.worker.replicas }} workers.
+Orbita is starting {{ .Values.node.replicas }} combined nodes with a voter target of {{ .Values.cluster.voterTarget }}.
 
 Watch them come up:
 
   kubectl --namespace {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} --watch
 
-Clients connect to one address, and any worker answers:
+Clients connect to one address, and any node answers:
 
   {{ include "orbita.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
 
@@ -28,28 +28,10 @@ networkPolicy.enabled if your CNI enforces policy.
 Before you upgrade this release, read docs/UPGRADES.md. Readiness here means
 the node has rejoined and caught up, while liveness means only that the process
 answers. Keep those two checks separate during an incident.
-{{- if .Values.leader.firstRaftUpgrade }}
-
-FIRST RAFT UPGRADE: the leader StatefulSet is OnDelete because the old pods
-cannot vote for the first new pod during a normal rolling update.
-
-Replace two voters together, then wait for their two-of-three quorum:
-
-  kubectl --namespace {{ .Release.Namespace }} delete pod {{ include "orbita.fullname" . }}-leader-1 {{ include "orbita.fullname" . }}-leader-2
-  kubectl --namespace {{ .Release.Namespace }} wait --for=condition=Ready pod/{{ include "orbita.fullname" . }}-leader-1 pod/{{ include "orbita.fullname" . }}-leader-2 --timeout=10m
-
-Replace the last old voter and wait for it to catch up:
-
-  kubectl --namespace {{ .Release.Namespace }} delete pod {{ include "orbita.fullname" . }}-leader-0
-  kubectl --namespace {{ .Release.Namespace }} wait --for=condition=Ready pod/{{ include "orbita.fullname" . }}-leader-0 --timeout=10m
-
-Then run Helm again with leader.firstRaftUpgrade=false. This restores ordinary
-readiness-gated RollingUpdate for every later release.
-{{- end }}
 {{ if not .Values.objectStore.endpoint }}
-Warning: no object store is configured, so compacted data stays on local disks
-and replacing a worker means rehydrating it from its replicas. Set
-objectStore.endpoint before this cluster holds anything you care about.
+Warning: no object store is configured. Combined clustered nodes require its
+conditional writes to agree on one durable bootstrap identity and will remain
+unready until objectStore.endpoint is set.
 {{- end }}
 {{- if and .Values.objectStore.endpoint (eq (include "orbita.credentialSource" .) "static") }}
 

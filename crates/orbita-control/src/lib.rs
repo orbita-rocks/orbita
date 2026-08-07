@@ -114,7 +114,7 @@ pub use client::{AdminOutcome, ControlClient, LocalControlClient, StatusReportRe
 pub use codec::CodecError;
 pub use command::ControlCommand;
 pub use config::ControlConfig;
-pub use consensus::{ConsensusLog, LogEntry, LogIndex, SingleNodeLog};
+pub use consensus::{ConsensusLog, LogEntry, LogIndex, MembershipChange, SingleNodeLog};
 pub use controller::{
     BootstrapSpec, ClusterView, Controller, FinalizedUpgrade, NodeView, PartitionView,
     RegistrationOutcome, ReplicaProgressView,
@@ -131,5 +131,5 @@ pub use version::{
 pub use wire::{
     METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
     METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
-    METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
 };

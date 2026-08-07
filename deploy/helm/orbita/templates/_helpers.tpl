@@ -41,26 +41,6 @@ app.kubernetes.io/part-of: orbita
 {{- end -}}
 
 {{/*
-The leader group, as stable DNS names from the headless Service, on the peer
-port. Every node gets the same list, which is what the bootstrap rule needs:
-the node with the lowest address forms the initial Raft configuration and the
-rest wait to hear from it, with no coordination and no race. Workers use the
-same list to find a leader to register with.
-
-These are peer addresses, not client ones. A leader group listed on the client
-port would look almost right and never form a quorum.
-*/}}
-{{- define "orbita.leaderPeers" -}}
-{{- $full := include "orbita.fullname" . -}}
-{{- $svc := printf "%s-leader" $full -}}
-{{- $peers := list -}}
-{{- range $i := until (int .Values.leader.replicas) -}}
-{{- $peers = append $peers (printf "%d=%s-%d.%s.%s.svc.cluster.local:%d" (add1 $i) $svc $i $svc $.Release.Namespace (int $.Values.service.peerPort)) -}}
-{{- end -}}
-{{- join "," $peers -}}
-{{- end -}}
-
-{{/*
 What the probes run: the binary asking its own client port.
 
 Two questions, two commands, on purpose. `cluster ready` asks whether this

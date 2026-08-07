@@ -55,7 +55,7 @@
 //! changing anything above the trait.
 
 use crate::command::ControlCommand;
-use crate::consensus::{ConsensusLog, LogEntry, LogIndex};
+use crate::consensus::{ConsensusLog, LogEntry, LogIndex, MembershipChange};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use orbita_core::{Error, NodeId, Result};
@@ -64,7 +64,10 @@ use orbita_runtime::{
     ServiceId, Transport, TransportError, TransportResult,
 };
 use prost::Message as _;
-use raft::eraftpb::{Entry, EntryType, HardState, Message};
+use raft::eraftpb::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, Entry, EntryType,
+    HardState, Message,
+};
 use raft::storage::MemStorage;
 use raft::{Config as RaftNodeConfig, RawNode, StateRole};
 
@@ -119,6 +122,9 @@ struct Shared {
     committed: Vec<ControlCommand>,
     is_leader: bool,
     leader: Option<NodeId>,
+    voters: Vec<NodeId>,
+    learners: Vec<NodeId>,
+    caught_up_learners: Vec<NodeId>,
 }
 
 enum Event {
@@ -132,6 +138,10 @@ enum Event {
     /// mailbox, so leadership cannot become authoritative before committed
     /// entries become visible to the controller.
     LeaderBarrier(oneshot::Sender<Result<LogIndex>>),
+    ChangeMembership {
+        change: MembershipChange,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Stops the driver, which is how a test restarts a node without tearing
     /// down the world around it. Production nodes run until the process dies.
     Shutdown,
@@ -158,13 +168,8 @@ impl RaftLog {
                 "the raft voter set contains a duplicate: {voters:?}"
             )));
         }
-        if !voters.contains(&local) {
-            return Err(Error::Internal(format!(
-                "node {local} is not in the raft voter set"
-            )));
-        }
-
-        assert_durable_voters(runtime, &durable_voters).await?;
+        let (durable_voters, durable_learners) =
+            load_durable_membership(runtime, &durable_voters).await?;
 
         let file = runtime
             .disk()
@@ -195,7 +200,14 @@ impl RaftLog {
         }
 
         let voter_ids: Vec<u64> = durable_voters.iter().map(|v| v.get()).collect();
-        let storage = MemStorage::new_with_conf_state((voter_ids, Vec::new()));
+        let mut learner_ids: Vec<u64> = durable_learners.iter().map(|v| v.get()).collect();
+        if !voter_ids.contains(&local.get()) && !learner_ids.contains(&local.get()) {
+            // A node discovered after bootstrap must run its Raft receiver so
+            // the leader can add and catch it up, but it is not entitled to
+            // campaign before that configuration change commits.
+            learner_ids.push(local.get());
+        }
+        let storage = MemStorage::new_with_conf_state((voter_ids, learner_ids));
         if let Some(hs) = &hard_state {
             storage.wl().set_hardstate(hs.clone());
         }
@@ -214,7 +226,11 @@ impl RaftLog {
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         let node = RawNode::new(&config, storage.clone(), &logger).map_err(raft_error)?;
 
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let shared = Arc::new(Mutex::new(Shared {
+            voters: durable_voters,
+            learners: durable_learners,
+            ..Shared::default()
+        }));
         let (tx, rx) = mpsc::unbounded_channel();
         runtime
             .transport()
@@ -231,6 +247,7 @@ impl RaftLog {
             rx,
             pending: HashMap::new(),
             barriers: HashMap::new(),
+            membership: HashMap::new(),
             next_proposal: 0,
             next_barrier: 0,
             was_leader: false,
@@ -248,54 +265,67 @@ impl RaftLog {
     }
 }
 
-async fn assert_durable_voters<R: Runtime>(runtime: &R, voters: &[NodeId]) -> Result<()> {
+async fn load_durable_membership<R: Runtime>(
+    runtime: &R,
+    voters: &[NodeId],
+) -> Result<(Vec<NodeId>, Vec<NodeId>)> {
     let file = runtime
         .disk()
         .open(VOTERS_PATH, OpenOptions::create())
         .await
         .map_err(disk_error)?;
-    let configured = encode_voters(voters);
+    let configured = encode_membership(voters, &[]);
     let size = file.size().await.map_err(disk_error)?;
     if size == 0 {
         file.append(configured).await.map_err(disk_error)?;
         file.sync().await.map_err(disk_error)?;
-        return Ok(());
+        return Ok((voters.to_vec(), Vec::new()));
     }
     let durable = file.read_at(0, size as usize).await.map_err(disk_error)?;
-    if durable != configured {
-        let held = decode_voters(&durable).unwrap_or_default();
-        return Err(Error::InvalidArgument(format!(
-            "configured raft voters {voters:?} do not match durable voters {held:?}; restore the \
-             original fixed peer set or use a new empty data directory for a new cluster"
-        )));
-    }
-    Ok(())
+    decode_membership(&durable)
+        .ok_or_else(|| Error::InvalidArgument("durable Raft membership is not decodable".into()))
 }
 
-fn encode_voters(voters: &[NodeId]) -> Bytes {
-    let mut bytes = BytesMut::with_capacity(4 + voters.len() * 8);
+fn encode_membership(voters: &[NodeId], learners: &[NodeId]) -> Bytes {
+    let mut bytes = BytesMut::with_capacity(8 + (voters.len() + learners.len()) * 8);
     bytes.put_u32_le(voters.len() as u32);
     for voter in voters {
         bytes.put_u64_le(voter.get());
     }
+    bytes.put_u32_le(learners.len() as u32);
+    for learner in learners {
+        bytes.put_u64_le(learner.get());
+    }
     bytes.freeze()
 }
 
-fn decode_voters(bytes: &[u8]) -> Option<Vec<NodeId>> {
+fn decode_membership(bytes: &[u8]) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
     let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
-    if bytes.len() != 4 + count * 8 {
+    let voters_end = 4 + count * 8;
+    if bytes.len() == voters_end {
+        return Some((decode_nodes(&bytes[4..voters_end]), Vec::new()));
+    }
+    let learner_count =
+        u32::from_le_bytes(bytes.get(voters_end..voters_end + 4)?.try_into().ok()?) as usize;
+    let learners_start = voters_end + 4;
+    if bytes.len() != learners_start + learner_count * 8 {
         return None;
     }
-    Some(
-        bytes[4..]
-            .chunks_exact(8)
-            .map(|chunk| {
-                NodeId(u64::from_le_bytes(
-                    chunk.try_into().expect("eight-byte chunk"),
-                ))
-            })
-            .collect(),
-    )
+    Some((
+        decode_nodes(&bytes[4..voters_end]),
+        decode_nodes(&bytes[learners_start..]),
+    ))
+}
+
+fn decode_nodes(bytes: &[u8]) -> Vec<NodeId> {
+    bytes
+        .chunks_exact(8)
+        .map(|chunk| {
+            NodeId(u64::from_le_bytes(
+                chunk.try_into().expect("eight-byte chunk"),
+            ))
+        })
+        .collect()
 }
 
 impl ConsensusLog for RaftLog {
@@ -341,6 +371,30 @@ impl ConsensusLog for RaftLog {
 
     async fn leader(&self) -> Option<NodeId> {
         self.lock().leader
+    }
+
+    async fn voters(&self) -> Vec<NodeId> {
+        self.lock().voters.clone()
+    }
+
+    async fn learners(&self) -> Vec<NodeId> {
+        self.lock().learners.clone()
+    }
+
+    async fn learner_caught_up(&self, node: NodeId) -> bool {
+        self.lock().caught_up_learners.contains(&node)
+    }
+
+    async fn change_membership(&self, change: MembershipChange) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Event::ChangeMembership { change, reply })
+            .map_err(|_| driver_gone())?;
+        response.await.map_err(|_| driver_gone())?
+    }
+
+    fn manages_membership(&self) -> bool {
+        true
     }
 }
 
@@ -410,6 +464,7 @@ struct Driver<R: Runtime> {
     pending: HashMap<u64, oneshot::Sender<Result<LogIndex>>>,
     /// Quorum-backed read-index checks waiting for their `ReadState`.
     barriers: HashMap<u64, oneshot::Sender<Result<LogIndex>>>,
+    membership: HashMap<u64, oneshot::Sender<Result<()>>>,
     next_proposal: u64,
     next_barrier: u64,
     was_leader: bool,
@@ -452,6 +507,9 @@ impl<R: Runtime> Driver<R> {
                 for (_, reply) in self.barriers.drain() {
                     let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
                 }
+                for (_, reply) in self.membership.drain() {
+                    let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
+                }
                 return;
             }
             self.publish_soft_state();
@@ -483,9 +541,59 @@ impl<R: Runtime> Driver<R> {
             }
             Event::Propose { command, reply } => self.handle_propose(command, reply),
             Event::LeaderBarrier(reply) => self.handle_leader_barrier(reply),
+            Event::ChangeMembership { change, reply } => {
+                self.handle_membership_change(change, reply)
+            }
             // Shutdown is consumed by the select in `run`; nothing routes it
             // here.
             Event::Shutdown => {}
+        }
+    }
+
+    fn handle_membership_change(
+        &mut self,
+        change: MembershipChange,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
+        if self.node.raft.state != StateRole::Leader {
+            let _ = reply.send(Err(Error::NotLeader {
+                leader: self.current_leader(),
+            }));
+            return;
+        }
+        if !self.membership.is_empty() {
+            let _ = reply.send(Err(Error::Unavailable(
+                "a Raft membership change is already in progress".into(),
+            )));
+            return;
+        }
+        let (node, change_type) = match change {
+            MembershipChange::AddLearner(node) => (node, ConfChangeType::AddLearnerNode),
+            MembershipChange::Promote(node) => (node, ConfChangeType::AddNode),
+            MembershipChange::Remove(node) => (node, ConfChangeType::RemoveNode),
+        };
+        let id = self.next_proposal;
+        self.next_proposal += 1;
+        let conf = ConfChangeV2 {
+            transition: ConfChangeTransition::Auto as i32,
+            changes: vec![ConfChangeSingle {
+                change_type: change_type as i32,
+                node_id: node.get(),
+            }],
+            context: Vec::new(),
+        };
+        match self
+            .node
+            .propose_conf_change(id.to_le_bytes().to_vec(), conf)
+        {
+            Ok(()) => {
+                self.membership.insert(id, reply);
+            }
+            Err(error) => {
+                let _ = reply.send(Err(Error::Unavailable(format!(
+                    "Raft dropped the membership proposal: {error}"
+                ))));
+            }
         }
     }
 
@@ -555,7 +663,7 @@ impl<R: Runtime> Driver<R> {
             "received a snapshot but snapshots are never generated"
         );
 
-        self.apply(ready.take_committed_entries())?;
+        self.apply(ready.take_committed_entries()).await?;
 
         let mut frames = BytesMut::new();
         if !ready.entries().is_empty() {
@@ -590,7 +698,7 @@ impl<R: Runtime> Driver<R> {
             self.persist(frame.freeze()).await?;
         }
         self.send_messages(light.take_messages());
-        self.apply(light.take_committed_entries())?;
+        self.apply(light.take_committed_entries()).await?;
         self.node.advance_apply();
         self.settle_read_states(read_states);
         Ok(())
@@ -645,8 +753,30 @@ impl<R: Runtime> Driver<R> {
 
     /// Feeds committed entries to the shared log and settles the proposals
     /// that produced them.
-    fn apply(&mut self, entries: Vec<Entry>) -> Result<()> {
+    async fn apply(&mut self, entries: Vec<Entry>) -> Result<()> {
         for entry in entries {
+            if entry.entry_type() == EntryType::EntryConfChangeV2 {
+                let change = ConfChangeV2::decode(entry.data.as_ref()).map_err(|error| {
+                    Error::Internal(format!(
+                        "committed membership entry did not decode: {error}"
+                    ))
+                })?;
+                let state = self.node.apply_conf_change(&change).map_err(raft_error)?;
+                let voters: Vec<NodeId> = state.voters.iter().copied().map(NodeId).collect();
+                let learners: Vec<NodeId> = state.learners.iter().copied().map(NodeId).collect();
+                self.persist_membership(&voters, &learners).await?;
+                {
+                    let mut shared = self.shared.lock().expect("raft shared state poisoned");
+                    shared.voters = voters;
+                    shared.learners = learners;
+                }
+                if let Ok(id) = <[u8; 8]>::try_from(entry.context.as_slice()) {
+                    if let Some(reply) = self.membership.remove(&u64::from_le_bytes(id)) {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+                continue;
+            }
             // Leaders append an empty entry on election, and nothing here
             // proposes conf changes. Neither is a command.
             if entry.entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
@@ -679,15 +809,49 @@ impl<R: Runtime> Driver<R> {
         Ok(())
     }
 
+    async fn persist_membership(&self, voters: &[NodeId], learners: &[NodeId]) -> Result<()> {
+        let file = self
+            .runtime
+            .disk()
+            .open(VOTERS_PATH, OpenOptions::create())
+            .await
+            .map_err(disk_error)?;
+        file.truncate(0).await.map_err(disk_error)?;
+        file.append(encode_membership(voters, learners))
+            .await
+            .map_err(disk_error)?;
+        file.sync().await.map_err(disk_error)
+    }
+
     /// Publishes leadership for the handle to read, and fails the proposals
     /// a deposed leader can no longer promise anything about.
     fn publish_soft_state(&mut self) {
         let is_leader = self.node.raft.state == StateRole::Leader;
         let leader = self.current_leader();
+        let caught_up_learners = if is_leader {
+            let committed = self.node.raft.raft_log.committed;
+            self.shared
+                .lock()
+                .expect("raft shared state poisoned")
+                .learners
+                .iter()
+                .copied()
+                .filter(|learner| {
+                    self.node
+                        .raft
+                        .prs()
+                        .get(learner.get())
+                        .is_some_and(|progress| progress.matched >= committed)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         {
             let mut shared = self.shared.lock().expect("raft shared state poisoned");
             shared.is_leader = is_leader;
             shared.leader = leader;
+            shared.caught_up_learners = caught_up_learners;
         }
         if self.was_leader && !is_leader {
             // The entries may still commit under the new leader; failing with
@@ -697,6 +861,9 @@ impl<R: Runtime> Driver<R> {
                 let _ = reply.send(Err(Error::NotLeader { leader }));
             }
             for (_, reply) in self.barriers.drain() {
+                let _ = reply.send(Err(Error::NotLeader { leader }));
+            }
+            for (_, reply) in self.membership.drain() {
                 let _ = reply.send(Err(Error::NotLeader { leader }));
             }
         }
@@ -911,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_rejects_a_voter_set_that_differs_from_durable_identity() {
+    fn a_restart_uses_the_durable_membership_instead_of_bootstrap_configuration() {
         let sim = Simulation::new(9);
         let runtime = sim.add_node(NodeId(1));
         let opening = runtime.clone();
@@ -919,11 +1086,14 @@ mod tests {
         log.shutdown();
 
         let reopening = sim.runtime(NodeId(1));
-        let error = sim
+        let reopened = sim
             .block_on(async move { RaftLog::open(&reopening, &[NodeId(1), NodeId(2)]).await })
-            .err()
-            .expect("the changed voter set is rejected");
-        assert!(error.to_string().contains("durable voters"), "{error}");
+            .expect("durable membership wins");
+        assert_eq!(
+            sim.block_on(async move { reopened.voters().await }),
+            vec![NodeId(1)],
+            "a bootstrap certificate is not allowed to roll membership backwards"
+        );
     }
 
     #[test]

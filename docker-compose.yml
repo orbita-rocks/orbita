@@ -1,85 +1,32 @@
-# A cluster you can poke at, in one command.
-#
-#   docker compose up --build -d
-#   docker compose run --rm cli keyspace create demo
-#   docker compose run --rm cli set demo greeting hello
-#   docker compose run --rm cli get demo greeting
-#
-# Or, if you have the binary on your machine, the same thing over the port
-# published to the host:
-#
-#   orbita --endpoint http://127.0.0.1:7100 keyspace create demo
-#   orbita --endpoint http://127.0.0.1:7100 set demo greeting hello
-#   orbita --endpoint http://127.0.0.1:7100 get demo greeting
-#   orbita --endpoint http://127.0.0.1:7100 cluster describe
-#
-# There is also a smoke test that does all of it and prints what it saw:
-#
-#   docker compose --profile smoke run --rm smoke
-#
-# Three leader group members running Raft, three workers owning partitions, and
-# MinIO standing in for S3. That is the real topology rather than a simplified
-# one, because the point of this file is to let someone see how the system is
-# actually shaped before they decide whether to run it. Someone who only wants
-# a key-value store on their laptop should run `orbita dev` instead, which is
-# one process and no Docker.
-#
-# # Two ports
-#
-# Every node binds two listeners: 7100 for client and admin gRPC, and 7101 for
-# peer traffic. Only 7100 is published to the host, and only from one worker.
-# 7101 stays inside the compose network, which is the container-shaped version
-# of the rule in docs/adr/0004-peer-traffic-uses-private-framing.md: peer
-# traffic belongs on a private network, and a peer port reachable from outside
-# is a hole. It is compatible only within a cluster version window, so it is
-# also not something a stranger should be able to speak.
-
+# A production-shaped minimum in one command. Every Orbita process serves the
+# worker path; the object-store bootstrap certificate selects three Raft voters.
+# Adding node-4 adds worker capacity without editing or restarting node-1..3.
 name: orbita
 
 x-orbita-image: &orbita-image
   build:
     context: .
     dockerfile: Dockerfile
-  # Plain `docker compose up` reuses this tag even when the Rust source changed.
-  # Use the `--build` command above whenever starting from a source checkout.
   image: orbita:local
 
 x-common-env: &common-env
+  ORBITA_NODE_ROLE: node
   ORBITA_CLUSTER_NAME: quickstart
+  ORBITA_VOTER_TARGET: "3"
   ORBITA_LISTEN: 0.0.0.0:7100
   ORBITA_PEER_LISTEN: 0.0.0.0:7101
+  ORBITA_DATA_DIR: /var/lib/orbita
   ORBITA_LOG_LEVEL: info
-  # The fixed leader voters and their peer addresses, listed identically on
-  # every node. The ids are persisted with the Raft log, so changing this set
-  # on an existing volume is rejected rather than forming another cluster.
-  ORBITA_LEADER_PEERS: 1=leader-1:7101,2=leader-2:7101,3=leader-3:7101
-  # Workers start alongside the leaders and retry until the group answers, so
-  # nothing here depends on getting the start order right. Two minutes rather
-  # than the default five, because on a laptop a cluster that is not up in two
-  # minutes is not coming up.
-  ORBITA_JOIN_TIMEOUT: 2m
   ORBITA_OBJECT_STORE_ENDPOINT: http://minio:9000
   ORBITA_OBJECT_STORE_BUCKET: orbita
   ORBITA_OBJECT_STORE_REGION: us-east-1
   ORBITA_OBJECT_STORE_ACCESS_KEY_ID: orbita
   ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY: orbita-quickstart
-  # MinIO addresses buckets by path, not by subdomain.
   ORBITA_OBJECT_STORE_FORCE_PATH_STYLE: "true"
 
-# The binary is its own health check. `cluster ready` asks the node-local health
-# service whether this member has joined and opened its partitions, so Raft
-# followers do not fail the probe merely because they reject leader-only Admin
-# calls. It is deliberately not `cluster describe`: a probe should say whether
-# this node is serving, not whether the whole cluster is well.
 x-orbita-healthcheck: &orbita-healthcheck
   healthcheck:
-    test:
-      - CMD
-      - /usr/local/bin/orbita
-      - --endpoint
-      - http://127.0.0.1:7100
-      - cluster
-      - ready
+    test: ["CMD", "/usr/local/bin/orbita", "--endpoint", "http://127.0.0.1:7100", "cluster", "ready"]
     interval: 5s
     timeout: 5s
     retries: 24
@@ -93,7 +40,6 @@ services:
       MINIO_ROOT_USER: orbita
       MINIO_ROOT_PASSWORD: orbita-quickstart
     ports:
-      # The console, for looking at what the workers uploaded.
       - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
@@ -103,144 +49,101 @@ services:
       timeout: 3s
       retries: 20
 
-  # Creates the bucket and exits. Nothing else in the file has to know how,
-  # and the workers can assume the bucket is there.
   minio-init:
     image: minio/mc:latest
     depends_on:
       minio:
         condition: service_healthy
     entrypoint: >
-      /bin/sh -c "
-        mc alias set local http://minio:9000 orbita orbita-quickstart &&
-        mc mb --ignore-existing local/orbita
-      "
+      /bin/sh -c "mc alias set local http://minio:9000 orbita orbita-quickstart &&
+      mc mb --ignore-existing local/orbita"
 
-  leader-1:
+  node-1:
     <<: [*orbita-image, *orbita-healthcheck]
-    command: ["serve", "--role", "leader"]
+    command: ["serve", "--role", "node"]
     environment:
       <<: *common-env
       ORBITA_NODE_ID: "1"
-      ORBITA_ADVERTISE: leader-1:7100
-      ORBITA_PEER_ADVERTISE: leader-1:7101
-    volumes:
-      - leader-1-data:/var/lib/orbita
-    depends_on:
-      minio-init:
-        condition: service_completed_successfully
-
-  leader-2:
-    <<: [*orbita-image, *orbita-healthcheck]
-    command: ["serve", "--role", "leader"]
-    environment:
-      <<: *common-env
-      ORBITA_NODE_ID: "2"
-      ORBITA_ADVERTISE: leader-2:7100
-      ORBITA_PEER_ADVERTISE: leader-2:7101
-    volumes:
-      - leader-2-data:/var/lib/orbita
-    depends_on:
-      minio-init:
-        condition: service_completed_successfully
-
-  leader-3:
-    <<: [*orbita-image, *orbita-healthcheck]
-    command: ["serve", "--role", "leader"]
-    environment:
-      <<: *common-env
-      ORBITA_NODE_ID: "3"
-      ORBITA_ADVERTISE: leader-3:7100
-      ORBITA_PEER_ADVERTISE: leader-3:7101
-    volumes:
-      - leader-3-data:/var/lib/orbita
-    depends_on:
-      minio-init:
-        condition: service_completed_successfully
-
-  # Worker 1 is the one published to the host. Any worker would do: a worker
-  # that does not own a key forwards the request to the one that does, so there
-  # is nothing to load balance for correctness.
-  #
-  # Only the client port is published, and only to the loopback address. The
-  # peer port stays on the compose network.
-  worker-1:
-    <<: [*orbita-image, *orbita-healthcheck]
-    command: ["serve", "--role", "worker"]
-    environment:
-      <<: *common-env
-      ORBITA_NODE_ID: "11"
-      ORBITA_ADVERTISE: worker-1:7100
-      ORBITA_PEER_ADVERTISE: worker-1:7101
+      ORBITA_ADVERTISE: node-1:7100
+      ORBITA_PEER_ADVERTISE: node-1:7101
+      ORBITA_FAILURE_DOMAIN: compose-1
     ports:
       - "127.0.0.1:7100:7100"
     volumes:
-      - worker-1-data:/var/lib/orbita
+      - node-1-data:/var/lib/orbita
     depends_on:
       minio-init:
         condition: service_completed_successfully
 
-  worker-2:
+  node-2:
     <<: [*orbita-image, *orbita-healthcheck]
-    command: ["serve", "--role", "worker"]
+    command: ["serve", "--role", "node"]
     environment:
       <<: *common-env
-      ORBITA_NODE_ID: "12"
-      ORBITA_ADVERTISE: worker-2:7100
-      ORBITA_PEER_ADVERTISE: worker-2:7101
+      ORBITA_NODE_ID: "2"
+      ORBITA_ADVERTISE: node-2:7100
+      ORBITA_PEER_ADVERTISE: node-2:7101
+      ORBITA_FAILURE_DOMAIN: compose-2
     volumes:
-      - worker-2-data:/var/lib/orbita
+      - node-2-data:/var/lib/orbita
     depends_on:
       minio-init:
         condition: service_completed_successfully
 
-  worker-3:
+  node-3:
     <<: [*orbita-image, *orbita-healthcheck]
-    command: ["serve", "--role", "worker"]
+    command: ["serve", "--role", "node"]
     environment:
       <<: *common-env
-      ORBITA_NODE_ID: "13"
-      ORBITA_ADVERTISE: worker-3:7100
-      ORBITA_PEER_ADVERTISE: worker-3:7101
+      ORBITA_NODE_ID: "3"
+      ORBITA_ADVERTISE: node-3:7100
+      ORBITA_PEER_ADVERTISE: node-3:7101
+      ORBITA_FAILURE_DOMAIN: compose-3
     volumes:
-      - worker-3-data:/var/lib/orbita
+      - node-3-data:/var/lib/orbita
     depends_on:
       minio-init:
         condition: service_completed_successfully
 
-  # The same image, run as a client. `docker compose run --rm cli <args>` gives
-  # anyone the CLI without installing it.
+  # Optional capacity. `docker compose --profile capacity up -d node-4` joins
+  # it as a worker while the voter set remains at the configured target of 3.
+  node-4:
+    <<: [*orbita-image, *orbita-healthcheck]
+    profiles: ["capacity"]
+    command: ["serve", "--role", "node"]
+    environment:
+      <<: *common-env
+      ORBITA_NODE_ID: "4"
+      ORBITA_ADVERTISE: node-4:7100
+      ORBITA_PEER_ADVERTISE: node-4:7101
+      ORBITA_FAILURE_DOMAIN: compose-4
+    volumes:
+      - node-4-data:/var/lib/orbita
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
   cli:
     <<: *orbita-image
     profiles: ["cli"]
     environment:
-      ORBITA_ENDPOINT: http://worker-1:7100
+      ORBITA_ENDPOINT: http://node-1:7100
     entrypoint: ["/usr/local/bin/orbita"]
     command: ["--help"]
     depends_on:
-      worker-1:
+      node-1:
         condition: service_healthy
 
-  # The whole quickstart as one command, so that "did it work" has an answer
-  # that is not a paragraph of instructions.
   smoke:
     <<: *orbita-image
     profiles: ["smoke"]
     environment:
-      ORBITA_ENDPOINT: http://worker-1:7100
+      ORBITA_ENDPOINT: http://node-1:7100
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -eu
         orbita keyspace create demo
-        # A keyspace exists the instant the control plane commits it, but its
-        # partition is not open on the nodes that replicate it until each of
-        # them next refreshes its map, and an owner cannot acknowledge a write
-        # it has not been able to put on a second copy. So the first write
-        # after a creation can be refused, with Unavailable, which is the
-        # status that means "ask again". A script talking to a distributed
-        # system should do that rather than treat a retryable answer as a
-        # failure, and this one is the worked example.
         for attempt in 1 2 3 4 5 6 7 8 9 10; do
           orbita set demo greeting hello && break
           sleep 1
@@ -248,14 +151,12 @@ services:
         orbita get demo greeting
         orbita cluster describe
     depends_on:
-      worker-1:
+      node-1:
         condition: service_healthy
 
 volumes:
   minio-data:
-  leader-1-data:
-  leader-2-data:
-  leader-3-data:
-  worker-1-data:
-  worker-2-data:
-  worker-3-data:
+  node-1-data:
+  node-2-data:
+  node-3-data:
+  node-4-data:

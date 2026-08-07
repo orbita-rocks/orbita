@@ -18,7 +18,7 @@
 
 use crate::command::ControlCommand;
 use crate::config::ControlConfig;
-use crate::consensus::{ConsensusLog, LogIndex};
+use crate::consensus::{ConsensusLog, LogIndex, MembershipChange};
 use crate::membership::{NodeHealth, NodeRole, NodeStatus};
 use crate::model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 use crate::state::{ClusterState, NodeRecord, PartitionPhase};
@@ -29,7 +29,7 @@ use orbita_core::{
 };
 use orbita_runtime::{Clock, Runtime, Transport};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -1104,10 +1104,96 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             }
         }
         self.refresh_health().await?;
+        self.repair_voter_set().await?;
         self.fence_dead_owners().await?;
         self.promote_drained_partitions().await?;
         self.place_unowned_partitions().await?;
         self.repair_replica_sets().await?;
+        Ok(())
+    }
+
+    async fn repair_voter_set(&self) -> Result<()> {
+        if !self.config.voter_management_enabled || !self.log.manages_membership() {
+            return Ok(());
+        }
+        let voters = self.log.voters().await;
+        let learners = self.log.learners().await;
+        let now = self.runtime.clock().monotonic_nanos();
+        let replacement_after = self.config.voter_replacement_after.as_nanos() as u64;
+        let (permanently_dead, candidates) = {
+            let inner = self.inner.lock().await;
+            let permanently_dead: Vec<NodeId> = voters
+                .iter()
+                .copied()
+                .filter(|voter| {
+                    inner
+                        .state
+                        .node(*voter)
+                        .is_some_and(|node| node.health == NodeHealth::Dead)
+                        && now.saturating_sub(
+                            inner
+                                .observations
+                                .get(voter)
+                                .map_or(inner.observing_since, |observation| {
+                                    observation.heard_at_nanos
+                                }),
+                        ) >= replacement_after
+                })
+                .collect();
+            let voter_domains: BTreeSet<&str> = voters
+                .iter()
+                .filter_map(|voter| inner.observations.get(voter))
+                .map(|observation| observation.status.failure_domain.as_str())
+                .filter(|domain| !domain.is_empty())
+                .collect();
+            let mut candidates: Vec<(bool, usize, String, NodeId)> = inner
+                .state
+                .placement_candidates()
+                .into_iter()
+                .filter(|node| !voters.contains(node))
+                .filter_map(|node| {
+                    let status = &inner.observations.get(&node)?.status;
+                    status.voter_eligible.then_some((
+                        status.failure_domain.is_empty()
+                            || voter_domains.contains(status.failure_domain.as_str()),
+                        inner.state.map().held_by(node).count(),
+                        status.node_identity.clone(),
+                        node,
+                    ))
+                })
+                .collect();
+            candidates.sort_unstable();
+            (permanently_dead, candidates)
+        };
+
+        let needs_voter = voters.len() < self.config.voter_target
+            || (!permanently_dead.is_empty() && voters.len() == self.config.voter_target);
+        if needs_voter {
+            let Some(candidate) = candidates.first().map(|candidate| candidate.3) else {
+                return Ok(());
+            };
+            if !learners.contains(&candidate) {
+                self.log
+                    .change_membership(MembershipChange::AddLearner(candidate))
+                    .await?;
+                tracing::info!(%candidate, "added a voter replacement as a Raft learner");
+            } else if self.log.learner_caught_up(candidate).await {
+                self.log
+                    .change_membership(MembershipChange::Promote(candidate))
+                    .await?;
+                tracing::info!(%candidate, "promoted a caught-up Raft learner to voter");
+            }
+            return Ok(());
+        }
+
+        if voters.len() > self.config.voter_target {
+            if let Some(dead) = permanently_dead.first().copied() {
+                self.log
+                    .change_membership(MembershipChange::Remove(dead))
+                    .await?;
+                tracing::info!(voter = %dead, "removed a permanently lost Raft voter");
+            }
+        }
         Ok(())
     }
 

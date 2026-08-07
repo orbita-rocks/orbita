@@ -203,6 +203,22 @@ pub struct ServerConfig {
     /// would put the rule at the mercy of how many nodes happened to be up.
     pub leader_owns_partitions: bool,
 
+    /// Whether clustered startup discovers its initial voters through the
+    /// object-store bootstrap certificate from ADR 0009.
+    pub automatic_cluster: bool,
+
+    /// The object-store namespace used to locate the durable cluster identity.
+    pub cluster_name: String,
+
+    /// The desired Raft voter count. Only three and five are supported.
+    pub voter_target: usize,
+
+    /// Whether this node may be selected for the voter set.
+    pub voter_eligible: bool,
+
+    /// The operator-supplied failure domain used to spread voters.
+    pub failure_domain: String,
+
     /// How often this node refetches the map and reports its own progress.
     ///
     /// One timer for both because they answer each other: the report says how
@@ -351,6 +367,11 @@ impl Default for ServerConfig {
             leader_group: Vec::new(),
             leader_member: false,
             leader_owns_partitions: false,
+            automatic_cluster: false,
+            cluster_name: "orbita".to_string(),
+            voter_target: 3,
+            voter_eligible: true,
+            failure_domain: String::new(),
             control_poll_interval: DEFAULT_CONTROL_POLL_INTERVAL,
             data_dir: PathBuf::from("data"),
             object_store: None,
@@ -462,6 +483,24 @@ impl ServerConfig {
     #[must_use]
     pub fn with_leader_owns_partitions(mut self, owns: bool) -> Self {
         self.leader_owns_partitions = owns;
+        self
+    }
+
+    /// Selects combined-node bootstrap. The object store fixes the identity
+    /// and initial voter certificate before Raft starts.
+    #[must_use]
+    pub fn with_automatic_cluster(
+        mut self,
+        cluster_name: impl Into<String>,
+        voter_target: usize,
+        voter_eligible: bool,
+        failure_domain: impl Into<String>,
+    ) -> Self {
+        self.automatic_cluster = true;
+        self.cluster_name = cluster_name.into();
+        self.voter_target = voter_target;
+        self.voter_eligible = voter_eligible;
+        self.failure_domain = failure_domain.into();
         self
     }
 

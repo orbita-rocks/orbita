@@ -27,6 +27,7 @@ pub struct ServerRuntime {
     disk: TokioDisk,
     transport: PeerTransport,
     rng: Arc<SeededRng>,
+    spawn_handle: Option<tokio::runtime::Handle>,
 }
 
 impl ServerRuntime {
@@ -45,7 +46,17 @@ impl ServerRuntime {
             transport: PeerTransport::new(node),
             rng: Arc::new(SeededRng::new(seed)),
             clock,
+            spawn_handle: None,
         }
+    }
+
+    /// Routes tasks spawned through this clone onto the reserved control
+    /// executor while preserving the same clock, disk, transport, and RNG.
+    #[must_use]
+    pub(crate) fn for_control(&self, handle: tokio::runtime::Handle) -> Self {
+        let mut runtime = self.clone();
+        runtime.spawn_handle = Some(handle);
+        runtime
     }
 
     /// Replaces the peer call timeout, which has to happen before anything is
@@ -83,7 +94,67 @@ impl Runtime for ServerRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        tokio::spawn(future);
+        if let Some(handle) = &self.spawn_handle {
+            handle.spawn(future);
+        } else {
+            tokio::spawn(future);
+        }
+    }
+}
+
+/// One executor thread reserved for Raft ticks and controller work.
+pub(crate) struct ControlExecutor {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    handle: tokio::runtime::Handle,
+}
+
+impl ControlExecutor {
+    pub(crate) fn start() -> orbita_core::Result<Self> {
+        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("orbita-control".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("building the reserved control runtime");
+                handle_tx
+                    .send(runtime.handle().clone())
+                    .expect("server receives the control runtime handle");
+                runtime.block_on(async {
+                    let _ = stopped.await;
+                });
+            })
+            .map_err(|error| {
+                orbita_core::Error::Internal(format!(
+                    "starting the reserved control executor: {error}"
+                ))
+            })?;
+        let handle = handle_rx.recv().map_err(|error| {
+            orbita_core::Error::Internal(format!("starting the control executor: {error}"))
+        })?;
+        Ok(Self {
+            stop: Some(stop),
+            thread: Some(thread),
+            handle,
+        })
+    }
+
+    pub(crate) fn handle(&self) -> tokio::runtime::Handle {
+        self.handle.clone()
+    }
+}
+
+impl Drop for ControlExecutor {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -120,5 +191,43 @@ mod tests {
         let a = ServerRuntime::new(NodeId(1), ".", Some(42));
         let b = ServerRuntime::new(NodeId(1), ".", Some(42));
         assert_eq!(a.rng().next_u64(), b.rng().next_u64());
+    }
+
+    #[test]
+    fn saturated_worker_execution_cannot_starve_control_ticks() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let worker = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let executor = ControlExecutor::start().unwrap();
+        let runtime = ServerRuntime::new(NodeId(1), ".", Some(1)).for_control(executor.handle());
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&ticks);
+        runtime.spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                observed.fetch_add(1, Ordering::Release);
+            }
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        worker.spawn(async move {
+            while !worker_stop.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            ticks.load(Ordering::Acquire),
+            5,
+            "the control executor has its own thread and bounded timers"
+        );
+        stop.store(true, Ordering::Release);
+        drop(worker);
+        drop(executor);
     }
 }
