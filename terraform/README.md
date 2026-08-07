@@ -12,6 +12,11 @@ This is the first Terraform in the repository. It sets the pattern on purpose:
 one small module, state that is honest about its scale, and comments that
 explain why rather than what.
 
+The operator runbook lives in
+[`docs/CI-LIVE-TESTS.md`](../docs/CI-LIVE-TESTS.md). Use it for first setup,
+state recovery, credential rotation, failure response, and retirement. This
+README explains the Terraform root itself.
+
 ## What it creates
 
 - An S3 bucket, with a lifecycle rule that deletes objects under `orbita-it/`
