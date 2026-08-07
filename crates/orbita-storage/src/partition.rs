@@ -369,6 +369,18 @@ pub struct Partition<R: Runtime> {
     /// contention we do not have in exchange for a class of bugs we would
     /// rather not reason about. Reads share it.
     state: tokio::sync::RwLock<State>,
+    /// True while this partition is a split parent whose children reference its
+    /// segments in place, per
+    /// [ADR 0009](../../../docs/adr/0009-a-split-shares-the-parents-segments.md).
+    /// It freezes flush, compaction, and sweep for the whole split, because
+    /// compaction deletes the self-written segments it replaces (see
+    /// [`Partition::compact`]) and those are exactly the objects the children
+    /// now point at — deleting one dangles a child's reference and loses the
+    /// data. Checked under [`Partition::state`], and set before the child
+    /// manifests are published, so any maintenance that acquires the lock after
+    /// the children exist sees it and stands down, while one that ran before
+    /// touched only segments no child had yet referenced.
+    maintenance_frozen: std::sync::atomic::AtomicBool,
 }
 
 impl<R: Runtime> Partition<R> {
@@ -417,7 +429,35 @@ impl<R: Runtime> Partition<R> {
             range,
             writer,
             state: tokio::sync::RwLock::new(state),
+            maintenance_frozen: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Freezes flush, compaction, and sweep because this partition is a split
+    /// parent whose children now reference its segments in place (ADR 0009).
+    ///
+    /// Set before the child manifests are published. Because every maintenance
+    /// path re-checks it under [`Partition::state`], and publication also holds
+    /// that lock, a maintenance pass either ran before the children existed
+    /// (touching only unshared segments) or sees the freeze and stands down;
+    /// there is no interleaving in which it deletes a segment a child points at.
+    pub fn freeze_maintenance(&self) {
+        self.maintenance_frozen
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Lifts the freeze, for a split that was abandoned. A completed split
+    /// retires this partition instead.
+    pub fn resume_maintenance(&self) {
+        self.maintenance_frozen
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether maintenance is frozen for an in-progress split.
+    #[must_use]
+    pub fn is_maintenance_frozen(&self) -> bool {
+        self.maintenance_frozen
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The key range this partition owns.
@@ -749,8 +789,17 @@ impl<R: Runtime> Partition<R> {
     ///
     /// A no-op when the table is empty. This is the explicit trigger ADR 0006
     /// names; the size trigger calls the same path from inside a write.
+    ///
+    /// A no-op too while a split has frozen maintenance: the flush counter it
+    /// would advance is what eventually triggers compaction, and compaction
+    /// deletes the very segments the children now reference. The check is under
+    /// the state lock so it cannot race the publication of those child
+    /// manifests. See [`Partition::freeze_maintenance`].
     pub async fn flush(&self) -> Result<()> {
         let mut state = self.state.write().await;
+        if self.is_maintenance_frozen() {
+            return Ok(());
+        }
         if !state.segments.is_empty() {
             state.timer_flushes_since_compaction += 1;
         }
@@ -767,8 +816,16 @@ impl<R: Runtime> Partition<R> {
     ///
     /// Ownership is deliberately the caller's decision. Replicas apply the
     /// same mutations but only the current owner may publish a manifest.
+    ///
+    /// Frozen during a split: a size-triggered flush can spill into compaction
+    /// the same way a timer flush can, so it stands down too. A split closes
+    /// write admission before it retires the parent, so the table it declines
+    /// to flush here is bounded by the brief pre-quiesce window.
     pub async fn flush_if_needed(&self) -> Result<()> {
         let mut state = self.state.write().await;
+        if self.is_maintenance_frozen() {
+            return Ok(());
+        }
         if state.memtable_bytes < FLUSH_TRIGGER_BYTES {
             return Ok(());
         }
@@ -993,8 +1050,17 @@ impl<R: Runtime> Partition<R> {
     /// product promises "eventually" rather than a bound. This exists so an
     /// operator, or a test, can ask for the sweep now. The mutable table is
     /// flushed first so the merge sees everything.
+    ///
+    /// A no-op while a split has frozen maintenance, because compaction is the
+    /// one operation that deletes a shared segment out from under a child. The
+    /// check is under the state lock and the freeze is set before the child
+    /// manifests are published, so a compaction can never run against a segment
+    /// a child already references. See [`Partition::freeze_maintenance`].
     pub async fn compact(&self) -> Result<()> {
         let mut state = self.state.write().await;
+        if self.is_maintenance_frozen() {
+            return Ok(());
+        }
         self.flush_locked(&mut state, false).await?;
         self.compact_locked(&mut state).await
     }
@@ -1042,6 +1108,18 @@ impl<R: Runtime> Partition<R> {
         max_skew_millis: u64,
         dry_run: bool,
     ) -> Result<SweepReport> {
+        // Frozen during a split. A split parent's children reference its
+        // segments, and the `shared` set a single node can assemble may not
+        // name a child owned only by another node, so the safe answer while the
+        // split is in flight is to sweep nothing here at all. Compaction is also
+        // frozen, so the parent's manifest is not dropping segments the sweep
+        // would then chase. See [`Partition::freeze_maintenance`].
+        if self.is_maintenance_frozen() {
+            return Ok(SweepReport {
+                dry_run,
+                ..Default::default()
+            });
+        }
         orbita_format::sweep_partition_protecting(
             self.store.as_ref(),
             &self.path,
@@ -1384,13 +1462,18 @@ impl<R: Runtime> Partition<R> {
         state.full_flushes_since_compaction = 0;
         state.timer_flushes_since_compaction = 0;
 
-        // The replaced objects are unreferenced the moment the manifest
-        // swapped, and this is the only writer, so deleting them now is safe.
-        // An external reader hydrating from the old manifest fails its read
-        // and retries against the new one, which the format documents as the
-        // deal. Failures here strand objects for the orphan sweep
-        // ([`Partition::sweep_orphans`]) to reclaim rather than failing the
-        // compaction that already happened.
+        // These deletes are why compaction is frozen during a split. The
+        // replaced objects are unreferenced by *this* manifest the moment it
+        // swapped, but since ADR 0009 a split child can reference this
+        // partition's self-written segments in place, so "unreferenced here"
+        // is no longer "unreferenced anywhere". Deleting one a child points at
+        // would dangle that reference and lose acknowledged data. `compact` is
+        // a no-op while [`Partition::maintenance_frozen`] is set, and the
+        // freeze is established before any child manifest is published, so this
+        // loop only ever runs when no child references what it deletes. Outside
+        // a split this is still the only writer, so the deletes are safe.
+        // Failures here strand objects for the cross-partition orphan sweep to
+        // reclaim, rather than failing a compaction that already happened.
         for name in replaced {
             let _ = self.store.delete(&self.path.object(&name)).await;
         }
@@ -1747,6 +1830,102 @@ mod tests {
                 "key {k} kept its version across the split"
             );
         }
+    }
+
+    /// The relative names of the segment objects physically under one
+    /// partition's directory, for a test that watches compaction delete them.
+    fn segment_objects(store: &orbita_format::testing::MemoryStore, id: u64) -> Vec<String> {
+        let prefix = child_prefix(id);
+        store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with(&prefix) && k.ends_with(".oseg"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_frozen_split_parent_does_not_compact_away_a_segment_a_child_references() {
+        // The ADR 0009 freeze, proven at the layer where the loss happens. A
+        // split parent's children reference its self-written segments in place;
+        // compaction deletes exactly those segments when it merges them, which
+        // would dangle the children's references and lose acknowledged data.
+        // Freezing maintenance for the split's duration is what prevents it.
+        let (parent, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        // Two segments, so compaction has something to merge and delete.
+        for k in ["a", "c", "e"] {
+            parent
+                .put(
+                    k.as_bytes(),
+                    bytes(&format!("v-{k}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .unwrap();
+        }
+        parent.flush().await.unwrap();
+        for k in ["n", "p", "r"] {
+            parent
+                .put(
+                    k.as_bytes(),
+                    bytes(&format!("v-{k}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .unwrap();
+        }
+        parent.flush().await.unwrap();
+
+        let (low, high) = parent.range().clone().split_at(bytes("m")).unwrap();
+        parent
+            .prepare_child_partitions(&[
+                ChildSpec {
+                    id: PartitionId(2),
+                    epoch: Epoch(2),
+                    range: low.clone(),
+                },
+                ChildSpec {
+                    id: PartitionId(3),
+                    epoch: Epoch(2),
+                    range: high.clone(),
+                },
+            ])
+            .await
+            .unwrap();
+        let shared = segment_objects(&store, 1);
+        assert!(
+            shared.len() >= 2,
+            "the parent has the segments the children now reference"
+        );
+
+        // Frozen: compaction is a no-op, so every shared segment survives.
+        parent.freeze_maintenance();
+        parent.compact().await.unwrap();
+        assert_eq!(
+            segment_objects(&store, 1),
+            shared,
+            "a frozen split parent must not compact away a segment a child references"
+        );
+        let child_low = open_child(&store, &clock, PartitionId(2), Epoch(2), low).await;
+        for k in ["a", "c", "e"] {
+            assert_eq!(
+                child_low.get(k.as_bytes()).await.unwrap().unwrap().value,
+                bytes(&format!("v-{k}")),
+                "the child still reads {k} from the shared segment"
+            );
+        }
+
+        // Lift the freeze — the abort path — and the same compaction now deletes
+        // those segments, which is exactly the loss the freeze prevented.
+        parent.resume_maintenance();
+        parent.compact().await.unwrap();
+        let after = segment_objects(&store, 1);
+        assert!(
+            after.iter().all(|name| !shared.contains(name)),
+            "unfrozen, compaction deletes the segments the children referenced: {after:?}"
+        );
     }
 
     #[tokio::test]

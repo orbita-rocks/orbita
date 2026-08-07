@@ -325,6 +325,104 @@ fn without_the_quiesce_gate_a_racing_write_is_lost() {
     }
 }
 
+#[test]
+fn the_flush_loop_does_not_compact_a_split_parent_while_it_is_pending() {
+    // The ADR 0009 freeze at the node level. A pending split leaves the parent
+    // owned and open; the background flush loop keeps visiting every owned host,
+    // and a flush pass advances the counter that eventually compacts — which
+    // deletes the segments the children now reference. The freeze takes the
+    // parent out of the flush loop for the split's duration. Here the loop runs
+    // well past the compaction trigger while the split is held pending, and the
+    // children still read every pre-split key afterward.
+    let sim = Simulation::new(1);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(parent_map());
+    let owner = start_node(&sim, OWNER, &source, Arc::clone(&store));
+    let replica = start_node(&sim, REPLICA, &source, Arc::clone(&store));
+    poll(&sim, &[&owner, &replica]);
+
+    // Two segments to divide.
+    for i in 0..2u64 {
+        write_one(&sim, &owner, i);
+    }
+    flush_owned(&sim, &owner);
+    for i in 2..4u64 {
+        write_one(&sim, &owner, i);
+    }
+    flush_owned(&sim, &owner);
+
+    // Begin the split through the real worker path: freeze and publish.
+    let prepared = {
+        let owner = Arc::clone(&owner);
+        sim.block_on(async move { owner.prepare_pending_splits(&[intent()]).await })
+    };
+    assert_eq!(prepared, vec![PARENT]);
+    assert!(
+        sim.block_on({
+            let owner = Arc::clone(&owner);
+            async move { owner.host(PARENT).await.unwrap().is_maintenance_frozen() }
+        }),
+        "a pending split freezes the parent's maintenance"
+    );
+
+    // Run the flush loop far past the compaction trigger. A frozen parent is
+    // skipped, so its segments are never merged and deleted.
+    for _ in 0..200 {
+        flush_owned(&sim, &owner);
+    }
+
+    // Complete the split and read every pre-split key from the children.
+    source.set(children_map());
+    poll(&sim, &[&owner, &replica]);
+    for i in 0..4u64 {
+        assert_eq!(
+            read(&sim, &owner, key_at(i)),
+            Some(value_at(i)),
+            "pre-split key {i} is still readable from its child after a long pending split"
+        );
+    }
+}
+
+#[test]
+fn an_aborted_split_reopens_the_parents_maintenance() {
+    // The freeze must lift when a split is abandoned — a required holder that
+    // never acks — so the parent resumes flushing, compacting, and sweeping.
+    let sim = Simulation::new(1);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(parent_map());
+    let owner = start_node(&sim, OWNER, &source, Arc::clone(&store));
+    let replica = start_node(&sim, REPLICA, &source, Arc::clone(&store));
+    poll(&sim, &[&owner, &replica]);
+    for i in 0..2u64 {
+        write_one(&sim, &owner, i);
+    }
+    flush_owned(&sim, &owner);
+
+    // Open the split, then abandon it: the next intent fetch returns nothing.
+    let owner2 = Arc::clone(&owner);
+    sim.block_on(async move { owner2.prepare_pending_splits(&[intent()]).await });
+    assert!(sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.host(PARENT).await.unwrap().is_maintenance_frozen() }
+    }));
+
+    let owner3 = Arc::clone(&owner);
+    sim.block_on(async move { owner3.prepare_pending_splits(&[]).await });
+    assert!(
+        !sim.block_on({
+            let owner = Arc::clone(&owner);
+            async move { owner.host(PARENT).await.unwrap().is_maintenance_frozen() }
+        }),
+        "an abandoned split reopens the parent's maintenance"
+    );
+}
+
+/// Runs one flush pass over every partition `node` owns.
+fn flush_owned(sim: &Simulation, node: &Arc<Node<SimRuntime>>) {
+    let node = Arc::clone(node);
+    sim.block_on(async move { node.flush_owned().await });
+}
+
 /// Writes one indexed key through `node`, returning whether it was acknowledged.
 fn write_one(sim: &Simulation, node: &Arc<Node<SimRuntime>>, index: u64) -> bool {
     let node = Arc::clone(node);

@@ -575,6 +575,25 @@ impl<R: Runtime> PartitionHost<R> {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Freezes this partition's flush, compaction, and sweep because it is a
+    /// split parent whose children reference its segments in place (ADR 0009).
+    /// Set from the moment the worker sees the split intent, so it covers the
+    /// whole window before the children publish and after, not just the
+    /// quiesced sub-window. See [`orbita_storage::Partition::freeze_maintenance`].
+    pub(crate) fn freeze_maintenance(&self) {
+        self.storage.freeze_maintenance();
+    }
+
+    /// Lifts the maintenance freeze, for a split that was abandoned.
+    pub(crate) fn resume_maintenance(&self) {
+        self.storage.resume_maintenance();
+    }
+
+    /// Whether this partition's maintenance is frozen for an in-progress split.
+    pub(crate) fn is_maintenance_frozen(&self) -> bool {
+        self.storage.is_maintenance_frozen()
+    }
+
     /// Whether this owner is currently admitting writes. False while a split is
     /// quiescing it.
     pub(crate) fn is_admitting_writes(&self) -> bool {

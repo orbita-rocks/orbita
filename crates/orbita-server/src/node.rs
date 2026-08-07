@@ -1646,7 +1646,14 @@ impl<R: Runtime> Node<R> {
         );
     }
 
-    /// Flushes every partition this node currently owns once.
+    /// Flushes every partition this node currently owns once, skipping any that
+    /// a split has frozen.
+    ///
+    /// A split parent is skipped because a flush pass advances the counter that
+    /// eventually triggers compaction, and compaction deletes the very segments
+    /// the parent's about-to-exist children reference (ADR 0009). The host's
+    /// `flush` re-checks the freeze under its own lock, so skipping here is the
+    /// cheap gate and the storage check is the race-free backstop.
     ///
     /// One pass rather than an internal timer keeps the same production code
     /// directly drivable under deterministic simulation.
@@ -1656,7 +1663,7 @@ impl<R: Runtime> Node<R> {
             .read()
             .await
             .values()
-            .filter(|host| host.is_owner())
+            .filter(|host| host.is_owner() && !host.is_maintenance_frozen())
             .cloned()
             .collect();
         for host in hosts {
@@ -1704,15 +1711,19 @@ impl<R: Runtime> Node<R> {
         let map = self.map();
         let pending: HashSet<PartitionId> = intents.iter().map(|intent| intent.parent).collect();
 
-        // Reopen writes on any partition we quiesced for a split that is no
-        // longer pending. A completed split retires the parent instead, so this
-        // only fires on an abort.
+        // Lift the freeze on any partition we quiesced or froze for a split
+        // that is no longer pending. A completed split retires the parent
+        // instead, so this only fires on an abort. Resuming maintenance here is
+        // what restarts its flush, compaction, and sweep once the children it
+        // was protecting will never exist.
         for host in self.hosts.read().await.values() {
-            if host.is_owner() && !host.is_admitting_writes() && !pending.contains(&host.id()) {
+            let was_splitting = !host.is_admitting_writes() || host.is_maintenance_frozen();
+            if host.is_owner() && was_splitting && !pending.contains(&host.id()) {
                 host.resume_write_admission();
+                host.resume_maintenance();
                 tracing::info!(
                     partition = host.id().get(),
-                    "reopened writes; the split was abandoned before it completed"
+                    "reopened writes and maintenance; the split was abandoned before it completed"
                 );
             }
         }
@@ -1737,6 +1748,11 @@ impl<R: Runtime> Node<R> {
             if is_owner {
                 let host = self.hosts.read().await.get(&intent.parent).cloned();
                 let Some(host) = host else { continue };
+                // Freeze flush, compaction, and sweep BEFORE preparing, so no
+                // maintenance pass can delete a segment the children are about
+                // to reference. The freeze is idempotent, so re-running it every
+                // poll while the split is pending costs nothing. See ADR 0009.
+                host.freeze_maintenance();
                 let specs = [
                     ChildSpec {
                         id: intent.lower,
@@ -1803,8 +1819,11 @@ impl<R: Runtime> Node<R> {
         // per ADR 0009. Gathered across every partition this node holds a copy
         // of — owner or replica — so a split child's reference to the parent's
         // segments protects them when the parent is swept. A child owned only
-        // by another node is not visible here; the split protocol freezes a
-        // parent's sweep for the split's duration to cover that window.
+        // by another node is not visible here, which is why a split *parent* is
+        // frozen out of the sweep entirely for the split's duration (both by
+        // the filter below and, race-free, inside `Partition::sweep_orphans`),
+        // rather than relying on this set being complete while a split is in
+        // flight.
         let mut shared_by_source: std::collections::BTreeMap<
             PartitionId,
             std::collections::BTreeSet<String>,
@@ -1816,7 +1835,10 @@ impl<R: Runtime> Node<R> {
         }
 
         let empty = std::collections::BTreeSet::new();
-        for host in hosts.into_iter().filter(|host| host.is_owner()) {
+        for host in hosts
+            .into_iter()
+            .filter(|host| host.is_owner() && !host.is_maintenance_frozen())
+        {
             let shared = shared_by_source.get(&host.id()).unwrap_or(&empty);
             match host
                 .sweep_orphans(shared, grace_millis, skew_millis, dry_run)
