@@ -13,11 +13,12 @@ use crate::model::Credential;
 use crate::version::{ClusterVersion, CompatibilityRefusal};
 use crate::wire::{
     AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, FetchSplitIntentsRequest,
-    ReportSplitPreparedRequest, ReportStatusRequest, WireSplitIntent, METHOD_ADMIN_CALL,
-    METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
-    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
-    METHOD_REPORT_SPLIT_PREPARED, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
-    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    ReportSplitPreparedV2Request, ReportStatusRequest, METHOD_ADMIN_CALL, METHOD_DRAIN_NODE,
+    METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_CREDENTIALS,
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
+    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_SPLIT_PREPARED_V2, METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
+    METHOD_REPORT_STATUS_V5,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionId, PartitionMap, Result};
@@ -291,16 +292,43 @@ impl<R: Runtime> ControlClient<R> {
     /// old leader mid-rollout. Every other refusal — including an unreachable
     /// group — is still an error, because those say nothing about whether a
     /// split is in flight.
-    pub async fn fetch_split_intents(&self, node: NodeId) -> Result<Vec<WireSplitIntent>> {
+    pub async fn fetch_split_intents(&self, node: NodeId) -> Result<crate::SplitIntentSnapshot> {
         match self
             .call(
-                METHOD_FETCH_SPLIT_INTENTS,
+                METHOD_FETCH_SPLIT_INTENTS_V2,
                 FetchSplitIntentsRequest { node }.encode(),
             )
             .await
         {
-            Ok(ControlResponse::SplitIntents(intents)) => Ok(intents),
-            Err(CallError::UnsupportedMethod(METHOD_FETCH_SPLIT_INTENTS)) => Ok(Vec::new()),
+            Ok(ControlResponse::SplitIntentsV2(snapshot)) => Ok(snapshot),
+            Err(CallError::UnsupportedMethod(METHOD_FETCH_SPLIT_INTENTS_V2)) => {
+                match self
+                    .call(
+                        METHOD_FETCH_SPLIT_INTENTS,
+                        FetchSplitIntentsRequest { node }.encode(),
+                    )
+                    .await
+                {
+                    Ok(ControlResponse::SplitIntents(intents)) if intents.is_empty() => {}
+                    Err(CallError::UnsupportedMethod(METHOD_FETCH_SPLIT_INTENTS)) => {}
+                    Ok(ControlResponse::SplitIntents(_)) => {
+                        return Err(Error::Unavailable(
+                            "the leader uses parent-scoped split acknowledgements; finalize the upgrade before splitting"
+                                .into(),
+                        ));
+                    }
+                    Ok(other) => return Err(unexpected(&other)),
+                    Err(error) => return Err(error.into_error()),
+                }
+                let map_version = self
+                    .fetch_map_if_newer(MapVersion::default())
+                    .await?
+                    .map_or(MapVersion::default(), |map| map.version());
+                Ok(crate::SplitIntentSnapshot {
+                    map_version,
+                    intents: Vec::new(),
+                })
+            }
             Ok(other) => Err(unexpected(&other)),
             Err(error) => Err(error.into_error()),
         }
@@ -308,11 +336,23 @@ impl<R: Runtime> ControlClient<R> {
 
     /// Reports that `node` has durably prepared its child storage for the split
     /// of `parent`. This is the real acknowledgement the completion waits on.
-    pub async fn report_split_prepared(&self, node: NodeId, parent: PartitionId) -> Result<()> {
+    pub async fn report_split_prepared(
+        &self,
+        node: NodeId,
+        parent: PartitionId,
+        lower: PartitionId,
+        upper: PartitionId,
+    ) -> Result<()> {
         match self
             .call_required(
-                METHOD_REPORT_SPLIT_PREPARED,
-                ReportSplitPreparedRequest { node, parent }.encode(),
+                METHOD_REPORT_SPLIT_PREPARED_V2,
+                ReportSplitPreparedV2Request {
+                    node,
+                    parent,
+                    lower,
+                    upper,
+                }
+                .encode(),
             )
             .await?
         {
@@ -694,6 +734,7 @@ mod tests {
                     },
                     Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
                 },
+                METHOD_FETCH_MAP => ControlResponse::Map(Some(PartitionMap::new(MapVersion(9)))),
                 other => ControlResponse::Error(format!("unknown control method {other}")),
             };
             Ok(response.encode())
@@ -740,7 +781,7 @@ mod tests {
             async move {
                 client
                     .call(
-                        METHOD_FETCH_SPLIT_INTENTS,
+                        METHOD_FETCH_SPLIT_INTENTS_V2,
                         FetchSplitIntentsRequest { node: NodeId(2) }.encode(),
                     )
                     .await
@@ -748,12 +789,57 @@ mod tests {
         });
         assert!(matches!(
             typed,
-            Err(CallError::UnsupportedMethod(METHOD_FETCH_SPLIT_INTENTS))
+            Err(CallError::UnsupportedMethod(METHOD_FETCH_SPLIT_INTENTS_V2))
         ));
         assert_eq!(
             sim.block_on(async move { client.fetch_split_intents(NodeId(2)).await }),
-            Ok(Vec::new()),
+            Ok(crate::SplitIntentSnapshot {
+                map_version: MapVersion(9),
+                intents: Vec::new(),
+            }),
             "a leader without split vocabulary cannot hold an active split"
+        );
+    }
+
+    #[test]
+    fn a_parent_scoped_split_leader_degrades_to_an_empty_versioned_snapshot() {
+        struct LegacySplitLeader;
+        impl PeerHandler for LegacySplitLeader {
+            async fn handle(
+                &self,
+                _from: orbita_runtime::NodeId,
+                call: PeerCall,
+            ) -> TransportResult<bytes::Bytes> {
+                let response = match call.method {
+                    METHOD_FETCH_SPLIT_INTENTS_V2 => {
+                        ControlResponse::Error(format!("unknown control method {}", call.method))
+                    }
+                    METHOD_FETCH_SPLIT_INTENTS => ControlResponse::SplitIntents(Vec::new()),
+                    METHOD_FETCH_MAP => {
+                        ControlResponse::Map(Some(PartitionMap::new(MapVersion(9))))
+                    }
+                    other => ControlResponse::Error(format!("unexpected control method {other}")),
+                };
+                Ok(response.encode())
+            }
+        }
+
+        let sim = Simulation::new(15);
+        let leader = sim.add_node(NodeId(1));
+        let worker = sim.add_node(NodeId(2));
+        orbita_runtime::Transport::register(
+            leader.transport(),
+            ServiceId::Control,
+            LegacySplitLeader,
+        );
+        let client = ControlClient::new(worker, vec![NodeId(1)]);
+
+        assert_eq!(
+            sim.block_on(async move { client.fetch_split_intents(NodeId(2)).await }),
+            Ok(crate::SplitIntentSnapshot {
+                map_version: MapVersion(9),
+                intents: Vec::new(),
+            })
         );
     }
 
@@ -769,7 +855,7 @@ mod tests {
                 _from: orbita_runtime::NodeId,
                 call: PeerCall,
             ) -> TransportResult<bytes::Bytes> {
-                assert_eq!(call.method, METHOD_FETCH_SPLIT_INTENTS);
+                assert_eq!(call.method, METHOD_FETCH_SPLIT_INTENTS_V2);
                 Ok(ControlResponse::Error(self.0.into()).encode())
             }
         }

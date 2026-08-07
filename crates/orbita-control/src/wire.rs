@@ -94,6 +94,10 @@ pub const METHOD_FETCH_SPLIT_INTENTS: u16 = 13;
 /// `MarkSplitPrepared` reflects storage that exists rather than a map version a
 /// node happened to observe.
 pub const METHOD_REPORT_SPLIT_PREPARED: u16 = 14;
+/// Fetches split intents with the map version observed beside them.
+pub const METHOD_FETCH_SPLIT_INTENTS_V2: u16 = 15;
+/// Reports preparation for one exact pair of child ids.
+pub const METHOD_REPORT_SPLIT_PREPARED_V2: u16 = 16;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -110,6 +114,7 @@ const STATUS_CREDENTIALS: u8 = 11;
 const STATUS_AUTH_POLICY: u8 = 12;
 const STATUS_SPLIT_INTENTS: u8 = 13;
 const STATUS_SPLIT_PREPARED: u8 = 14;
+const STATUS_SPLIT_INTENTS_V2: u8 = 15;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -306,7 +311,8 @@ impl FetchSplitIntentsRequest {
     }
 }
 
-/// A node's report that it has durably prepared child storage for a split.
+/// A node's report that it has durably prepared one exact generation of child
+/// storage for a split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReportSplitPreparedRequest {
     pub node: NodeId,
@@ -314,6 +320,7 @@ pub(crate) struct ReportSplitPreparedRequest {
 }
 
 impl ReportSplitPreparedRequest {
+    #[cfg(test)]
     pub(crate) fn encode(self) -> Bytes {
         Writer::new()
             .u64(self.node.get())
@@ -332,6 +339,39 @@ impl ReportSplitPreparedRequest {
     }
 }
 
+/// The generation-scoped preparation report introduced after the legacy
+/// parent-only shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportSplitPreparedV2Request {
+    pub node: NodeId,
+    pub parent: PartitionId,
+    pub lower: PartitionId,
+    pub upper: PartitionId,
+}
+
+impl ReportSplitPreparedV2Request {
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new()
+            .u64(self.node.get())
+            .u64(self.parent.get())
+            .u64(self.lower.get())
+            .u64(self.upper.get())
+            .finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+            parent: PartitionId(r.u64()?),
+            lower: PartitionId(r.u64()?),
+            upper: PartitionId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
 /// One active split a worker holds: which parent, at what boundary, into which
 /// two child ids, and whether this node still owes preparation work.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +381,14 @@ pub struct WireSplitIntent {
     pub lower: PartitionId,
     pub upper: PartitionId,
     pub prepared_by_this_node: bool,
+}
+
+/// Split intents observed from the same committed control state as this map
+/// version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitIntentSnapshot {
+    pub map_version: MapVersion,
+    pub intents: Vec<WireSplitIntent>,
 }
 
 /// The one response shape both methods share.
@@ -409,6 +457,8 @@ pub(crate) enum ControlResponse {
     Error(String),
     /// The splits a node must prepare child storage for.
     SplitIntents(Vec<WireSplitIntent>),
+    /// Generation-safe intents observed with their routing map version.
+    SplitIntentsV2(SplitIntentSnapshot),
     /// A split-preparation report was accepted.
     SplitPrepared,
 }
@@ -485,13 +535,12 @@ impl ControlResponse {
             }
             ControlResponse::SplitIntents(intents) => {
                 w.u8(STATUS_SPLIT_INTENTS);
-                w.seq(intents, |w, intent| {
-                    w.u64(intent.parent.get())
-                        .bytes(&intent.at)
-                        .u64(intent.lower.get())
-                        .u64(intent.upper.get())
-                        .u8(u8::from(intent.prepared_by_this_node));
-                });
+                w.seq(intents, encode_split_intent);
+            }
+            ControlResponse::SplitIntentsV2(snapshot) => {
+                w.u8(STATUS_SPLIT_INTENTS_V2);
+                w.u64(snapshot.map_version.get());
+                w.seq(&snapshot.intents, encode_split_intent);
             }
             ControlResponse::SplitPrepared => {
                 w.u8(STATUS_SPLIT_PREPARED);
@@ -543,15 +592,11 @@ impl ControlResponse {
             STATUS_COMMIT_INDEX => ControlResponse::CommitIndex(r.u64()?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
             STATUS_UNAVAILABLE => ControlResponse::Unavailable(r.string()?),
-            STATUS_SPLIT_INTENTS => ControlResponse::SplitIntents(r.seq(|r| {
-                Ok(WireSplitIntent {
-                    parent: PartitionId(r.u64()?),
-                    at: r.bytes()?,
-                    lower: PartitionId(r.u64()?),
-                    upper: PartitionId(r.u64()?),
-                    prepared_by_this_node: r.u8()? != 0,
-                })
-            })?),
+            STATUS_SPLIT_INTENTS => ControlResponse::SplitIntents(r.seq(decode_split_intent)?),
+            STATUS_SPLIT_INTENTS_V2 => ControlResponse::SplitIntentsV2(SplitIntentSnapshot {
+                map_version: MapVersion(r.u64()?),
+                intents: r.seq(decode_split_intent)?,
+            }),
             STATUS_SPLIT_PREPARED => ControlResponse::SplitPrepared,
             tag => {
                 return Err(CodecError::UnknownTag {
@@ -563,6 +608,24 @@ impl ControlResponse {
         r.done()?;
         Ok(response)
     }
+}
+
+fn encode_split_intent(w: &mut Writer, intent: &WireSplitIntent) {
+    w.u64(intent.parent.get())
+        .bytes(&intent.at)
+        .u64(intent.lower.get())
+        .u64(intent.upper.get())
+        .u8(u8::from(intent.prepared_by_this_node));
+}
+
+fn decode_split_intent(r: &mut Reader<'_>) -> CodecResult<WireSplitIntent> {
+    Ok(WireSplitIntent {
+        parent: PartitionId(r.u64()?),
+        at: r.bytes()?,
+        lower: PartitionId(r.u64()?),
+        upper: PartitionId(r.u64()?),
+        prepared_by_this_node: r.u8()? != 0,
+    })
 }
 
 /// Encodes a map for the wire.
@@ -749,23 +812,37 @@ mod tests {
             },
             ControlResponse::AuthPolicy(true),
             ControlResponse::AuthPolicy(false),
-            ControlResponse::SplitIntents(vec![
-                WireSplitIntent {
-                    parent: PartitionId(7),
-                    at: Bytes::from_static(b"m"),
-                    lower: PartitionId(20),
-                    upper: PartitionId(21),
-                    prepared_by_this_node: true,
-                },
-                WireSplitIntent {
-                    parent: PartitionId(8),
-                    at: Bytes::new(),
-                    lower: PartitionId(22),
-                    upper: PartitionId(23),
-                    prepared_by_this_node: false,
-                },
-            ]),
+            ControlResponse::SplitIntents(vec![WireSplitIntent {
+                parent: PartitionId(6),
+                at: Bytes::from_static(b"g"),
+                lower: PartitionId(18),
+                upper: PartitionId(19),
+                prepared_by_this_node: false,
+            }]),
+            ControlResponse::SplitIntentsV2(SplitIntentSnapshot {
+                map_version: MapVersion(14),
+                intents: vec![
+                    WireSplitIntent {
+                        parent: PartitionId(7),
+                        at: Bytes::from_static(b"m"),
+                        lower: PartitionId(20),
+                        upper: PartitionId(21),
+                        prepared_by_this_node: true,
+                    },
+                    WireSplitIntent {
+                        parent: PartitionId(8),
+                        at: Bytes::new(),
+                        lower: PartitionId(22),
+                        upper: PartitionId(23),
+                        prepared_by_this_node: false,
+                    },
+                ],
+            }),
             ControlResponse::SplitIntents(Vec::new()),
+            ControlResponse::SplitIntentsV2(SplitIntentSnapshot {
+                map_version: MapVersion(15),
+                intents: Vec::new(),
+            }),
             ControlResponse::SplitPrepared,
         ] {
             assert_eq!(
@@ -785,6 +862,16 @@ mod tests {
         };
         assert_eq!(
             ReportSplitPreparedRequest::decode(&report.encode()),
+            Ok(report)
+        );
+        let report = ReportSplitPreparedV2Request {
+            node: NodeId(4),
+            parent: PartitionId(7),
+            lower: PartitionId(20),
+            upper: PartitionId(21),
+        };
+        assert_eq!(
+            ReportSplitPreparedV2Request::decode(&report.encode()),
             Ok(report)
         );
     }

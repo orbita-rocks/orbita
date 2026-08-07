@@ -179,6 +179,9 @@ pub(crate) struct PartitionHost<R: Runtime> {
     drained: Arc<tokio::sync::Notify>,
     read_state: Mutex<ReplicaReadState>,
     leases: Mutex<LeaseTable>,
+    /// Until this instant a previous process incarnation may have a lease out
+    /// to a replica the current map no longer names.
+    leases_uncertain_until_nanos: u64,
     lease: LeasePolicy,
     /// The peers this node replicates to, when it owns the partition.
     ///
@@ -364,6 +367,15 @@ impl<R: Runtime> PartitionHost<R> {
         let pending = Arc::new(Mutex::new(PendingSet::default()));
         let drained = Arc::new(tokio::sync::Notify::new());
         let flushing = Arc::new(tokio::sync::Mutex::new(()));
+        // A same-epoch process restart cannot know which leases its previous
+        // incarnation granted, including to a replica removed from the current
+        // map. One full duration is the only conservative reconstruction.
+        let leases_uncertain_until_nanos = wal.as_ref().map_or(0, |_| {
+            runtime
+                .clock()
+                .monotonic_nanos()
+                .saturating_add(spec.lease.duration.as_nanos() as u64)
+        });
 
         // The applier holds weak references so that dropping a host retires
         // its storage engine there and then. A background task keeping the
@@ -395,6 +407,7 @@ impl<R: Runtime> PartitionHost<R> {
             drained,
             read_state: Mutex::new(ReplicaReadState::new(Lamport::ZERO)),
             leases: Mutex::new(LeaseTable::default()),
+            leases_uncertain_until_nanos,
             lease: spec.lease,
             grantable: Mutex::new(replicas.iter().copied().collect()),
             replicas: Mutex::new(replicas),
@@ -591,20 +604,6 @@ impl<R: Runtime> PartitionHost<R> {
         self.storage.prepare_child_partitions(children).await
     }
 
-    /// Reopens write admission, for a split that was abandoned before it
-    /// completed. A completed split retires this partition instead, so this is
-    /// only reached on an abort.
-    pub(crate) fn resume_write_admission(&self) {
-        self.admitting_writes
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Reopens read-lease issuance after a split aborts.
-    pub(crate) fn resume_lease_admission(&self) {
-        self.admitting_leases
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
     /// Freezes this partition's flush, compaction, and sweep because it is a
     /// split parent whose children reference its segments in place (ADR 0009).
     /// Set from the moment the worker sees the split intent, so it covers the
@@ -612,11 +611,6 @@ impl<R: Runtime> PartitionHost<R> {
     /// quiesced sub-window. See [`orbita_storage::Partition::freeze_maintenance`].
     pub(crate) fn freeze_maintenance(&self) {
         self.storage.freeze_maintenance();
-    }
-
-    /// Lifts the maintenance freeze, for a split that was abandoned.
-    pub(crate) fn resume_maintenance(&self) {
-        self.storage.resume_maintenance();
     }
 
     /// Whether this partition's maintenance is frozen for an in-progress split.
@@ -1145,6 +1139,7 @@ impl<R: Runtime> PartitionHost<R> {
             return;
         };
         let _renewal = self.lease_renewal.lock().await;
+        self.wait_for_possible_restart_leases().await;
         let replicas = self.replicas.lock().expect("replica set poisoned").clone();
         let through = wal.durable_lamport();
         let committed = wal.committed_lamport();
@@ -1183,8 +1178,11 @@ impl<R: Runtime> PartitionHost<R> {
     /// The wait is bounded by the leases themselves. A replica that does not
     /// answer stops being a lease holder when its lease runs out, so the worst
     /// case is one lease duration, once, and then the replica is out of the
-    /// read set.
+    /// read set. A newly opened owner also waits one duration because its prior
+    /// process may have granted a lease to a replica the current map no longer
+    /// names.
     async fn await_coherence(&self, wal: &Arc<Wal<R>>, lamport: Lamport) {
+        self.wait_for_possible_restart_leases().await;
         loop {
             let now = self.runtime.clock().monotonic_nanos();
             let behind: Vec<(NodeId, u64)> = self
@@ -1233,6 +1231,18 @@ impl<R: Runtime> PartitionHost<R> {
                     }
                 }
             }
+        }
+    }
+
+    pub(crate) async fn wait_for_possible_restart_leases(&self) {
+        let now = self.runtime.clock().monotonic_nanos();
+        if now < self.leases_uncertain_until_nanos {
+            self.runtime
+                .clock()
+                .sleep(Duration::from_nanos(
+                    self.leases_uncertain_until_nanos - now,
+                ))
+                .await;
         }
     }
 

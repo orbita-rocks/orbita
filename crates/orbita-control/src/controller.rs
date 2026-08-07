@@ -191,7 +191,7 @@ struct Inner {
     /// the driver turns it into the replicated `MarkSplitPrepared` entries the
     /// completion depends on. It is the real durable ack the review demanded in
     /// place of a mere map-version observation.
-    prepared_splits: BTreeMap<PartitionId, BTreeSet<NodeId>>,
+    prepared_splits: BTreeMap<(PartitionId, PartitionId, PartitionId), BTreeSet<NodeId>>,
     /// When this leader first saw each partition in the fenced phase, on its
     /// own monotonic clock. Not replicated, because the lease wait it drives
     /// is measured from an instant only this node observed.
@@ -885,23 +885,36 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// [`Controller::record_split_prepared`]. The boolean distinguishes work
     /// remaining from lifecycle: an acknowledged intent stays visible until a
     /// replicated CompleteSplit or AbortSplit removes it, so workers keep the
-    /// parent's gates closed without needlessly preparing it again.
-    pub async fn active_split_intents_for(&self, node: NodeId) -> Vec<(crate::SplitIntent, bool)> {
-        let inner = self.inner.lock().await;
+    /// parent's gates closed without needlessly preparing it again. The map
+    /// version is captured under the same lock so a worker can reject a
+    /// lifecycle observation made before or after its routing snapshot.
+    pub async fn active_split_intents_for(
+        &self,
+        node: NodeId,
+    ) -> (MapVersion, Vec<(crate::SplitIntent, bool)>) {
+        let mut inner = self.inner.lock().await;
+        let map_version = inner.state.map_version();
+        let state_intents = inner.state.split_intents();
+        let active: BTreeSet<_> = state_intents
+            .iter()
+            .map(|intent| (intent.parent, intent.lower, intent.upper))
+            .collect();
         inner
-            .state
-            .split_intents()
+            .prepared_splits
+            .retain(|generation, _| active.contains(generation));
+        let intents = state_intents
             .into_iter()
             .filter(|intent| intent.required.contains(&node))
             .map(|intent| {
                 let prepared = intent.prepared.contains(&node)
                     || inner
                         .prepared_splits
-                        .get(&intent.parent)
+                        .get(&(intent.parent, intent.lower, intent.upper))
                         .is_some_and(|set| set.contains(&node));
                 (intent, prepared)
             })
-            .collect()
+            .collect();
+        (map_version, intents)
     }
 
     /// Records that `node` has durably prepared its child storage for the split
@@ -911,14 +924,29 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     /// it only after both child manifests are on the object store, so the
     /// controller's `MarkSplitPrepared` reflects storage that exists, not a map
     /// version a node happened to observe.
-    pub async fn record_split_prepared(&self, node: NodeId, parent: PartitionId) {
-        self.inner
-            .lock()
-            .await
+    pub async fn record_split_prepared(
+        &self,
+        node: NodeId,
+        parent: PartitionId,
+        lower: PartitionId,
+        upper: PartitionId,
+    ) -> bool {
+        let mut inner = self.inner.lock().await;
+        let active = inner.state.split_intents().into_iter().any(|intent| {
+            intent.parent == parent
+                && intent.lower == lower
+                && intent.upper == upper
+                && intent.required.contains(&node)
+        });
+        if !active {
+            return false;
+        }
+        inner
             .prepared_splits
-            .entry(parent)
+            .entry((parent, lower, upper))
             .or_default()
             .insert(node);
+        true
     }
 
     /// Turns durable preparation acknowledgements into the replicated entries a
@@ -934,7 +962,8 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             let mut prepares = Vec::new();
             let mut completes = Vec::new();
             for intent in inner.state.split_intents() {
-                let acked = inner.prepared_splits.get(&intent.parent);
+                let generation = (intent.parent, intent.lower, intent.upper);
+                let acked = inner.prepared_splits.get(&generation);
                 for node in &intent.required {
                     if intent.prepared.contains(node) {
                         continue;
@@ -976,7 +1005,11 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 Ok(()) => {
                     tracing::info!(%parent, "retired a split parent; its children own its range");
                     crate::metrics::record_split(crate::metrics::Outcome::Committed);
-                    self.inner.lock().await.prepared_splits.remove(&parent);
+                    self.inner
+                        .lock()
+                        .await
+                        .prepared_splits
+                        .retain(|(held_parent, _, _), _| *held_parent != parent);
                 }
                 Err(
                     Error::StaleEpoch { .. } | Error::InvalidArgument(_) | Error::Unavailable(_),

@@ -319,8 +319,8 @@ impl Server {
         // and `fetch_split_intents` already answers that with the empty set,
         // so an old-binary leader does not crash-loop a new worker.
         let initial_split_intents = match &control {
-            Some(client) => client.fetch_split_intents(config.node_id).await?,
-            None => Vec::new(),
+            Some(client) => Some(client.fetch_split_intents(config.node_id).await?),
+            None => None,
         };
 
         let node = Node::start(
@@ -825,9 +825,12 @@ impl Server {
             // there are no intents, so a partition quiesced for a split the
             // leader later abandoned has its writes reopened.
             match client.fetch_split_intents(node_id).await {
-                Ok(intents) => {
-                    for parent in live.prepare_pending_splits(&intents).await {
-                        if let Err(error) = client.report_split_prepared(node_id, parent).await {
+                Ok(snapshot) => {
+                    for (parent, lower, upper) in live.prepare_split_snapshot(&snapshot).await {
+                        if let Err(error) = client
+                            .report_split_prepared(node_id, parent, lower, upper)
+                            .await
+                        {
                             tracing::debug!(
                                 %error,
                                 partition = parent.get(),

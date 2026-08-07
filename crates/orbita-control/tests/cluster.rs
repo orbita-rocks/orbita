@@ -1067,11 +1067,14 @@ impl Cluster {
             let clock = self.sim.runtime(LEADER).clock().clone();
             self.sim.runtime(LEADER).spawn(async move {
                 loop {
-                    for (intent, prepared) in controller.active_split_intents_for(node).await {
+                    let (_, intents) = controller.active_split_intents_for(node).await;
+                    for (intent, prepared) in intents {
                         if prepared {
                             continue;
                         }
-                        controller.record_split_prepared(node, intent.parent).await;
+                        controller
+                            .record_split_prepared(node, intent.parent, intent.lower, intent.upper)
+                            .await;
                     }
                     clock.sleep(Duration::from_millis(50)).await;
                 }
@@ -1099,7 +1102,7 @@ fn an_acknowledged_holder_still_sees_a_multi_holder_split_as_active() {
     });
     cluster.sim.run_for(Duration::from_millis(100));
 
-    let first = cluster.sim.block_on({
+    let (_, first) = cluster.sim.block_on({
         let controller = cluster.controller.clone();
         async move { controller.active_split_intents_for(owner).await }
     });
@@ -1107,11 +1110,16 @@ fn an_acknowledged_holder_still_sees_a_multi_holder_split_as_active() {
     assert!(!first[0].1);
     cluster.sim.block_on({
         let controller = cluster.controller.clone();
-        async move { controller.record_split_prepared(owner, parent).await }
+        let intent = first[0].0.clone();
+        async move {
+            controller
+                .record_split_prepared(owner, parent, intent.lower, intent.upper)
+                .await
+        }
     });
 
     for _ in 0..3 {
-        let owner_active = cluster.sim.block_on({
+        let (_, owner_active) = cluster.sim.block_on({
             let controller = cluster.controller.clone();
             async move { controller.active_split_intents_for(owner).await }
         });
@@ -1120,7 +1128,7 @@ fn an_acknowledged_holder_still_sees_a_multi_holder_split_as_active() {
             owner_active[0].1,
             "the owner has no work left but the split is active"
         );
-        let waiting_active = cluster.sim.block_on({
+        let (_, waiting_active) = cluster.sim.block_on({
             let controller = cluster.controller.clone();
             async move { controller.active_split_intents_for(waiting).await }
         });
@@ -1133,6 +1141,99 @@ fn an_acknowledged_holder_still_sees_a_multi_holder_split_as_active() {
     assert!(
         outcome.lock().expect("split outcome poisoned").is_none(),
         "the split cannot complete while another required holder remains unacknowledged"
+    );
+}
+
+#[test]
+fn an_aborted_generations_acknowledgement_does_not_prepare_its_retry() {
+    let cluster = Cluster::start(37);
+    let parent = cluster.only_partition();
+    let info = cluster.map().partition(parent).unwrap().clone();
+    let owner = info.owner.unwrap();
+    let begin = move |lower, upper| ControlCommand::BeginSplit {
+        parent,
+        at: Bytes::from_static(b"m"),
+        lower,
+        upper,
+        expect_epoch: info.epoch,
+    };
+
+    cluster
+        .sim
+        .block_on({
+            let controller = cluster.controller.clone();
+            async move {
+                controller
+                    .submit(begin(PartitionId(10), PartitionId(11)))
+                    .await
+            }
+        })
+        .unwrap();
+    assert!(cluster.sim.block_on({
+        let controller = cluster.controller.clone();
+        async move {
+            controller
+                .record_split_prepared(owner, parent, PartitionId(10), PartitionId(11))
+                .await
+        }
+    }));
+    assert!(
+        cluster.sim.block_on({
+            let controller = cluster.controller.clone();
+            async move {
+                controller
+                    .record_split_prepared(owner, parent, PartitionId(10), PartitionId(11))
+                    .await
+            }
+        }),
+        "retries of the active generation remain idempotent"
+    );
+    cluster
+        .sim
+        .block_on({
+            let controller = cluster.controller.clone();
+            async move {
+                controller
+                    .submit(ControlCommand::AbortSplit {
+                        parent,
+                        expect_epoch: info.epoch,
+                    })
+                    .await
+            }
+        })
+        .unwrap();
+    cluster
+        .sim
+        .block_on({
+            let controller = cluster.controller.clone();
+            async move {
+                controller
+                    .submit(begin(PartitionId(12), PartitionId(13)))
+                    .await
+            }
+        })
+        .unwrap();
+
+    assert!(
+        !cluster.sim.block_on({
+            let controller = cluster.controller.clone();
+            async move {
+                controller
+                    .record_split_prepared(owner, parent, PartitionId(10), PartitionId(11))
+                    .await
+            }
+        }),
+        "a delayed report for the abandoned children is rejected"
+    );
+    let (_, active) = cluster.sim.block_on({
+        let controller = cluster.controller.clone();
+        async move { controller.active_split_intents_for(owner).await }
+    });
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].0.lower, PartitionId(12));
+    assert!(
+        !active[0].1,
+        "the new child ids define a fresh preparation generation"
     );
 }
 
@@ -1234,11 +1335,14 @@ fn a_split_aborts_rather_than_wedging_when_a_required_holder_dies() {
         let clock = cluster.sim.runtime(LEADER).clock().clone();
         cluster.sim.runtime(LEADER).spawn(async move {
             loop {
-                for (intent, prepared) in controller.active_split_intents_for(node).await {
+                let (_, intents) = controller.active_split_intents_for(node).await;
+                for (intent, prepared) in intents {
                     if prepared {
                         continue;
                     }
-                    controller.record_split_prepared(node, intent.parent).await;
+                    controller
+                        .record_split_prepared(node, intent.parent, intent.lower, intent.upper)
+                        .await;
                 }
                 clock.sleep(Duration::from_millis(50)).await;
             }

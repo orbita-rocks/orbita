@@ -41,7 +41,7 @@ use crate::validate;
 
 use bytes::Bytes;
 use orbita_control::Permission;
-use orbita_control::WireSplitIntent;
+use orbita_control::{SplitIntentSnapshot, WireSplitIntent};
 use orbita_core::{
     Error, KeyspaceId, KeyspaceInfo, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
     Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
@@ -282,7 +282,7 @@ impl<R: Runtime> Node<R> {
         node_id: NodeId,
         layout: DataLayout,
         source: BoxedMapSource,
-        initial_split_intents: Vec<WireSplitIntent>,
+        initial_split_intents: Option<SplitIntentSnapshot>,
         lease_duration: Duration,
         readiness: Arc<ReadinessGate>,
         authenticator: Arc<Authenticator<R::Clock>>,
@@ -319,7 +319,23 @@ impl<R: Runtime> Node<R> {
             keyspace_miss_repaired_at: AtomicU64::new(0),
         });
         node.reconcile_hosts().await?;
-        node.apply_active_split_gates(&initial_split_intents).await;
+        let owners: Vec<_> = node
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner())
+            .cloned()
+            .collect();
+        join_all(
+            owners
+                .iter()
+                .map(|host| host.wait_for_possible_restart_leases())
+                .collect(),
+        )
+        .await;
+        node.apply_active_split_gates(initial_split_intents.as_ref())
+            .await;
         // Nothing is known to be stranded before a single heartbeat has gone
         // out, and a node held unready for a verdict it has not reached would
         // never start. The heartbeat corrects this within one interval.
@@ -344,10 +360,17 @@ impl<R: Runtime> Node<R> {
     }
 
     /// Restores split gates before startup publishes peer or client handlers.
-    async fn apply_active_split_gates(&self, intents: &[WireSplitIntent]) {
-        let active: HashSet<PartitionId> = intents.iter().map(|intent| intent.parent).collect();
+    async fn apply_active_split_gates(&self, snapshot: Option<&SplitIntentSnapshot>) {
+        let active: HashSet<PartitionId> = snapshot
+            .filter(|snapshot| snapshot.map_version == self.map().version())
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.intents)
+            .map(|intent| intent.parent)
+            .collect();
+        let snapshot_is_current =
+            snapshot.is_none_or(|snapshot| snapshot.map_version == self.map().version());
         for host in self.hosts.read().await.values() {
-            if host.is_owner() && active.contains(&host.id()) {
+            if host.is_owner() && (!snapshot_is_current || active.contains(&host.id())) {
                 host.close_split_gates();
             }
         }
@@ -1720,10 +1743,25 @@ impl<R: Runtime> Node<R> {
     /// the leader aborted it — is detected by its parent being absent from the
     /// intents, and any parent this node had quiesced for it has its writes
     /// reopened here rather than being left stuck closed.
+    pub(crate) async fn prepare_split_snapshot(
+        &self,
+        snapshot: &SplitIntentSnapshot,
+    ) -> Vec<(PartitionId, PartitionId, PartitionId)> {
+        if snapshot.map_version != self.map().version() {
+            tracing::debug!(
+                map_version = self.map().version().get(),
+                intent_map_version = snapshot.map_version.get(),
+                "deferring split intents until the map and lifecycle snapshot agree"
+            );
+            return Vec::new();
+        }
+        self.prepare_pending_splits(&snapshot.intents).await
+    }
+
     pub(crate) async fn prepare_pending_splits(
         &self,
         intents: &[WireSplitIntent],
-    ) -> Vec<PartitionId> {
+    ) -> Vec<(PartitionId, PartitionId, PartitionId)> {
         let map = self.map();
         let pending: HashSet<PartitionId> = intents.iter().map(|intent| intent.parent).collect();
 
@@ -1732,17 +1770,27 @@ impl<R: Runtime> Node<R> {
         // instead, so this only fires on an abort. Resuming maintenance here is
         // what restarts its flush, compaction, and sweep once the children it
         // was protecting will never exist.
-        for host in self.hosts.read().await.values() {
-            let was_splitting = !host.is_admitting_writes()
-                || !host.is_admitting_leases()
-                || host.is_maintenance_frozen();
-            if host.is_owner() && was_splitting && !pending.contains(&host.id()) {
-                host.resume_write_admission();
-                host.resume_lease_admission();
-                host.resume_maintenance();
-                tracing::info!(
-                    partition = host.id().get(),
-                    "reopened writes and maintenance; the split was abandoned before it completed"
+        let abandoned: Vec<PartitionId> = self
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| {
+                host.is_owner()
+                    && (!host.is_admitting_writes()
+                        || !host.is_admitting_leases()
+                        || host.is_maintenance_frozen())
+                    && !pending.contains(&host.id())
+            })
+            .map(|host| host.id())
+            .collect();
+        for parent in abandoned {
+            if let Err(error) = self.reopen_aborted_split_parent(parent).await {
+                self.unreconciled.store(true, Ordering::Release);
+                tracing::warn!(
+                    partition = parent.get(),
+                    %error,
+                    "could not reopen a split parent after abort; will retry"
                 );
             }
         }
@@ -1805,10 +1853,50 @@ impl<R: Runtime> Node<R> {
                 .child_manifests_exist(parent.keyspace, intent.lower, intent.upper)
                 .await
             {
-                prepared.push(intent.parent);
+                prepared.push((intent.parent, intent.lower, intent.upper));
             }
         }
         prepared
+    }
+
+    /// Recreates an aborted split parent because WAL quiescence is deliberately
+    /// irreversible within one host incarnation.
+    async fn reopen_aborted_split_parent(&self, parent: PartitionId) -> Result<()> {
+        let map = self.map();
+        let info = map
+            .partition(parent)
+            .filter(|info| info.owner == Some(self.node_id))
+            .ok_or_else(|| Error::NotOwner {
+                partition: parent,
+                owner: map.partition(parent).and_then(|info| info.owner),
+            })?
+            .clone();
+        let mut hosts = self.hosts.write().await;
+        let Some(held) = hosts.get(&parent) else {
+            return Ok(());
+        };
+        if held.is_admitting_writes() && held.is_admitting_leases() && !held.is_maintenance_frozen()
+        {
+            return Ok(());
+        }
+        hosts.remove(&parent);
+        self.wal_service.unregister(parent);
+        self.bridge.unregister(parent);
+        let paths = self.layout.paths(info.keyspace, parent);
+        let spec = HostSpec {
+            id: parent,
+            epoch: info.epoch,
+            range: info.range,
+            lease: self.lease,
+        };
+        let reopened =
+            PartitionHost::open_owner(self.runtime.clone(), spec, &paths, info.replicas).await?;
+        hosts.insert(parent, reopened);
+        tracing::info!(
+            partition = parent.get(),
+            "reopened the owner host after its split was abandoned"
+        );
+        Ok(())
     }
 
     /// The host for one partition this node holds, for a test that drives the
@@ -2238,7 +2326,7 @@ mod tests {
                     NodeId(1),
                     layout,
                     source,
-                    Vec::new(),
+                    None,
                     crate::DEFAULT_LEASE_DURATION,
                     gate,
                     authenticator,
@@ -2303,7 +2391,7 @@ mod tests {
                 NodeId(1),
                 layout,
                 source,
-                Vec::new(),
+                None,
                 crate::DEFAULT_LEASE_DURATION,
                 gate,
                 authenticator,

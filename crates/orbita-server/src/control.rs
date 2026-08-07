@@ -280,13 +280,20 @@ impl<R: Runtime> StatusReporter<R> {
     }
 
     /// The splits this node must prepare child storage for. See ADR 0009.
-    pub async fn fetch_split_intents(&self) -> Result<Vec<orbita_control::WireSplitIntent>> {
+    pub async fn fetch_split_intents(&self) -> Result<orbita_control::SplitIntentSnapshot> {
         self.client.fetch_split_intents(self.node).await
     }
 
     /// Reports that this node has durably prepared its child storage for the
     /// split of `parent`.
-    pub async fn report_split_prepared(&self, parent: PartitionId) -> Result<()> {
-        self.client.report_split_prepared(self.node, parent).await
+    pub async fn report_split_prepared(
+        &self,
+        parent: PartitionId,
+        lower: PartitionId,
+        upper: PartitionId,
+    ) -> Result<()> {
+        self.client
+            .report_split_prepared(self.node, parent, lower, upper)
+            .await
     }
 }

@@ -16,11 +16,12 @@ use crate::controller::Controller;
 use crate::controller::RegistrationOutcome;
 use crate::wire::{
     AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, FetchSplitIntentsRequest,
-    ReportSplitPreparedRequest, ReportStatusRequest, WireSplitIntent, METHOD_ADMIN_CALL,
-    METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
+    ReportSplitPreparedRequest, ReportSplitPreparedV2Request, ReportStatusRequest, WireSplitIntent,
+    METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
     METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
-    METHOD_REPORT_SPLIT_PREPARED, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
-    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_SPLIT_PREPARED, METHOD_REPORT_SPLIT_PREPARED_V2,
+    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
+    METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
 };
 
 use bytes::Bytes;
@@ -200,32 +201,68 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 Err(e) => ControlResponse::Error(format!("undecodable admin call: {e}")),
             },
             METHOD_FETCH_SPLIT_INTENTS => match FetchSplitIntentsRequest::decode(&call.payload) {
-                Ok(request) => ControlResponse::SplitIntents(
-                    self.controller
-                        .active_split_intents_for(request.node)
-                        .await
-                        .into_iter()
-                        .map(|(intent, prepared_by_this_node)| WireSplitIntent {
-                            parent: intent.parent,
-                            at: intent.at,
-                            lower: intent.lower,
-                            upper: intent.upper,
-                            prepared_by_this_node,
-                        })
-                        .collect(),
-                ),
+                // Protocol 0.0 cannot begin a worker-prepared split, and its
+                // parent-only acknowledgement cannot safely name a retry.
+                Ok(_) => ControlResponse::SplitIntents(Vec::new()),
                 Err(e) => ControlResponse::Error(format!("undecodable split intents fetch: {e}")),
             },
+            METHOD_FETCH_SPLIT_INTENTS_V2 => {
+                match FetchSplitIntentsRequest::decode(&call.payload) {
+                    Ok(request) => {
+                        let (map_version, intents) =
+                            self.controller.active_split_intents_for(request.node).await;
+                        ControlResponse::SplitIntentsV2(crate::SplitIntentSnapshot {
+                            map_version,
+                            intents: intents
+                                .into_iter()
+                                .map(|(intent, prepared_by_this_node)| WireSplitIntent {
+                                    parent: intent.parent,
+                                    at: intent.at,
+                                    lower: intent.lower,
+                                    upper: intent.upper,
+                                    prepared_by_this_node,
+                                })
+                                .collect(),
+                        })
+                    }
+                    Err(e) => {
+                        ControlResponse::Error(format!("undecodable split intents fetch: {e}"))
+                    }
+                }
+            }
             METHOD_REPORT_SPLIT_PREPARED => match ReportSplitPreparedRequest::decode(&call.payload)
             {
-                Ok(request) => {
-                    self.controller
-                        .record_split_prepared(request.node, request.parent)
-                        .await;
-                    ControlResponse::SplitPrepared
-                }
+                // Kept as a no-op for a worker rolling from protocol 0.0. Such
+                // a worker is never handed an intent by the legacy fetch above.
+                Ok(_) => ControlResponse::SplitPrepared,
                 Err(e) => ControlResponse::Error(format!("undecodable split-prepared report: {e}")),
             },
+            METHOD_REPORT_SPLIT_PREPARED_V2 => {
+                match ReportSplitPreparedV2Request::decode(&call.payload) {
+                    Ok(request) => {
+                        if self
+                            .controller
+                            .record_split_prepared(
+                                request.node,
+                                request.parent,
+                                request.lower,
+                                request.upper,
+                            )
+                            .await
+                        {
+                            ControlResponse::SplitPrepared
+                        } else {
+                            ControlResponse::Error(
+                                "the reported split generation is no longer active for this node"
+                                    .into(),
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        ControlResponse::Error(format!("undecodable split-prepared report: {e}"))
+                    }
+                }
+            }
             METHOD_FETCH_NODES => ControlResponse::Nodes(self.controller.node_addresses().await),
             METHOD_FETCH_CREDENTIALS => ControlResponse::Credentials(
                 self.controller

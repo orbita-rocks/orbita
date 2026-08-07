@@ -197,7 +197,7 @@ fn start_node(
                 node,
                 layout,
                 source,
-                Vec::new(),
+                None,
                 lease,
                 gate,
                 authenticator,

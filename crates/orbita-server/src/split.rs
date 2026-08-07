@@ -19,7 +19,7 @@
 use crate::map_source::{BoxedMapSource, StaticMapSource};
 use crate::node::{DataLayout, Node};
 
-use orbita_control::WireSplitIntent;
+use orbita_control::{SplitIntentSnapshot, WireSplitIntent};
 use orbita_core::{
     Epoch, KeyRange, KeyspaceId, KeyspaceInfo, KeyspaceName, MapVersion, NodeId, PartitionId,
     PartitionInfo, PartitionMap,
@@ -109,6 +109,25 @@ fn start_node_with_intents(
     store: Arc<MemoryStore>,
     intents: Vec<WireSplitIntent>,
 ) -> Arc<Node<SimRuntime>> {
+    start_node_with_snapshot(
+        sim,
+        node,
+        source,
+        store,
+        Some(SplitIntentSnapshot {
+            map_version: MapVersion(1),
+            intents,
+        }),
+    )
+}
+
+fn start_node_with_snapshot(
+    sim: &Simulation,
+    node: NodeId,
+    source: &StaticMapSource,
+    store: Arc<MemoryStore>,
+    snapshot: Option<SplitIntentSnapshot>,
+) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
         store,
@@ -129,7 +148,7 @@ fn start_node_with_intents(
             node,
             layout,
             source,
-            intents,
+            snapshot,
             Duration::from_millis(150),
             gate,
             authenticator,
@@ -244,6 +263,10 @@ fn intent() -> WireSplitIntent {
         upper: UPPER,
         prepared_by_this_node: false,
     }
+}
+
+fn generation() -> (PartitionId, PartitionId, PartitionId) {
+    (PARENT, LOWER, UPPER)
 }
 
 #[test]
@@ -368,7 +391,7 @@ fn the_flush_loop_does_not_compact_a_split_parent_while_it_is_pending() {
         let owner = Arc::clone(&owner);
         sim.block_on(async move { owner.prepare_pending_splits(&[intent()]).await })
     };
-    assert_eq!(prepared, vec![PARENT]);
+    assert_eq!(prepared, vec![generation()]);
     let mut acknowledged = intent();
     acknowledged.prepared_by_this_node = true;
     for _ in 0..3 {
@@ -421,7 +444,7 @@ fn a_restarted_acknowledged_owner_is_gated_before_it_can_serve() {
         let owner = Arc::clone(&owner);
         sim.block_on(async move { owner.prepare_pending_splits(&[intent()]).await })
     };
-    assert_eq!(prepared, vec![PARENT]);
+    assert_eq!(prepared, vec![generation()]);
 
     drop(owner);
     let mut acknowledged = intent();
@@ -457,6 +480,28 @@ fn a_restarted_acknowledged_owner_is_gated_before_it_can_serve() {
 }
 
 #[test]
+fn startup_keeps_owners_closed_until_the_map_matches_the_intent_snapshot() {
+    let sim = Simulation::new(43);
+    let source = StaticMapSource::new(parent_map());
+    let owner = start_node_with_snapshot(
+        &sim,
+        OWNER,
+        &source,
+        Arc::new(MemoryStore::new()),
+        Some(SplitIntentSnapshot {
+            map_version: MapVersion(2),
+            intents: Vec::new(),
+        }),
+    );
+
+    assert!(!write_one(&sim, &owner, 1));
+    assert!(!sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.host(PARENT).await.unwrap().is_admitting_writes() }
+    }));
+}
+
+#[test]
 fn split_preparation_revokes_parent_read_leases_before_acknowledging() {
     let sim = Simulation::new(23);
     let store = Arc::new(MemoryStore::new());
@@ -482,7 +527,7 @@ fn split_preparation_revokes_parent_read_leases_before_acknowledging() {
         let owner = Arc::clone(&owner);
         async move { owner.prepare_pending_splits(&[intent()]).await }
     });
-    assert_eq!(prepared, vec![PARENT]);
+    assert_eq!(prepared, vec![generation()]);
     assert!(
         !replica_host.might_serve(&key_at(0)),
         "the durable prepared ack follows explicit parent-lease revocation"
@@ -496,13 +541,13 @@ fn split_preparation_revokes_parent_read_leases_before_acknowledging() {
         "heartbeat cannot reissue a lease while the split remains active"
     );
 
-    let owner_host = sim.block_on({
-        let owner = Arc::clone(&owner);
-        async move { owner.host(PARENT).await.unwrap() }
-    });
     sim.block_on({
         let owner = Arc::clone(&owner);
         async move { owner.prepare_pending_splits(&[]).await }
+    });
+    let owner_host = sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.host(PARENT).await.unwrap() }
     });
     assert!(
         owner_host.is_admitting_leases(),
@@ -515,6 +560,10 @@ fn split_preparation_revokes_parent_read_leases_before_acknowledging() {
     assert!(
         replica_host.might_serve(&key_at(0)),
         "the live parent may grant read leases again after abort"
+    );
+    assert!(
+        write_one(&sim, &owner, 999),
+        "abort replaces the irreversibly quiesced WAL before reopening writes"
     );
 }
 
@@ -554,6 +603,50 @@ fn an_aborted_split_reopens_the_parents_maintenance() {
         let owner = Arc::clone(&owner);
         async move { owner.host(PARENT).await.unwrap().is_admitting_leases() }
     }));
+}
+
+#[test]
+fn an_empty_intent_snapshot_cannot_abort_a_split_against_an_older_map() {
+    let sim = Simulation::new(41);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(parent_map());
+    let owner = start_node(&sim, OWNER, &source, Arc::clone(&store));
+    let _replica = start_node(&sim, REPLICA, &source, store);
+    assert_eq!(
+        sim.block_on({
+            let owner = Arc::clone(&owner);
+            async move { owner.prepare_pending_splits(&[intent()]).await }
+        }),
+        vec![generation()]
+    );
+
+    let newer_empty = SplitIntentSnapshot {
+        map_version: MapVersion(2),
+        intents: Vec::new(),
+    };
+    assert!(sim
+        .block_on({
+            let owner = Arc::clone(&owner);
+            async move { owner.prepare_split_snapshot(&newer_empty).await }
+        })
+        .is_empty());
+    assert!(
+        !sim.block_on({
+            let owner = Arc::clone(&owner);
+            async move { owner.host(PARENT).await.unwrap().is_admitting_writes() }
+        }),
+        "completion or abort observed after a stale map must leave the parent gated"
+    );
+
+    let matching_empty = SplitIntentSnapshot {
+        map_version: MapVersion(1),
+        intents: Vec::new(),
+    };
+    sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.prepare_split_snapshot(&matching_empty).await }
+    });
+    assert!(write_one(&sim, &owner, 999));
 }
 
 /// Runs one flush pass over every partition `node` owns.
@@ -611,7 +704,7 @@ fn run(seed: u64) -> Result<(), Failure> {
         let owner = Arc::clone(&owner);
         sim.block_on(async move { owner.prepare_pending_splits(&[intent()]).await })
     };
-    if prepared != vec![PARENT] {
+    if prepared != vec![generation()] {
         return Err(sim.failure(format!(
             "the owner did not report the split prepared: {prepared:?}"
         )));
