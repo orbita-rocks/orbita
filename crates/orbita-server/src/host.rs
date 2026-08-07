@@ -50,7 +50,9 @@ use orbita_core::{
 use orbita_format::PartitionPath;
 use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
-use orbita_storage::{Mutation, Partition, ScanBudget, ScanPage, TOMBSTONE_RETENTION_MILLIS};
+use orbita_storage::{
+    ChildSpec, Mutation, Partition, ScanBudget, ScanPage, TOMBSTONE_RETENTION_MILLIS,
+};
 use orbita_wal::{CatchUpPass, Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
@@ -216,6 +218,9 @@ pub(crate) struct PartitionHost<R: Runtime> {
     drained: Arc<tokio::sync::Notify>,
     read_state: Mutex<ReplicaReadState>,
     leases: Mutex<LeaseTable>,
+    /// Until this instant a previous process incarnation may have a lease out
+    /// to a replica the current map no longer names.
+    leases_uncertain_until_nanos: u64,
     lease: LeasePolicy,
     /// The peers this node replicates to, when it owns the partition.
     ///
@@ -237,6 +242,26 @@ pub(crate) struct PartitionHost<R: Runtime> {
     applying: tokio::sync::Mutex<()>,
     /// Serializes segment publication with the WAL checkpoint it permits.
     flushing: Arc<tokio::sync::Mutex<()>>,
+    /// Whether this owner is still admitting writes. Closed for the duration of
+    /// a split so the committed prefix the children inherit is final: no
+    /// acknowledged write can land above it after the children are published.
+    /// Per-partition rather than the node-wide drain gate, because a split
+    /// quiesces one partition while the rest of the node keeps serving. See
+    /// [`PartitionHost::quiesce_and_prepare_children`].
+    admitting_writes: std::sync::atomic::AtomicBool,
+    /// Whether this owner may issue parent read leases. Split preparation
+    /// closes this before draining existing grants, so no retired parent can
+    /// remain in the read set after its children activate.
+    admitting_leases: std::sync::atomic::AtomicBool,
+    /// Orders ordinary renewal passes against split lease drainage. Without
+    /// this, an already-started positive renewal could arrive after the
+    /// split's zero-duration revocation and resurrect the lease.
+    lease_renewal: tokio::sync::Mutex<()>,
+    /// Held for a write's whole duration as a read guard; a split takes the
+    /// write guard to wait for every already-admitted write to resolve before
+    /// it settles the log to the committed prefix. This is the same close-then-
+    /// drain shape the node-wide handoff drain uses, scoped to one partition.
+    write_barrier: tokio::sync::RwLock<()>,
 }
 
 impl<R: Runtime> PartitionHost<R> {
@@ -381,6 +406,15 @@ impl<R: Runtime> PartitionHost<R> {
         let pending = Arc::new(Mutex::new(PendingSet::default()));
         let drained = Arc::new(tokio::sync::Notify::new());
         let flushing = Arc::new(tokio::sync::Mutex::new(()));
+        // A same-epoch process restart cannot know which leases its previous
+        // incarnation granted, including to a replica removed from the current
+        // map. One full duration is the only conservative reconstruction.
+        let leases_uncertain_until_nanos = wal.as_ref().map_or(0, |_| {
+            runtime
+                .clock()
+                .monotonic_nanos()
+                .saturating_add(spec.lease.duration.as_nanos() as u64)
+        });
 
         // The applier holds weak references so that dropping a host retires
         // its storage engine there and then. A background task keeping the
@@ -413,6 +447,7 @@ impl<R: Runtime> PartitionHost<R> {
             drained,
             read_state: Mutex::new(ReplicaReadState::new(Lamport::ZERO)),
             leases: Mutex::new(LeaseTable::default()),
+            leases_uncertain_until_nanos,
             lease: spec.lease,
             grantable: Mutex::new(replicas.iter().copied().collect()),
             replicas: Mutex::new(replicas),
@@ -420,6 +455,10 @@ impl<R: Runtime> PartitionHost<R> {
             withheld: Mutex::new(VecDeque::new()),
             applying: tokio::sync::Mutex::new(()),
             flushing,
+            admitting_writes: std::sync::atomic::AtomicBool::new(true),
+            admitting_leases: std::sync::atomic::AtomicBool::new(true),
+            lease_renewal: tokio::sync::Mutex::new(()),
+            write_barrier: tokio::sync::RwLock::new(()),
         })
     }
 
@@ -535,6 +574,113 @@ impl<R: Runtime> PartitionHost<R> {
             Some(wal) => wal.quiesce().await.map(|_| ()),
             None => Ok(()),
         }
+    }
+
+    /// The highest Lamport this owner's log handed back, or zero.
+    ///
+    /// Asked before a partition is reopened in place, because a reopen above
+    /// this mark reissues versions a replica may still hold different bytes
+    /// for, and only a higher epoch makes a replica give that tail up. See
+    /// [`orbita_wal::Wal::surrendered_lamport`].
+    pub(crate) fn surrendered_lamport(&self) -> Lamport {
+        self.wal
+            .as_ref()
+            .map_or(Lamport::ZERO, |wal| wal.surrendered_lamport())
+    }
+
+    /// Quiesces this partition and durably prepares both split children over
+    /// its segments, returning the committed prefix the children inherit.
+    ///
+    /// This is the worker's half of the ADR 0009 split, and the ordering is the
+    /// write-loss guard. It closes write admission, waits for every already
+    /// admitted write to resolve, then `quiesce`s the log — dropping the
+    /// uncommitted tail whose clients were told `Unavailable`, exactly as a
+    /// handoff drain does (#79/#87), so the position it settles to is the
+    /// committed prefix and never the owner's local durable tail. It waits for
+    /// the applier to carry storage up to that prefix, then prepares the
+    /// children over it with no copy. Nothing above the returned horizon can be
+    /// in the children, and nothing above it can be admitted afterwards, so no
+    /// acknowledged write is lost across the split.
+    ///
+    /// Idempotent and safe to repeat: a re-run re-quiesces a quiesced log for
+    /// free and re-publishes child manifests that already exist as a no-op.
+    /// Only the owner runs it; a replica has no writes to quiesce and reaches
+    /// the same child manifests through the shared bucket.
+    pub(crate) async fn quiesce_and_prepare_children(
+        &self,
+        children: &[ChildSpec],
+    ) -> Result<Lamport> {
+        if self.wal.is_none() {
+            return Err(Error::NotOwner {
+                partition: self.id,
+                owner: None,
+            });
+        }
+        // Close write and lease admission, then wait out in-flight writes and
+        // every lease under which a replica could still serve the parent.
+        self.close_split_gates();
+        let _barrier = self.write_barrier.write().await;
+        self.drain_read_leases().await;
+        // Give up the uncommitted tail so the log settles to the committed
+        // prefix, then let the applier carry storage up to it before capturing.
+        self.quiesce().await?;
+        self.wait_for_applies().await;
+        self.storage.prepare_child_partitions(children).await
+    }
+
+    /// Closes the split gates without doing preparation work.
+    ///
+    /// A recovered owner is put in this state before it enters the node's host
+    /// table. The first authoritative active-intent fetch either keeps it
+    /// closed or reopens it, so restart never exposes an unchecked parent.
+    pub(crate) fn close_split_gates(&self) {
+        self.admitting_writes
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.admitting_leases
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.freeze_maintenance();
+    }
+
+    /// Prepares child storage over the parent's segments *without* quiescing —
+    /// no admission close, no log settle — so a test can show why the quiesce is
+    /// load-bearing: a write acknowledged after the horizon this captures lands
+    /// in the parent's still-live log, which no child inherits, and is lost when
+    /// the parent retires. Only the real
+    /// [`quiesce_and_prepare_children`](Self::quiesce_and_prepare_children) is
+    /// used in production.
+    #[cfg(test)]
+    pub(crate) async fn prepare_children_without_quiescing(
+        &self,
+        children: &[ChildSpec],
+    ) -> Result<Lamport> {
+        self.storage.prepare_child_partitions(children).await
+    }
+
+    /// Freezes this partition's flush, compaction, and sweep because it is a
+    /// split parent whose children reference its segments in place (ADR 0009).
+    /// Set from the moment the worker sees the split intent, so it covers the
+    /// whole window before the children publish and after, not just the
+    /// quiesced sub-window. See [`orbita_storage::Partition::freeze_maintenance`].
+    pub(crate) fn freeze_maintenance(&self) {
+        self.storage.freeze_maintenance();
+    }
+
+    /// Whether this partition's maintenance is frozen for an in-progress split.
+    pub(crate) fn is_maintenance_frozen(&self) -> bool {
+        self.storage.is_maintenance_frozen()
+    }
+
+    /// Whether this owner is currently admitting writes. False while a split is
+    /// quiescing it.
+    pub(crate) fn is_admitting_writes(&self) -> bool {
+        self.admitting_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this owner may currently issue read leases.
+    pub(crate) fn is_admitting_leases(&self) -> bool {
+        self.admitting_leases
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether this node might answer a read for `key` without asking the
@@ -747,6 +893,7 @@ impl<R: Runtime> PartitionHost<R> {
     /// clock-domain contract the deletion decision rests on.
     pub(crate) async fn sweep_orphans(
         &self,
+        shared: &std::collections::BTreeSet<String>,
         grace_millis: u64,
         max_skew_millis: u64,
         dry_run: bool,
@@ -758,8 +905,17 @@ impl<R: Runtime> PartitionHost<R> {
             });
         }
         self.storage
-            .sweep_orphans(grace_millis, max_skew_millis, dry_run)
+            .sweep_orphans(shared, grace_millis, max_skew_millis, dry_run)
             .await
+    }
+
+    /// The segments this host references in place under other partitions'
+    /// directories, grouped by the partition each lives under. See ADR 0009 and
+    /// [`Node::sweep_owned`].
+    pub(crate) async fn shared_segment_sources(
+        &self,
+    ) -> std::collections::BTreeMap<PartitionId, std::collections::BTreeSet<String>> {
+        self.storage.shared_segment_sources().await
     }
 
     /// Evaluates the condition, commits through the log, and answers the
@@ -789,9 +945,41 @@ impl<R: Runtime> PartitionHost<R> {
             });
         };
 
+        // A split quiesces this partition by closing admission and draining
+        // in-flight writes. Checking before the barrier turns away a write that
+        // arrives after the close; holding the barrier read guard for the
+        // write's whole duration is what lets the quiesce wait for the ones
+        // already admitted. Re-checking after acquiring closes the race where
+        // the close landed between the two.
+        if !self
+            .admitting_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(format!(
+                "partition {} is splitting and is not admitting writes",
+                self.id
+            )));
+        }
+        let admission = self.write_barrier.read().await;
+        if !self
+            .admitting_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(format!(
+                "partition {} is splitting and is not admitting writes",
+                self.id
+            )));
+        }
+
         // The whole call gets one waiting budget, not one per attempt, so a
         // key under constant conditional traffic cannot hold a caller here
         // indefinitely by staying uncertain.
+        //
+        // The admission guard above is deliberately held across that wait. A
+        // conditional write parked on an in-flight neighbour is an already
+        // admitted write, and waiting for those to resolve is exactly what the
+        // quiesce is for, so a split drains it rather than racing it. The wait
+        // is bounded, so the drain is too.
         let settle_by = self
             .runtime
             .clock()
@@ -912,6 +1100,13 @@ impl<R: Runtime> PartitionHost<R> {
                 if queued {
                     let _ = resolved.send(Some(mutation_of_op(lamport, &key, &wal_op)));
                 }
+                // The write is durable at quorum by here, so its Lamport is in
+                // the committed prefix a split would capture: releasing the
+                // admission guard now still keeps a concurrent quiesce from
+                // capturing a horizon below this write, while not holding the
+                // guard across the coherence wait, which can take a lease
+                // interval and would otherwise stall a racing split on it.
+                drop(admission);
                 // Durable is not enough to answer the client. Every replica
                 // that could still serve a read has to have the invalidation
                 // too, or the client would be told about a value another node
@@ -955,6 +1150,7 @@ impl<R: Runtime> PartitionHost<R> {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
+        let _renewal = self.lease_renewal.lock().await;
         let replicas = self.replicas.lock().expect("replica set poisoned").clone();
         if replicas.is_empty() {
             return;
@@ -970,19 +1166,28 @@ impl<R: Runtime> PartitionHost<R> {
         let committed = wal.committed_lamport();
         let epoch = self.epoch;
 
+        let granting = self.is_admitting_leases();
         let renewals: Vec<_> = replicas
             .iter()
-            .map(|node| self.renew_one(*node, epoch, through, committed))
+            .map(|node| self.renew_one(*node, epoch, through, committed, granting))
             .collect();
         join_all(renewals).await;
     }
 
-    async fn renew_one(&self, node: NodeId, epoch: Epoch, through: Lamport, committed: Lamport) {
-        let granting = self
-            .grantable
-            .lock()
-            .expect("grantable set poisoned")
-            .contains(&node);
+    async fn renew_one(
+        &self,
+        node: NodeId,
+        epoch: Epoch,
+        through: Lamport,
+        committed: Lamport,
+        admission_open: bool,
+    ) {
+        let granting = admission_open
+            && self
+                .grantable
+                .lock()
+                .expect("grantable set poisoned")
+                .contains(&node);
         let duration = if granting {
             self.lease.duration
         } else {
@@ -1061,6 +1266,42 @@ impl<R: Runtime> PartitionHost<R> {
         }
     }
 
+    /// Revokes every parent read lease and waits out any replica that could not
+    /// confirm revocation. The wait derives from the actual grants in the
+    /// owner's lease table rather than a guessed sleep.
+    async fn drain_read_leases(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        let _renewal = self.lease_renewal.lock().await;
+        self.wait_for_possible_restart_leases().await;
+        let replicas = self.replicas.lock().expect("replica set poisoned").clone();
+        let through = wal.durable_lamport();
+        let committed = wal.committed_lamport();
+        let renewals: Vec<_> = replicas
+            .iter()
+            .map(|node| self.renew_one(*node, self.epoch, through, committed, false))
+            .collect();
+        join_all(renewals).await;
+
+        loop {
+            let now = self.runtime.clock().monotonic_nanos();
+            let until = self
+                .leases
+                .lock()
+                .expect("lease table poisoned")
+                .holders_with_expiry(now)
+                .into_iter()
+                .map(|(_, until)| until)
+                .max();
+            let Some(until) = until else { return };
+            self.runtime
+                .clock()
+                .sleep(Duration::from_nanos(until.saturating_sub(now)))
+                .await;
+        }
+    }
+
     /// Waits for the writes already in flight on `key` to come back from the
     /// log, so a condition against it can be decided on facts.
     ///
@@ -1126,8 +1367,11 @@ impl<R: Runtime> PartitionHost<R> {
     /// The wait is bounded by the leases themselves. A replica that does not
     /// answer stops being a lease holder when its lease runs out, so the worst
     /// case is one lease duration, once, and then the replica is out of the
-    /// read set.
+    /// read set. A newly opened owner also waits one duration because its prior
+    /// process may have granted a lease to a replica the current map no longer
+    /// names.
     async fn await_coherence(&self, wal: &Arc<Wal<R>>, lamport: Lamport) {
+        self.wait_for_possible_restart_leases().await;
         loop {
             let now = self.runtime.clock().monotonic_nanos();
             let behind: Vec<(NodeId, u64)> = self
@@ -1176,6 +1420,18 @@ impl<R: Runtime> PartitionHost<R> {
                     }
                 }
             }
+        }
+    }
+
+    pub(crate) async fn wait_for_possible_restart_leases(&self) {
+        let now = self.runtime.clock().monotonic_nanos();
+        if now < self.leases_uncertain_until_nanos {
+            self.runtime
+                .clock()
+                .sleep(Duration::from_nanos(
+                    self.leases_uncertain_until_nanos - now,
+                ))
+                .await;
         }
     }
 
@@ -1297,11 +1553,26 @@ impl<R: Runtime> PartitionHost<R> {
     }
 
     /// A newer owner said this replica's history ends at `above`.
+    ///
+    /// The withheld queue is cut to match, and that half is load-bearing rather
+    /// than tidy. An entry sits withheld from the moment it is durable until
+    /// the owner says it was acknowledged, so a tail the log just dropped is
+    /// still queued here — waiting on a commit watermark that is never coming.
+    /// The new owner resumes from the cut and reissues those Lamports with
+    /// different bytes, and both copies would end up in this queue. Applies run
+    /// in Lamport order and storage ignores a mutation at or below its
+    /// committed Lamport, so the stale copy would apply first and the
+    /// replacement would be silently discarded — this replica would serve the
+    /// value the cluster threw away.
     pub(crate) fn truncated(&self, above: Lamport) {
         self.read_state
             .lock()
             .expect("read state poisoned")
             .truncated(above);
+        self.withheld
+            .lock()
+            .expect("withheld entries poisoned")
+            .retain(|entry| entry.lamport <= above);
     }
 
     /// Takes an entry this node received as a replica.
@@ -1826,6 +2097,66 @@ mod tests {
         assert_eq!(manifest.segments.len(), 1);
         assert_eq!(checkpoint, manifest.committed_lamport);
         assert_eq!(segment.records()[0].key, Bytes::from_static(b"key"));
+    }
+
+    #[test]
+    fn a_truncation_drops_the_entries_a_replica_was_holding_for_release() {
+        // A replica keeps an entry between "durable in my log" and "the owner
+        // says it was acknowledged". A truncation cuts the log, and this queue
+        // has to go with it: the new owner resumes from the cut and reissues
+        // those Lamports, so both copies would sit here, applies run in order,
+        // and storage ignores a mutation at or below its committed Lamport. The
+        // surrendered entry would win and the reissue would be dropped without
+        // a word — this replica serving the value the cluster discarded, and
+        // missing the one it kept.
+        let sim = Simulation::new(16);
+        let store = Arc::new(FaultStore::new());
+        let replica = start_replica(&sim, sim.add_node(NodeId(1)), Arc::clone(&store));
+        let entry = |lamport: u64, key: &'static str| WalEntry {
+            lamport: Lamport(lamport),
+            epoch: Epoch(1),
+            partition: PartitionId(1),
+            op: WalOp::Put {
+                key: Bytes::from_static(key.as_bytes()),
+                value: Bytes::from_static(b"value"),
+                expires_at_millis: None,
+            },
+        };
+        let queue = |entry: WalEntry| {
+            let replica = Arc::clone(&replica);
+            sim.block_on(async move { replica.apply_replicated(&entry).await.unwrap() });
+        };
+        let release = |through: u64| {
+            let replica = Arc::clone(&replica);
+            sim.block_on(async move { replica.commit_through(Lamport(through)).await });
+        };
+        let holds = |key: &'static str| {
+            let replica = Arc::clone(&replica);
+            sim.block_on(async move { replica.get(key.as_bytes()).await.unwrap().is_some() })
+        };
+
+        queue(entry(1, "committed"));
+        queue(entry(2, "surrendered"));
+        release(1);
+        assert_eq!(
+            replica.withheld_len(),
+            1,
+            "the entry above the owner's watermark is held, not applied"
+        );
+
+        // The owner gave Lamport 2 back and reopened above this replica's
+        // epoch, so it says history ends at 1.
+        replica.truncated(Lamport(1));
+        queue(entry(2, "reissued"));
+        release(2);
+
+        assert!(holds("reissued"), "the reissued entry must reach storage");
+        assert!(
+            !holds("surrendered"),
+            "a replica that applied the entry its owner handed back is serving a value no client \
+             was ever told about, under a version that now means something else"
+        );
+        assert!(holds("committed"), "and committed history is untouched");
     }
 
     #[test]

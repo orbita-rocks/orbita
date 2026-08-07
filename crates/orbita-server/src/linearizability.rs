@@ -39,7 +39,7 @@ use orbita_sim::lin::{check, Recorder, Register, RegisterOp, RegisterRet};
 use orbita_sim::{harness, DiskFaults, SimConfig, SimRuntime, Simulation};
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How many states the checker may explore before giving up. Concurrency
@@ -572,6 +572,10 @@ fn a_conditional_write_that_cannot_settle_in_time_is_undecided_rather_than_lost(
 
 /// One partition owned by node one and replicated by node two.
 fn owner_and_replica_map() -> PartitionMap {
+    map_with_replicas(vec![NodeId(2)])
+}
+
+fn map_with_replicas(replicas: Vec<NodeId>) -> PartitionMap {
     let keyspace = KeyspaceId(1);
     let mut map = PartitionMap::new(MapVersion(1));
     map.insert_keyspace(KeyspaceInfo {
@@ -589,7 +593,7 @@ fn owner_and_replica_map() -> PartitionMap {
         range: KeyRange::unbounded(),
         owner: Some(NodeId(1)),
         epoch: Epoch(1),
-        replicas: vec![NodeId(2)],
+        replicas,
     });
     map
 }
@@ -603,6 +607,15 @@ const KEYSPACE: &str = "default";
 const RENEWALS: u32 = 40;
 
 fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRuntime>> {
+    start_node_with_map(sim, node, lease, owner_and_replica_map())
+}
+
+fn start_node_with_map(
+    sim: &Simulation,
+    node: NodeId,
+    lease: Duration,
+    map: PartitionMap,
+) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     // Each node gets its own store, the way each node owns its own bucket
     // prefix or data directory in production.
@@ -611,7 +624,7 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
         wal_root: "wal".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
     };
-    let source = BoxedMapSource::new(StaticMapSource::new(owner_and_replica_map()));
+    let source = BoxedMapSource::new(StaticMapSource::new(map));
     sim.block_on(async move {
         // Authentication off: this suite drives the read path directly, so
         // admission passes every request through to it.
@@ -626,6 +639,7 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
             node,
             layout,
             source,
+            None,
             lease,
             Arc::new(crate::ReadinessGate::new()),
             authenticator,
@@ -633,6 +647,104 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
         .await
         .expect("the node starts")
     })
+}
+
+#[test]
+fn a_same_epoch_owner_restart_waits_out_leases_its_previous_process_granted() {
+    let sim = Simulation::new(29);
+    let lease = Duration::from_millis(150);
+    let map = map_with_replicas(vec![NodeId(2), NodeId(3)]);
+    let owner = start_node_with_map(&sim, NodeId(1), lease, map.clone());
+    let stale = start_node_with_map(&sim, NodeId(2), lease, map.clone());
+    let _quorum = start_node_with_map(&sim, NodeId(3), lease, map.clone());
+
+    let first = sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move {
+            owner
+                .set(
+                    SetRequest {
+                        keyspace: KEYSPACE.to_string(),
+                        key: KEY.to_vec(),
+                        value: 1u64.to_be_bytes().to_vec(),
+                        ttl_millis: None,
+                        condition: None,
+                    },
+                    false,
+                    None,
+                )
+                .await
+        }
+    });
+    assert!(first.is_ok());
+    sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.renew_leases().await }
+    });
+    let served_before = stale.replica_reads();
+    let old = sim
+        .block_on({
+            let stale = Arc::clone(&stale);
+            async move {
+                stale
+                    .get(
+                        GetRequest {
+                            keyspace: KEYSPACE.to_string(),
+                            key: KEY.to_vec(),
+                        },
+                        false,
+                        None,
+                    )
+                    .await
+            }
+        })
+        .unwrap();
+    assert_eq!(old.value, 1u64.to_be_bytes());
+    assert!(
+        stale.replica_reads() > served_before,
+        "the replica holds a live lease"
+    );
+
+    sim.partition(NodeId(1), NodeId(2));
+    drop(owner);
+    let before_restart = sim.runtime(NodeId(1)).clock().monotonic_nanos();
+    let restarted = start_node_with_map(&sim, NodeId(1), lease, map_with_replicas(vec![NodeId(3)]));
+    let after_restart = sim.runtime(NodeId(1)).clock().monotonic_nanos();
+    assert!(
+        after_restart.saturating_sub(before_restart) >= lease.as_nanos() as u64,
+        "the restarted owner must wait out every lease its previous process may have granted"
+    );
+    let outcome = Arc::new(Mutex::new(None));
+    sim.spawn({
+        let restarted = Arc::clone(&restarted);
+        let outcome = Arc::clone(&outcome);
+        async move {
+            let result = restarted
+                .set(
+                    SetRequest {
+                        keyspace: KEYSPACE.to_string(),
+                        key: KEY.to_vec(),
+                        value: 2u64.to_be_bytes().to_vec(),
+                        ttl_millis: None,
+                        condition: None,
+                    },
+                    false,
+                    None,
+                )
+                .await;
+            *outcome.lock().expect("write outcome poisoned") = Some(result);
+        }
+    });
+
+    sim.run_until_idle();
+    assert!(
+        outcome
+            .lock()
+            .expect("write outcome poisoned")
+            .as_ref()
+            .is_some_and(|result| result.is_ok()),
+        "the write may complete once the possible old lease has certainly expired"
+    );
 }
 
 #[test]

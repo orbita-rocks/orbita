@@ -119,7 +119,7 @@ restart two Raft voters together after this transition.
 
 ## Migrating to combined nodes
 
-The first release implementing ADR 0009 reads the old `ORBITA_LEADER_PEERS`
+The first release implementing ADR 0010 reads the old `ORBITA_LEADER_PEERS`
 configuration and the durable `control/raft-voters` file for one compatibility
 window. Old leader processes remain the three voters and old workers remain
 data-only while old and new binaries coexist. A new binary started with

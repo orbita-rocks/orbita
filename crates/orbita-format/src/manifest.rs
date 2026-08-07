@@ -23,14 +23,31 @@ use std::collections::BTreeSet;
 /// One live segment, as the manifest describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentEntry {
-    /// The object's name, relative to the partition directory.
+    /// The object's name, relative to the partition directory it lives under
+    /// (which is [`Self::source`]'s directory when the segment is shared, and
+    /// this manifest's own otherwise).
     pub name: String,
+    /// The partition whose directory the object physically lives under, when
+    /// this is a shared reference produced by a split. `None` for a segment
+    /// this partition wrote itself, which is resolved relative to its own
+    /// directory exactly as before. See
+    /// [ADR 0009](../../../docs/adr/0009-a-split-shares-the-parents-segments.md):
+    /// a child references the parent's immutable segments in place rather than
+    /// copying them.
+    pub source: Option<PartitionId>,
     /// The object's exact size. A reader without suffix range requests uses
-    /// this to compute the footer's absolute offset.
+    /// this to compute the footer's absolute offset. Always the real object
+    /// size, including for a shared reference, because the reader reads the
+    /// whole object's footer.
     pub bytes: u64,
+    /// The number of records in the object. For a shared reference this is the
+    /// full object's count, not the subset in this child's range, because the
+    /// reader validates it against the object's own footer before filtering.
     pub record_count: u64,
     /// The smallest and largest keys actually present, both inclusive. Not the
-    /// range the segment was written for.
+    /// range the segment was written for. For a shared reference these are
+    /// clamped to the keys present within this partition's range, so pruning
+    /// and range validation see only what this partition serves.
     pub min_key: Bytes,
     pub max_key: Bytes,
     pub min_lamport: Lamport,
@@ -38,11 +55,13 @@ pub struct SegmentEntry {
 }
 
 impl SegmentEntry {
-    /// The entry for a segment that has just been built, under `name`.
+    /// The entry for a segment that has just been built, under `name`. Written
+    /// by this partition, so it carries no cross-partition source.
     #[must_use]
     pub fn of(name: String, built: &BuiltSegment) -> Self {
         Self {
             name,
+            source: None,
             bytes: built.bytes.len() as u64,
             record_count: built.record_count,
             min_key: built.min_key.clone(),
@@ -193,6 +212,13 @@ struct WireRange {
 #[serde(deny_unknown_fields)]
 struct WireSegment {
     name: String,
+    /// The source partition a shared segment lives under. Absent for a
+    /// self-written segment, and skipped on serialization when absent, so a
+    /// manifest with no shared segments is byte-identical to one written
+    /// before this field existed. That is what keeps historical manifests
+    /// replaying unchanged without moving the format version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_partition_id: Option<u64>,
     bytes: u64,
     record_count: u64,
     min_key: String,
@@ -218,6 +244,7 @@ impl From<&Manifest> for Wire {
                 .iter()
                 .map(|s| WireSegment {
                     name: s.name.clone(),
+                    source_partition_id: s.source.map(PartitionId::get),
                     bytes: s.bytes,
                     record_count: s.record_count,
                     min_key: BASE64.encode(&s.min_key),
@@ -258,7 +285,11 @@ impl Wire {
         let mut names = BTreeSet::new();
         let mut segments = Vec::with_capacity(self.segments.len());
         for segment in self.segments {
-            if !names.insert(segment.name.clone()) {
+            // Identity is (source, name): one object is fully qualified by which
+            // partition's directory it lives under plus its relative name, so a
+            // shared reference and a self-written segment that happened to share
+            // a relative name are still distinct objects.
+            if !names.insert((segment.source_partition_id, segment.name.clone())) {
                 return Err(malformed(&format!(
                     "segment {} is listed twice",
                     segment.name
@@ -321,8 +352,24 @@ impl Wire {
                 )));
             }
 
+            // A shared reference must name another partition, never this one:
+            // a segment under our own prefix is resolved relatively, and a
+            // "source" pointing at ourselves would be a second, ambiguous way
+            // to say the same thing.
+            let source = match segment.source_partition_id {
+                None => None,
+                Some(id) if id == self.partition_id => {
+                    return Err(malformed(&format!(
+                        "segment {} names its own partition as its source",
+                        segment.name
+                    )))
+                }
+                Some(id) => Some(PartitionId(id)),
+            };
+
             segments.push(SegmentEntry {
                 name: segment.name,
+                source,
                 bytes: segment.bytes,
                 record_count: segment.record_count,
                 min_key,
@@ -526,6 +573,65 @@ mod tests {
             Manifest::decode(json.as_bytes()),
             Err(FormatError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn a_self_written_manifest_does_not_emit_the_source_field() {
+        // The additive-and-invisible property that keeps replay compatible: a
+        // manifest with no shared segments must serialize exactly as it did
+        // before the field existed, so historical bytes and freshly written
+        // self-owned bytes are indistinguishable.
+        let json = String::from_utf8(example().encode().to_vec()).unwrap();
+        assert!(
+            !json.contains("source_partition_id"),
+            "a self-owned manifest must not carry the shared-segment field: {json}"
+        );
+    }
+
+    #[test]
+    fn a_shared_segment_reference_round_trips_and_names_its_source() {
+        // A child's manifest referencing the parent's segment in place, per ADR
+        // 0009. It carries the source partition, decodes back to it, and the
+        // encoding is the only place the new field appears.
+        let mut manifest = example();
+        manifest.partition_id = PartitionId(20);
+        manifest.segments[0].source = Some(PartitionId(7));
+        let encoded = manifest.encode();
+        assert!(String::from_utf8(encoded.to_vec())
+            .unwrap()
+            .contains("\"source_partition_id\": 7"));
+        let decoded = Manifest::decode(&encoded).unwrap();
+        assert_eq!(decoded, manifest);
+        assert_eq!(decoded.segments[0].source, Some(PartitionId(7)));
+        assert_eq!(
+            decoded.segments[1].source, None,
+            "the other stays self-owned"
+        );
+    }
+
+    #[test]
+    fn a_segment_that_names_its_own_partition_as_source_is_rejected() {
+        // A segment under a partition's own directory is resolved relatively; a
+        // source pointing back at that same partition is a second, ambiguous
+        // way to say the same thing, and refused rather than tolerated.
+        let json = SPEC_EXAMPLE.replace(
+            "\"name\": \"segments/0000000000000005-0000000000000011.oseg\",",
+            "\"name\": \"segments/0000000000000005-0000000000000011.oseg\",\n          \
+             \"source_partition_id\": 7,",
+        );
+        assert!(matches!(
+            Manifest::decode(json.as_bytes()),
+            Err(FormatError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn an_old_manifest_without_the_source_field_decodes_unchanged() {
+        // The replay guarantee stated as a test: the specification's own
+        // example predates the field, and must decode to segments that are all
+        // self-owned.
+        let manifest = example();
+        assert!(manifest.segments.iter().all(|s| s.source.is_none()));
     }
 
     #[test]

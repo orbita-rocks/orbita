@@ -53,6 +53,15 @@ const TAG_REGISTER_NODE_V2: u8 = 14;
 const TAG_REGISTER_NODE_V3: u8 = 15;
 const TAG_TRANSFER_OWNERSHIP: u8 = 16;
 const TAG_COMPLETE_FENCE_DRAIN: u8 = 17;
+// The worker-prepared split protocol, tags 18 through 21. These belong to
+// protocol 0.1: an active cluster below it never proposes one, so a historical
+// log never contains a tag a pre-0.1 binary cannot decode. See
+// `ControlCommand::BeginSplit` for why the operation is four entries and not
+// one.
+const TAG_BEGIN_SPLIT: u8 = 18;
+const TAG_MARK_SPLIT_PREPARED: u8 = 19;
+const TAG_COMPLETE_SPLIT: u8 = 20;
+const TAG_ABORT_SPLIT: u8 = 21;
 
 /// One decision, committed once and applied everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,16 +183,76 @@ pub enum ControlCommand {
         expect_epoch: Epoch,
     },
 
-    /// Replaces one partition with two at a boundary key.
+    /// Replaces one partition with two at a boundary key, in a single entry.
     ///
-    /// One entry, so the map goes from covered to covered with nothing in
-    /// between. There is no instant at which a key in the parent's range
-    /// belongs to nobody, and no instant at which it belongs to two owners.
+    /// The unsafe original. Retained decode-only for replay: a historical log
+    /// from before the worker-prepared protocol still contains these, and the
+    /// state machine must replay them to reconstruct the map a 0.0 cluster
+    /// committed. It is refused for any new proposal at protocol 0.1 and above,
+    /// because it retires the parent in the same entry that names the children
+    /// as owners — before any worker has storage for them, which is the window
+    /// [PR #53](https://github.com/anomalyco/orbita/pull/53) closed. The
+    /// four-entry protocol below replaces it.
     SplitPartition {
         parent: PartitionId,
         at: Bytes,
         lower: PartitionId,
         upper: PartitionId,
+        expect_epoch: Epoch,
+    },
+
+    /// Opens a split without touching the partition table.
+    ///
+    /// The parent keeps its range and keeps serving; all this records is that a
+    /// split is in progress, which two children it will produce, and which
+    /// nodes hold the parent and must therefore prepare storage for those
+    /// children. The map version bumps so those holders notice and start
+    /// preparing, but no key changes owner. This is the first of four entries
+    /// because the safety property is an *ordering*: the parent must not retire
+    /// until every holder has prepared, and an ordering cannot be expressed in
+    /// one atomic entry. See [`CompleteSplit`](Self::CompleteSplit).
+    BeginSplit {
+        parent: PartitionId,
+        at: Bytes,
+        lower: PartitionId,
+        upper: PartitionId,
+        expect_epoch: Epoch,
+    },
+
+    /// Records that one holder has prepared storage for the pending split's
+    /// children.
+    ///
+    /// `expect_epoch` is the parent's epoch, unchanged since the split began. A
+    /// failover fences the parent and bumps it, which makes this fail closed
+    /// rather than acknowledge preparation against a split the cluster has
+    /// already abandoned.
+    MarkSplitPrepared {
+        parent: PartitionId,
+        node: NodeId,
+        expect_epoch: Epoch,
+    },
+
+    /// Retires the parent and installs both children, in one entry.
+    ///
+    /// Refused until every holder recorded by [`BeginSplit`](Self::BeginSplit)
+    /// has a matching [`MarkSplitPrepared`](Self::MarkSplitPrepared). Once it
+    /// applies the map goes from covered-by-the-parent to covered-by-the-two-
+    /// children with nothing in between, exactly as the old one-entry split
+    /// did — the difference is only that it cannot reach this point until the
+    /// children have somewhere to live.
+    CompleteSplit {
+        parent: PartitionId,
+        expect_epoch: Epoch,
+    },
+
+    /// Abandons a pending split, leaving the parent exactly as it was.
+    ///
+    /// The escape hatch for a split that cannot finish: a holder that will
+    /// never prepare, or an operator who changed their mind. Nothing about the
+    /// map moved during preparation, so abandoning it is a version bump and a
+    /// forgotten intent.
+    AbortSplit {
+        parent: PartitionId,
         expect_epoch: Epoch,
     },
 
@@ -333,6 +402,46 @@ impl ControlCommand {
                     .u64(upper.get())
                     .u64(expect_epoch.get());
             }
+            ControlCommand::BeginSplit {
+                parent,
+                at,
+                lower,
+                upper,
+                expect_epoch,
+            } => {
+                w.u8(TAG_BEGIN_SPLIT)
+                    .u64(parent.get())
+                    .bytes(at)
+                    .u64(lower.get())
+                    .u64(upper.get())
+                    .u64(expect_epoch.get());
+            }
+            ControlCommand::MarkSplitPrepared {
+                parent,
+                node,
+                expect_epoch,
+            } => {
+                w.u8(TAG_MARK_SPLIT_PREPARED)
+                    .u64(parent.get())
+                    .u64(node.get())
+                    .u64(expect_epoch.get());
+            }
+            ControlCommand::CompleteSplit {
+                parent,
+                expect_epoch,
+            } => {
+                w.u8(TAG_COMPLETE_SPLIT)
+                    .u64(parent.get())
+                    .u64(expect_epoch.get());
+            }
+            ControlCommand::AbortSplit {
+                parent,
+                expect_epoch,
+            } => {
+                w.u8(TAG_ABORT_SPLIT)
+                    .u64(parent.get())
+                    .u64(expect_epoch.get());
+            }
             ControlCommand::SetClusterVersion { version, expect } => {
                 w.u8(TAG_SET_CLUSTER_VERSION);
                 version.encode(&mut w);
@@ -416,6 +525,26 @@ impl ControlCommand {
                 at: r.bytes()?,
                 lower: PartitionId(r.u64()?),
                 upper: PartitionId(r.u64()?),
+                expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_BEGIN_SPLIT => ControlCommand::BeginSplit {
+                parent: PartitionId(r.u64()?),
+                at: r.bytes()?,
+                lower: PartitionId(r.u64()?),
+                upper: PartitionId(r.u64()?),
+                expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_MARK_SPLIT_PREPARED => ControlCommand::MarkSplitPrepared {
+                parent: PartitionId(r.u64()?),
+                node: NodeId(r.u64()?),
+                expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_COMPLETE_SPLIT => ControlCommand::CompleteSplit {
+                parent: PartitionId(r.u64()?),
+                expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_ABORT_SPLIT => ControlCommand::AbortSplit {
+                parent: PartitionId(r.u64()?),
                 expect_epoch: Epoch(r.u64()?),
             },
             TAG_SET_CLUSTER_VERSION => ControlCommand::SetClusterVersion {
@@ -575,6 +704,26 @@ mod tests {
                 at: Bytes::from_static(b"m"),
                 lower: PartitionId(2),
                 upper: PartitionId(3),
+                expect_epoch: Epoch(4),
+            },
+            ControlCommand::BeginSplit {
+                parent: PartitionId(1),
+                at: Bytes::from_static(b"m"),
+                lower: PartitionId(2),
+                upper: PartitionId(3),
+                expect_epoch: Epoch(4),
+            },
+            ControlCommand::MarkSplitPrepared {
+                parent: PartitionId(1),
+                node: NodeId(2),
+                expect_epoch: Epoch(4),
+            },
+            ControlCommand::CompleteSplit {
+                parent: PartitionId(1),
+                expect_epoch: Epoch(4),
+            },
+            ControlCommand::AbortSplit {
+                parent: PartitionId(1),
                 expect_epoch: Epoch(4),
             },
             ControlCommand::SetClusterVersion {

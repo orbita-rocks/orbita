@@ -39,17 +39,17 @@ use crate::mutation::{version_at, Mutation, MutationOp};
 
 use bytes::Bytes;
 use orbita_core::{
-    Epoch, Error, KeyRange, Lamport, Record, Result, Version, WriteCondition, MAX_KEY_BYTES,
-    MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
+    Epoch, Error, KeyRange, Lamport, PartitionId, Record, Result, Version, WriteCondition,
+    MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
 };
 use orbita_format::segment::{Segment, SegmentBuilder};
 use orbita_format::{
-    compact, sweep_partition, CommitPlan, FormatError, PartitionPath, PartitionWriter, RecordValue,
-    SegmentEntry, SegmentRecord, Snapshot, SweepReport,
+    compact, load_manifest, CommitPlan, ExternalValue, FormatError, PartitionPath, PartitionWriter,
+    RecordValue, SegmentEntry, SegmentRecord, Snapshot, SweepReport,
 };
 use orbita_objectstore::{ObjectError, ObjectStore};
 use orbita_runtime::{Clock, Runtime};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
@@ -178,6 +178,18 @@ impl WriteOutcome {
             )),
         }
     }
+}
+
+/// A child partition to prepare during a split.
+///
+/// The id and epoch are the ones the control plane allocated for the child, and
+/// the range is the child's half of the parent's range. See
+/// [`Partition::prepare_child_partitions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSpec {
+    pub id: PartitionId,
+    pub epoch: Epoch,
+    pub range: KeyRange,
 }
 
 /// One key and its record, as returned by a scan.
@@ -357,6 +369,18 @@ pub struct Partition<R: Runtime> {
     /// contention we do not have in exchange for a class of bugs we would
     /// rather not reason about. Reads share it.
     state: tokio::sync::RwLock<State>,
+    /// True while this partition is a split parent whose children reference its
+    /// segments in place, per
+    /// [ADR 0009](../../../docs/adr/0009-a-split-shares-the-parents-segments.md).
+    /// It freezes flush, compaction, and sweep for the whole split, because
+    /// compaction deletes the self-written segments it replaces (see
+    /// [`Partition::compact`]) and those are exactly the objects the children
+    /// now point at — deleting one dangles a child's reference and loses the
+    /// data. Checked under [`Partition::state`], and set before the child
+    /// manifests are published, so any maintenance that acquires the lock after
+    /// the children exist sees it and stands down, while one that ran before
+    /// touched only segments no child had yet referenced.
+    maintenance_frozen: std::sync::atomic::AtomicBool,
 }
 
 impl<R: Runtime> Partition<R> {
@@ -405,7 +429,35 @@ impl<R: Runtime> Partition<R> {
             range,
             writer,
             state: tokio::sync::RwLock::new(state),
+            maintenance_frozen: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Freezes flush, compaction, and sweep because this partition is a split
+    /// parent whose children now reference its segments in place (ADR 0009).
+    ///
+    /// Set before the child manifests are published. Because every maintenance
+    /// path re-checks it under [`Partition::state`], and publication also holds
+    /// that lock, a maintenance pass either ran before the children existed
+    /// (touching only unshared segments) or sees the freeze and stands down;
+    /// there is no interleaving in which it deletes a segment a child points at.
+    pub fn freeze_maintenance(&self) {
+        self.maintenance_frozen
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Lifts the freeze, for a split that was abandoned. A completed split
+    /// retires this partition instead.
+    pub fn resume_maintenance(&self) {
+        self.maintenance_frozen
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether maintenance is frozen for an in-progress split.
+    #[must_use]
+    pub fn is_maintenance_frozen(&self) -> bool {
+        self.maintenance_frozen
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The key range this partition owns.
@@ -737,8 +789,17 @@ impl<R: Runtime> Partition<R> {
     ///
     /// A no-op when the table is empty. This is the explicit trigger ADR 0006
     /// names; the size trigger calls the same path from inside a write.
+    ///
+    /// A no-op too while a split has frozen maintenance: the flush counter it
+    /// would advance is what eventually triggers compaction, and compaction
+    /// deletes the very segments the children now reference. The check is under
+    /// the state lock so it cannot race the publication of those child
+    /// manifests. See [`Partition::freeze_maintenance`].
     pub async fn flush(&self) -> Result<()> {
         let mut state = self.state.write().await;
+        if self.is_maintenance_frozen() {
+            return Ok(());
+        }
         if !state.segments.is_empty() {
             state.timer_flushes_since_compaction += 1;
         }
@@ -755,12 +816,136 @@ impl<R: Runtime> Partition<R> {
     ///
     /// Ownership is deliberately the caller's decision. Replicas apply the
     /// same mutations but only the current owner may publish a manifest.
+    ///
+    /// Frozen during a split: a size-triggered flush can spill into compaction
+    /// the same way a timer flush can, so it stands down too. A split closes
+    /// write admission before it retires the parent, so the table it declines
+    /// to flush here is bounded by the brief pre-quiesce window.
     pub async fn flush_if_needed(&self) -> Result<()> {
         let mut state = self.state.write().await;
+        if self.is_maintenance_frozen() {
+            return Ok(());
+        }
         if state.memtable_bytes < FLUSH_TRIGGER_BYTES {
             return Ok(());
         }
         self.flush_locked(&mut state, true).await
+    }
+
+    /// Durably prepares child storage for a split, copying no segment bytes.
+    ///
+    /// This is the data-plane half of the worker-prepared split from ADR 0009.
+    /// It flushes the parent so every committed record is in a segment, then
+    /// publishes a manifest for each child that references the parent's
+    /// segments *in place* — each child names exactly the parent segments that
+    /// hold a key in the child's range, as cross-partition references, with
+    /// bounds clamped to the keys the child actually owns. No object is copied;
+    /// the children and the parent share the same immutable segment objects
+    /// until a later compaction rewrites them under a child's own directory.
+    ///
+    /// Every child begins at the parent's flush horizon, which is the returned
+    /// value, so a child's Lamport sequence continues the parent's and no key's
+    /// version regresses (ADR 0002). The caller must have quiesced the parent
+    /// first, so that horizon is the parent's final committed position and no
+    /// write can land above it after the children are published.
+    ///
+    /// Idempotent: a child whose manifest is already published at or above its
+    /// intended epoch is left untouched, so a retried preparation — which a
+    /// worker will do whenever a report is lost — publishes nothing new.
+    pub async fn prepare_child_partitions(&self, children: &[ChildSpec]) -> Result<Lamport> {
+        let mut state = self.state.write().await;
+        // The memtable is not shareable: only segments can be referenced, so
+        // everything committed has to be flushed into one before a child can
+        // point at it.
+        self.flush_locked(&mut state, false).await?;
+        let horizon = state.flushed;
+        for child in children {
+            self.prepare_one_child(&state, child, horizon).await?;
+        }
+        Ok(horizon)
+    }
+
+    /// Publishes one child's manifest over the parent's segments.
+    async fn prepare_one_child(
+        &self,
+        state: &State,
+        child: &ChildSpec,
+        horizon: Lamport,
+    ) -> Result<()> {
+        // The parent segments that hold at least one key in the child's range,
+        // with the min and max keys the child actually owns in each. The parent
+        // index already resolved which segment holds each key's winning record,
+        // so referencing exactly those segments gives the child every live
+        // record in its range and nothing shadowed.
+        let mut refs: BTreeMap<usize, (Bytes, Bytes)> = BTreeMap::new();
+        for (key, loc) in &state.index {
+            if !child.range.contains(key) {
+                continue;
+            }
+            refs.entry(loc.segment)
+                .and_modify(|(min, max)| {
+                    if key < min {
+                        *min = key.clone();
+                    }
+                    if key > max {
+                        *max = key.clone();
+                    }
+                })
+                .or_insert_with(|| (key.clone(), key.clone()));
+        }
+
+        let mut child_segments: Vec<SegmentEntry> = refs
+            .into_iter()
+            .map(|(position, (min_key, max_key))| {
+                let parent = &state.segments[position];
+                // Point at where the object physically lives. Usually that is
+                // this partition, but if the parent's own entry is itself a
+                // shared reference (this partition was a child of a prior
+                // split), follow it to the true owner so references never chain.
+                let source = parent.source.unwrap_or_else(|| self.path.partition_id());
+                SegmentEntry {
+                    name: parent.name.clone(),
+                    source: Some(source),
+                    bytes: parent.bytes,
+                    // The full object's record count and lamports, not the
+                    // child's subset: the reader validates these against the
+                    // object's own footer before it filters to the range.
+                    record_count: parent.record_count,
+                    min_key,
+                    max_key,
+                    min_lamport: parent.min_lamport,
+                    max_lamport: parent.max_lamport,
+                }
+            })
+            .collect();
+        // A stable order so a re-prepared child encodes identical bytes.
+        child_segments.sort_by(|a, b| a.name.cmp(&b.name).then(a.source.cmp(&b.source)));
+
+        let child_path = self.path.for_partition(child.id);
+        // Already prepared? A manifest at or above the child's epoch means an
+        // earlier attempt published it, and re-publishing would only risk a
+        // lost race with the child's own writer once it is live.
+        if let Some((existing, _)) = load_manifest(self.store.as_ref(), &child_path)
+            .await
+            .map_err(format_error)?
+        {
+            if existing.epoch >= child.epoch {
+                return Ok(());
+            }
+        }
+
+        let writer = PartitionWriter::open(Arc::clone(&self.store), child_path, child.epoch)
+            .await
+            .map_err(format_error)?;
+        writer
+            .commit(|_| CommitPlan {
+                committed_lamport: horizon,
+                range: child.range.clone(),
+                segments: child_segments.clone(),
+            })
+            .await
+            .map_err(format_error)?;
+        Ok(())
     }
 
     /// Reclaims replica memtable entries covered by a manifest the owner has
@@ -865,8 +1050,17 @@ impl<R: Runtime> Partition<R> {
     /// product promises "eventually" rather than a bound. This exists so an
     /// operator, or a test, can ask for the sweep now. The mutable table is
     /// flushed first so the merge sees everything.
+    ///
+    /// A no-op while a split has frozen maintenance, because compaction is the
+    /// one operation that deletes a shared segment out from under a child. The
+    /// check is under the state lock and the freeze is set before the child
+    /// manifests are published, so a compaction can never run against a segment
+    /// a child already references. See [`Partition::freeze_maintenance`].
     pub async fn compact(&self) -> Result<()> {
         let mut state = self.state.write().await;
+        if self.is_maintenance_frozen() {
+            return Ok(());
+        }
         self.flush_locked(&mut state, false).await?;
         self.compact_locked(&mut state).await
     }
@@ -900,21 +1094,58 @@ impl<R: Runtime> Partition<R> {
     ///
     /// [`flush`]: Partition::flush
     /// [`compact`]: Partition::compact
+    /// `shared` names the objects under this partition's directory that other
+    /// live partitions still reference in place, per ADR 0009 — a split child
+    /// referencing this partition's segments. The sweep protects every one of
+    /// them as if this partition's own manifest named it, so it can never
+    /// delete a segment a sibling is serving from. The caller assembles the set
+    /// from the sibling manifests it can see; an incomplete set is a deleted
+    /// segment, so a caller that cannot be sure must pass nothing and skip.
     pub async fn sweep_orphans(
         &self,
+        shared: &std::collections::BTreeSet<String>,
         grace_millis: u64,
         max_skew_millis: u64,
         dry_run: bool,
     ) -> Result<SweepReport> {
-        sweep_partition(
+        // Frozen during a split. A split parent's children reference its
+        // segments, and the `shared` set a single node can assemble may not
+        // name a child owned only by another node, so the safe answer while the
+        // split is in flight is to sweep nothing here at all. Compaction is also
+        // frozen, so the parent's manifest is not dropping segments the sweep
+        // would then chase. See [`Partition::freeze_maintenance`].
+        if self.is_maintenance_frozen() {
+            return Ok(SweepReport {
+                dry_run,
+                ..Default::default()
+            });
+        }
+        orbita_format::sweep_partition_protecting(
             self.store.as_ref(),
             &self.path,
+            shared,
             grace_millis,
             max_skew_millis,
             dry_run,
         )
         .await
         .map_err(format_error)
+    }
+
+    /// The segments this partition references in place under other partitions'
+    /// directories, grouped by the partition each lives under.
+    ///
+    /// A node hands this to the orphan sweep so that when it sweeps a partition
+    /// P, it knows which of P's objects a sibling still needs and must not
+    /// delete. See [`Partition::sweep_orphans`] and ADR 0009.
+    pub async fn shared_segment_sources(&self) -> BTreeMap<PartitionId, BTreeSet<String>> {
+        let mut out: BTreeMap<PartitionId, BTreeSet<String>> = BTreeMap::new();
+        for entry in &self.state.read().await.segments {
+            if let Some(source) = entry.source {
+                out.entry(source).or_default().insert(entry.name.clone());
+            }
+        }
+        out
     }
 
     fn now_millis(&self) -> u64 {
@@ -952,11 +1183,15 @@ impl<R: Runtime> Partition<R> {
     /// Reads one record out of its segment and verifies it is the one the
     /// index promised.
     async fn fetch(&self, state: &State, loc: Loc, key: &[u8]) -> Result<Stored> {
-        let name = &state.segments[loc.segment].name;
+        // A shared segment (a split child's cross-partition reference) lives
+        // under the source partition's directory, so resolve the object there
+        // rather than under this partition's own prefix. See ADR 0009.
+        let entry = &state.segments[loc.segment];
+        let name = &entry.name;
         let raw = self
             .store
             .get_range(
-                &self.path.object(name),
+                &self.path.resolve_segment(entry),
                 loc.offset..loc.offset + u64::from(loc.record_length),
             )
             .await
@@ -977,11 +1212,13 @@ impl<R: Runtime> Partition<R> {
             // by other implementations of the format. ADR 0007's write path,
             // where large values spill to their own objects, is future work.
             RecordValue::External(external) => {
-                let (bytes, _) = self
-                    .store
-                    .get(&self.path.object(&external.name))
-                    .await
-                    .map_err(store_error)?;
+                // The value object lives beside its segment, under the source
+                // partition for a shared reference.
+                let value_key = match entry.source {
+                    None => self.path.object(&external.name),
+                    Some(source) => self.path.for_partition(source).object(&external.name),
+                };
+                let (bytes, _) = self.store.get(&value_key).await.map_err(store_error)?;
                 if bytes.len() as u64 != external.length
                     || crc32c::crc32c(&bytes) != external.crc32c
                 {
@@ -1135,22 +1372,74 @@ impl<R: Runtime> Partition<R> {
         // host, is the known follow-up rather than an accident.
 
         let mut inputs = Vec::with_capacity(state.segments.len());
+        let mut relocated_values: BTreeMap<(PartitionId, String), ExternalValue> = BTreeMap::new();
         for entry in &state.segments {
+            // A shared segment is read from the source partition's directory.
+            // Compaction merges it into a new self-written segment, which is
+            // how a child eventually stops sharing the parent's objects.
             let (bytes, _) = self
                 .store
-                .get(&self.path.object(&entry.name))
+                .get(&self.path.resolve_segment(entry))
                 .await
                 .map_err(store_error)?;
             let segment = Segment::decode(&bytes).map_err(format_error)?;
-            inputs.push(segment.records().to_vec());
+            let mut records = segment.records().to_vec();
+            if let Some(source) = entry.source {
+                for record in &mut records {
+                    let RecordValue::External(external) = &record.value else {
+                        continue;
+                    };
+                    let source_key = (source, external.name.clone());
+                    let relocated = match relocated_values.get(&source_key) {
+                        Some(relocated) => relocated.clone(),
+                        None => {
+                            let value_key = self.path.for_partition(source).object(&external.name);
+                            let (value, _) =
+                                self.store.get(&value_key).await.map_err(store_error)?;
+                            if value.len() as u64 != external.length
+                                || crc32c::crc32c(&value) != external.crc32c
+                            {
+                                return Err(Error::Internal(format!(
+                                    "external value {} does not match its record",
+                                    external.name
+                                )));
+                            }
+                            let relocated =
+                                self.writer.put_value(value).await.map_err(format_error)?;
+                            relocated_values.insert(source_key, relocated.clone());
+                            relocated
+                        }
+                    };
+                    record.value = RecordValue::External(relocated);
+                }
+            }
+            inputs.push(records);
         }
         // A whole-partition merge, whose tombstone rule is time-based: an
         // unexpired tombstone still answers a retrying deleter, so it
         // survives until its retention passes and the expiry rule reclaims
         // it on schedule.
-        let merged = compact::merge_all(&inputs, now).map_err(format_error)?;
+        let mut merged = compact::merge_all(&inputs, now).map_err(format_error)?;
+        // A shared segment physically holds keys on both sides of a split
+        // boundary, so a child compacting one must keep only the keys it owns;
+        // writing the rest would put keys outside its range into its own
+        // segment, which the manifest would rightly refuse. For a partition
+        // that shares nothing this is a no-op, since its records are all in
+        // range already. See ADR 0009.
+        merged.retain(|record| self.range.contains(&record.key));
 
-        let replaced: Vec<String> = state.segments.iter().map(|e| e.name.clone()).collect();
+        // Only self-written segments are ours to delete after the swap. A
+        // shared reference's object lives under another partition's directory
+        // and may still be referenced by a sibling child, so compaction drops
+        // the reference from this manifest but never deletes the object; the
+        // cross-partition-aware orphan sweep reclaims it once no live manifest
+        // names it. See ADR 0009.
+        let replaced: Vec<String> = state
+            .segments
+            .iter()
+            .filter(|e| e.source.is_none())
+            .map(|e| e.name.clone())
+            .collect();
         let (segments, index) = if merged.is_empty() {
             (Vec::new(), BTreeMap::new())
         } else {
@@ -1204,13 +1493,18 @@ impl<R: Runtime> Partition<R> {
         state.full_flushes_since_compaction = 0;
         state.timer_flushes_since_compaction = 0;
 
-        // The replaced objects are unreferenced the moment the manifest
-        // swapped, and this is the only writer, so deleting them now is safe.
-        // An external reader hydrating from the old manifest fails its read
-        // and retries against the new one, which the format documents as the
-        // deal. Failures here strand objects for the orphan sweep
-        // ([`Partition::sweep_orphans`]) to reclaim rather than failing the
-        // compaction that already happened.
+        // These deletes are why compaction is frozen during a split. The
+        // replaced objects are unreferenced by *this* manifest the moment it
+        // swapped, but since ADR 0009 a split child can reference this
+        // partition's self-written segments in place, so "unreferenced here"
+        // is no longer "unreferenced anywhere". Deleting one a child points at
+        // would dangle that reference and lose acknowledged data. `compact` is
+        // a no-op while [`Partition::maintenance_frozen`] is set, and the
+        // freeze is established before any child manifest is published, so this
+        // loop only ever runs when no child references what it deletes. Outside
+        // a split this is still the only writer, so the deletes are safe.
+        // Failures here strand objects for the cross-partition orphan sweep to
+        // reclaim, rather than failing a compaction that already happened.
         for name in replaced {
             let _ = self.store.delete(&self.path.object(&name)).await;
         }
@@ -1407,12 +1701,421 @@ fn evaluate(
 mod tests {
     use super::*;
     use crate::testing::{
-        owner, owner_in_range, owner_with_clock, partition_pair_at_epochs,
-        partition_pair_with_clock, partition_with_clock, reopened,
+        open_child, owner, owner_in_range, owner_with_clock, owner_with_clocked_store,
+        partition_pair_at_epochs, partition_pair_with_clock, partition_with_clock, reopened,
     };
+    use orbita_core::KeyspaceId;
+    use orbita_format::PartitionPath;
 
     fn bytes(s: &str) -> Bytes {
         Bytes::copy_from_slice(s.as_bytes())
+    }
+
+    /// The 26 single-letter keys, so a split at "m" leaves data on both sides.
+    fn alphabet() -> Vec<String> {
+        (b'a'..=b'z').map(|c| (c as char).to_string()).collect()
+    }
+
+    async fn write_alphabet(owner: &crate::testing::Owner) {
+        for k in alphabet() {
+            owner
+                .put(
+                    k.as_bytes(),
+                    bytes(&format!("v-{k}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .expect("write a letter");
+        }
+    }
+
+    fn child_prefix(id: u64) -> String {
+        PartitionPath::new("", KeyspaceId(1), PartitionId(id))
+            .prefix()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_prepared_child_serves_the_parents_keys_in_its_range_without_copying_a_segment() {
+        // The proof the split review demanded: every pre-split key is readable
+        // from exactly one child afterwards, and no segment byte was copied to
+        // make that true. A child that had been created empty (the data-loss
+        // bug) would fail every read here.
+        let (parent, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        write_alphabet(&parent).await;
+
+        let (low, high) = parent
+            .range()
+            .clone()
+            .split_at(bytes("m"))
+            .expect("the boundary is inside the range");
+        let horizon = parent
+            .prepare_child_partitions(&[
+                ChildSpec {
+                    id: PartitionId(2),
+                    epoch: Epoch(2),
+                    range: low.clone(),
+                },
+                ChildSpec {
+                    id: PartitionId(3),
+                    epoch: Epoch(2),
+                    range: high.clone(),
+                },
+            ])
+            .await
+            .expect("preparing both children");
+        assert_eq!(
+            horizon,
+            parent.committed_lamport().await.unwrap(),
+            "children begin at the parent's committed position"
+        );
+
+        // No copy: a child's directory holds a manifest and nothing else, and
+        // every segment object still lives under the parent's prefix.
+        let keys = store.keys();
+        for id in [2, 3] {
+            let prefix = child_prefix(id);
+            assert!(
+                !keys
+                    .iter()
+                    .any(|k| k.starts_with(&prefix) && k.ends_with(".oseg")),
+                "child {id} must reference the parent's segments, not copies of them"
+            );
+            assert!(
+                keys.iter().any(|k| *k == format!("{prefix}manifest.json")),
+                "child {id} must have a published manifest"
+            );
+        }
+        assert!(
+            keys.iter()
+                .any(|k| k.starts_with(&child_prefix(1)) && k.ends_with(".oseg")),
+            "the parent's segment objects are the ones being shared"
+        );
+
+        // Every key is served by exactly one child: the owning child returns
+        // it, the other rejects it as out of range.
+        let child2 = open_child(&store, &clock, PartitionId(2), Epoch(2), low).await;
+        let child3 = open_child(&store, &clock, PartitionId(3), Epoch(2), high).await;
+        for k in alphabet() {
+            let (owner, other) = if k.as_str() < "m" {
+                (&child2, &child3)
+            } else {
+                (&child3, &child2)
+            };
+            let record = owner
+                .get(k.as_bytes())
+                .await
+                .expect("the owning child answers")
+                .unwrap_or_else(|| panic!("key {k} lost across the split"));
+            assert_eq!(record.value, bytes(&format!("v-{k}")));
+            assert!(
+                other.get(k.as_bytes()).await.is_err(),
+                "the non-owning child rejects {k} as outside its range"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prepared_child_preserves_each_keys_version() {
+        // ADR 0002: a key's version is its Lamport, and a split must not move
+        // it. The value read from the child carries the same version the parent
+        // wrote it at.
+        let (parent, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        write_alphabet(&parent).await;
+        let want: Vec<(String, Version)> = {
+            let mut out = Vec::new();
+            for k in alphabet() {
+                let v = parent.get(k.as_bytes()).await.unwrap().unwrap().version;
+                out.push((k, v));
+            }
+            out
+        };
+
+        let (low, high) = parent.range().clone().split_at(bytes("m")).unwrap();
+        parent
+            .prepare_child_partitions(&[
+                ChildSpec {
+                    id: PartitionId(2),
+                    epoch: Epoch(2),
+                    range: low.clone(),
+                },
+                ChildSpec {
+                    id: PartitionId(3),
+                    epoch: Epoch(2),
+                    range: high.clone(),
+                },
+            ])
+            .await
+            .unwrap();
+        let child2 = open_child(&store, &clock, PartitionId(2), Epoch(2), low).await;
+        let child3 = open_child(&store, &clock, PartitionId(3), Epoch(2), high).await;
+
+        for (k, version) in want {
+            let child = if k.as_str() < "m" { &child2 } else { &child3 };
+            assert_eq!(
+                child.get(k.as_bytes()).await.unwrap().unwrap().version,
+                version,
+                "key {k} kept its version across the split"
+            );
+        }
+    }
+
+    /// The relative names of the segment objects physically under one
+    /// partition's directory, for a test that watches compaction delete them.
+    fn segment_objects(store: &orbita_format::testing::MemoryStore, id: u64) -> Vec<String> {
+        let prefix = child_prefix(id);
+        store
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with(&prefix) && k.ends_with(".oseg"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_frozen_split_parent_does_not_compact_away_a_segment_a_child_references() {
+        // The ADR 0009 freeze, proven at the layer where the loss happens. A
+        // split parent's children reference its self-written segments in place;
+        // compaction deletes exactly those segments when it merges them, which
+        // would dangle the children's references and lose acknowledged data.
+        // Freezing maintenance for the split's duration is what prevents it.
+        let (parent, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        // Two segments, so compaction has something to merge and delete.
+        for k in ["a", "c", "e"] {
+            parent
+                .put(
+                    k.as_bytes(),
+                    bytes(&format!("v-{k}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .unwrap();
+        }
+        parent.flush().await.unwrap();
+        for k in ["n", "p", "r"] {
+            parent
+                .put(
+                    k.as_bytes(),
+                    bytes(&format!("v-{k}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .unwrap();
+        }
+        parent.flush().await.unwrap();
+
+        let (low, high) = parent.range().clone().split_at(bytes("m")).unwrap();
+        parent
+            .prepare_child_partitions(&[
+                ChildSpec {
+                    id: PartitionId(2),
+                    epoch: Epoch(2),
+                    range: low.clone(),
+                },
+                ChildSpec {
+                    id: PartitionId(3),
+                    epoch: Epoch(2),
+                    range: high.clone(),
+                },
+            ])
+            .await
+            .unwrap();
+        let shared = segment_objects(&store, 1);
+        assert!(
+            shared.len() >= 2,
+            "the parent has the segments the children now reference"
+        );
+
+        // Frozen: compaction is a no-op, so every shared segment survives.
+        parent.freeze_maintenance();
+        parent.compact().await.unwrap();
+        assert_eq!(
+            segment_objects(&store, 1),
+            shared,
+            "a frozen split parent must not compact away a segment a child references"
+        );
+        let child_low = open_child(&store, &clock, PartitionId(2), Epoch(2), low).await;
+        for k in ["a", "c", "e"] {
+            assert_eq!(
+                child_low.get(k.as_bytes()).await.unwrap().unwrap().value,
+                bytes(&format!("v-{k}")),
+                "the child still reads {k} from the shared segment"
+            );
+        }
+
+        // Lift the freeze — the abort path — and the same compaction now deletes
+        // those segments, which is exactly the loss the freeze prevented.
+        parent.resume_maintenance();
+        parent.compact().await.unwrap();
+        let after = segment_objects(&store, 1);
+        assert!(
+            after.iter().all(|name| !shared.contains(name)),
+            "unfrozen, compaction deletes the segments the children referenced: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_stops_sharing_once_it_compacts() {
+        // Sharing is self-healing: when a child compacts, it merges the shared
+        // segments into one it writes under its own directory and drops the
+        // cross-partition references, so it can be read with no parent objects
+        // in play.
+        let (parent, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        write_alphabet(&parent).await;
+        let (low, high) = parent.range().clone().split_at(bytes("m")).unwrap();
+        parent
+            .prepare_child_partitions(&[
+                ChildSpec {
+                    id: PartitionId(2),
+                    epoch: Epoch(2),
+                    range: low.clone(),
+                },
+                ChildSpec {
+                    id: PartitionId(3),
+                    epoch: Epoch(2),
+                    range: high.clone(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        let child2 = open_child(&store, &clock, PartitionId(2), Epoch(2), low.clone()).await;
+        child2
+            .compact()
+            .await
+            .expect("the child compacts its shared segments");
+
+        // After compaction the child has its own segment and reads still hold.
+        let prefix = child_prefix(2);
+        assert!(
+            store
+                .keys()
+                .iter()
+                .any(|k| k.starts_with(&prefix) && k.ends_with(".oseg")),
+            "compaction wrote a segment under the child's own directory"
+        );
+        let reopened = open_child(&store, &clock, PartitionId(2), Epoch(2), low).await;
+        for k in alphabet().into_iter().filter(|k| k.as_str() < "m") {
+            assert_eq!(
+                reopened.get(k.as_bytes()).await.unwrap().unwrap().value,
+                bytes(&format!("v-{k}")),
+                "the compacted child still serves {k}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn child_compaction_relocates_an_external_value_out_of_a_shared_parent_segment() {
+        let (parent, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        let value = Bytes::from(vec![0x5a; 4096]);
+        let source_external = parent.writer.put_value(value.clone()).await.unwrap();
+        let source_value_key = parent.path.object(&source_external.name);
+        let mut builder = SegmentBuilder::new(KeyspaceId(1), PartitionId(1), Epoch(1));
+        builder
+            .push(&SegmentRecord {
+                key: bytes("a"),
+                lamport: Lamport(1),
+                expires_at_millis: None,
+                value: RecordValue::External(source_external),
+            })
+            .unwrap();
+        let built = builder.finish().unwrap();
+        let segment = parent.writer.put_segment(&built).await.unwrap();
+        let range = KeyRange::unbounded();
+        parent
+            .writer
+            .commit(|_| CommitPlan {
+                committed_lamport: Lamport(1),
+                range: range.clone(),
+                segments: vec![segment.clone()],
+            })
+            .await
+            .unwrap();
+        parent.hydrate().await.unwrap();
+
+        let (low, high) = parent.range().clone().split_at(bytes("m")).unwrap();
+        parent
+            .prepare_child_partitions(&[
+                ChildSpec {
+                    id: PartitionId(2),
+                    epoch: Epoch(2),
+                    range: low.clone(),
+                },
+                ChildSpec {
+                    id: PartitionId(3),
+                    epoch: Epoch(2),
+                    range: high,
+                },
+            ])
+            .await
+            .unwrap();
+        let child = open_child(&store, &clock, PartitionId(2), Epoch(2), low.clone()).await;
+        assert_eq!(child.get(b"a").await.unwrap().unwrap().value, value);
+
+        let shared = child
+            .shared_segment_sources()
+            .await
+            .remove(&PartitionId(1))
+            .unwrap();
+        clock.set_millis(10_000);
+        parent
+            .sweep_orphans(&shared, 1_000, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            store.keys().contains(&source_value_key),
+            "the source external value stays live while a child shares its segment"
+        );
+
+        child.compact().await.unwrap();
+        let reopened = open_child(&store, &clock, PartitionId(2), Epoch(2), low).await;
+        assert_eq!(reopened.get(b"a").await.unwrap().unwrap().value, value);
+        let child_values: Vec<_> = store
+            .keys()
+            .into_iter()
+            .filter(|key| key.starts_with(&child_prefix(2)) && key.ends_with(".oval"))
+            .collect();
+        assert_eq!(
+            child_values.len(),
+            1,
+            "compaction materialized one child-owned value"
+        );
+        reopened
+            .sweep_orphans(&BTreeSet::new(), 1_000, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            store.keys().contains(&child_values[0]),
+            "the child segment keeps its relocated external value live"
+        );
+
+        let range = KeyRange::unbounded();
+        parent
+            .writer
+            .commit(|_| CommitPlan {
+                committed_lamport: Lamport(1),
+                range: range.clone(),
+                segments: Vec::new(),
+            })
+            .await
+            .unwrap();
+        clock.set_millis(12_000);
+        parent
+            .sweep_orphans(&BTreeSet::new(), 1_000, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            !store.keys().contains(&source_value_key),
+            "the source value is collectible after no manifest references its segment"
+        );
+        assert!(store.keys().contains(&child_values[0]));
     }
 
     #[tokio::test]
@@ -2868,7 +3571,10 @@ mod tests {
             .unwrap();
         p.flush().await.unwrap();
 
-        let report = p.sweep_orphans(5_000, 0, false).await.unwrap();
+        let report = p
+            .sweep_orphans(&BTreeSet::new(), 5_000, 0, false)
+            .await
+            .unwrap();
         assert!(
             report.deleted.is_empty(),
             "the dropping manifest has not settled yet"
@@ -2889,12 +3595,18 @@ mod tests {
         clock.set_millis(20_000);
 
         // A dry run first: it names the orphan without removing it.
-        let preview = p.sweep_orphans(5_000, 0, true).await.unwrap();
+        let preview = p
+            .sweep_orphans(&BTreeSet::new(), 5_000, 0, true)
+            .await
+            .unwrap();
         assert_eq!(preview.deleted, vec![orphan.clone()]);
         assert!(store.keys().contains(&orphan), "a dry run touches nothing");
 
         // Then for real.
-        let swept = p.sweep_orphans(5_000, 0, false).await.unwrap();
+        let swept = p
+            .sweep_orphans(&BTreeSet::new(), 5_000, 0, false)
+            .await
+            .unwrap();
         assert_eq!(swept.deleted, vec![orphan.clone()]);
         assert!(
             !store.keys().contains(&orphan),

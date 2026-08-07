@@ -2,7 +2,7 @@
 //!
 //! Peer discovery alone cannot decide that two fresh partitions are the same
 //! cluster. The shared object store supplies the one conditional-create point
-//! that both partitions must agree through; see ADR 0009.
+//! that both partitions must agree through; see ADR 0010.
 
 use bytes::Bytes;
 use orbita_core::{Error, NodeId, Result};

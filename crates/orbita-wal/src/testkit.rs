@@ -443,6 +443,7 @@ struct NetworkInner {
     handlers: HashMap<(NodeId, ServiceId), Arc<dyn ErasedHandler>>,
     down: HashSet<NodeId>,
     slow: HashSet<NodeId>,
+    swallowed: HashSet<NodeId>,
     calls: u64,
 }
 
@@ -483,6 +484,30 @@ impl MemNetwork {
         self.inner.lock().expect("network poisoned").slow.insert(id);
     }
 
+    /// Delivers this node's requests and discards its replies, so the peer
+    /// stores the append and the caller is told the write failed.
+    ///
+    /// This is not the same fault as [`MemNetwork::isolate`], and the
+    /// difference is the whole point: an isolated peer holds nothing, while a
+    /// peer whose reply was lost holds an entry nobody knows it has. That
+    /// asymmetry is what leaves a tail on a replica for an owner to trip over
+    /// later, and a symmetric partition can never produce it.
+    pub(crate) fn swallow_replies(&self, id: NodeId) {
+        self.inner
+            .lock()
+            .expect("network poisoned")
+            .swallowed
+            .insert(id);
+    }
+
+    pub(crate) fn deliver_replies(&self, id: NodeId) {
+        self.inner
+            .lock()
+            .expect("network poisoned")
+            .swallowed
+            .remove(&id);
+    }
+
     pub(crate) fn calls(&self) -> u64 {
         self.inner.lock().expect("network poisoned").calls
     }
@@ -496,13 +521,14 @@ pub(crate) struct MemTransport {
 
 impl Transport for MemTransport {
     async fn call(&self, to: NodeId, call: PeerCall) -> Result<Bytes, TransportError> {
-        let (handler, down, slow) = {
+        let (handler, down, slow, swallowed) = {
             let mut inner = self.network.lock().expect("network poisoned");
             inner.calls += 1;
             (
                 inner.handlers.get(&(to, call.service)).cloned(),
                 inner.down.contains(&to),
                 inner.slow.contains(&to),
+                inner.swallowed.contains(&to),
             )
         };
         if down {
@@ -513,10 +539,17 @@ impl Transport for MemTransport {
                 yield_now().await;
             }
         }
-        match handler {
+        let answer = match handler {
             Some(handler) => handler.handle(self.local, call).await,
             None => Err(TransportError::NoHandler(call.service)),
+        };
+        if swallowed {
+            // The peer has already applied the request. Reporting the loss as
+            // unreachable is what the caller would see, and it is the honest
+            // shape: a timeout says nothing about whether the peer acted.
+            return Err(TransportError::Unreachable(to));
         }
+        answer
     }
 
     fn register(&self, service: ServiceId, handler: impl PeerHandler) {

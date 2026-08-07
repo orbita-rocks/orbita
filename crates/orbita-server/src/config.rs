@@ -204,7 +204,7 @@ pub struct ServerConfig {
     pub leader_owns_partitions: bool,
 
     /// Whether clustered startup discovers its initial voters through the
-    /// object-store bootstrap certificate from ADR 0009.
+    /// object-store bootstrap certificate from ADR 0010.
     pub automatic_cluster: bool,
 
     /// The object-store namespace used to locate the durable cluster identity.

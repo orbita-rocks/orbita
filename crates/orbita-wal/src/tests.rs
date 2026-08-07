@@ -1181,6 +1181,136 @@ fn quiescing_gives_up_the_tail_no_client_was_told_about_and_keeps_the_rest() {
     });
 }
 
+/// The key a peer holds at `lamport`, or `None` if its log does not reach
+/// there. Reads the log rather than a watermark, because the whole question
+/// here is whose *bytes* sit under a version.
+async fn key_at(peer: &Peer, lamport: Lamport) -> Option<String> {
+    let log = peer.service.log(PARTITION).expect("registered");
+    let entry = log
+        .entries_after(Lamport(lamport.get() - 1))
+        .await
+        .ok()
+        .and_then(|found| match found {
+            CatchUp::Entries(entries) => entries.into_iter().find(|e| e.lamport == lamport),
+            _ => None,
+        })?;
+    match entry.op {
+        WalOp::Put { key, .. } => Some(String::from_utf8_lossy(&key).into_owned()),
+        WalOp::Delete { key, .. } => Some(String::from_utf8_lossy(&key).into_owned()),
+    }
+}
+
+/// Leaves a replica holding an entry the owner then gives back: the append
+/// lands, the reply is lost, the owner reports the write failed, and quiescing
+/// drops it locally. Returns the Lamport that now means different things on the
+/// two nodes' disks.
+async fn strand_a_tail_on_the_replicas(c: &Cluster) -> Lamport {
+    c.owner.commit(op("kept")).await.expect("a healthy write");
+    for peer in [PEER_A, PEER_B] {
+        c.net.swallow_replies(peer);
+    }
+    assert!(
+        c.owner.commit(op("ghost")).await.is_err(),
+        "with no reply coming back the owner cannot call this write durable"
+    );
+    for peer in [PEER_A, PEER_B] {
+        c.net.deliver_replies(peer);
+    }
+    let ghost = c.owner.durable_lamport();
+    assert_eq!(ghost, Lamport(2));
+    for peer in &c.peers {
+        assert_eq!(
+            key_at(peer, ghost).await.as_deref(),
+            Some("ghost"),
+            "the append landed; only the answer was lost"
+        );
+    }
+
+    // The split's preparation. The owner gives up everything above the
+    // committed prefix, which is where it will start assigning again.
+    assert_eq!(c.owner.quiesce().await.unwrap(), Lamport(1));
+    assert_eq!(c.owner.surrendered_lamport(), ghost);
+    ghost
+}
+
+#[test]
+fn a_reopened_owner_replaces_a_surrendered_lamport_on_its_replicas() {
+    // The abort path's hazard, end to end in one crate. A replica holds an
+    // entry at Lamport 2 that the owner has handed back, and the reopened owner
+    // is about to issue Lamport 2 again with different bytes. Reopening above
+    // the epoch the log records fences the replicas first, so the version means
+    // one thing everywhere afterwards.
+    let base = TestRuntime::solo(115);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        let reissued = strand_a_tail_on_the_replicas(&c).await;
+
+        // The abort raised the parent's epoch, so the owner reopens above what
+        // its own log records. That is what lets it truncate its replicas.
+        let reopened = Wal::open(
+            c.owner_peer.runtime.clone(),
+            WalConfig::new(PARTITION, DIR, Epoch(2)).with_replicas(vec![PEER_A, PEER_B]),
+        )
+        .await
+        .expect("reopen at the abort's epoch");
+        for peer in &c.peers {
+            assert_eq!(
+                peer.durable().await,
+                Lamport(1),
+                "fenced back to the prefix"
+            );
+            assert_eq!(peer.epoch().await, Epoch(2), "and the fence is durable");
+        }
+
+        assert_eq!(reopened.commit(op("replacement")).await.unwrap(), reissued);
+        for peer in &c.peers {
+            assert_eq!(
+                key_at(peer, reissued).await.as_deref(),
+                Some("replacement"),
+                "a replica that skipped the reissued Lamport as a retransmission would still \
+                 hold the surrendered entry, and would serve it after a promotion"
+            );
+        }
+    });
+}
+
+#[test]
+fn reopening_at_the_surrendered_epoch_would_leave_two_values_at_one_version() {
+    // The proof the epoch bump is load-bearing rather than decorative. Reopen
+    // at the epoch the log already records — which is what an abort that left
+    // the parent's epoch alone produces — and nothing tells the replicas their
+    // tail is dead. A replica skips an entry at or below its durable position
+    // without comparing bytes, so it acknowledges the replacement and goes on
+    // holding the original. This asserts that divergence, so a change that made
+    // the bump stop mattering fails here rather than passing silently.
+    let base = TestRuntime::solo(116);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        let reissued = strand_a_tail_on_the_replicas(&c).await;
+
+        let reopened = Wal::open(
+            c.owner_peer.runtime.clone(),
+            WalConfig::new(PARTITION, DIR, Epoch(1)).with_replicas(vec![PEER_A, PEER_B]),
+        )
+        .await
+        .expect("the log permits a same-epoch reopen; only the caller knows better");
+        assert_eq!(
+            reopened.commit(op("replacement")).await.unwrap(),
+            reissued,
+            "the owner is told the reissued write reached a quorum"
+        );
+        for peer in &c.peers {
+            assert_eq!(
+                key_at(peer, reissued).await.as_deref(),
+                Some("ghost"),
+                "and the replica still holds the surrendered bytes under that version"
+            );
+        }
+        // Which is exactly why the reopening caller has to ask first.
+        assert_eq!(c.owner.surrendered_lamport(), reissued);
+    });
+}
+
 #[test]
 fn an_append_from_a_fenced_owner_is_rejected_however_well_formed_it_is() {
     let base = TestRuntime::solo(13);

@@ -2,7 +2,14 @@
 //!
 //! The nodes that hold the cluster's authoritative metadata: the partition
 //! map, worker membership, keyspace definitions and quotas, and ownership
-//! epochs. It detects dead workers and fences and replaces partition owners.
+//! epochs. It detects dead workers, fences and replaces partition owners, and
+//! drives the worker-prepared partition split end to end. The state machine
+//! refuses to retire a parent until every holder has *durably* prepared child
+//! storage and reported it — the prepare-before-retire ordering of ADR 0009 —
+//! and the controller turns those acknowledgements into the completion. A worker
+//! fetches the split intent over the control wire, quiesces the parent, and
+//! builds the child storage with `orbita_storage::Partition::prepare_child_partitions`,
+//! which shares the parent's segments in place with no copy.
 //!
 //! Nothing here is on the data path. Workers cache what they need and keep
 //! serving reads while the leader group is unavailable, which is deliberate: a
@@ -123,13 +130,15 @@ pub use membership::{NodeHealth, NodeRole, NodeStatus, PartitionProgress};
 pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 pub use raft::RaftLog;
 pub use service::ControlService;
-pub use state::{ClusterState, NodeRecord, PartitionPhase};
+pub use state::{ClusterState, NodeRecord, PartitionPhase, SplitIntent};
 pub use version::{
     binary_speaks, binary_version, lifecycle_protocol_active, speaks_for, ClusterVersion,
     CompatibilityRefusal, VersionRange, PROTOCOL_0_1,
 };
 pub use wire::{
-    METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_NODES,
-    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
-    METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
+    SplitIntentSnapshot, WireSplitIntent, METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX,
+    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
+    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
+    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    METHOD_REPORT_STATUS_V6,
 };

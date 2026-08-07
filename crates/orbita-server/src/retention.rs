@@ -192,9 +192,18 @@ fn start_node(
                 std::time::Duration::from_secs(86_400),
                 runtime.clock().clone(),
             ));
-            Node::start(runtime, node, layout, source, lease, gate, authenticator)
-                .await
-                .expect("the node starts")
+            Node::start(
+                runtime,
+                node,
+                layout,
+                source,
+                None,
+                lease,
+                gate,
+                authenticator,
+            )
+            .await
+            .expect("the node starts")
         })
     };
     Worker {

@@ -8,7 +8,7 @@ use std::task::Poll;
 
 use bytes::Bytes;
 use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId, Result};
-use orbita_runtime::{PeerCall, Runtime, ServiceId, Transport};
+use orbita_runtime::{join_all, PeerCall, Runtime, ServiceId, Transport};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
 use crate::log::{CatchUp, PartitionLog, RecoveryState, DEFAULT_SEGMENT_TARGET_BYTES};
@@ -266,6 +266,20 @@ struct OwnerState {
     /// Set when this owner has given up its uncommitted tail and will never
     /// assign another Lamport. See [`Wal::quiesce`].
     quiesced: bool,
+    /// The highest Lamport [`Wal::quiesce`] handed back, or zero if it never
+    /// dropped anything.
+    ///
+    /// Read by whoever reopens this partition, because it is the one fact that
+    /// decides whether reopening at the same epoch is safe. Lamports above the
+    /// committed prefix can be on a replica — the append landed and the reply
+    /// was lost — and a reopened owner starts assigning again from the prefix.
+    /// Reopening at the same epoch would therefore issue new bytes under a
+    /// version a replica already holds different bytes for, and a replica skips
+    /// an entry at or below its durable position without comparing bytes, so it
+    /// would acknowledge the replacement and keep the original. A reopen above
+    /// this mark needs a higher epoch, which is the only thing that makes a
+    /// replica give its tail up. See [`Wal::surrendered_lamport`].
+    surrendered: Lamport,
     /// What this owner has established about each replica: where its log ends,
     /// and whether this log can still extend it. Seeded `Unestablished` for
     /// every configured replica when the log opens, so that having heard
@@ -352,7 +366,7 @@ impl<R: Runtime> Wal<R> {
             .map(|node| (*node, ReplicaCatchUp::Unestablished))
             .collect();
 
-        Ok(Arc::new(Self {
+        let wal = Arc::new(Self {
             runtime,
             log,
             partition: config.partition,
@@ -368,11 +382,79 @@ impl<R: Runtime> Wal<R> {
                 failed_through: Lamport::ZERO,
                 acked: HashMap::new(),
                 quiesced: false,
+                surrendered: Lamport::ZERO,
                 catch_up,
                 fatal: None,
             }),
             progress: tokio::sync::Notify::new(),
-        }))
+        });
+
+        // Opening above the epoch this node's own log recorded means this
+        // incarnation is claiming the partition from whatever held it before —
+        // a promotion, or a split parent reopening after its abort bumped the
+        // epoch. Either way a peer can be holding entries above `durable` that
+        // this node has no record of, and `durable` is where this owner is
+        // about to start assigning Lamports again. Telling the peers where
+        // history ends *here*, rather than letting the first append carry the
+        // news, is what stops a peer acknowledging a reissued Lamport as a
+        // retransmission of the bytes it already has.
+        //
+        // Skipped on a same-epoch reopen because nothing new is being claimed:
+        // the peers already hold this epoch, the cut would be a no-op on the
+        // replica side, and a restart should not pay a round trip per replica
+        // to learn that.
+        if config.epoch > seen {
+            wal.fence_peers(config.epoch, durable).await?;
+        }
+        Ok(wal)
+    }
+
+    /// Tells every replica that this owner's history ends at `truncate_above`,
+    /// so a peer holding entries beyond it drops them.
+    ///
+    /// The cut is the position this owner resumes from, and it is deliberately
+    /// the same cut the first append at this epoch would have applied — this
+    /// only moves it earlier, to before any write can be admitted. See the
+    /// crate docs on replica divergence for why discarding is safe rather than
+    /// merely convenient.
+    ///
+    /// Errors only when a peer says this owner is already stale, which is not
+    /// a retryable condition and must stop it. A peer that cannot be reached is
+    /// left to the first append it sees at this epoch, which truncates it the
+    /// same way; blocking ownership on an unreachable peer would trade a
+    /// narrow window for an outage.
+    async fn fence_peers(&self, epoch: Epoch, truncate_above: Lamport) -> Result<()> {
+        let replicas = self.replicas();
+        if replicas.is_empty() {
+            return Ok(());
+        }
+        let request = FenceRequest {
+            partition: self.partition,
+            epoch,
+            truncate_above,
+        };
+        // Concurrently, because these are bounded by a per-call timeout and a
+        // dead peer would otherwise add its whole timeout to the latency of
+        // every peer behind it in the list.
+        let sent = join_all(
+            replicas
+                .iter()
+                .map(|node| self.send(*node, METHOD_FENCE, request.encode()))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        for reply in sent {
+            if let Ok(WalResponse::StaleEpoch { current }) = reply {
+                let error = Error::StaleEpoch {
+                    partition: self.partition,
+                    got: epoch,
+                    current,
+                };
+                self.set_fatal(error.clone());
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// The log this owner writes to, so a node that is demoted to replica can
@@ -447,6 +529,26 @@ impl<R: Runtime> Wal<R> {
     #[must_use]
     pub fn committed_lamport(&self) -> Lamport {
         self.state().replicated
+    }
+
+    /// The highest Lamport this owner handed back in [`Wal::quiesce`], or zero
+    /// if it never gave anything up.
+    ///
+    /// Whoever reopens the partition has to ask, because the answer decides
+    /// whether the reopen may happen at the same epoch. Everything in
+    /// `(committed_lamport, this]` was dropped from this node's log while
+    /// possibly sitting on a replica — the append landed and the reply was
+    /// lost — and a reopened owner resumes assigning from the committed prefix,
+    /// so those Lamports are about to be issued a second time with different
+    /// bytes under them. A replica skips an entry at or below its own durable
+    /// position without comparing bytes, so at an unchanged epoch it would
+    /// acknowledge the replacement and go on holding the original: two values
+    /// at one version, a divergent replica read, and the replacement lost if
+    /// that replica is later promoted. Only a higher epoch makes a replica give
+    /// its tail up, so a reopen above this mark must carry one.
+    #[must_use]
+    pub fn surrendered_lamport(&self) -> Lamport {
+        self.state().surrendered
     }
 
     /// The advertised replicas a catch-up still owes a pass, meaning those not
@@ -810,28 +912,7 @@ impl<R: Runtime> Wal<R> {
             state.fatal = None;
         }
 
-        let request = FenceRequest {
-            partition: self.partition,
-            epoch,
-            truncate_above: durable,
-        };
-        for node in self.replicas().iter() {
-            // A peer we cannot reach is fenced by the first append it sees at
-            // the new epoch, so promotion does not wait on it. A peer that
-            // says we are already stale is another matter.
-            if let Ok(WalResponse::StaleEpoch { current }) =
-                self.send(*node, METHOD_FENCE, request.encode()).await
-            {
-                let error = Error::StaleEpoch {
-                    partition: self.partition,
-                    got: epoch,
-                    current,
-                };
-                self.set_fatal(error.clone());
-                return Err(error);
-            }
-        }
-        Ok(())
+        self.fence_peers(epoch, durable).await
     }
 
     /// Brings every replica up to the committed prefix without waiting for a
@@ -997,6 +1078,10 @@ impl<R: Runtime> Wal<R> {
             // it. The floor is the committed prefix, so a kept entry is never
             // failed by this.
             state.failed_through = state.failed_through.max(dropped_from);
+            // Recorded so that whoever reopens this partition can see that
+            // Lamports were handed back and refuse to reissue them under an
+            // epoch the replicas still hold. See [`Wal::surrendered_lamport`].
+            state.surrendered = state.surrendered.max(dropped_from);
             // A batch that is gone from the log cannot be rescued by a reply
             // that is still on the wire.
             state.inflight.retain(|batch| batch.last <= durable);

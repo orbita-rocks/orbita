@@ -191,7 +191,7 @@ to the design doc.
 
 A cluster is three or more combined nodes. Every node serves the worker data
 path, while an automatically managed subset of three or five nodes votes in
-Raft. See [ADR 0009](adr/0009-combined-nodes-form-one-automatically-managed-voter-set.md).
+Raft. See [ADR 0010](adr/0010-combined-nodes-form-one-automatically-managed-voter-set.md).
 
 - **The voters** are three nodes by default, or five when configured. One voter
   is the elected Raft leader. The group owns the partition

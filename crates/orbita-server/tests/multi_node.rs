@@ -30,14 +30,16 @@
 
 use orbita_control::{
     binary_speaks, BootstrapSpec, ClusterVersion, ControlCommand, ControlConfig, ControlService,
-    Controller, KeyspaceConfig, SingleNodeLog,
+    Controller, KeyspaceConfig, SingleNodeLog, METHOD_FETCH_SPLIT_INTENTS,
+    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
 };
 use orbita_core::{NodeId, PartitionMap};
 use orbita_proto::v1::kv_client::KvClient;
 use orbita_proto::v1::{GetRequest, SetRequest};
-use orbita_runtime::{Runtime, ServiceId, Transport};
+use orbita_runtime::{PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportResult};
 use orbita_server::{Server, ServerConfig, ServerRuntime, DEFAULT_KEYSPACE};
 
+use bytes::{BufMut, Bytes, BytesMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -84,6 +86,73 @@ struct LeaderGroup {
     _dir: DataDir,
 }
 
+/// A leader group whose split vocabulary is missing, wrapped around a real
+/// controller so every other method behaves normally. This is the shape of a
+/// rolling upgrade in progress: the worker is new, the leader is not, and the
+/// worker still has to boot.
+struct PreSplitControl {
+    inner: ControlService<ServerRuntime, SingleNodeLog<ServerRuntime>>,
+    split_fetch: SplitFetchResponse,
+    refuse_version: bool,
+    split_calls: Arc<AtomicU64>,
+    status_calls: Arc<AtomicU64>,
+}
+
+enum SplitFetchResponse {
+    UnknownMethod,
+    Refuse(String),
+}
+
+impl PeerHandler for PreSplitControl {
+    async fn handle(&self, from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
+        match call.method {
+            METHOD_FETCH_SPLIT_INTENTS | METHOD_FETCH_SPLIT_INTENTS_V2 => {
+                // Startup fetches split state before its first status report.
+                // Count that exchange only, not later control-loop polls.
+                if self.status_calls.load(Ordering::Relaxed) == 0 {
+                    self.split_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                let message = match &self.split_fetch {
+                    SplitFetchResponse::UnknownMethod => {
+                        format!("unknown control method {}", call.method)
+                    }
+                    SplitFetchResponse::Refuse(message) => message.clone(),
+                };
+                Ok(legacy_control_error(&message))
+            }
+            METHOD_REPORT_STATUS_V6 if self.refuse_version => Ok(legacy_control_error(&format!(
+                "unknown control method {METHOD_REPORT_STATUS_V6}"
+            ))),
+            METHOD_REPORT_STATUS_V5 if self.refuse_version => {
+                self.status_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(incompatible_response())
+            }
+            _ => self.inner.handle(from, call).await,
+        }
+    }
+}
+
+/// The exact response shape an old control service emits for an unknown method.
+fn legacy_control_error(message: &str) -> Bytes {
+    let mut encoded = BytesMut::new();
+    encoded.put_u8(3);
+    encoded.put_u32_le(message.len() as u32);
+    encoded.put_slice(message.as_bytes());
+    encoded.freeze()
+}
+
+fn incompatible_response() -> Bytes {
+    let speaks = binary_speaks();
+    let active = ClusterVersion::new(speaks.max.major + 1, 0);
+    let mut encoded = BytesMut::new();
+    encoded.put_u8(7);
+    for version in [speaks.min, speaks.max, active] {
+        encoded.put_u32_le(version.major);
+        encoded.put_u32_le(version.minor);
+    }
+    encoded.freeze()
+}
+
 async fn start_leader_group(config: ControlConfig) -> LeaderGroup {
     let dir = DataDir::new("leader");
     let runtime = ServerRuntime::new(LEADER, &dir.0, Some(1));
@@ -126,6 +195,57 @@ async fn start_leader_group(config: ControlConfig) -> LeaderGroup {
         address,
         _dir: dir,
     }
+}
+
+async fn start_pre_split_leader_group(
+    split_fetch: SplitFetchResponse,
+    refuse_version: bool,
+) -> (LeaderGroup, Arc<AtomicU64>, Arc<AtomicU64>) {
+    let dir = DataDir::new("pre-split-leader");
+    let runtime = ServerRuntime::new(LEADER, &dir.0, Some(1));
+    let log = SingleNodeLog::open(&runtime)
+        .await
+        .expect("the consensus log opens");
+    let controller = Controller::new(runtime.clone(), log, ControlConfig::default());
+    let split_calls = Arc::new(AtomicU64::new(0));
+    let status_calls = Arc::new(AtomicU64::new(0));
+    runtime.transport().register(
+        ServiceId::Control,
+        PreSplitControl {
+            inner: ControlService::new(controller.clone()),
+            split_fetch,
+            refuse_version,
+            split_calls: Arc::clone(&split_calls),
+            status_calls: Arc::clone(&status_calls),
+        },
+    );
+    let listener = runtime
+        .transport()
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("the leader group binds a peer port");
+    let address = listener.local_addr().to_string();
+    std::mem::forget(listener);
+    controller
+        .bootstrap(&BootstrapSpec {
+            keyspace: DEFAULT_KEYSPACE.to_string(),
+            config: KeyspaceConfig::default(),
+            leaders: vec![(LEADER, address.clone())],
+            workers: vec![(WORKERS[0], String::new())],
+        })
+        .await
+        .expect("the cluster bootstraps");
+    let sweeping = controller.clone();
+    tokio::spawn(async move { sweeping.run().await });
+    (
+        LeaderGroup {
+            controller,
+            address,
+            _dir: dir,
+        },
+        split_calls,
+        status_calls,
+    )
 }
 
 /// One worker, with the directory it writes to.
@@ -173,6 +293,69 @@ impl Worker {
         let server = self.server.take().expect("this worker is still running");
         server.drain(timeout).await
     }
+}
+
+/// The worker-first rolling upgrade in UPGRADES.md: a new binary meets a leader
+/// that has never heard of split intents. Startup fetches those intents before
+/// hosts enter routing, so if the unknown-method refusal were fatal every new
+/// worker would crash-loop instead of coming up not-ready.
+#[tokio::test]
+async fn a_worker_boots_against_a_leader_that_does_not_know_the_split_intent_method() {
+    let (group, split_calls, status_calls) =
+        start_pre_split_leader_group(SplitFetchResponse::UnknownMethod, true).await;
+    let mut worker = start_worker(WORKERS[0], &group.address, BUDGET).await;
+
+    let deadline = Instant::now() + BUDGET;
+    while status_calls.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        split_calls.load(Ordering::Relaxed),
+        2,
+        "startup falls back from the unknown V2 method to the unknown V1 method"
+    );
+    assert!(
+        status_calls.load(Ordering::Relaxed) > 0,
+        "the running worker reached the version-aware heartbeat"
+    );
+    let readiness = worker.server().readiness().state();
+    assert!(!readiness.is_ready());
+    assert!(
+        !readiness.is_met(orbita_server::ReadinessCondition::ClusterVersionCompatible),
+        "an authoritative version refusal stops the rollout without stopping the process"
+    );
+    worker.kill().await;
+}
+
+/// The compatibility path is scoped to one refusal, not to the method. A leader
+/// that knows the method and cannot answer it leaves the worker unable to rule
+/// out an in-flight split, which is exactly what the restart gates need.
+#[tokio::test]
+async fn a_non_compatibility_split_fetch_refusal_still_fails_worker_startup() {
+    let (group, split_calls, _) = start_pre_split_leader_group(
+        SplitFetchResponse::Refuse("split state is unavailable".into()),
+        false,
+    )
+    .await;
+    let dir = DataDir::new("refused-split-fetch-worker");
+    let config = ServerConfig::single_node(&dir.0)
+        .with_node_id(WORKERS[0])
+        .on_ephemeral_port()
+        .with_peers(vec![(LEADER, group.address.clone())])
+        .with_leader_group(vec![LEADER]);
+
+    let error = match Server::start(config).await {
+        Ok(server) => {
+            server.shutdown().await.unwrap();
+            panic!("a real split-state refusal must not be treated as an empty active set")
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        orbita_core::Error::Internal(message) if message == "split state is unavailable"
+    ));
+    assert_eq!(split_calls.load(Ordering::Relaxed), 1);
 }
 
 fn set(key: &str, value: &str) -> SetRequest {

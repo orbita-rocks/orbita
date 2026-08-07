@@ -41,12 +41,13 @@ use crate::validate;
 
 use bytes::Bytes;
 use orbita_control::Permission;
+use orbita_control::{SplitIntentSnapshot, WireSplitIntent};
 use orbita_core::{
-    Error, KeyspaceId, KeyspaceInfo, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
-    Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
+    Error, KeyspaceId, KeyspaceInfo, Lamport, NodeId, PartitionId, PartitionInfo, PartitionMap,
+    Result, Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
     MESSAGE_OVERHEAD_BYTES,
 };
-use orbita_format::PartitionPath;
+use orbita_format::{load_manifest, PartitionPath};
 use orbita_objectstore::ObjectStore;
 use orbita_proto::v1::{
     DeleteRequest, DeleteResponse, GetLimitsResponse, GetRequest, GetResponse, ListEntry,
@@ -56,10 +57,10 @@ use orbita_runtime::{
     join_all, Clock, PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError,
     TransportResult,
 };
-use orbita_storage::ScanBudget;
+use orbita_storage::{ChildSpec, ScanBudget};
 use orbita_wal::WalService;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
@@ -272,11 +273,16 @@ impl Access {
 impl<R: Runtime> Node<R> {
     /// Fetches the map, opens every partition this node holds, and starts
     /// serving peer traffic.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "startup dependencies and the authoritative split snapshot are independent"
+    )]
     pub(crate) async fn start(
         runtime: R,
         node_id: NodeId,
         layout: DataLayout,
         source: BoxedMapSource,
+        initial_split_intents: Option<SplitIntentSnapshot>,
         lease_duration: Duration,
         readiness: Arc<ReadinessGate>,
         authenticator: Arc<Authenticator<R::Clock>>,
@@ -313,6 +319,23 @@ impl<R: Runtime> Node<R> {
             keyspace_miss_repaired_at: AtomicU64::new(0),
         });
         node.reconcile_hosts().await?;
+        let owners: Vec<_> = node
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner())
+            .cloned()
+            .collect();
+        join_all(
+            owners
+                .iter()
+                .map(|host| host.wait_for_possible_restart_leases())
+                .collect(),
+        )
+        .await;
+        node.apply_active_split_gates(initial_split_intents.as_ref())
+            .await;
         // Nothing is known to be stranded before a single heartbeat has gone
         // out, and a node held unready for a verdict it has not reached would
         // never start. The heartbeat corrects this within one interval.
@@ -334,6 +357,23 @@ impl<R: Runtime> Node<R> {
             },
         );
         Ok(node)
+    }
+
+    /// Restores split gates before startup publishes peer or client handlers.
+    async fn apply_active_split_gates(&self, snapshot: Option<&SplitIntentSnapshot>) {
+        let active: HashSet<PartitionId> = snapshot
+            .filter(|snapshot| snapshot.map_version == self.map().version())
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.intents)
+            .map(|intent| intent.parent)
+            .collect();
+        let snapshot_is_current =
+            snapshot.is_none_or(|snapshot| snapshot.map_version == self.map().version());
+        for host in self.hosts.read().await.values() {
+            if host.is_owner() && (!snapshot_is_current || active.contains(&host.id())) {
+                host.close_split_gates();
+            }
+        }
     }
 
     #[must_use]
@@ -1645,7 +1685,14 @@ impl<R: Runtime> Node<R> {
         );
     }
 
-    /// Flushes every partition this node currently owns once.
+    /// Flushes every partition this node currently owns once, skipping any that
+    /// a split has frozen.
+    ///
+    /// A split parent is skipped because a flush pass advances the counter that
+    /// eventually triggers compaction, and compaction deletes the very segments
+    /// the parent's about-to-exist children reference (ADR 0009). The host's
+    /// `flush` re-checks the freeze under its own lock, so skipping here is the
+    /// cheap gate and the storage check is the race-free backstop.
     ///
     /// One pass rather than an internal timer keeps the same production code
     /// directly drivable under deterministic simulation.
@@ -1655,7 +1702,7 @@ impl<R: Runtime> Node<R> {
             .read()
             .await
             .values()
-            .filter(|host| host.is_owner())
+            .filter(|host| host.is_owner() && !host.is_maintenance_frozen())
             .cloned()
             .collect();
         for host in hosts {
@@ -1681,17 +1728,260 @@ impl<R: Runtime> Node<R> {
     /// A failed sweep is logged and skipped, not retried here: an orphan that
     /// survives one pass is reclaimed on the next, and a store that is refusing
     /// deletes has a louder problem than leaked space.
-    pub(crate) async fn sweep_owned(&self, grace_millis: u64, skew_millis: u64, dry_run: bool) {
-        let hosts: Vec<Arc<PartitionHost<R>>> = self
+    /// Prepares durable child storage for every split this node holds the
+    /// parent of, and returns the parents it has fully prepared so the caller
+    /// can acknowledge them.
+    ///
+    /// This is the worker's half of the ADR 0009 split. The owner quiesces the
+    /// parent and publishes both child manifests over its segments with no
+    /// copy; a replica has no writes to quiesce and reaches the same manifests
+    /// through the shared bucket. A parent is reported prepared only once both
+    /// child manifests are durable, which is the real acknowledgement the
+    /// leader's completion waits on — never a mere observation that a map moved.
+    ///
+    /// A split that is no longer pending — because a required holder died and
+    /// the leader aborted it — is detected by its parent being absent from the
+    /// intents, and any parent this node had quiesced for it has its writes
+    /// reopened here rather than being left stuck closed.
+    pub(crate) async fn prepare_split_snapshot(
+        &self,
+        snapshot: &SplitIntentSnapshot,
+    ) -> Vec<(PartitionId, PartitionId, PartitionId)> {
+        if snapshot.map_version != self.map().version() {
+            tracing::debug!(
+                map_version = self.map().version().get(),
+                intent_map_version = snapshot.map_version.get(),
+                "deferring split intents until the map and lifecycle snapshot agree"
+            );
+            return Vec::new();
+        }
+        self.prepare_pending_splits(&snapshot.intents).await
+    }
+
+    pub(crate) async fn prepare_pending_splits(
+        &self,
+        intents: &[WireSplitIntent],
+    ) -> Vec<(PartitionId, PartitionId, PartitionId)> {
+        let map = self.map();
+        let pending: HashSet<PartitionId> = intents.iter().map(|intent| intent.parent).collect();
+
+        // Lift the freeze on any partition we quiesced or froze for a split
+        // that is no longer pending. A completed split retires the parent
+        // instead, so this only fires on an abort. Resuming maintenance here is
+        // what restarts its flush, compaction, and sweep once the children it
+        // was protecting will never exist.
+        let abandoned: Vec<PartitionId> = self
             .hosts
             .read()
             .await
             .values()
-            .filter(|host| host.is_owner())
-            .cloned()
+            .filter(|host| {
+                host.is_owner()
+                    && (!host.is_admitting_writes()
+                        || !host.is_admitting_leases()
+                        || host.is_maintenance_frozen())
+                    && !pending.contains(&host.id())
+            })
+            .map(|host| host.id())
             .collect();
-        for host in hosts {
-            match host.sweep_orphans(grace_millis, skew_millis, dry_run).await {
+        for parent in abandoned {
+            if let Err(error) = self.reopen_aborted_split_parent(parent).await {
+                self.unreconciled.store(true, Ordering::Release);
+                tracing::warn!(
+                    partition = parent.get(),
+                    %error,
+                    "could not reopen a split parent after abort; will retry"
+                );
+            }
+        }
+
+        let mut prepared = Vec::new();
+        for intent in intents {
+            let Some(parent) = map.partition(intent.parent) else {
+                continue;
+            };
+            let is_owner = parent.owner == Some(self.node_id);
+            let is_replica = parent.replicas.contains(&self.node_id);
+            if !is_owner && !is_replica {
+                continue;
+            }
+            let Some((low_range, high_range)) = parent.range.clone().split_at(intent.at.clone())
+            else {
+                // An impossible boundary the leader will never complete against.
+                continue;
+            };
+            let child_epoch = parent.epoch.next();
+
+            if is_owner {
+                let host = self.hosts.read().await.get(&intent.parent).cloned();
+                let Some(host) = host else { continue };
+                // Freeze flush, compaction, and sweep BEFORE preparing, so no
+                // maintenance pass can delete a segment the children are about
+                // to reference. The freeze is idempotent, so re-running it every
+                // poll while the split is pending costs nothing. See ADR 0009.
+                host.close_split_gates();
+                if intent.prepared_by_this_node {
+                    continue;
+                }
+                let specs = [
+                    ChildSpec {
+                        id: intent.lower,
+                        epoch: child_epoch,
+                        range: low_range,
+                    },
+                    ChildSpec {
+                        id: intent.upper,
+                        epoch: child_epoch,
+                        range: high_range,
+                    },
+                ];
+                if let Err(error) = host.quiesce_and_prepare_children(&specs).await {
+                    tracing::warn!(
+                        partition = intent.parent.get(),
+                        %error,
+                        "could not prepare split children; will retry"
+                    );
+                    continue;
+                }
+            } else if intent.prepared_by_this_node {
+                continue;
+            }
+
+            // Acknowledge only once both child manifests are durable — the
+            // owner just published them, a replica waits for that publish.
+            if self
+                .child_manifests_exist(parent.keyspace, intent.lower, intent.upper)
+                .await
+            {
+                prepared.push((intent.parent, intent.lower, intent.upper));
+            }
+        }
+        prepared
+    }
+
+    /// Recreates an aborted split parent because WAL quiescence is deliberately
+    /// irreversible within one host incarnation.
+    ///
+    /// Refuses to do it at the epoch the parent quiesced under, once that
+    /// quiesce actually handed Lamports back. Those Lamports can be on a
+    /// replica whose acknowledgement was lost on the way home, and a reopened
+    /// owner resumes assigning from the committed prefix, so reissuing them at
+    /// an unchanged epoch would put new bytes under a version a replica already
+    /// holds — which it would skip as a retransmission without comparing bytes,
+    /// acknowledge, and keep the original for. The abandoning control-plane
+    /// entry bumps the parent's epoch for exactly this reason (see
+    /// `orbita_control` state machine's `abort_split`); until that entry is visible here the
+    /// parent stays closed, which costs availability on one partition and is
+    /// the only direction that cannot reissue a version.
+    ///
+    /// A quiesce that dropped nothing is not affected. Nothing was handed back,
+    /// so nothing can be reissued, and the parent reopens in place — which is
+    /// the ordinary case, since the tail only exists when a write was in flight
+    /// to a replica that never answered.
+    async fn reopen_aborted_split_parent(&self, parent: PartitionId) -> Result<()> {
+        let map = self.map();
+        let info = map
+            .partition(parent)
+            .filter(|info| info.owner == Some(self.node_id))
+            .ok_or_else(|| Error::NotOwner {
+                partition: parent,
+                owner: map.partition(parent).and_then(|info| info.owner),
+            })?
+            .clone();
+        let mut hosts = self.hosts.write().await;
+        let Some(held) = hosts.get(&parent) else {
+            return Ok(());
+        };
+        if held.is_admitting_writes() && held.is_admitting_leases() && !held.is_maintenance_frozen()
+        {
+            return Ok(());
+        }
+        let surrendered = held.surrendered_lamport();
+        if surrendered > Lamport::ZERO && info.epoch <= held.epoch() {
+            return Err(Error::Unavailable(format!(
+                "partition {parent} gave up its log through {surrendered} while quiescing for a \
+                 split and cannot reopen at epoch {} without reissuing those versions; waiting \
+                 for the abort to raise its epoch",
+                info.epoch
+            )));
+        }
+        hosts.remove(&parent);
+        self.wal_service.unregister(parent);
+        self.bridge.unregister(parent);
+        let paths = self.layout.paths(info.keyspace, parent);
+        let spec = HostSpec {
+            id: parent,
+            epoch: info.epoch,
+            range: info.range,
+            lease: self.lease,
+        };
+        let reopened =
+            PartitionHost::open_owner(self.runtime.clone(), spec, &paths, info.replicas).await?;
+        hosts.insert(parent, reopened);
+        tracing::info!(
+            partition = parent.get(),
+            "reopened the owner host after its split was abandoned"
+        );
+        Ok(())
+    }
+
+    /// The host for one partition this node holds, for a test that drives the
+    /// split's data-plane steps directly.
+    #[cfg(test)]
+    pub(crate) async fn host(&self, id: PartitionId) -> Option<Arc<PartitionHost<R>>> {
+        self.hosts.read().await.get(&id).cloned()
+    }
+
+    /// Whether both of a split's child manifests are durably published in the
+    /// shared bucket, which is what makes it safe to acknowledge preparation.
+    async fn child_manifests_exist(
+        &self,
+        keyspace: KeyspaceId,
+        lower: PartitionId,
+        upper: PartitionId,
+    ) -> bool {
+        for id in [lower, upper] {
+            let paths = self.layout.paths(keyspace, id);
+            match load_manifest(paths.store.as_ref(), &paths.path).await {
+                Ok(Some(_)) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    pub(crate) async fn sweep_owned(&self, grace_millis: u64, skew_millis: u64, dry_run: bool) {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self.hosts.read().await.values().cloned().collect();
+
+        // Which of one partition's objects a sibling still references in place,
+        // per ADR 0009. Gathered across every partition this node holds a copy
+        // of — owner or replica — so a split child's reference to the parent's
+        // segments protects them when the parent is swept. A child owned only
+        // by another node is not visible here, which is why a split *parent* is
+        // frozen out of the sweep entirely for the split's duration (both by
+        // the filter below and, race-free, inside `Partition::sweep_orphans`),
+        // rather than relying on this set being complete while a split is in
+        // flight.
+        let mut shared_by_source: std::collections::BTreeMap<
+            PartitionId,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for host in &hosts {
+            for (source, names) in host.shared_segment_sources().await {
+                shared_by_source.entry(source).or_default().extend(names);
+            }
+        }
+
+        let empty = std::collections::BTreeSet::new();
+        for host in hosts
+            .into_iter()
+            .filter(|host| host.is_owner() && !host.is_maintenance_frozen())
+        {
+            let shared = shared_by_source.get(&host.id()).unwrap_or(&empty);
+            match host
+                .sweep_orphans(shared, grace_millis, skew_millis, dry_run)
+                .await
+            {
                 Ok(report) if report.deleted.is_empty() => {}
                 Ok(report) if report.dry_run => tracing::info!(
                     partition = host.id().get(),
@@ -2062,6 +2352,7 @@ mod tests {
                     NodeId(1),
                     layout,
                     source,
+                    None,
                     crate::DEFAULT_LEASE_DURATION,
                     gate,
                     authenticator,
@@ -2126,6 +2417,7 @@ mod tests {
                 NodeId(1),
                 layout,
                 source,
+                None,
                 crate::DEFAULT_LEASE_DURATION,
                 gate,
                 authenticator,
