@@ -151,7 +151,7 @@ The first version of this document specified credentials and quotas and said
 nothing about transport security or granular authorization, which had the
 priorities inverted for a system asking to hold control-plane state. This
 section fixes the requirements; ROADMAP.md schedules them, currently at
-v0.4.0.
+v0.5.0.
 
 - **Encryption in transit, everywhere.** TLS on the client surface, and
   mutually authenticated connections between peers, completing what
@@ -165,9 +165,21 @@ v0.4.0.
 - **Audit logging.** Administrative and credential operations produce an
   audit record. The target buyer's security review asks for this by name.
 
-Encryption at rest stays out of scope here: object storage backends provide
-it, and the deployment docs should say how to turn it on rather than Orbita
-reimplementing it.
+- **Encryption at rest.** Envelope encryption of the write-ahead log and the
+  object segments under a single KMS-backed cluster key, with key rotation
+  re-wrapping data keys rather than rewriting data.
+
+An earlier version of this document fenced encryption at rest out, on the
+argument that object storage backends provide it and the deployment docs
+should say how to turn it on. That reversal is deliberate. The argument was
+never complete: server-side encryption covers segments and manifests, but the
+2-of-3 replicated WAL lives on local worker disks and holds every
+acknowledged write that has not yet flushed, so the data with the strongest
+durability promise had the weakest at-rest story. Per-keyspace keys and
+customer-supplied keys are noted as a possible multitenancy differentiator
+and deliberately not required here; one cluster key closes the gap without
+pulling key-per-tenant plumbing through the format, compaction, and the admin
+surface.
 
 ## Architecture requirements
 
