@@ -67,6 +67,23 @@ def _walk(node, prefix=b"", limit=7):
     raise AssertionError("the cross-partition list did not terminate")
 
 
+def _set_after_routing_converges(node, key, value):
+    """Retry the brief interval where control has children but the worker has the parent."""
+
+    def write():
+        try:
+            response = node.kv.Set(
+                kv_pb2.SetRequest(keyspace=KS, key=key, value=value), timeout=2.0
+            )
+            return response if response.applied else None
+        except grpc.RpcError as error:
+            if error.code() == grpc.StatusCode.UNAVAILABLE:
+                return None
+            raise
+
+    return poll_until(write, timeout=20.0)
+
+
 def test_manual_split_preserves_both_ranges_and_lists_each_key_once(node):
     expected = {}
     for side in (b"a", b"z"):
@@ -145,9 +162,7 @@ def test_split_children_and_later_writes_survive_a_process_restart(node):
 
     after = {b"b/after": b"new-lower", b"y/after": b"new-upper"}
     for key, value in after.items():
-        assert node.kv.Set(
-            kv_pb2.SetRequest(keyspace=KS, key=key, value=value), timeout=10.0
-        ).applied
+        assert _set_after_routing_converges(node, key, value).applied
     restart(node)
 
     for key, value in {**before, **after}.items():
@@ -186,9 +201,7 @@ def test_reads_remain_current_through_split_activation_and_a_child_update(node):
     reader = threading.Thread(target=read_loop, daemon=True)
     reader.start()
     _split(node)
-    assert node.kv.Set(
-        kv_pb2.SetRequest(keyspace=KS, key=key, value=new), timeout=10.0
-    ).applied
+    assert _set_after_routing_converges(node, key, new).applied
     updated.set()
     poll_until(lambda: len(after_update) >= 10, timeout=10.0)
     stop.set()

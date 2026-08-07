@@ -266,7 +266,7 @@ def test_deliberately_unimplemented_admin_calls_refuse_and_say_why(node, method_
 
     Kept as its own test rather than folded into the descriptor walk so that
     the list of deliberate refusals is somewhere a reader will find it. When
-    When it lands, this test is where the deletion goes.
+    it lands, this test is where the deletion goes.
     """
     method = ADMIN_SERVICE.methods_by_name[method_name]
     request = message_factory.GetMessageClass(method.input_type)()
