@@ -18,7 +18,7 @@ use crate::map_source::MapSource;
 
 use orbita_control::{
     binary_speaks, lifecycle_protocol_active, ClusterVersion, CompatibilityRefusal, ControlClient,
-    NodeRole, NodeStatus, PartitionProgress, StatusReportResponse,
+    NodeRole, NodeStatus, PartitionProgress, StatusReportResponse, VersionRange,
 };
 use orbita_core::{Error, MapVersion, NodeId, PartitionMap, Result};
 use orbita_runtime::Runtime;
@@ -188,9 +188,14 @@ impl<R: Runtime> StatusReporter<R> {
         *self.active.lock().expect("active version poisoned")
     }
 
-    /// Whether this worker may use the finalized lifecycle protocol.
+    /// Whether this worker may use the finalized lifecycle protocol: put a
+    /// `ready`/`draining` claim on its heartbeats, and attempt a planned
+    /// handoff rather than ordinary failover when it is asked to stop.
     ///
-    /// The question is whether the *cluster* has finalized onto a version that
+    /// Two conditions, asking two different questions of two different
+    /// versions.
+    ///
+    /// The first is whether the *cluster* has finalized onto a version that
     /// carries lifecycle state, not whether the cluster happens to be on this
     /// binary's own version. Those coincide only for a node whose binary is
     /// exactly the finalized one, which during a rolling upgrade is precisely
@@ -201,12 +206,40 @@ impl<R: Runtime> StatusReporter<R> {
     /// being placed. `lifecycle_protocol_active` is the same predicate the
     /// state machine gates on, so both ends of the heartbeat now agree from
     /// the one version they share.
+    ///
+    /// The second is whether this binary can speak that active version at
+    /// all, and it is a containment test against the whole n-1 window rather
+    /// than an equality test, because speaking the version before your own is
+    /// the entire reason [`binary_speaks`] returns a range. A node outside
+    /// the window has every report refused as `Incompatible`, so choosing
+    /// planned handoff for it would put it in a drain loop that can never see
+    /// an `Accepted` and would sit there until the drain budget expires
+    /// before falling back to ordinary failover. That is the slowest possible
+    /// shutdown for the node that most needs the fastest one: an
+    /// incompatible node holds partitions the cluster wants back. A node in
+    /// this state is one that missed a `finalize-upgrade` — down while the
+    /// window moved, then restarted on a binary the cluster has left behind.
+    ///
+    /// # Why this may read the binary and the apply-time gate may not
+    ///
+    /// This is a *local* decision: one process choosing how to shut itself
+    /// down, and how to describe itself on its own heartbeat. Nothing about
+    /// it is replicated, so consulting the running binary's capability costs
+    /// nothing and is the only way to know that a planned handoff is
+    /// hopeless.
+    ///
+    /// The replicated gate is the opposite case and must stay
+    /// cluster-version-only. `ClusterState::lifecycle_enabled` is read from
+    /// `apply`, where every member replays the same committed entry and the
+    /// map stays a state machine only if they all reach the same conclusion
+    /// from it. A rule that consulted the running binary there would let one
+    /// committed entry produce divergent state on two members mid-rollout —
+    /// see [ADR 0008]. Do not copy this check into that one.
+    ///
+    /// [ADR 0008]: ../../../docs/adr/0008-a-fenced-owner-stays-a-replica.md
     #[must_use]
     pub fn can_handoff(&self) -> bool {
-        self.role == NodeRole::Worker
-            && self
-                .active_cluster_version()
-                .is_some_and(lifecycle_protocol_active)
+        handoff_eligible(self.role, self.active_cluster_version(), binary_speaks())
     }
 
     /// Sends one report, carrying how far this node has got on every partition
@@ -295,16 +328,29 @@ impl<R: Runtime> StatusReporter<R> {
     }
 }
 
+/// [`StatusReporter::can_handoff`] with both versions passed in.
+///
+/// Split out so the rule can be tested against binary/cluster version pairs
+/// this workspace is not currently built at. `binary_speaks` is derived from
+/// `CARGO_PKG_VERSION`, so a test that reached for it directly could only
+/// describe one point in the upgrade window, and would silently stop
+/// describing the case it was written for on the next version bump.
+fn handoff_eligible(role: NodeRole, active: Option<ClusterVersion>, speaks: VersionRange) -> bool {
+    role == NodeRole::Worker
+        && active.is_some_and(|active| lifecycle_protocol_active(active) && speaks.contains(active))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orbita_control::binary_version;
+    use orbita_control::{binary_version, speaks_for as speaks_at};
     use orbita_sim::Simulation;
 
-    /// A reporter that has been told `active` is the cluster's version.
+    /// A reporter that has been told `active` is the cluster's version, and
+    /// whose speakable window is whatever this binary was built at.
     ///
     /// The transport is never used: `can_handoff` is a pure decision about
-    /// two version numbers, and it is the decision, not the round trip, that
+    /// version numbers, and it is the decision, not the round trip, that
     /// issue #105 got wrong.
     fn reporter_told(active: Option<ClusterVersion>) -> StatusReporter<orbita_sim::SimRuntime> {
         let sim = Simulation::new(1);
@@ -326,13 +372,46 @@ mod tests {
         // protocol. Asking whether the active version is *this binary's*
         // version says no for every node in the n-1 window, which is every
         // node a rolling upgrade has just replaced.
-        let own = binary_version();
-        let ahead = ClusterVersion::new(own.major, own.minor + 1);
+        //
+        // The shape of #105 exactly: a worker one minor ahead of the cluster,
+        // which is what a half-finished rolling update looks like from the
+        // new binary's side. It speaks the active version, so it claims.
         assert!(
-            reporter_told(Some(ahead)).can_handoff(),
-            "a cluster past 0.1 carries lifecycle state whatever this binary's own version is"
+            handoff_eligible(
+                NodeRole::Worker,
+                Some(ClusterVersion::new(0, 2)),
+                speaks_at(ClusterVersion::new(0, 3)),
+            ),
+            "a new binary must still claim the lifecycle state its old leader is waiting for"
         );
         assert!(reporter_told(Some(orbita_control::PROTOCOL_0_1)).can_handoff());
+    }
+
+    #[test]
+    fn a_worker_whose_binary_cannot_speak_the_active_version_takes_ordinary_failover() {
+        // A node that was down when `finalize-upgrade` moved the window comes
+        // back speaking a version the cluster has left behind. Every report it
+        // sends is refused as `Incompatible`, so a planned handoff can never
+        // reach an `Accepted` reply: choosing one puts `Server::drain` in a
+        // loop that only ends when the drain budget does. Answering false here
+        // is what sends it straight to ordinary failover instead, which is the
+        // fast path an incompatible node holding partitions needs.
+        assert!(
+            !handoff_eligible(
+                NodeRole::Worker,
+                Some(ClusterVersion::new(0, 3)),
+                speaks_at(ClusterVersion::new(0, 1)),
+            ),
+            "0.1 speaks 0.0..0.1 and the cluster has finalized past both"
+        );
+
+        // The same claim through the public predicate and the real binary, so
+        // this stays honest about what the shipped code does rather than only
+        // about the helper.
+        let own = binary_version();
+        let past_the_window = ClusterVersion::new(own.major, own.minor + 1);
+        assert!(!binary_speaks().contains(past_the_window), "premise check");
+        assert!(!reporter_told(Some(past_the_window)).can_handoff());
     }
 
     #[test]

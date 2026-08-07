@@ -189,7 +189,14 @@ pub fn binary_speaks() -> VersionRange {
     speaks_for(binary_version())
 }
 
-fn speaks_for(own: ClusterVersion) -> VersionRange {
+/// The window [`binary_speaks`] would return for a binary built at `own`.
+///
+/// Public because the rule, not the current build, is what callers reason
+/// about. Anything gating on compatibility has to be testable at the version
+/// pairs a rolling upgrade actually produces, and `binary_speaks` can only
+/// ever describe the one version this workspace happens to be at today.
+#[must_use]
+pub fn speaks_for(own: ClusterVersion) -> VersionRange {
     if own.minor == 0 {
         VersionRange::exactly(own)
     } else {
