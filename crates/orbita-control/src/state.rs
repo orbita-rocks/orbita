@@ -67,6 +67,34 @@ pub(crate) struct PendingSplit {
     pub prepared: BTreeSet<NodeId>,
 }
 
+/// A split in flight, as the controller drives it and a worker prepares
+/// against it.
+///
+/// This is the public projection of a [`PendingSplit`] joined to the parent's
+/// map entry, so a worker learns which children to build, at which epoch, over
+/// what range, without seeing the leader group's private bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitIntent {
+    pub parent: PartitionId,
+    pub keyspace: KeyspaceId,
+    /// The boundary key the parent's range splits at.
+    pub at: bytes::Bytes,
+    pub lower: PartitionId,
+    pub upper: PartitionId,
+    /// The parent's epoch when the split began; every split entry is checked
+    /// against it, so a failover that bumps it aborts the split.
+    pub epoch: Epoch,
+    /// The epoch the children take, one above the parent's, which fences a
+    /// write the old owner had in flight.
+    pub child_epoch: Epoch,
+    /// The owner and replicas that must each prepare child storage.
+    pub required: Vec<NodeId>,
+    /// Which of `required` have durably acknowledged preparation.
+    pub prepared: Vec<NodeId>,
+    /// The parent's current range, so a worker can derive each child's half.
+    pub parent_range: KeyRange,
+}
+
 /// Where a partition is in its ownership lifecycle.
 ///
 /// The distinction between `Unowned` and `Fenced` is the read lease. A
@@ -213,6 +241,31 @@ impl ClusterState {
     #[must_use]
     pub fn is_splitting(&self, partition: PartitionId) -> bool {
         self.pending_splits.contains_key(&partition)
+    }
+
+    /// Every split in flight, in the shape the controller drives and a worker
+    /// prepares against. Carries the parent's current range so a worker can
+    /// derive each child's half without a second lookup.
+    #[must_use]
+    pub fn split_intents(&self) -> Vec<SplitIntent> {
+        self.pending_splits
+            .iter()
+            .filter_map(|(parent, split)| {
+                let info = self.map.partition(*parent)?;
+                Some(SplitIntent {
+                    parent: *parent,
+                    keyspace: info.keyspace,
+                    at: split.at.clone(),
+                    lower: split.lower,
+                    upper: split.upper,
+                    epoch: split.epoch,
+                    child_epoch: split.epoch.next(),
+                    required: split.required.clone(),
+                    prepared: split.prepared.iter().copied().collect(),
+                    parent_range: info.range.clone(),
+                })
+            })
+            .collect()
     }
 
     /// True when nothing has ever been created, which is the condition

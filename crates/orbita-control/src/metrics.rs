@@ -49,6 +49,9 @@ fn instruments() -> &'static Instruments {
 /// How a split or merge attempt resolved. A fixed set, so the label is bounded.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Outcome {
+    /// The operation took effect: the parent retired and the children own its
+    /// range.
+    Committed,
     /// The operation is not yet executable and was refused without changing the
     /// map.
     Unimplemented,
@@ -57,6 +60,7 @@ pub(crate) enum Outcome {
 impl Outcome {
     fn as_str(self) -> &'static str {
         match self {
+            Outcome::Committed => "committed",
             Outcome::Unimplemented => "unimplemented",
         }
     }

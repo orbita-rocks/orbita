@@ -127,7 +127,7 @@ pub use membership::{NodeHealth, NodeRole, NodeStatus, PartitionProgress};
 pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 pub use raft::RaftLog;
 pub use service::ControlService;
-pub use state::{ClusterState, NodeRecord, PartitionPhase};
+pub use state::{ClusterState, NodeRecord, PartitionPhase, SplitIntent};
 pub use version::{
     binary_speaks, binary_version, ClusterVersion, CompatibilityRefusal, VersionRange,
 };

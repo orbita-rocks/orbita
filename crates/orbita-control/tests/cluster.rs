@@ -34,7 +34,9 @@ use orbita_control::{
     NodeRole, NodeStatus, PartitionProgress, RegistrationOutcome, SingleNodeLog,
     StatusReportResponse, VersionRange,
 };
-use orbita_core::{Epoch, Error, Lamport, MapVersion, NodeId, PartitionId, PartitionMap};
+use orbita_core::{
+    Epoch, Error, KeyspaceId, Lamport, MapVersion, NodeId, PartitionId, PartitionMap,
+};
 use orbita_proto::v1::admin_server::Admin as _;
 use orbita_runtime::{Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_sim::{
@@ -999,6 +1001,224 @@ fn coverage_holds_through_every_entry(entries: &[ControlCommand]) -> Result<(), 
             .map_err(|e| format!("coverage broke after entry {position} ({command:?}): {e}"))?;
     }
     Ok(())
+}
+
+/// Replays the log and, after every committed entry, requires that every probe
+/// key resolves to exactly one owned partition and that no split child appears
+/// in the map while its parent is still there — the prepare-before-retire
+/// invariant, read as a continuous scan through the split.
+fn every_key_has_one_owner_through_the_split(
+    entries: &[ControlCommand],
+    keyspace: KeyspaceId,
+    parent: PartitionId,
+    lower: PartitionId,
+    upper: PartitionId,
+) -> Result<(), String> {
+    let probes: [&[u8]; 6] = [b"", b"a", b"l", b"m", b"n", b"zzz"];
+    let mut state = ClusterState::new();
+    for (position, command) in entries.iter().enumerate() {
+        let _ = state.apply(command);
+        let map = state.map();
+        map.check_coverage()
+            .map_err(|e| format!("coverage broke after entry {position} ({command:?}): {e}"))?;
+        let parent_present = map.partition(parent).is_some();
+        for child in [lower, upper] {
+            if map.partition(child).is_some() && parent_present {
+                return Err(format!(
+                    "child {child} and parent {parent} were both in the map after entry \
+                     {position} ({command:?}); a child appeared before the parent retired"
+                ));
+            }
+        }
+        let keyspace_live =
+            parent_present || map.partition(lower).is_some() || map.partition(upper).is_some();
+        if !keyspace_live {
+            continue;
+        }
+        for key in probes {
+            match map.lookup(keyspace, key) {
+                Some(info) if info.owner.is_some() => {}
+                Some(info) => {
+                    return Err(format!(
+                        "key {key:?} resolved to unowned partition {} after entry {position}",
+                        info.id
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "key {key:?} resolved to no partition after entry {position} ({command:?})"
+                    ))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Cluster {
+    /// Spawns a task that stands in for the workers' durable child-storage
+    /// preparation: it polls the intents each worker must prepare and records a
+    /// durable acknowledgement for it. The actual byte-level preparation is
+    /// proven in `orbita-storage`; here the ack is what the controller's
+    /// completion waits on, exactly as it does in production.
+    fn spawn_split_preparers(&self) {
+        for node in WORKERS {
+            let controller = self.controller.clone();
+            let clock = self.sim.runtime(LEADER).clock().clone();
+            self.sim.runtime(LEADER).spawn(async move {
+                loop {
+                    for intent in controller.pending_split_intents_for(node).await {
+                        controller.record_split_prepared(node, intent.parent).await;
+                    }
+                    clock.sleep(Duration::from_millis(50)).await;
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn a_manual_split_retires_the_parent_only_after_every_holder_durably_prepares() {
+    // The end-to-end control-plane proof, driven by real preparation acks
+    // rather than a map-version observation. Every pre-split key stays owned by
+    // exactly one partition throughout, no child appears before the parent
+    // retires, and the children advance the epoch. Reproduce a failure with
+    //   ORBITA_SIM_SEED=<seed> cargo test -p orbita-control --test cluster \
+    //     a_manual_split_retires_the_parent_only_after_every_holder_durably_prepares
+    check_seeds(
+        "a_manual_split_retires_the_parent_only_after_every_holder_durably_prepares",
+        16,
+        |seed| {
+            let cluster = Cluster::start(seed);
+            cluster.spawn_split_preparers();
+            let parent = cluster.only_partition();
+            let keyspace = cluster
+                .map()
+                .partition(parent)
+                .expect("the partition")
+                .keyspace;
+            let parent_epoch = cluster.epoch_of(parent);
+
+            let controller = cluster.controller.clone();
+            let split = cluster.sim.block_on(async move {
+                controller
+                    .split_partition(parent, Some(Bytes::from_static(b"m")))
+                    .await
+            });
+            let (lower, upper) = match split {
+                Ok(children) => children,
+                Err(reason) => {
+                    return Err(cluster
+                        .sim
+                        .failure(format!("the manual split did not complete: {reason:?}")))
+                }
+            };
+
+            if let Err(reason) = every_key_has_one_owner_through_the_split(
+                &cluster.entries(),
+                keyspace,
+                parent,
+                lower,
+                upper,
+            ) {
+                return Err(cluster.sim.failure(reason));
+            }
+
+            let map = cluster.map();
+            for (key, expected) in [
+                (&b"a"[..], lower),
+                (b"l", lower),
+                (b"m", upper),
+                (b"zz", upper),
+            ] {
+                match map.lookup(keyspace, key) {
+                    Some(info) if info.id == expected => {}
+                    other => {
+                        return Err(cluster.sim.failure(format!(
+                            "key {key:?} resolved to {:?}, expected {expected}",
+                            other.map(|i| i.id)
+                        )))
+                    }
+                }
+            }
+            if map.partition(parent).is_some() {
+                return Err(cluster.sim.failure("the parent outlived the split"));
+            }
+            for child in [lower, upper] {
+                if map.partition(child).expect("a live child").epoch <= parent_epoch {
+                    return Err(cluster.sim.failure(format!(
+                        "child {child}'s epoch did not advance past the parent"
+                    )));
+                }
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_split_aborts_rather_than_wedging_when_a_required_holder_dies() {
+    // The P2 fix, end to end: a required replica dies after BeginSplit, so it
+    // can never prepare. Repair replaces it with a SetReplicas, which aborts the
+    // split, and the parent is left whole and re-splittable rather than stuck.
+    let cluster = Cluster::start(1);
+    // Only the owner ever prepares; the replicas never do, so a split that
+    // needed all three would hang without the abort.
+    let owner = {
+        let controller = cluster.controller.clone();
+        let node = cluster
+            .map()
+            .partition(cluster.only_partition())
+            .unwrap()
+            .owner
+            .unwrap();
+        let clock = cluster.sim.runtime(LEADER).clock().clone();
+        cluster.sim.runtime(LEADER).spawn(async move {
+            loop {
+                for intent in controller.pending_split_intents_for(node).await {
+                    controller.record_split_prepared(node, intent.parent).await;
+                }
+                clock.sleep(Duration::from_millis(50)).await;
+            }
+        });
+        node
+    };
+    let partition = cluster.only_partition();
+    let before = cluster.map().partition(partition).unwrap().clone();
+    let doomed = *before.replicas.iter().find(|r| **r != owner).unwrap();
+
+    // Open the split, then kill a required replica.
+    let controller = cluster.controller.clone();
+    cluster
+        .sim
+        .block_on(async move {
+            controller
+                .submit(ControlCommand::BeginSplit {
+                    parent: partition,
+                    at: Bytes::from_static(b"m"),
+                    lower: PartitionId(100),
+                    upper: PartitionId(101),
+                    expect_epoch: before.epoch,
+                })
+                .await
+        })
+        .expect("the split opens");
+    assert!(cluster.sim.block_on({
+        let controller = cluster.controller.clone();
+        async move { controller.snapshot().await.is_splitting(partition) }
+    }));
+
+    cluster.sim.crash(doomed);
+    // Repair notices the dead replica and replaces it, which aborts the split.
+    assert!(cluster.run_until(Duration::from_secs(10), |c| {
+        !c.sim.block_on({
+            let controller = c.controller.clone();
+            async move { controller.snapshot().await.is_splitting(partition) }
+        })
+    }));
+    // The parent is intact and coverage never broke.
+    assert!(cluster.map().partition(partition).is_some());
+    assert_eq!(cluster.map().check_coverage(), Ok(()));
 }
 
 #[test]

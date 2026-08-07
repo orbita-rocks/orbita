@@ -24,13 +24,15 @@ use crate::model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission
 use crate::state::{ClusterState, NodeRecord, PartitionPhase};
 use crate::version::{binary_speaks, ClusterVersion, CompatibilityRefusal};
 
+use bytes::Bytes;
 use orbita_core::{
     Epoch, Error, Lamport, MapVersion, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
 };
 use orbita_runtime::{Clock, Runtime, Transport};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// What the leader has heard from one node, and when.
@@ -182,6 +184,14 @@ struct Inner {
     /// learns what its command did even when another task did the applying.
     results: BTreeMap<LogIndex, Result<()>>,
     observations: BTreeMap<NodeId, Observation>,
+    /// Durable split-preparation acknowledgements: for each parent being split,
+    /// the holders that have reported their child storage is prepared. This is
+    /// an observation, not replicated state — a worker re-reports it whenever it
+    /// is asked, so a new leader re-collects it rather than inheriting it — and
+    /// the driver turns it into the replicated `MarkSplitPrepared` entries the
+    /// completion depends on. It is the real durable ack the review demanded in
+    /// place of a mere map-version observation.
+    prepared_splits: BTreeMap<PartitionId, BTreeSet<NodeId>>,
     /// When this leader first saw each partition in the fenced phase, on its
     /// own monotonic clock. Not replicated, because the lease wait it drives
     /// is measured from an instant only this node observed.
@@ -228,6 +238,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 applied: 0,
                 results: BTreeMap::new(),
                 observations: BTreeMap::new(),
+                prepared_splits: BTreeMap::new(),
                 fenced_since: BTreeMap::new(),
                 observing_since,
                 was_leader: false,
@@ -793,6 +804,186 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         Ok(())
     }
 
+    /// Splits a partition at `at`, driving the worker-prepared protocol to
+    /// completion.
+    ///
+    /// It opens the split, then waits — through the sweep, which proposes the
+    /// preparation acknowledgements and the completion — until the parent has
+    /// retired and both children are in the map. The parent never retires until
+    /// every holder has *durably* prepared child storage and reported it, which
+    /// is the prepare-before-retire ordering ADR 0009 and PR #53 require. A
+    /// caller with no `at` gets a boundary derived from the range, which is a
+    /// poor split point kept only so a keyless request does something.
+    pub async fn split_partition(
+        &self,
+        partition: PartitionId,
+        at: Option<Bytes>,
+    ) -> Result<(PartitionId, PartitionId)> {
+        let (lower, upper, begin) = {
+            let inner = self.inner.lock().await;
+            let info = inner
+                .state
+                .map()
+                .partition(partition)
+                .ok_or_else(|| Error::InvalidArgument(format!("no partition {partition}")))?
+                .clone();
+            let at = match at {
+                Some(at) => at,
+                None => suggested_split_key(&info).ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "no split key was given and none could be derived from the range".into(),
+                    )
+                })?,
+            };
+            let lower = inner.state.next_partition_id();
+            let upper = lower.next();
+            (
+                lower,
+                upper,
+                ControlCommand::BeginSplit {
+                    parent: partition,
+                    at,
+                    lower,
+                    upper,
+                    expect_epoch: info.epoch,
+                },
+            )
+        };
+        self.submit(begin).await?;
+
+        let deadline = self.runtime.clock().monotonic_nanos()
+            + (self.config.convergence_bound() + Duration::from_secs(5)).as_nanos() as u64;
+        loop {
+            self.advance_pending_splits().await?;
+            {
+                let inner = self.inner.lock().await;
+                let map = inner.state.map();
+                if map.partition(lower).is_some() && map.partition(upper).is_some() {
+                    return Ok((lower, upper));
+                }
+                if !inner.state.is_splitting(partition) {
+                    return Err(Error::Unavailable(format!(
+                        "the split of partition {partition} was abandoned before it completed; \
+                         re-read the map and retry"
+                    )));
+                }
+            }
+            if self.runtime.clock().monotonic_nanos() >= deadline {
+                return Err(Error::Unavailable(format!(
+                    "the split of partition {partition} did not complete: not every holder \
+                     durably prepared child storage in time"
+                )));
+            }
+            self.runtime.clock().sleep(self.config.sweep_interval).await;
+        }
+    }
+
+    /// The splits a node still has to prepare for: those it holds the parent of
+    /// and has not yet been recorded as having prepared.
+    ///
+    /// A worker polls this, prepares durable child storage for each, and calls
+    /// [`Controller::record_split_prepared`]. Returning the intents it has
+    /// already acknowledged too would be harmless; filtering them keeps a
+    /// worker from re-preparing every poll.
+    pub async fn pending_split_intents_for(&self, node: NodeId) -> Vec<crate::SplitIntent> {
+        let inner = self.inner.lock().await;
+        inner
+            .state
+            .split_intents()
+            .into_iter()
+            .filter(|intent| {
+                intent.required.contains(&node)
+                    && !inner
+                        .prepared_splits
+                        .get(&intent.parent)
+                        .is_some_and(|set| set.contains(&node))
+            })
+            .collect()
+    }
+
+    /// Records that `node` has durably prepared its child storage for the split
+    /// of `parent`.
+    ///
+    /// This is the real acknowledgement the completion waits on: a worker calls
+    /// it only after both child manifests are on the object store, so the
+    /// controller's `MarkSplitPrepared` reflects storage that exists, not a map
+    /// version a node happened to observe.
+    pub async fn record_split_prepared(&self, node: NodeId, parent: PartitionId) {
+        self.inner
+            .lock()
+            .await
+            .prepared_splits
+            .entry(parent)
+            .or_default()
+            .insert(node);
+    }
+
+    /// Turns durable preparation acknowledgements into the replicated entries a
+    /// split needs: `MarkSplitPrepared` for each acknowledged holder, then
+    /// `CompleteSplit` once the state machine records every one.
+    ///
+    /// Tolerant of racing itself and a fence landing mid-flight: every refusal a
+    /// lost race produces is swallowed, because the next pass re-derives the
+    /// same intent from committed state and in-memory acks.
+    async fn advance_pending_splits(&self) -> Result<()> {
+        let (prepares, completes) = {
+            let inner = self.inner.lock().await;
+            let mut prepares = Vec::new();
+            let mut completes = Vec::new();
+            for intent in inner.state.split_intents() {
+                let acked = inner.prepared_splits.get(&intent.parent);
+                for node in &intent.required {
+                    if intent.prepared.contains(node) {
+                        continue;
+                    }
+                    if acked.is_some_and(|set| set.contains(node)) {
+                        prepares.push(ControlCommand::MarkSplitPrepared {
+                            parent: intent.parent,
+                            node: *node,
+                            expect_epoch: intent.epoch,
+                        });
+                    }
+                }
+                let all_prepared = intent
+                    .required
+                    .iter()
+                    .all(|node| intent.prepared.contains(node));
+                if all_prepared {
+                    completes.push(ControlCommand::CompleteSplit {
+                        parent: intent.parent,
+                        expect_epoch: intent.epoch,
+                    });
+                }
+            }
+            (prepares, completes)
+        };
+
+        for command in prepares {
+            match self.submit(command).await {
+                Ok(()) | Err(Error::StaleEpoch { .. } | Error::InvalidArgument(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        for command in completes {
+            let parent = match &command {
+                ControlCommand::CompleteSplit { parent, .. } => *parent,
+                _ => continue,
+            };
+            match self.submit(command).await {
+                Ok(()) => {
+                    tracing::info!(%parent, "retired a split parent; its children own its range");
+                    crate::metrics::record_split(crate::metrics::Outcome::Committed);
+                    self.inner.lock().await.prepared_splits.remove(&parent);
+                }
+                Err(
+                    Error::StaleEpoch { .. } | Error::InvalidArgument(_) | Error::Unavailable(_),
+                ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Hands a partition to one of its replicas, deliberately.
     ///
     /// This is the same two-step sequence as a failover, for the same reason:
@@ -1091,6 +1282,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 // fence a healthy worker immediately or promote before the
                 // new leader has waited out the old owner's leases.
                 inner.observations.clear();
+                inner.prepared_splits.clear();
                 inner.fenced_since.clear();
                 inner.observing_since = now;
                 inner.was_leader = true;
@@ -1099,6 +1291,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.refresh_health().await?;
         self.fence_dead_owners().await?;
         self.promote_drained_partitions().await?;
+        self.advance_pending_splits().await?;
         self.place_unowned_partitions().await?;
         self.repair_replica_sets().await?;
         Ok(())
@@ -1464,6 +1657,28 @@ fn best_candidate(
         })
         .min()
         .copied()
+}
+
+/// A boundary key derived from the range alone, used only when the caller did
+/// not supply one.
+///
+/// A poor split point on purpose: it exists so a keyless manual split does
+/// something rather than failing. A good boundary comes from the owner, the
+/// only node that knows how the keys are distributed inside the range.
+fn suggested_split_key(info: &PartitionInfo) -> Option<Bytes> {
+    let start = info.range.start();
+    match info.range.end() {
+        None => {
+            let mut key = start.to_vec();
+            key.push(0);
+            Some(Bytes::from(key))
+        }
+        Some(end) => {
+            let mut key = start.to_vec();
+            key.push(0);
+            (key.as_slice() < end).then(|| Bytes::from(key))
+        }
+    }
 }
 
 /// Splits an ordered candidate list into an owner and a replica set.

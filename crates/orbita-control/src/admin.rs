@@ -741,21 +741,26 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         {
             return Ok(Response::new(response));
         }
-        crate::metrics::record_split(crate::metrics::Outcome::Unimplemented);
-        // Fail closed. The control-plane split protocol exists in the state
-        // machine (BeginSplit/MarkSplitPrepared/CompleteSplit/AbortSplit, which
-        // structurally refuse to retire a parent until every holder has
-        // prepared child storage), but the worker side that actually prepares
-        // that storage does not. Completing a split today would publish
-        // children backed by empty manifest and WAL paths and make the parent's
-        // existing data unreachable, and there is no path yet to quiesce the
-        // parent's writes before the swap. Refusing is the only safe answer
-        // until that machinery lands; see the crate documentation and #71.
-        Err(Status::unimplemented(
-            "partition split is disabled until workers can durably prepare child storage and the \
-             parent can be quiesced; the control-plane protocol is in place but its data-plane \
-             half is not",
-        ))
+        // Empty means "pick a boundary", so it travels as `None` rather than a
+        // zero-length key, which the range split would reject.
+        let at = if request.split_key.is_empty() {
+            None
+        } else {
+            Some(Bytes::from(request.split_key))
+        };
+        let split = self
+            .leader()
+            .split_partition(PartitionId(request.partition_id), at)
+            .await;
+        let (lower, upper) = match split {
+            Ok(children) => children,
+            Err(error) => return Err(status(error)),
+        };
+        let map = self.leader().partition_map().await;
+        Ok(Response::new(pb::SplitPartitionResponse {
+            lower: map.partition(lower).map(partition_message),
+            upper: map.partition(upper).map(partition_message),
+        }))
     }
 
     async fn merge_partitions(
