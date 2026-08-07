@@ -35,7 +35,9 @@
 //! conditional can be decided against a key in that state, so a conditional
 //! write that finds one waits for it — outside the submission lock, which is
 //! the part that keeps ADR 0003's promise. See
-//! [`PartitionHost::await_settled`].
+//! [`PartitionHost::await_settled`]. A wait that runs out of budget fails the
+//! call `Unavailable` rather than answering from outside the window, because
+//! the owner still does not know who won.
 
 use crate::lease::{LeaseTable, ReplicaReadState, DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 use crate::pending::{self, PendingRecord, PendingSet};
@@ -67,15 +69,23 @@ use std::time::Duration;
 const SCAN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a conditional write waits for an in-flight write to the same key
-/// to come back from the log before answering with what it can already see.
+/// to come back from the log before giving up on deciding the condition.
 ///
 /// The wait is normally one replication round trip, because that is all it
 /// takes for the other write to learn its Lamport. This bound exists for the
 /// case where that never happens — a log that has stopped answering — and it
 /// is set at the same five seconds a scan waits for the same reason: long
 /// enough that a healthy cluster never reaches it, short enough that a client
-/// gets an answer rather than a hung call. Reaching it is not a failure. The
-/// call falls back to the pessimistic answer it would have given anyway.
+/// gets an answer rather than a hung call.
+///
+/// Reaching it means the owner still does not know, and *still does not know*
+/// is the answer the client gets: [`Error::Unavailable`], which is retryable.
+/// This bound is not an upper bound on the thing being waited for. A peer call
+/// timeout is configurable well past five seconds and a local disk write has
+/// no timeout at all, so the write parked on here can and does resolve
+/// afterwards. Answering `applied: false` from a stale read at expiry would
+/// claim the caller lost to a write that may yet fail, and would report a
+/// version that may not be the one that ends up winning.
 const CONDITION_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many keys a replica may hold unreadable before it is worth saying so.
@@ -759,6 +769,13 @@ impl<R: Runtime> PartitionHost<R> {
     /// decided yet, and this waits for that write rather than refusing on the
     /// spot. See [`PartitionHost::await_settled`] for why that is the answer
     /// and not just a nicer error message.
+    ///
+    /// If that wait runs out the call fails [`Error::Unavailable`] rather than
+    /// answering. A conditional write therefore has three outcomes on the
+    /// wire, not two: applied, definitively not applied, and *undecided*. The
+    /// third is retryable and is the only honest thing to say, because the
+    /// owner never learned whether the caller lost. See
+    /// [`CONDITION_SETTLE_TIMEOUT`].
     pub(crate) async fn write(
         &self,
         key: Bytes,
@@ -802,7 +819,25 @@ impl<R: Runtime> PartitionHost<R> {
                 settle_by.saturating_sub(self.runtime.clock().monotonic_nanos()),
             );
             if remaining.is_zero() {
-                break (guard, overlay, visible, now);
+                // Undecided, and said as such. `visible` here is state from
+                // outside the in-flight window, so evaluating against it would
+                // manufacture a definitive `applied: false` out of a question
+                // this node never got an answer to — the exact dishonesty the
+                // wait exists to remove, on a slower path. The write parked on
+                // may still fail, in which case the caller never lost, or land
+                // with a version this response would have got wrong.
+                drop(guard);
+                tracing::warn!(
+                    partition = self.id.get(),
+                    "a conditional write is undecided: the in-flight write to the same key did \
+                     not settle within the budget"
+                );
+                return Err(Error::Unavailable(format!(
+                    "partition {} still has a write in flight on this key after {} seconds, so \
+                     the condition is undecided; retry",
+                    self.id,
+                    CONDITION_SETTLE_TIMEOUT.as_secs()
+                )));
             }
             // Released first, and deliberately. Waiting under the submission
             // lock would hold a lock across replication, which is the one
@@ -1047,6 +1082,11 @@ impl<R: Runtime> PartitionHost<R> {
     /// the version the pending write is about to get would answer the first
     /// case and lie about the second.
     ///
+    /// Returning is not the same as settling. The budget can expire with the
+    /// key still uncertain, and the caller re-checks rather than trusting
+    /// this, because expiry is not an answer to the condition — see
+    /// [`CONDITION_SETTLE_TIMEOUT`] for what the caller does with it instead.
+    ///
     /// This must not be called with the submission lock held. It waits on a
     /// replication round trip, and ADR 0003 exists precisely to keep that out
     /// from under a lock.
@@ -1068,15 +1108,11 @@ impl<R: Runtime> PartitionHost<R> {
             return;
         }
 
-        if timeout(self.runtime.clock(), budget, notified)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                partition = self.id.get(),
-                "a conditional write gave up waiting for an in-flight write to the same key"
-            );
-        }
+        // The expiry is not logged here. A budget that runs out on a key that
+        // settled a moment earlier is a non-event, and only the caller — which
+        // re-reads the overlay — can tell that case from the one worth
+        // warning about.
+        let _ = timeout(self.runtime.clock(), budget, notified).await;
     }
 
     /// Waits until no replica that could still be serving reads is missing
@@ -1450,9 +1486,13 @@ fn evaluate(
     let holds = match condition {
         WriteCondition::None => true,
         // A key with a write in flight has no version anyone can hold, so no
-        // condition against it can be satisfied. See the pending module. The
-        // write path waits this window out rather than answering from inside
-        // it, so reaching here means the wait was given up on.
+        // condition against it can be satisfied. See the pending module.
+        //
+        // The write path never reaches this arm any more: it waits the window
+        // out, and if the wait expires it fails the call `Unavailable` rather
+        // than deciding. The arm stays because the property it protects —
+        // never letting two swaps against one version both win — must not
+        // depend on a caller upstream remembering to check first.
         _ if uncertain => false,
         WriteCondition::IfNotPresent => visible.is_none(),
         WriteCondition::IfVersion(expected) => found == Some(expected),

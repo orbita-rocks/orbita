@@ -67,6 +67,21 @@ fn partition_paths() -> PartitionPaths {
 }
 
 fn open(sim: &Simulation, runtime: SimRuntime) -> Arc<PartitionHost<SimRuntime>> {
+    open_with_replicas(sim, runtime, Vec::new())
+}
+
+/// Opens the owner with peers it must reach before a write resolves.
+///
+/// Separate from [`open`] because a replica set changes what "in flight"
+/// means: with no replicas a write is durable the moment the local disk
+/// answers, and the window a conditional write can be caught inside is a few
+/// microseconds wide. Replication is what makes that window wide enough to
+/// hold open on purpose.
+fn open_with_replicas(
+    sim: &Simulation,
+    runtime: SimRuntime,
+    replicas: Vec<NodeId>,
+) -> Arc<PartitionHost<SimRuntime>> {
     let paths = partition_paths();
     sim.block_on(async move {
         PartitionHost::open_owner(
@@ -78,7 +93,7 @@ fn open(sim: &Simulation, runtime: SimRuntime) -> Arc<PartitionHost<SimRuntime>>
                 lease: LeasePolicy::default(),
             },
             &paths,
-            Vec::new(),
+            replicas,
         )
         .await
         .expect("the partition opens")
@@ -422,6 +437,135 @@ fn a_contender_waiting_on_an_acquisition_that_fails_is_released_by_the_failure()
                 }
             }
             Ok(())
+        },
+    );
+}
+
+/// How long a conditional write may spend waiting for an in-flight write to
+/// the same key before it gives up. Mirrors `host::CONDITION_SETTLE_TIMEOUT`,
+/// which is private and deliberately so: the scenario below is about what a
+/// client is told when that budget expires, and it has to be able to say when
+/// expiry happened without the constant being part of anyone's API.
+const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long the replicas in the scenario below take to give up on a call.
+///
+/// Chosen well above [`SETTLE_BUDGET`] because that is the case the scenario
+/// exists for, and because real deployments can produce it: a peer call
+/// timeout is configuration, and a local disk write has no timeout at all. So
+/// the settle budget is not an upper bound on how long the write being waited
+/// for may stay in flight, and a run that assumed otherwise would be testing a
+/// world that cannot happen rather than the one that can.
+const UNANSWERING_PEER_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[test]
+fn a_conditional_write_that_cannot_settle_in_time_is_undecided_rather_than_lost() {
+    harness::check_seeds(
+        "linearizability::a_conditional_write_that_cannot_settle_in_time_is_undecided_rather_than_lost",
+        20,
+        |seed| {
+            let mut config = SimConfig::new(seed);
+            // Long enough that the leading write is still in flight when the
+            // contender's budget runs out. This is the whole scenario: the
+            // owner is asked to decide a condition it has no answer for, and
+            // is still going to have no answer for well after it has to reply.
+            config.call_timeout = UNANSWERING_PEER_TIMEOUT;
+            let sim = Simulation::with_config(config);
+            let runtime = sim.add_node(NodeId(1));
+            let replicas = vec![NodeId(2), NodeId(3)];
+            for replica in &replicas {
+                sim.add_node(*replica);
+                // Silent rather than down. A replica that refuses the
+                // connection answers immediately and the leading write
+                // resolves; one that is simply unreachable leaves it in
+                // flight, which is the state the condition cannot be decided
+                // against.
+                sim.partition(NodeId(1), *replica);
+            }
+            let host = open_with_replicas(&sim, runtime.clone(), replicas);
+
+            // Unconditional, so it never waits on anything itself, and it is
+            // the write everyone else ends up parked on.
+            let leader = Arc::clone(&host);
+            sim.spawn(async move {
+                let _ = leader
+                    .write(
+                        Bytes::from_static(KEY),
+                        WriteOp::Put {
+                            value: encode(1),
+                            ttl_millis: None,
+                        },
+                        WriteCondition::None,
+                    )
+                    .await;
+            });
+
+            let answer = Arc::new(std::sync::Mutex::new(None));
+            let sink = Arc::clone(&answer);
+            let contender = Arc::clone(&host);
+            let clock = runtime.clock().clone();
+            sim.spawn(async move {
+                // Sleeping inside the task rather than running the world
+                // forward outside it. The simulated clock jumps to the next
+                // scheduled timer, and the only timer the leading write leaves
+                // behind is its own peer-call deadline a minute out, so a
+                // `run_for` here would land past the very window it is trying
+                // to arrive inside. A sleep puts a timer on the calendar at
+                // the moment worth stopping at: well past a local append,
+                // nowhere near the settle budget.
+                clock.sleep(Duration::from_millis(100)).await;
+                let started = clock.monotonic_nanos();
+                let result = contender
+                    .write(
+                        Bytes::from_static(KEY),
+                        WriteOp::Put {
+                            value: encode(2),
+                            ttl_millis: None,
+                        },
+                        WriteCondition::IfNotPresent,
+                    )
+                    .await;
+                *sink.lock().expect("result poisoned") =
+                    Some((result, clock.monotonic_nanos().saturating_sub(started)));
+            });
+
+            sim.run_until_idle();
+            let answer = answer.lock().expect("result poisoned").take();
+            drop(host);
+
+            let Some((result, waited)) = answer else {
+                return Err(sim.failure(
+                    "the contender never got an answer at all".to_string(),
+                ));
+            };
+            let waited = Duration::from_nanos(waited);
+
+            match result {
+                // The condition was never decided, so nothing may claim it
+                // was. `applied: false` here would be a verdict built out of
+                // state read from outside the window the answer lives in: the
+                // write it is parked on may still fail, in which case this
+                // caller never lost, or land on a version this response does
+                // not name.
+                Ok(ack) => Err(sim.failure(format!(
+                    "an undecided conditional write was answered applied={} \
+                     current_version={:?}, which is a verdict the owner never reached",
+                    ack.applied, ack.current_version
+                ))),
+                Err(error) if !error.is_retryable() => Err(sim.failure(format!(
+                    "an undecided conditional write failed {error}, which a client cannot \
+                     retry; uncertainty has to be retryable or the caller is stuck"
+                ))),
+                Err(_) if waited < SETTLE_BUDGET => Err(sim.failure(format!(
+                    "the contender gave up after {waited:?}, short of its {SETTLE_BUDGET:?} \
+                     budget, so it never actually waited the window out"
+                ))),
+                Err(_) if waited >= UNANSWERING_PEER_TIMEOUT => Err(sim.failure(format!(
+                    "the contender answered after {waited:?}, which is when the leading write \
+                     finally failed, so this seed proved nothing about the budget"
+                ))),
+                Err(_) => Ok(()),
+            }
         },
     );
 }

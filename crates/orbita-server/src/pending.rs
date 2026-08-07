@@ -31,7 +31,9 @@
 //! from inside this window has no version to report, and the same client
 //! arriving a moment later would have been told exactly which write beat it.
 //! Uncertainty is this module's problem to describe and the write path's
-//! problem to wait out.
+//! problem to wait out. Uncertainty it cannot wait out becomes a retryable
+//! error, never a condition failure: the difference between "you lost" and "I
+//! do not know yet" is the whole reason this state has a name.
 
 use bytes::Bytes;
 use orbita_core::{Lamport, Record, Version};
