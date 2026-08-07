@@ -38,6 +38,10 @@ locals {
     ? aws_iam_openid_connect_provider.github[0].arn
     : data.aws_iam_openid_connect_provider.github[0].arn
   )
+  github_oidc_subject_prefix = coalesce(
+    var.github_oidc_subject_prefix,
+    "repo:${var.github_owner}/${var.github_repo}",
+  )
 }
 
 resource "aws_s3_bucket" "live_test" {
@@ -89,7 +93,7 @@ data "aws_iam_policy_document" "github_trust" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_owner}/${var.github_repo}:*"]
+      values   = ["${local.github_oidc_subject_prefix}:*"]
     }
 
     # job_workflow_ref pins it further to this one workflow file, so a different
