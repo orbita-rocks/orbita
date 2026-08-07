@@ -146,10 +146,10 @@ a second `ObjectStore` rather than this one with a different endpoint.
 
 The buckets, the AWS IAM role, and the S3 lifecycle rules all come from the
 Terraform in [`terraform/`](../terraform/), so most of this is `terraform apply`
-rather than console clicks. `terraform/README.md` is the full bootstrapping
-guide: what an operator needs before the first apply, what state backend it
-uses, and which outputs map to which repository settings. What follows is the
-result, so the workflow's side is documented next to the workflow.
+rather than console clicks. [CI live object store tests](CI-LIVE-TESTS.md) is the
+operator runbook for first setup, state custody, credential rotation, failure
+response, and retirement. What follows is the workflow contract, kept here next
+to the rest of the build system.
 
 These live on the repository. Everything that identifies an account or
 authenticates to one is a secret. The region is a variable, because GitHub
