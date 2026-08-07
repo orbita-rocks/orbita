@@ -439,6 +439,33 @@ pub(crate) async fn owner_with_clocked_store() -> (Owner, Arc<MemoryStore>, Manu
     (owner_from(partition), store, clock)
 }
 
+/// Opens a partition at an arbitrary id, epoch, and range over an existing
+/// store, which is how a test inspects a split child that was prepared over the
+/// parent's objects: same bucket, new partition directory, no copy.
+pub(crate) async fn open_child(
+    store: &Arc<MemoryStore>,
+    clock: &ManualClock,
+    id: PartitionId,
+    epoch: Epoch,
+    range: KeyRange,
+) -> crate::Partition<TestRuntime> {
+    let runtime = TestRuntime {
+        clock: clock.clone(),
+        disk: NoDisk,
+        transport: NoTransport,
+        rng: SharedRng(Arc::new(SeededRng::new(0))),
+    };
+    crate::Partition::open(
+        runtime,
+        store.clone(),
+        PartitionPath::new("", KeyspaceId(1), id),
+        epoch,
+        range,
+    )
+    .await
+    .expect("opening a child over the parent's store")
+}
+
 fn owner_from(partition: TempPartition) -> Owner {
     Owner {
         partition,
