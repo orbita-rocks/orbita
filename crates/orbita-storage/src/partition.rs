@@ -865,6 +865,85 @@ impl<R: Runtime> Partition<R> {
         Ok(horizon)
     }
 
+    /// Durably prepares one merged child over two adjacent parents without
+    /// copying segment bytes.
+    ///
+    /// Both parents must already be quiesced and maintenance-frozen by the
+    /// caller. Their remaining memtables are flushed, their physical segment
+    /// sources are flattened into one manifest, and the child horizon is the
+    /// greater committed horizon. Existing record versions are untouched, so
+    /// equal Lamports on different keys remain valid while the first new child
+    /// write is allocated strictly above both source sequences (ADR 0002).
+    pub async fn prepare_merged_partition(
+        &self,
+        upper: &Self,
+        child: &ChildSpec,
+    ) -> Result<Lamport> {
+        let combined = KeyRange::merge(&self.range, &upper.range).ok_or_else(|| {
+            Error::InvalidArgument("merge sources must be adjacent and in lower/upper order".into())
+        })?;
+        if combined != child.range || self.path.keyspace_id() != upper.path.keyspace_id() {
+            return Err(Error::InvalidArgument(
+                "merged child range and keyspace must exactly match both sources".into(),
+            ));
+        }
+
+        // Callers always pass lower then upper, so taking the locks in range
+        // order gives every merge one lock order and avoids a dual-parent
+        // deadlock. Both maintenance freezes are already set, so no compaction
+        // can invalidate either state while these guards are held.
+        let mut lower_state = self.state.write().await;
+        self.flush_locked(&mut lower_state, false).await?;
+        let mut upper_state = upper.state.write().await;
+        upper.flush_locked(&mut upper_state, false).await?;
+        let horizon = lower_state.flushed.max(upper_state.flushed);
+
+        let mut by_object: BTreeMap<(PartitionId, String), SegmentEntry> = BTreeMap::new();
+        for (partition, state) in [(self, &*lower_state), (upper, &*upper_state)] {
+            for mut entry in state.segments.iter().cloned() {
+                let source = entry
+                    .source
+                    .unwrap_or_else(|| partition.path.partition_id());
+                entry.source = Some(source);
+                by_object
+                    .entry((source, entry.name.clone()))
+                    .and_modify(|existing| {
+                        if entry.min_key < existing.min_key {
+                            existing.min_key = entry.min_key.clone();
+                        }
+                        if entry.max_key > existing.max_key {
+                            existing.max_key = entry.max_key.clone();
+                        }
+                    })
+                    .or_insert(entry);
+            }
+        }
+        let mut segments: Vec<_> = by_object.into_values().collect();
+        segments.sort_by(|a, b| a.source.cmp(&b.source).then(a.name.cmp(&b.name)));
+
+        let child_path = self.path.for_partition(child.id);
+        if let Some((existing, _)) = load_manifest(self.store.as_ref(), &child_path)
+            .await
+            .map_err(format_error)?
+        {
+            if existing.epoch >= child.epoch {
+                return Ok(existing.committed_lamport);
+            }
+        }
+        let writer = PartitionWriter::open(Arc::clone(&self.store), child_path, child.epoch)
+            .await
+            .map_err(format_error)?;
+        writer
+            .commit(|_| CommitPlan {
+                committed_lamport: horizon,
+                range: child.range.clone(),
+                segments: segments.clone(),
+            })
+            .await
+            .map_err(format_error)?;
+        Ok(horizon)
+    }
+
     /// Publishes one child's manifest over the parent's segments.
     async fn prepare_one_child(
         &self,
@@ -1941,6 +2020,40 @@ mod tests {
         assert_eq!(merged.get(b"y").await.unwrap().unwrap().version, Version(3));
         assert_eq!(merged.get(b"a").await.unwrap().unwrap().version, Version(1));
         assert_eq!(merged.get(b"z").await.unwrap().unwrap().version, Version(2));
+        let shared = merged.shared_segment_sources().await;
+        assert!(shared.contains_key(&PartitionId(1)));
+        assert!(shared.contains_key(&PartitionId(2)));
+        assert!(shared.contains_key(&PartitionId(3)));
+        assert!(
+            segment_objects(&store, 4).is_empty(),
+            "merge preparation copies no source segment bytes"
+        );
+        clock.set_millis(10_000);
+        parent
+            .sweep_orphans(&shared[&PartitionId(1)], 1_000, 0, false)
+            .await
+            .unwrap();
+        low.sweep_orphans(&shared[&PartitionId(2)], 1_000, 0, false)
+            .await
+            .unwrap();
+        high.sweep_orphans(&shared[&PartitionId(3)], 1_000, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.get(b"b").await.unwrap().unwrap().value,
+            bytes("equal-low")
+        );
+        assert_eq!(
+            merged.get(b"y").await.unwrap().unwrap().value,
+            bytes("equal-high")
+        );
+
+        merged.compact().await.unwrap();
+        assert!(
+            merged.shared_segment_sources().await.is_empty(),
+            "merged compaction materializes both source sets under the child"
+        );
+        assert!(!segment_objects(&store, 4).is_empty());
         merged
             .put(
                 Lamport(4),
@@ -1952,10 +2065,191 @@ mod tests {
             .await
             .expect("the first merged write is above both source horizons");
         assert_eq!(merged.get(b"n").await.unwrap().unwrap().version, Version(4));
+    }
 
+    #[tokio::test]
+    async fn merged_compaction_relocates_external_values_from_both_parents() {
+        let (_unused, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        let (low_range, high_range) = KeyRange::unbounded().split_at(bytes("m")).unwrap();
+        let low = open_child(&store, &clock, PartitionId(2), Epoch(2), low_range.clone()).await;
+        let high = open_child(&store, &clock, PartitionId(3), Epoch(2), high_range.clone()).await;
+        let low_value = Bytes::from(vec![0x2a; 4096]);
+        let high_value = Bytes::from(vec![0x3b; 4096]);
+        let mut source_value_keys = Vec::new();
+        for (partition, id, key, value, range) in [
+            (
+                &low,
+                PartitionId(2),
+                bytes("a"),
+                low_value.clone(),
+                low_range,
+            ),
+            (
+                &high,
+                PartitionId(3),
+                bytes("z"),
+                high_value.clone(),
+                high_range,
+            ),
+        ] {
+            let external = partition.writer.put_value(value).await.unwrap();
+            source_value_keys.push(partition.path.object(&external.name));
+            let mut builder = SegmentBuilder::new(KeyspaceId(1), id, Epoch(2));
+            builder
+                .push(&SegmentRecord {
+                    key,
+                    lamport: Lamport(1),
+                    expires_at_millis: None,
+                    value: RecordValue::External(external),
+                })
+                .unwrap();
+            let segment = partition
+                .writer
+                .put_segment(&builder.finish().unwrap())
+                .await
+                .unwrap();
+            partition
+                .writer
+                .commit(|_| CommitPlan {
+                    committed_lamport: Lamport(1),
+                    range: range.clone(),
+                    segments: vec![segment.clone()],
+                })
+                .await
+                .unwrap();
+            partition.hydrate().await.unwrap();
+        }
+
+        low.prepare_merged_partition(
+            &high,
+            &ChildSpec {
+                id: PartitionId(4),
+                epoch: Epoch(3),
+                range: KeyRange::unbounded(),
+            },
+        )
+        .await
+        .unwrap();
+        let merged = open_child(
+            &store,
+            &clock,
+            PartitionId(4),
+            Epoch(3),
+            KeyRange::unbounded(),
+        )
+        .await;
+        assert_eq!(merged.get(b"a").await.unwrap().unwrap().value, low_value);
+        assert_eq!(merged.get(b"z").await.unwrap().unwrap().value, high_value);
+
+        let shared = merged.shared_segment_sources().await;
+        clock.set_millis(10_000);
+        low.sweep_orphans(&shared[&PartitionId(2)], 1_000, 0, false)
+            .await
+            .unwrap();
+        high.sweep_orphans(&shared[&PartitionId(3)], 1_000, 0, false)
+            .await
+            .unwrap();
+        assert!(source_value_keys
+            .iter()
+            .all(|key| store.keys().contains(key)));
+
+        merged.compact().await.unwrap();
+        let child_values: Vec<_> = store
+            .keys()
+            .into_iter()
+            .filter(|key| key.starts_with(&child_prefix(4)) && key.ends_with(".oval"))
+            .collect();
+        assert_eq!(child_values.len(), 2);
+        assert!(merged.shared_segment_sources().await.is_empty());
+        assert_eq!(merged.get(b"a").await.unwrap().unwrap().value, low_value);
+        assert_eq!(merged.get(b"z").await.unwrap().unwrap().value, high_value);
+
+        for (partition, range) in [(&low, low.range().clone()), (&high, high.range().clone())] {
+            partition
+                .writer
+                .commit(|_| CommitPlan {
+                    committed_lamport: Lamport(1),
+                    range: range.clone(),
+                    segments: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        clock.set_millis(12_000);
+        for partition in [&low, &high] {
+            partition
+                .sweep_orphans(&BTreeSet::new(), 1_000, 0, false)
+                .await
+                .unwrap();
+        }
         assert!(
-            segment_objects(&store, 4).is_empty(),
-            "merge preparation copies no source segment bytes"
+            source_value_keys
+                .iter()
+                .all(|key| !store.keys().contains(key)),
+            "source values collect only after merged compaction drops both references"
+        );
+        assert!(child_values.iter().all(|key| store.keys().contains(key)));
+    }
+
+    #[tokio::test]
+    async fn without_dual_quiesce_a_racing_parent_write_is_absent_from_the_merge() {
+        let (_unused, store, clock) = owner_with_clocked_store().await;
+        let (low_range, high_range) = KeyRange::unbounded().split_at(bytes("m")).unwrap();
+        let low = open_child(&store, &clock, PartitionId(2), Epoch(2), low_range).await;
+        let high = open_child(&store, &clock, PartitionId(3), Epoch(2), high_range).await;
+        low.put(
+            Lamport(1),
+            b"a",
+            bytes("before"),
+            None,
+            WriteCondition::None,
+        )
+        .await
+        .unwrap();
+        high.put(
+            Lamport(1),
+            b"z",
+            bytes("before"),
+            None,
+            WriteCondition::None,
+        )
+        .await
+        .unwrap();
+        low.prepare_merged_partition(
+            &high,
+            &ChildSpec {
+                id: PartitionId(4),
+                epoch: Epoch(3),
+                range: KeyRange::unbounded(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // This is the write both admission gates prevent. It lands after M's
+        // horizon and has nowhere to go once the parents retire.
+        low.put(
+            Lamport(2),
+            b"b-raced",
+            bytes("acknowledged-too-late"),
+            None,
+            WriteCondition::None,
+        )
+        .await
+        .unwrap();
+        let merged = open_child(
+            &store,
+            &clock,
+            PartitionId(4),
+            Epoch(3),
+            KeyRange::unbounded(),
+        )
+        .await;
+        assert_eq!(
+            merged.get(b"b-raced").await.unwrap(),
+            None,
+            "the negative control must demonstrate why both WALs quiesce before preparation"
         );
     }
 

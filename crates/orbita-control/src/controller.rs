@@ -192,6 +192,7 @@ struct Inner {
     /// completion depends on. It is the real durable ack the review demanded in
     /// place of a mere map-version observation.
     prepared_splits: BTreeMap<(PartitionId, PartitionId, PartitionId), BTreeSet<NodeId>>,
+    prepared_merges: Vec<(crate::MergeGeneration, BTreeSet<NodeId>)>,
     /// When this leader first saw each partition in the fenced phase, on its
     /// own monotonic clock. Not replicated, because the lease wait it drives
     /// is measured from an instant only this node observed.
@@ -239,6 +240,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 results: BTreeMap::new(),
                 observations: BTreeMap::new(),
                 prepared_splits: BTreeMap::new(),
+                prepared_merges: Vec::new(),
                 fenced_since: BTreeMap::new(),
                 observing_since,
                 was_leader: false,
@@ -1027,6 +1029,190 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         Ok(())
     }
 
+    /// Merges two compatible adjacent partitions through durable worker
+    /// preparation, returning the new partition id after the atomic map swap.
+    pub async fn merge_partitions(
+        &self,
+        lower: PartitionId,
+        upper: PartitionId,
+    ) -> Result<PartitionId> {
+        let generation = {
+            let inner = self.inner.lock().await;
+            let lower_info = inner
+                .state
+                .map()
+                .partition(lower)
+                .ok_or_else(|| Error::InvalidArgument(format!("no partition {lower}")))?;
+            let upper_info = inner
+                .state
+                .map()
+                .partition(upper)
+                .ok_or_else(|| Error::InvalidArgument(format!("no partition {upper}")))?;
+            let range = orbita_core::KeyRange::merge(&lower_info.range, &upper_info.range)
+                .ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "merge partitions must be adjacent and in lower/upper order".into(),
+                    )
+                })?;
+            crate::MergeGeneration {
+                lower,
+                upper,
+                lower_epoch: lower_info.epoch,
+                upper_epoch: upper_info.epoch,
+                merged: inner.state.next_partition_id(),
+                boundary: Bytes::copy_from_slice(upper_info.range.start()),
+                range,
+            }
+        };
+        self.submit(ControlCommand::BeginMerge {
+            generation: generation.clone(),
+        })
+        .await?;
+
+        let deadline = self.runtime.clock().monotonic_nanos()
+            + (self.config.convergence_bound() + Duration::from_secs(5)).as_nanos() as u64;
+        loop {
+            self.advance_pending_merges().await?;
+            {
+                let inner = self.inner.lock().await;
+                if inner.state.map().partition(generation.merged).is_some() {
+                    return Ok(generation.merged);
+                }
+                if !inner.state.is_merging(lower) && !inner.state.is_merging(upper) {
+                    return Err(Error::Unavailable(
+                        "the merge was abandoned before completion; re-read the map and retry"
+                            .into(),
+                    ));
+                }
+            }
+            if self.runtime.clock().monotonic_nanos() >= deadline {
+                return Err(Error::Unavailable(
+                    "the merge did not complete: not every holder durably prepared storage in time"
+                        .into(),
+                ));
+            }
+            self.runtime.clock().sleep(self.config.sweep_interval).await;
+        }
+    }
+
+    /// Active merges held by one worker, observed with the routing map version.
+    pub async fn active_merge_intents_for(
+        &self,
+        node: NodeId,
+    ) -> (MapVersion, Vec<(crate::MergeIntent, bool)>) {
+        let mut inner = self.inner.lock().await;
+        let map_version = inner.state.map_version();
+        let active = inner.state.merge_intents();
+        inner
+            .prepared_merges
+            .retain(|(generation, _)| active.iter().any(|intent| intent.generation == *generation));
+        let intents = active
+            .into_iter()
+            .filter(|intent| intent.required.contains(&node))
+            .map(|intent| {
+                let prepared = intent.prepared.contains(&node)
+                    || inner
+                        .prepared_merges
+                        .iter()
+                        .find(|(generation, _)| generation == &intent.generation)
+                        .is_some_and(|(_, nodes)| nodes.contains(&node));
+                (intent, prepared)
+            })
+            .collect();
+        (map_version, intents)
+    }
+
+    pub async fn record_merge_prepared(
+        &self,
+        node: NodeId,
+        generation: crate::MergeGeneration,
+    ) -> bool {
+        let mut inner = self.inner.lock().await;
+        let active = inner
+            .state
+            .merge_intents()
+            .into_iter()
+            .any(|intent| intent.generation == generation && intent.required.contains(&node));
+        if !active {
+            return false;
+        }
+        match inner
+            .prepared_merges
+            .iter_mut()
+            .find(|(held, _)| held == &generation)
+        {
+            Some((_, nodes)) => {
+                nodes.insert(node);
+            }
+            None => inner
+                .prepared_merges
+                .push((generation, BTreeSet::from([node]))),
+        }
+        true
+    }
+
+    async fn advance_pending_merges(&self) -> Result<()> {
+        let (prepares, completes) = {
+            let inner = self.inner.lock().await;
+            let mut prepares = Vec::new();
+            let mut completes = Vec::new();
+            for intent in inner.state.merge_intents() {
+                let acked = inner
+                    .prepared_merges
+                    .iter()
+                    .find(|(generation, _)| generation == &intent.generation)
+                    .map(|(_, nodes)| nodes);
+                for node in &intent.required {
+                    if !intent.prepared.contains(node)
+                        && acked.is_some_and(|set| set.contains(node))
+                    {
+                        prepares.push(ControlCommand::MarkMergePrepared {
+                            generation: intent.generation.clone(),
+                            node: *node,
+                        });
+                    }
+                }
+                if intent
+                    .required
+                    .iter()
+                    .all(|node| intent.prepared.contains(node))
+                {
+                    completes.push(ControlCommand::CompleteMerge {
+                        generation: intent.generation,
+                    });
+                }
+            }
+            (prepares, completes)
+        };
+        for command in prepares {
+            match self.submit(command).await {
+                Ok(()) | Err(Error::StaleEpoch { .. } | Error::InvalidArgument(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for command in completes {
+            let generation = match &command {
+                ControlCommand::CompleteMerge { generation } => generation.clone(),
+                _ => continue,
+            };
+            match self.submit(command).await {
+                Ok(()) => {
+                    crate::metrics::record_merge(crate::metrics::Outcome::Committed);
+                    self.inner
+                        .lock()
+                        .await
+                        .prepared_merges
+                        .retain(|(held, _)| held != &generation);
+                }
+                Err(
+                    Error::StaleEpoch { .. } | Error::InvalidArgument(_) | Error::Unavailable(_),
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     /// Hands a partition to one of its replicas, deliberately.
     ///
     /// This is the same two-step sequence as a failover, for the same reason:
@@ -1326,6 +1512,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 // new leader has waited out the old owner's leases.
                 inner.observations.clear();
                 inner.prepared_splits.clear();
+                inner.prepared_merges.clear();
                 inner.fenced_since.clear();
                 inner.observing_since = now;
                 inner.was_leader = true;
@@ -1335,6 +1522,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.fence_dead_owners().await?;
         self.promote_drained_partitions().await?;
         self.advance_pending_splits().await?;
+        self.advance_pending_merges().await?;
         self.place_unowned_partitions().await?;
         self.repair_replica_sets().await?;
         Ok(())

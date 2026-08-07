@@ -12,13 +12,14 @@ use crate::membership::NodeStatus;
 use crate::model::Credential;
 use crate::version::{ClusterVersion, CompatibilityRefusal};
 use crate::wire::{
-    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, FetchSplitIntentsRequest,
-    ReportSplitPreparedV2Request, ReportStatusRequest, METHOD_ADMIN_CALL, METHOD_DRAIN_NODE,
-    METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_CREDENTIALS,
-    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
-    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_SPLIT_PREPARED_V2, METHOD_REPORT_STATUS,
-    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
-    METHOD_REPORT_STATUS_V5,
+    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, FetchMergeIntentsRequest,
+    FetchSplitIntentsRequest, ReportMergePreparedRequest, ReportSplitPreparedV2Request,
+    ReportStatusRequest, METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY,
+    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP,
+    METHOD_FETCH_MERGE_INTENTS, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
+    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_MERGE_PREPARED, METHOD_REPORT_SPLIT_PREPARED_V2,
+    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
+    METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionId, PartitionMap, Result};
@@ -357,6 +358,53 @@ impl<R: Runtime> ControlClient<R> {
             .await?
         {
             ControlResponse::SplitPrepared => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Fetches coherent merge lifecycle state for `node`.
+    ///
+    /// An old leader has no merge vocabulary and cannot hold an active merge,
+    /// so unsupported degrades to an empty snapshot at that leader's map
+    /// version. Other failures remain fatal and keep startup closed.
+    pub async fn fetch_merge_intents(&self, node: NodeId) -> Result<crate::MergeIntentSnapshot> {
+        match self
+            .call(
+                METHOD_FETCH_MERGE_INTENTS,
+                FetchMergeIntentsRequest { node }.encode(),
+            )
+            .await
+        {
+            Ok(ControlResponse::MergeIntents(snapshot)) => Ok(snapshot),
+            Err(CallError::UnsupportedMethod(METHOD_FETCH_MERGE_INTENTS)) => {
+                let map_version = self
+                    .fetch_map_if_newer(MapVersion::default())
+                    .await?
+                    .map_or(MapVersion::default(), |map| map.version());
+                Ok(crate::MergeIntentSnapshot {
+                    map_version,
+                    intents: Vec::new(),
+                })
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(error) => Err(error.into_error()),
+        }
+    }
+
+    /// Reports durable, servable storage for one exact merge generation.
+    pub async fn report_merge_prepared(
+        &self,
+        node: NodeId,
+        generation: crate::MergeGeneration,
+    ) -> Result<()> {
+        match self
+            .call_required(
+                METHOD_REPORT_MERGE_PREPARED,
+                ReportMergePreparedRequest { node, generation }.encode(),
+            )
+            .await?
+        {
+            ControlResponse::MergePrepared => Ok(()),
             other => Err(unexpected(&other)),
         }
     }
@@ -811,6 +859,24 @@ mod tests {
                 intents: Vec::new(),
             }),
             "a leader without split vocabulary cannot hold an active split"
+        );
+    }
+
+    #[test]
+    fn a_pre_merge_leader_lets_a_new_worker_boot_with_no_merge_intents() {
+        let sim = Simulation::new(125);
+        let leader = sim.add_node(NodeId(1));
+        let worker = sim.add_node(NodeId(2));
+        orbita_runtime::Transport::register(leader.transport(), ServiceId::Control, V001Leader);
+        let client = ControlClient::new(worker, vec![NodeId(1)]);
+
+        assert_eq!(
+            sim.block_on(async move { client.fetch_merge_intents(NodeId(2)).await }),
+            Ok(crate::MergeIntentSnapshot {
+                map_version: MapVersion(9),
+                intents: Vec::new(),
+            }),
+            "an old leader cannot hold a merge and does not crash-loop a new worker"
         );
     }
 

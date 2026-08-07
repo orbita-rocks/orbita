@@ -640,6 +640,7 @@ fn start_node_with_map(
             layout,
             source,
             None,
+            None,
             lease,
             Arc::new(crate::ReadinessGate::new()),
             authenticator,

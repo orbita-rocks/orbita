@@ -198,6 +198,7 @@ fn start_node(
                 layout,
                 source,
                 None,
+                None,
                 lease,
                 gate,
                 authenticator,

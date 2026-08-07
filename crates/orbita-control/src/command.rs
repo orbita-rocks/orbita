@@ -25,7 +25,7 @@ use crate::model::{Credential, KeyspaceConfig};
 use crate::version::{ClusterVersion, VersionRange};
 
 use bytes::Bytes;
-use orbita_core::{Epoch, KeyspaceId, NodeId, PartitionId};
+use orbita_core::{Epoch, KeyRange, KeyspaceId, NodeId, PartitionId};
 
 // Kept as decode-only legacy. v0.0.1 persisted `RegisterNode` entries under
 // this tag with nothing after the address, and recovery treats an entry it
@@ -62,6 +62,63 @@ const TAG_BEGIN_SPLIT: u8 = 18;
 const TAG_MARK_SPLIT_PREPARED: u8 = 19;
 const TAG_COMPLETE_SPLIT: u8 = 20;
 const TAG_ABORT_SPLIT: u8 = 21;
+// The dual-parent worker-prepared merge protocol. Like split, these tags are
+// emitted only after the active cluster protocol has been finalized to a
+// version whose binaries all understand them.
+const TAG_BEGIN_MERGE: u8 = 22;
+const TAG_MARK_MERGE_PREPARED: u8 = 23;
+const TAG_COMPLETE_MERGE: u8 = 24;
+const TAG_ABORT_MERGE: u8 = 25;
+
+/// The complete identity of one merge attempt.
+///
+/// Parent ids alone are not enough: an acknowledgement can arrive after an
+/// abort and retry. Epochs, child id, boundary, and combined range make that
+/// delayed report fail closed even when the same adjacent pair is retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeGeneration {
+    pub lower: PartitionId,
+    pub upper: PartitionId,
+    pub lower_epoch: Epoch,
+    pub upper_epoch: Epoch,
+    pub merged: PartitionId,
+    pub boundary: Bytes,
+    pub range: KeyRange,
+}
+
+impl MergeGeneration {
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        w.u64(self.lower.get())
+            .u64(self.upper.get())
+            .u64(self.lower_epoch.get())
+            .u64(self.upper_epoch.get())
+            .u64(self.merged.get())
+            .bytes(&self.boundary)
+            .bytes(self.range.start())
+            .opt_bytes(self.range.end());
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>) -> CodecResult<Self> {
+        let lower = PartitionId(r.u64()?);
+        let upper = PartitionId(r.u64()?);
+        let lower_epoch = Epoch(r.u64()?);
+        let upper_epoch = Epoch(r.u64()?);
+        let merged = PartitionId(r.u64()?);
+        let boundary = r.bytes()?;
+        let start = r.bytes()?;
+        let end = r.opt_bytes()?;
+        let range = KeyRange::new(start, end).ok_or(CodecError::OutOfRange("merge range"))?;
+        Ok(Self {
+            lower,
+            upper,
+            lower_epoch,
+            upper_epoch,
+            merged,
+            boundary,
+            range,
+        })
+    }
+}
 
 /// One decision, committed once and applied everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +313,27 @@ pub enum ControlCommand {
         expect_epoch: Epoch,
     },
 
+    /// Freezes two adjacent parents while leaving both in the routing map.
+    BeginMerge {
+        generation: MergeGeneration,
+    },
+
+    /// Records durable merged-child preparation by one exact holder.
+    MarkMergePrepared {
+        generation: MergeGeneration,
+        node: NodeId,
+    },
+
+    /// Atomically retires both parents and installs their prepared child.
+    CompleteMerge {
+        generation: MergeGeneration,
+    },
+
+    /// Abandons a merge and raises both parent epochs before gates reopen.
+    AbortMerge {
+        generation: MergeGeneration,
+    },
+
     /// Advances the cluster's active protocol version, which is what
     /// `orbita cluster finalize-upgrade` commits.
     ///
@@ -442,6 +520,23 @@ impl ControlCommand {
                     .u64(parent.get())
                     .u64(expect_epoch.get());
             }
+            ControlCommand::BeginMerge { generation } => {
+                w.u8(TAG_BEGIN_MERGE);
+                generation.encode(&mut w);
+            }
+            ControlCommand::MarkMergePrepared { generation, node } => {
+                w.u8(TAG_MARK_MERGE_PREPARED);
+                generation.encode(&mut w);
+                w.u64(node.get());
+            }
+            ControlCommand::CompleteMerge { generation } => {
+                w.u8(TAG_COMPLETE_MERGE);
+                generation.encode(&mut w);
+            }
+            ControlCommand::AbortMerge { generation } => {
+                w.u8(TAG_ABORT_MERGE);
+                generation.encode(&mut w);
+            }
             ControlCommand::SetClusterVersion { version, expect } => {
                 w.u8(TAG_SET_CLUSTER_VERSION);
                 version.encode(&mut w);
@@ -546,6 +641,19 @@ impl ControlCommand {
             TAG_ABORT_SPLIT => ControlCommand::AbortSplit {
                 parent: PartitionId(r.u64()?),
                 expect_epoch: Epoch(r.u64()?),
+            },
+            TAG_BEGIN_MERGE => ControlCommand::BeginMerge {
+                generation: MergeGeneration::decode(&mut r)?,
+            },
+            TAG_MARK_MERGE_PREPARED => ControlCommand::MarkMergePrepared {
+                generation: MergeGeneration::decode(&mut r)?,
+                node: NodeId(r.u64()?),
+            },
+            TAG_COMPLETE_MERGE => ControlCommand::CompleteMerge {
+                generation: MergeGeneration::decode(&mut r)?,
+            },
+            TAG_ABORT_MERGE => ControlCommand::AbortMerge {
+                generation: MergeGeneration::decode(&mut r)?,
             },
             TAG_SET_CLUSTER_VERSION => ControlCommand::SetClusterVersion {
                 version: ClusterVersion::decode(&mut r)?,
@@ -726,11 +834,36 @@ mod tests {
                 parent: PartitionId(1),
                 expect_epoch: Epoch(4),
             },
+            ControlCommand::BeginMerge {
+                generation: merge_generation(),
+            },
+            ControlCommand::MarkMergePrepared {
+                generation: merge_generation(),
+                node: NodeId(2),
+            },
+            ControlCommand::CompleteMerge {
+                generation: merge_generation(),
+            },
+            ControlCommand::AbortMerge {
+                generation: merge_generation(),
+            },
             ControlCommand::SetClusterVersion {
                 version: ClusterVersion::new(0, 2),
                 expect: ClusterVersion::new(0, 1),
             },
         ]
+    }
+
+    fn merge_generation() -> MergeGeneration {
+        MergeGeneration {
+            lower: PartitionId(1),
+            upper: PartitionId(2),
+            lower_epoch: Epoch(4),
+            upper_epoch: Epoch(5),
+            merged: PartitionId(3),
+            boundary: Bytes::from_static(b"m"),
+            range: KeyRange::unbounded(),
+        }
     }
 
     #[test]

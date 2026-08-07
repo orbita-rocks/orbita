@@ -98,6 +98,11 @@ pub const METHOD_REPORT_SPLIT_PREPARED: u16 = 14;
 pub const METHOD_FETCH_SPLIT_INTENTS_V2: u16 = 15;
 /// Reports preparation for one exact pair of child ids.
 pub const METHOD_REPORT_SPLIT_PREPARED_V2: u16 = 16;
+/// Fetches coherent dual-parent merge intents. Unsupported means no merge can
+/// be active on that older leader, so new workers degrade to an empty snapshot.
+pub const METHOD_FETCH_MERGE_INTENTS: u16 = 17;
+/// Reports durable preparation for one complete merge generation.
+pub const METHOD_REPORT_MERGE_PREPARED: u16 = 18;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -115,6 +120,8 @@ const STATUS_AUTH_POLICY: u8 = 12;
 const STATUS_SPLIT_INTENTS: u8 = 13;
 const STATUS_SPLIT_PREPARED: u8 = 14;
 const STATUS_SPLIT_INTENTS_V2: u8 = 15;
+const STATUS_MERGE_INTENTS: u8 = 16;
+const STATUS_MERGE_PREPARED: u8 = 17;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -296,6 +303,9 @@ pub(crate) struct FetchSplitIntentsRequest {
     pub node: NodeId,
 }
 
+/// Which worker is asking for merges it must prepare.
+pub(crate) type FetchMergeIntentsRequest = FetchSplitIntentsRequest;
+
 impl FetchSplitIntentsRequest {
     pub(crate) fn encode(self) -> Bytes {
         Writer::new().u64(self.node.get()).finish()
@@ -391,6 +401,43 @@ pub struct SplitIntentSnapshot {
     pub intents: Vec<WireSplitIntent>,
 }
 
+/// One exact merge generation a worker must keep frozen or prepare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireMergeIntent {
+    pub generation: crate::MergeGeneration,
+    pub prepared_by_this_node: bool,
+}
+
+/// Merge lifecycle state captured with its routing map version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeIntentSnapshot {
+    pub map_version: MapVersion,
+    pub intents: Vec<WireMergeIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportMergePreparedRequest {
+    pub node: NodeId,
+    pub generation: crate::MergeGeneration,
+}
+
+impl ReportMergePreparedRequest {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut writer = Writer::new();
+        writer.u64(self.node.get());
+        self.generation.encode(&mut writer);
+        writer.finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut reader = Reader::new(buf);
+        let node = NodeId(reader.u64()?);
+        let generation = crate::MergeGeneration::decode(&mut reader)?;
+        reader.done()?;
+        Ok(Self { node, generation })
+    }
+}
+
 /// The one response shape both methods share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlResponse {
@@ -461,6 +508,8 @@ pub(crate) enum ControlResponse {
     SplitIntentsV2(SplitIntentSnapshot),
     /// A split-preparation report was accepted.
     SplitPrepared,
+    MergeIntents(MergeIntentSnapshot),
+    MergePrepared,
 }
 
 impl ControlResponse {
@@ -545,6 +594,16 @@ impl ControlResponse {
             ControlResponse::SplitPrepared => {
                 w.u8(STATUS_SPLIT_PREPARED);
             }
+            ControlResponse::MergeIntents(snapshot) => {
+                w.u8(STATUS_MERGE_INTENTS).u64(snapshot.map_version.get());
+                w.seq(&snapshot.intents, |w, intent| {
+                    intent.generation.encode(w);
+                    w.u8(u8::from(intent.prepared_by_this_node));
+                });
+            }
+            ControlResponse::MergePrepared => {
+                w.u8(STATUS_MERGE_PREPARED);
+            }
         }
         w.finish()
     }
@@ -598,6 +657,16 @@ impl ControlResponse {
                 intents: r.seq(decode_split_intent)?,
             }),
             STATUS_SPLIT_PREPARED => ControlResponse::SplitPrepared,
+            STATUS_MERGE_INTENTS => ControlResponse::MergeIntents(MergeIntentSnapshot {
+                map_version: MapVersion(r.u64()?),
+                intents: r.seq(|r| {
+                    Ok(WireMergeIntent {
+                        generation: crate::MergeGeneration::decode(r)?,
+                        prepared_by_this_node: r.u8()? != 0,
+                    })
+                })?,
+            }),
+            STATUS_MERGE_PREPARED => ControlResponse::MergePrepared,
             tag => {
                 return Err(CodecError::UnknownTag {
                     what: "control response",
@@ -844,6 +913,14 @@ mod tests {
                 intents: Vec::new(),
             }),
             ControlResponse::SplitPrepared,
+            ControlResponse::MergeIntents(MergeIntentSnapshot {
+                map_version: MapVersion(16),
+                intents: vec![WireMergeIntent {
+                    generation: merge_generation(),
+                    prepared_by_this_node: true,
+                }],
+            }),
+            ControlResponse::MergePrepared,
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),
@@ -874,6 +951,30 @@ mod tests {
             ReportSplitPreparedV2Request::decode(&report.encode()),
             Ok(report)
         );
+    }
+
+    #[test]
+    fn the_merge_preparation_request_carries_the_exact_generation() {
+        let report = ReportMergePreparedRequest {
+            node: NodeId(4),
+            generation: merge_generation(),
+        };
+        assert_eq!(
+            ReportMergePreparedRequest::decode(&report.encode()),
+            Ok(report)
+        );
+    }
+
+    fn merge_generation() -> crate::MergeGeneration {
+        crate::MergeGeneration {
+            lower: PartitionId(2),
+            upper: PartitionId(3),
+            lower_epoch: Epoch(4),
+            upper_epoch: Epoch(5),
+            merged: PartitionId(6),
+            boundary: Bytes::from_static(b"m"),
+            range: KeyRange::unbounded(),
+        }
     }
 
     #[test]

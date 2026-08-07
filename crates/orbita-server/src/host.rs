@@ -253,6 +253,10 @@ pub(crate) struct PartitionHost<R: Runtime> {
     /// closes this before draining existing grants, so no retired parent can
     /// remain in the read set after its children activate.
     admitting_leases: std::sync::atomic::AtomicBool,
+    /// Merge retires both source ranges, so a stale route must not read from
+    /// either source after preparation. Split keeps owner reads available, so
+    /// this is deliberately separate from lease admission.
+    admitting_reads: std::sync::atomic::AtomicBool,
     /// Orders ordinary renewal passes against split lease drainage. Without
     /// this, an already-started positive renewal could arrive after the
     /// split's zero-duration revocation and resurrect the lease.
@@ -457,6 +461,7 @@ impl<R: Runtime> PartitionHost<R> {
             flushing,
             admitting_writes: std::sync::atomic::AtomicBool::new(true),
             admitting_leases: std::sync::atomic::AtomicBool::new(true),
+            admitting_reads: std::sync::atomic::AtomicBool::new(true),
             lease_renewal: tokio::sync::Mutex::new(()),
             write_barrier: tokio::sync::RwLock::new(()),
         })
@@ -628,6 +633,38 @@ impl<R: Runtime> PartitionHost<R> {
         self.storage.prepare_child_partitions(children).await
     }
 
+    /// Quiesces two compatible owners and publishes their merged child.
+    ///
+    /// Both admission gates close before either barrier is awaited, so a write
+    /// cannot slip into the second parent while the first drains. Read leases,
+    /// including each host's conservative same-epoch restart interval, drain
+    /// before either WAL is settled. The resulting child starts at the greater
+    /// committed prefix and references both immutable source sets in place.
+    pub(crate) async fn quiesce_and_prepare_merge(
+        &self,
+        upper: &Self,
+        child: &ChildSpec,
+    ) -> Result<Lamport> {
+        if self.wal.is_none() || upper.wal.is_none() {
+            return Err(Error::Unavailable(
+                "both merge parents must be owned by the preparing worker".into(),
+            ));
+        }
+        self.close_merge_gates();
+        upper.close_merge_gates();
+        let _lower_barrier = self.write_barrier.write().await;
+        let _upper_barrier = upper.write_barrier.write().await;
+        join_all(vec![self.drain_read_leases(), upper.drain_read_leases()]).await;
+        let results = join_all(vec![self.quiesce(), upper.quiesce()]).await;
+        for result in results {
+            result?;
+        }
+        join_all(vec![self.wait_for_applies(), upper.wait_for_applies()]).await;
+        self.storage
+            .prepare_merged_partition(&upper.storage, child)
+            .await
+    }
+
     /// Closes the split gates without doing preparation work.
     ///
     /// A recovered owner is put in this state before it enters the node's host
@@ -639,6 +676,15 @@ impl<R: Runtime> PartitionHost<R> {
         self.admitting_leases
             .store(false, std::sync::atomic::Ordering::Release);
         self.freeze_maintenance();
+    }
+
+    /// Closes split's gates plus direct owner reads, because both merge parents
+    /// will be retired and a stale route must fail closed rather than serve
+    /// their last snapshot.
+    pub(crate) fn close_merge_gates(&self) {
+        self.close_split_gates();
+        self.admitting_reads
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Prepares child storage over the parent's segments *without* quiescing —
@@ -683,6 +729,11 @@ impl<R: Runtime> PartitionHost<R> {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    pub(crate) fn is_admitting_reads(&self) -> bool {
+        self.admitting_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Whether this node might answer a read for `key` without asking the
     /// owner.
     ///
@@ -715,6 +766,12 @@ impl<R: Runtime> PartitionHost<R> {
     /// it here rather than anyone reasoning it out.
     pub(crate) async fn read(&self, key: &[u8]) -> Result<Read> {
         if self.is_owner() {
+            if !self.is_admitting_reads() {
+                return Err(Error::Unavailable(format!(
+                    "partition {} is quiescing for a lifecycle transition",
+                    self.id
+                )));
+            }
             return Ok(Read::Served(self.get(key).await?));
         }
         let now = self.runtime.clock().monotonic_nanos();

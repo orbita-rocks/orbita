@@ -22,9 +22,7 @@ from conftest import DEFAULT_KEYSPACE, poll_until
 ADMIN_SERVICE = admin_pb2.DESCRIPTOR.services_by_name["Admin"]
 METHODS = [method.name for method in ADMIN_SERVICE.methods]
 
-# Merge remains deliberately unavailable. Split is exercised over the real
-# public API in test_split.py.
-DELIBERATELY_UNIMPLEMENTED = {"MergePartitions"}
+DELIBERATELY_UNIMPLEMENTED = set()
 
 
 def test_the_proto_still_declares_the_admin_surface_we_expect():

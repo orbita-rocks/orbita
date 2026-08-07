@@ -3,13 +3,11 @@
 //! The nodes that hold the cluster's authoritative metadata: the partition
 //! map, worker membership, keyspace definitions and quotas, and ownership
 //! epochs. It detects dead workers, fences and replaces partition owners, and
-//! drives the worker-prepared partition split end to end. The state machine
-//! refuses to retire a parent until every holder has *durably* prepared child
-//! storage and reported it — the prepare-before-retire ordering of ADR 0009 —
-//! and the controller turns those acknowledgements into the completion. A worker
-//! fetches the split intent over the control wire, quiesces the parent, and
-//! builds the child storage with `orbita_storage::Partition::prepare_child_partitions`,
-//! which shares the parent's segments in place with no copy.
+//! drives worker-prepared partition splits and merges end to end. The state
+//! machine refuses to retire source partitions until every holder has durably
+//! prepared child storage and reported it. Workers quiesce the source WALs and
+//! publish child manifests over shared immutable segments before the atomic map
+//! replacement.
 //!
 //! Nothing here is on the data path. Workers cache what they need and keep
 //! serving reads while the leader group is unavailable, which is deliberate: a
@@ -36,14 +34,10 @@
 //! of its IO routed through `orbita_runtime`. [`consensus`] documents the
 //! seam and the `raft` module documents how the pieces map onto it.
 //!
-//! Partition merge is not implemented. It is the highest-risk requirement in
-//! the project, `docs/plan/README.md` flags it as the first thing to cut, and
-//! a half-built merge would be worse than none. The constraint it has to meet
-//! is written down in
-//! [ADR 0002](../../../docs/adr/0002-key-versions-are-partition-lamports.md):
-//! a merged partition's Lamport sequence has to exceed everything either side
-//! ever issued, or a client's held version stops matching through no write of
-//! its own.
+//! Merge follows
+//! [ADR 0010](../../../docs/adr/0010-a-merge-shares-both-parents-segments.md):
+//! both parents quiesce, the child keeps existing record versions, and its
+//! Lamport sequence resumes above both source horizons.
 //!
 //! # The failover ordering
 //!
@@ -119,7 +113,7 @@ pub use admin::AdminService;
 pub use auth::{bearer_secret, root_secret_hash, CredentialSnapshot};
 pub use client::{AdminOutcome, ControlClient, LocalControlClient, StatusReportResponse};
 pub use codec::CodecError;
-pub use command::ControlCommand;
+pub use command::{ControlCommand, MergeGeneration};
 pub use config::ControlConfig;
 pub use consensus::{ConsensusLog, LogEntry, LogIndex, SingleNodeLog};
 pub use controller::{
@@ -130,14 +124,15 @@ pub use membership::{NodeHealth, NodeRole, NodeStatus, PartitionProgress};
 pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
 pub use raft::RaftLog;
 pub use service::ControlService;
-pub use state::{ClusterState, NodeRecord, PartitionPhase, SplitIntent};
+pub use state::{ClusterState, MergeIntent, NodeRecord, PartitionPhase, SplitIntent};
 pub use version::{
     binary_speaks, binary_version, lifecycle_protocol_active, speaks_for, ClusterVersion,
     CompatibilityRefusal, VersionRange, PROTOCOL_0_1,
 };
 pub use wire::{
-    SplitIntentSnapshot, WireSplitIntent, METHOD_DRAIN_NODE, METHOD_FETCH_COMMIT_INDEX,
-    METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
-    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
-    METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    MergeIntentSnapshot, SplitIntentSnapshot, WireMergeIntent, WireSplitIntent, METHOD_DRAIN_NODE,
+    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_MERGE_INTENTS, METHOD_FETCH_NODES,
+    METHOD_FETCH_SPLIT_INTENTS, METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
+    METHOD_REPORT_STATUS_V5,
 };

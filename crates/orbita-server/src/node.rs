@@ -41,13 +41,15 @@ use crate::validate;
 
 use bytes::Bytes;
 use orbita_control::Permission;
-use orbita_control::{SplitIntentSnapshot, WireSplitIntent};
+use orbita_control::{
+    MergeGeneration, MergeIntentSnapshot, SplitIntentSnapshot, WireMergeIntent, WireSplitIntent,
+};
 use orbita_core::{
     Error, KeyspaceId, KeyspaceInfo, Lamport, NodeId, PartitionId, PartitionInfo, PartitionMap,
     Result, Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
     MESSAGE_OVERHEAD_BYTES,
 };
-use orbita_format::{load_manifest, PartitionPath};
+use orbita_format::{load_manifest, PartitionPath, Snapshot};
 use orbita_objectstore::ObjectStore;
 use orbita_proto::v1::{
     DeleteRequest, DeleteResponse, GetLimitsResponse, GetRequest, GetResponse, ListEntry,
@@ -283,6 +285,7 @@ impl<R: Runtime> Node<R> {
         layout: DataLayout,
         source: BoxedMapSource,
         initial_split_intents: Option<SplitIntentSnapshot>,
+        initial_merge_intents: Option<MergeIntentSnapshot>,
         lease_duration: Duration,
         readiness: Arc<ReadinessGate>,
         authenticator: Arc<Authenticator<R::Clock>>,
@@ -334,8 +337,11 @@ impl<R: Runtime> Node<R> {
                 .collect(),
         )
         .await;
-        node.apply_active_split_gates(initial_split_intents.as_ref())
-            .await;
+        node.apply_active_transition_gates(
+            initial_split_intents.as_ref(),
+            initial_merge_intents.as_ref(),
+        )
+        .await;
         // Nothing is known to be stranded before a single heartbeat has gone
         // out, and a node held unready for a verdict it has not reached would
         // never start. The heartbeat corrects this within one interval.
@@ -359,18 +365,32 @@ impl<R: Runtime> Node<R> {
         Ok(node)
     }
 
-    /// Restores split gates before startup publishes peer or client handlers.
-    async fn apply_active_split_gates(&self, snapshot: Option<&SplitIntentSnapshot>) {
-        let active: HashSet<PartitionId> = snapshot
-            .filter(|snapshot| snapshot.map_version == self.map().version())
+    /// Restores all transition gates before startup publishes handlers.
+    async fn apply_active_transition_gates(
+        &self,
+        splits: Option<&SplitIntentSnapshot>,
+        merges: Option<&MergeIntentSnapshot>,
+    ) {
+        let map_version = self.map().version();
+        let snapshots_are_current = splits
+            .is_none_or(|snapshot| snapshot.map_version == map_version)
+            && merges.is_none_or(|snapshot| snapshot.map_version == map_version);
+        let split_parents: HashSet<PartitionId> = splits
             .into_iter()
             .flat_map(|snapshot| &snapshot.intents)
             .map(|intent| intent.parent)
             .collect();
-        let snapshot_is_current =
-            snapshot.is_none_or(|snapshot| snapshot.map_version == self.map().version());
+        let merge_parents: HashSet<PartitionId> = merges
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.intents)
+            .flat_map(|intent| [intent.generation.lower, intent.generation.upper])
+            .collect();
         for host in self.hosts.read().await.values() {
-            if host.is_owner() && (!snapshot_is_current || active.contains(&host.id())) {
+            if host.is_owner() && merge_parents.contains(&host.id()) {
+                host.close_merge_gates();
+            } else if host.is_owner()
+                && (!snapshots_are_current || split_parents.contains(&host.id()))
+            {
                 host.close_split_gates();
             }
         }
@@ -1743,6 +1763,7 @@ impl<R: Runtime> Node<R> {
     /// the leader aborted it — is detected by its parent being absent from the
     /// intents, and any parent this node had quiesced for it has its writes
     /// reopened here rather than being left stuck closed.
+    #[cfg(test)]
     pub(crate) async fn prepare_split_snapshot(
         &self,
         snapshot: &SplitIntentSnapshot,
@@ -1758,12 +1779,24 @@ impl<R: Runtime> Node<R> {
         self.prepare_pending_splits(&snapshot.intents).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_pending_splits(
         &self,
         intents: &[WireSplitIntent],
     ) -> Vec<(PartitionId, PartitionId, PartitionId)> {
+        self.prepare_pending_splits_with(intents, &HashSet::new())
+            .await
+    }
+
+    async fn prepare_pending_splits_with(
+        &self,
+        intents: &[WireSplitIntent],
+        additionally_pending: &HashSet<PartitionId>,
+    ) -> Vec<(PartitionId, PartitionId, PartitionId)> {
         let map = self.map();
-        let pending: HashSet<PartitionId> = intents.iter().map(|intent| intent.parent).collect();
+        let mut pending: HashSet<PartitionId> =
+            intents.iter().map(|intent| intent.parent).collect();
+        pending.extend(additionally_pending);
 
         // Lift the freeze on any partition we quiesced or froze for a split
         // that is no longer pending. A completed split retires the parent
@@ -1857,6 +1890,119 @@ impl<R: Runtime> Node<R> {
             }
         }
         prepared
+    }
+
+    /// Reconciles split and merge lifecycle state from one coherent routing
+    /// version, so an empty split snapshot can never reopen a merge parent (or
+    /// vice versa) between the two independent control-method fetches.
+    pub(crate) async fn prepare_transition_snapshots(
+        &self,
+        splits: &SplitIntentSnapshot,
+        merges: &MergeIntentSnapshot,
+    ) -> (
+        Vec<(PartitionId, PartitionId, PartitionId)>,
+        Vec<MergeGeneration>,
+    ) {
+        let map_version = self.map().version();
+        if splits.map_version != map_version || merges.map_version != map_version {
+            return (Vec::new(), Vec::new());
+        }
+        let merge_parents: HashSet<_> = merges
+            .intents
+            .iter()
+            .flat_map(|intent| [intent.generation.lower, intent.generation.upper])
+            .collect();
+        let split_prepared = self
+            .prepare_pending_splits_with(&splits.intents, &merge_parents)
+            .await;
+        let merge_prepared = self.prepare_pending_merges(&merges.intents).await;
+        (split_prepared, merge_prepared)
+    }
+
+    async fn prepare_pending_merges(&self, intents: &[WireMergeIntent]) -> Vec<MergeGeneration> {
+        let map = self.map();
+        let mut prepared = Vec::new();
+        for intent in intents {
+            let generation = &intent.generation;
+            let (Some(lower_info), Some(upper_info)) = (
+                map.partition(generation.lower),
+                map.partition(generation.upper),
+            ) else {
+                continue;
+            };
+            if lower_info.epoch != generation.lower_epoch
+                || upper_info.epoch != generation.upper_epoch
+            {
+                continue;
+            }
+            let is_owner =
+                lower_info.owner == Some(self.node_id) && upper_info.owner == Some(self.node_id);
+            let is_replica = lower_info.replicas.contains(&self.node_id)
+                && upper_info.replicas.contains(&self.node_id);
+            if !is_owner && !is_replica {
+                continue;
+            }
+            if is_owner {
+                let hosts = self.hosts.read().await;
+                let Some(lower) = hosts.get(&generation.lower).cloned() else {
+                    continue;
+                };
+                let Some(upper) = hosts.get(&generation.upper).cloned() else {
+                    continue;
+                };
+                drop(hosts);
+                lower.close_merge_gates();
+                upper.close_merge_gates();
+                if !intent.prepared_by_this_node {
+                    let child = ChildSpec {
+                        id: generation.merged,
+                        epoch: orbita_core::Epoch(
+                            generation
+                                .lower_epoch
+                                .get()
+                                .max(generation.upper_epoch.get()),
+                        )
+                        .next(),
+                        range: generation.range.clone(),
+                    };
+                    if let Err(error) = lower.quiesce_and_prepare_merge(&upper, &child).await {
+                        tracing::warn!(%error, "could not prepare merged partition; will retry");
+                        continue;
+                    }
+                }
+            } else if intent.prepared_by_this_node {
+                continue;
+            }
+            if self
+                .merged_snapshot_is_servable(lower_info.keyspace, generation)
+                .await
+            {
+                prepared.push(generation.clone());
+            }
+        }
+        prepared
+    }
+
+    async fn merged_snapshot_is_servable(
+        &self,
+        keyspace: KeyspaceId,
+        generation: &MergeGeneration,
+    ) -> bool {
+        let paths = self.layout.paths(keyspace, generation.merged);
+        let expected_epoch = orbita_core::Epoch(
+            generation
+                .lower_epoch
+                .get()
+                .max(generation.upper_epoch.get()),
+        )
+        .next();
+        match Snapshot::open(Arc::clone(&paths.store), paths.path).await {
+            Ok(Some(snapshot)) => {
+                snapshot.manifest().epoch >= expected_epoch
+                    && snapshot.manifest().range == generation.range
+            }
+            _ => false,
+        }
     }
 
     /// Recreates an aborted split parent because WAL quiescence is deliberately
@@ -2353,6 +2499,7 @@ mod tests {
                     layout,
                     source,
                     None,
+                    None,
                     crate::DEFAULT_LEASE_DURATION,
                     gate,
                     authenticator,
@@ -2417,6 +2564,7 @@ mod tests {
                 NodeId(1),
                 layout,
                 source,
+                None,
                 None,
                 crate::DEFAULT_LEASE_DURATION,
                 gate,

@@ -19,7 +19,9 @@
 use crate::map_source::{BoxedMapSource, StaticMapSource};
 use crate::node::{DataLayout, Node};
 
-use orbita_control::{SplitIntentSnapshot, WireSplitIntent};
+use orbita_control::{
+    MergeGeneration, MergeIntentSnapshot, SplitIntentSnapshot, WireMergeIntent, WireSplitIntent,
+};
 use orbita_core::{
     Epoch, KeyRange, KeyspaceId, KeyspaceInfo, KeyspaceName, Lamport, MapVersion, NodeId,
     PartitionId, PartitionInfo, PartitionMap,
@@ -118,6 +120,68 @@ fn children_map() -> PartitionMap {
     map
 }
 
+fn merge_generation() -> MergeGeneration {
+    MergeGeneration {
+        lower: LOWER,
+        upper: UPPER,
+        lower_epoch: Epoch(2),
+        upper_epoch: Epoch(2),
+        merged: PartitionId(4),
+        boundary: bytes::Bytes::from_static(BOUNDARY),
+        range: KeyRange::unbounded(),
+    }
+}
+
+fn merge_snapshot(prepared_by_this_node: bool) -> MergeIntentSnapshot {
+    MergeIntentSnapshot {
+        map_version: MapVersion(3),
+        intents: vec![WireMergeIntent {
+            generation: merge_generation(),
+            prepared_by_this_node,
+        }],
+    }
+}
+
+fn start_merge_node(
+    sim: &Simulation,
+    node: NodeId,
+    source: &StaticMapSource,
+    store: Arc<MemoryStore>,
+) -> Arc<Node<SimRuntime>> {
+    start_node_with_snapshots(
+        sim,
+        node,
+        source,
+        store,
+        Some(SplitIntentSnapshot {
+            map_version: MapVersion(3),
+            intents: Vec::new(),
+        }),
+        Some(MergeIntentSnapshot {
+            map_version: MapVersion(3),
+            intents: Vec::new(),
+        }),
+    )
+}
+
+fn merged_map() -> PartitionMap {
+    merged_map_owned(OWNER, vec![REPLICA])
+}
+
+fn merged_map_owned(owner: NodeId, replicas: Vec<NodeId>) -> PartitionMap {
+    let mut map = PartitionMap::new(MapVersion(5));
+    map.insert_keyspace(keyspace_info());
+    map.insert_partition(PartitionInfo {
+        id: PartitionId(4),
+        keyspace: KeyspaceId(1),
+        range: KeyRange::unbounded(),
+        owner: Some(owner),
+        epoch: Epoch(3),
+        replicas,
+    });
+    map
+}
+
 fn start_node(
     sim: &Simulation,
     node: NodeId,
@@ -153,6 +217,17 @@ fn start_node_with_snapshot(
     store: Arc<MemoryStore>,
     snapshot: Option<SplitIntentSnapshot>,
 ) -> Arc<Node<SimRuntime>> {
+    start_node_with_snapshots(sim, node, source, store, snapshot, None)
+}
+
+fn start_node_with_snapshots(
+    sim: &Simulation,
+    node: NodeId,
+    source: &StaticMapSource,
+    store: Arc<MemoryStore>,
+    split_snapshot: Option<SplitIntentSnapshot>,
+    merge_snapshot: Option<MergeIntentSnapshot>,
+) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
         store,
@@ -173,7 +248,8 @@ fn start_node_with_snapshot(
             node,
             layout,
             source,
-            snapshot,
+            split_snapshot,
+            merge_snapshot,
             Duration::from_millis(150),
             gate,
             authenticator,
@@ -1084,4 +1160,209 @@ fn run(seed: u64) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn no_acknowledged_write_is_lost_across_a_merge_under_contention() {
+    // Replay with:
+    //   ORBITA_SIM_SEED=<seed> cargo test -p orbita-server \
+    //     no_acknowledged_write_is_lost_across_a_merge_under_contention
+    harness::check_seeds(
+        "split::no_acknowledged_write_is_lost_across_a_merge_under_contention",
+        24,
+        run_merge,
+    );
+}
+
+fn run_merge(seed: u64) -> Result<(), Failure> {
+    let sim = Simulation::new(seed);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(children_map());
+    let owner = start_merge_node(&sim, OWNER, &source, Arc::clone(&store));
+    let replica = start_merge_node(&sim, REPLICA, &source, Arc::clone(&store));
+    poll(&sim, &[&owner, &replica]);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    spawn_writer(&sim, &owner, &stop, &log);
+    sim.run_for(Duration::from_millis(200));
+
+    let split_snapshot = SplitIntentSnapshot {
+        map_version: MapVersion(3),
+        intents: Vec::new(),
+    };
+    let owner_prepared = {
+        let owner = Arc::clone(&owner);
+        let splits = split_snapshot.clone();
+        let merges = merge_snapshot(false);
+        sim.block_on(async move { owner.prepare_transition_snapshots(&splits, &merges).await.1 })
+    };
+    if owner_prepared != vec![merge_generation()] {
+        return Err(sim.failure(format!(
+            "the owner did not durably prepare the merge: {owner_prepared:?}"
+        )));
+    }
+    let replica_prepared = {
+        let replica = Arc::clone(&replica);
+        let splits = split_snapshot;
+        let merges = merge_snapshot(false);
+        sim.block_on(async move {
+            replica
+                .prepare_transition_snapshots(&splits, &merges)
+                .await
+                .1
+        })
+    };
+    if replica_prepared != vec![merge_generation()] {
+        return Err(sim.failure("the replica acknowledged before the merged snapshot was servable"));
+    }
+
+    source.set(merged_map());
+    poll(&sim, &[&owner, &replica]);
+    sim.run_for(Duration::from_millis(200));
+    stop.store(true, Ordering::Release);
+    sim.run_until_idle();
+
+    let writes = log.lock().expect("write log poisoned");
+    if !writes.iter().any(|write| write.acknowledged) {
+        return Err(sim.failure("no write was acknowledged, so the merge proved nothing"));
+    }
+    for wrote in writes.iter().filter(|write| write.acknowledged) {
+        let key = key_at(wrote.index);
+        match read(&sim, &owner, key.clone()) {
+            Some(value) if value == value_at(wrote.index) => {}
+            other => {
+                return Err(sim.failure(format!(
+                    "acknowledged merge-racing key {:?} read back {other:?}",
+                    String::from_utf8_lossy(&key)
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn one_merge_holder_acked_and_one_pending_keeps_both_parents_closed() {
+    let sim = Simulation::new(125);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(children_map());
+    let owner = start_merge_node(&sim, OWNER, &source, store);
+    let splits = SplitIntentSnapshot {
+        map_version: MapVersion(3),
+        intents: Vec::new(),
+    };
+    let merges = merge_snapshot(false);
+    let preparing = Arc::clone(&owner);
+    let prepared = sim.block_on(async move {
+        preparing
+            .prepare_transition_snapshots(&splits, &merges)
+            .await
+            .1
+    });
+    assert_eq!(prepared, vec![merge_generation()]);
+    for parent in [LOWER, UPPER] {
+        let owner = Arc::clone(&owner);
+        assert!(sim.block_on(async move {
+            let host = owner.host(parent).await.unwrap();
+            !host.is_admitting_writes()
+                && !host.is_admitting_leases()
+                && host.is_maintenance_frozen()
+        }));
+    }
+    assert!(read(&sim, &owner, b"a-stale-route".to_vec()).is_none());
+}
+
+#[test]
+fn a_same_epoch_merge_parent_restart_restores_both_gates_closed() {
+    let sim = Simulation::new(126);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(children_map());
+    let splits = Some(SplitIntentSnapshot {
+        map_version: MapVersion(3),
+        intents: Vec::new(),
+    });
+    let owner = start_node_with_snapshots(
+        &sim,
+        OWNER,
+        &source,
+        store,
+        splits,
+        Some(merge_snapshot(false)),
+    );
+    for parent in [LOWER, UPPER] {
+        let owner = Arc::clone(&owner);
+        assert!(sim.block_on(async move {
+            let host = owner.host(parent).await.unwrap();
+            !host.is_admitting_writes() && !host.is_admitting_leases()
+        }));
+    }
+}
+
+#[test]
+fn owner_failure_after_merge_preparation_resumes_from_the_durable_child() {
+    let sim = Simulation::new(127);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(children_map());
+    let owner = start_merge_node(&sim, OWNER, &source, Arc::clone(&store));
+    let replica = start_merge_node(&sim, REPLICA, &source, store);
+    poll(&sim, &[&owner, &replica]);
+    let wrote = Arc::clone(&owner);
+    let write = sim.block_on(async move {
+        wrote
+            .set(
+                SetRequest {
+                    keyspace: KEYSPACE.into(),
+                    key: b"a-before-owner-failure".to_vec(),
+                    value: b"durable".to_vec(),
+                    ttl_millis: None,
+                    condition: None,
+                },
+                false,
+                None,
+            )
+            .await
+    });
+    assert!(write.is_ok(), "the pre-failure write lands: {write:?}");
+    let splits = SplitIntentSnapshot {
+        map_version: MapVersion(3),
+        intents: Vec::new(),
+    };
+    let merges = merge_snapshot(false);
+    let preparing = Arc::clone(&owner);
+    assert_eq!(
+        sim.block_on(async move {
+            preparing
+                .prepare_transition_snapshots(&splits, &merges)
+                .await
+                .1
+        }),
+        vec![merge_generation()]
+    );
+
+    sim.crash(OWNER);
+    drop(owner);
+    let splits = SplitIntentSnapshot {
+        map_version: MapVersion(3),
+        intents: Vec::new(),
+    };
+    let merges = merge_snapshot(false);
+    let preparing = Arc::clone(&replica);
+    assert_eq!(
+        sim.block_on(async move {
+            preparing
+                .prepare_transition_snapshots(&splits, &merges)
+                .await
+                .1
+        }),
+        vec![merge_generation()],
+        "the survivor verifies the owner's durable child rather than wedging"
+    );
+
+    source.set(merged_map_owned(REPLICA, vec![OWNER]));
+    poll(&sim, &[&replica]);
+    assert_eq!(
+        read(&sim, &replica, b"a-before-owner-failure".to_vec()),
+        Some(b"durable".to_vec())
+    );
 }

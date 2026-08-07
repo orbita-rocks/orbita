@@ -15,13 +15,15 @@ use crate::consensus::ConsensusLog;
 use crate::controller::Controller;
 use crate::controller::RegistrationOutcome;
 use crate::wire::{
-    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, FetchSplitIntentsRequest,
-    ReportSplitPreparedRequest, ReportSplitPreparedV2Request, ReportStatusRequest, WireSplitIntent,
+    AdminCallRequest, ControlResponse, DrainNodeRequest, FetchMapRequest, FetchMergeIntentsRequest,
+    FetchSplitIntentsRequest, ReportMergePreparedRequest, ReportSplitPreparedRequest,
+    ReportSplitPreparedV2Request, ReportStatusRequest, WireMergeIntent, WireSplitIntent,
     METHOD_ADMIN_CALL, METHOD_DRAIN_NODE, METHOD_FETCH_AUTH_POLICY, METHOD_FETCH_COMMIT_INDEX,
-    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
-    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_SPLIT_PREPARED, METHOD_REPORT_SPLIT_PREPARED_V2,
-    METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3,
-    METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    METHOD_FETCH_CREDENTIALS, METHOD_FETCH_MAP, METHOD_FETCH_MERGE_INTENTS, METHOD_FETCH_NODES,
+    METHOD_FETCH_SPLIT_INTENTS, METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_MERGE_PREPARED,
+    METHOD_REPORT_SPLIT_PREPARED, METHOD_REPORT_SPLIT_PREPARED_V2, METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
+    METHOD_REPORT_STATUS_V5,
 };
 
 use bytes::Bytes;
@@ -261,6 +263,45 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     Err(e) => {
                         ControlResponse::Error(format!("undecodable split-prepared report: {e}"))
                     }
+                }
+            }
+            METHOD_FETCH_MERGE_INTENTS => match FetchMergeIntentsRequest::decode(&call.payload) {
+                Ok(request) => {
+                    let (map_version, intents) =
+                        self.controller.active_merge_intents_for(request.node).await;
+                    ControlResponse::MergeIntents(crate::MergeIntentSnapshot {
+                        map_version,
+                        intents: intents
+                            .into_iter()
+                            .map(|(intent, prepared_by_this_node)| WireMergeIntent {
+                                generation: intent.generation,
+                                prepared_by_this_node,
+                            })
+                            .collect(),
+                    })
+                }
+                Err(error) => {
+                    ControlResponse::Error(format!("undecodable merge intents fetch: {error}"))
+                }
+            },
+            METHOD_REPORT_MERGE_PREPARED => {
+                match ReportMergePreparedRequest::decode(&call.payload) {
+                    Ok(request) => {
+                        if self
+                            .controller
+                            .record_merge_prepared(request.node, request.generation)
+                            .await
+                        {
+                            ControlResponse::MergePrepared
+                        } else {
+                            ControlResponse::Error(
+                                "merge generation is no longer active for this worker".into(),
+                            )
+                        }
+                    }
+                    Err(error) => ControlResponse::Error(format!(
+                        "undecodable merge-prepared report: {error}"
+                    )),
                 }
             }
             METHOD_FETCH_NODES => ControlResponse::Nodes(self.controller.node_addresses().await),
