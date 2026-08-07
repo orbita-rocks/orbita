@@ -97,6 +97,27 @@ fn three_nodes_elect_exactly_one_leader() {
 }
 
 #[test]
+fn a_quorum_barrier_expires_instead_of_pinning_a_restart_forever() {
+    let sim = Simulation::new(91);
+    let logs = start(&sim);
+    let leader = elect(&sim, &logs).expect("the initial group elects a leader");
+    for node in NODES {
+        if node != leader {
+            sim.crash(node);
+        }
+    }
+
+    let log = Arc::clone(&logs[(leader.get() - 1) as usize]);
+    let error = sim
+        .block_on(async move { log.leader_barrier().await })
+        .expect_err("a barrier without quorum must expire");
+    assert!(
+        matches!(error, Error::Unavailable(ref message) if message.contains("did not reach quorum")),
+        "the caller needs a retryable, diagnostic timeout, got {error}"
+    );
+}
+
+#[test]
 fn a_command_proposed_on_the_leader_reaches_every_node() {
     check_seeds(
         "a_command_proposed_on_the_leader_reaches_every_node",

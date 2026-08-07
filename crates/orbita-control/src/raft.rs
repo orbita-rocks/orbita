@@ -97,6 +97,13 @@ const ELECTION_TICK: usize = 10;
 /// timeout.
 const HEARTBEAT_TICK: usize = 2;
 
+/// A quorum operation that has not settled inside several election windows is
+/// no longer useful to its caller. In particular, raft-rs does not retry a
+/// read-index request issued while quorum is reconnecting; expiring it lets
+/// startup and controller loops submit a fresh request instead of waiting on a
+/// one-shot response that can never arrive.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `kind u8 | len u32 | crc32 u32 | payload`, appended per record.
 ///
 /// Same reasoning as the single-node log's framing: a per-record checksum
@@ -461,16 +468,21 @@ struct Driver<R: Runtime> {
     rx: mpsc::UnboundedReceiver<Event>,
     /// Proposals waiting to commit, keyed by the id carried in the entry's
     /// context.
-    pending: HashMap<u64, oneshot::Sender<Result<LogIndex>>>,
+    pending: HashMap<u64, Pending<LogIndex>>,
     /// Quorum-backed read-index checks waiting for their `ReadState`.
-    barriers: HashMap<u64, oneshot::Sender<Result<LogIndex>>>,
-    membership: HashMap<u64, oneshot::Sender<Result<()>>>,
+    barriers: HashMap<u64, Pending<LogIndex>>,
+    membership: HashMap<u64, Pending<()>>,
     next_proposal: u64,
     next_barrier: u64,
     was_leader: bool,
     /// The `(term, role)` the current election jitter was drawn for.
     timeout_key: Option<(u64, StateRole)>,
     timeout_ticks: usize,
+}
+
+struct Pending<T> {
+    deadline: u64,
+    reply: oneshot::Sender<Result<T>>,
 }
 
 impl<R: Runtime> Driver<R> {
@@ -481,6 +493,7 @@ impl<R: Runtime> Driver<R> {
             self.assert_election_timeout();
 
             let now = self.runtime.clock().monotonic_nanos();
+            self.expire_requests(now);
             if now >= next_tick {
                 self.node.tick();
                 // Measured from now rather than accumulated, so a stall does
@@ -501,18 +514,37 @@ impl<R: Runtime> Driver<R> {
                 // participating, which to the rest of the group looks like a
                 // crash and is handled like one.
                 tracing::error!(node = %self.local, error = %e, "raft driver stopping");
-                for (_, reply) in self.pending.drain() {
-                    let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
+                for (_, pending) in self.pending.drain() {
+                    let _ = pending
+                        .reply
+                        .send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
                 }
-                for (_, reply) in self.barriers.drain() {
-                    let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
+                for (_, pending) in self.barriers.drain() {
+                    let _ = pending
+                        .reply
+                        .send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
                 }
-                for (_, reply) in self.membership.drain() {
-                    let _ = reply.send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
+                for (_, pending) in self.membership.drain() {
+                    let _ = pending
+                        .reply
+                        .send(Err(Error::Unavailable(format!("consensus stopped: {e}"))));
                 }
                 return;
             }
             self.publish_soft_state();
+        }
+    }
+
+    fn expire_requests(&mut self, now: u64) {
+        expire(&mut self.pending, now, "proposal");
+        expire(&mut self.barriers, now, "leader barrier");
+        expire(&mut self.membership, now, "membership change");
+    }
+
+    fn pending<T>(&self, reply: oneshot::Sender<Result<T>>) -> Pending<T> {
+        Pending {
+            deadline: self.runtime.clock().monotonic_nanos() + REQUEST_TIMEOUT.as_nanos() as u64,
+            reply,
         }
     }
 
@@ -587,7 +619,8 @@ impl<R: Runtime> Driver<R> {
             .propose_conf_change(id.to_le_bytes().to_vec(), conf)
         {
             Ok(()) => {
-                self.membership.insert(id, reply);
+                let pending = self.pending(reply);
+                self.membership.insert(id, pending);
             }
             Err(error) => {
                 let _ = reply.send(Err(Error::Unavailable(format!(
@@ -606,7 +639,8 @@ impl<R: Runtime> Driver<R> {
         }
         let id = self.next_barrier;
         self.next_barrier += 1;
-        self.barriers.insert(id, reply);
+        let pending = self.pending(reply);
+        self.barriers.insert(id, pending);
         self.node.read_index(id.to_le_bytes().to_vec());
     }
 
@@ -632,7 +666,8 @@ impl<R: Runtime> Driver<R> {
             .propose(id.to_le_bytes().to_vec(), command.encode().to_vec())
         {
             Ok(()) => {
-                self.pending.insert(id, reply);
+                let pending = self.pending(reply);
+                self.pending.insert(id, pending);
             }
             Err(e) => {
                 let _ = reply.send(Err(Error::Unavailable(format!(
@@ -725,8 +760,8 @@ impl<R: Runtime> Driver<R> {
             let Ok(id) = <[u8; 8]>::try_from(state.request_ctx.as_slice()) else {
                 continue;
             };
-            if let Some(reply) = self.barriers.remove(&u64::from_le_bytes(id)) {
-                let _ = reply.send(result.clone());
+            if let Some(pending) = self.barriers.remove(&u64::from_le_bytes(id)) {
+                let _ = pending.reply.send(result.clone());
             }
         }
     }
@@ -771,8 +806,8 @@ impl<R: Runtime> Driver<R> {
                     shared.learners = learners;
                 }
                 if let Ok(id) = <[u8; 8]>::try_from(entry.context.as_slice()) {
-                    if let Some(reply) = self.membership.remove(&u64::from_le_bytes(id)) {
-                        let _ = reply.send(Ok(()));
+                    if let Some(pending) = self.membership.remove(&u64::from_le_bytes(id)) {
+                        let _ = pending.reply.send(Ok(()));
                     }
                 }
                 continue;
@@ -801,8 +836,8 @@ impl<R: Runtime> Driver<R> {
                 shared.committed.len() as LogIndex
             };
             if let Ok(id) = <[u8; 8]>::try_from(entry.context.as_slice()) {
-                if let Some(reply) = self.pending.remove(&u64::from_le_bytes(id)) {
-                    let _ = reply.send(Ok(index));
+                if let Some(pending) = self.pending.remove(&u64::from_le_bytes(id)) {
+                    let _ = pending.reply.send(Ok(index));
                 }
             }
         }
@@ -857,14 +892,14 @@ impl<R: Runtime> Driver<R> {
             // The entries may still commit under the new leader; failing with
             // NotLeader tells the caller to retry there, and the state
             // machine above the trait is what makes a duplicate harmless.
-            for (_, reply) in self.pending.drain() {
-                let _ = reply.send(Err(Error::NotLeader { leader }));
+            for (_, pending) in self.pending.drain() {
+                let _ = pending.reply.send(Err(Error::NotLeader { leader }));
             }
-            for (_, reply) in self.barriers.drain() {
-                let _ = reply.send(Err(Error::NotLeader { leader }));
+            for (_, pending) in self.barriers.drain() {
+                let _ = pending.reply.send(Err(Error::NotLeader { leader }));
             }
-            for (_, reply) in self.membership.drain() {
-                let _ = reply.send(Err(Error::NotLeader { leader }));
+            for (_, pending) in self.membership.drain() {
+                let _ = pending.reply.send(Err(Error::NotLeader { leader }));
             }
         }
         self.was_leader = is_leader;
@@ -893,6 +928,20 @@ impl<R: Runtime> Driver<R> {
                     tracing::debug!(peer = %to, error = %e, "raft message not delivered");
                 }
             });
+        }
+    }
+}
+
+fn expire<T>(pending: &mut HashMap<u64, Pending<T>>, now: u64, operation: &str) {
+    let expired: Vec<u64> = pending
+        .iter()
+        .filter_map(|(id, request)| (now >= request.deadline).then_some(*id))
+        .collect();
+    for id in expired {
+        if let Some(request) = pending.remove(&id) {
+            let _ = request.reply.send(Err(Error::Unavailable(format!(
+                "Raft {operation} did not reach quorum within {REQUEST_TIMEOUT:?}"
+            ))));
         }
     }
 }
