@@ -22,3 +22,4 @@ forward. The history of a wrong turn is worth more than a tidy directory.
 | [0006](0006-partitions-are-an-index-over-immutable-objects.md) | Partitions are a memory-resident index over immutable objects | Accepted |
 | [0007](0007-large-values-are-their-own-objects.md) | Large values are their own objects | Accepted |
 | [0008](0008-a-fenced-owner-stays-a-replica.md) | A fenced owner stays a replica | Accepted |
+| [0009](0009-a-split-shares-the-parents-segments.md) | A split shares the parent's segments in place | Accepted |

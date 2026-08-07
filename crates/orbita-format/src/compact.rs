@@ -135,6 +135,7 @@ mod tests {
     fn entry(name: &str, min_key: &str, max_key: &str, lamports: (u64, u64)) -> SegmentEntry {
         SegmentEntry {
             name: format!("segments/{name}"),
+            source: None,
             bytes: 1024,
             record_count: 1,
             min_key: Bytes::copy_from_slice(min_key.as_bytes()),

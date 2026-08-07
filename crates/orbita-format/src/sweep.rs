@@ -379,6 +379,7 @@ mod tests {
                 .into_iter()
                 .map(|name| SegmentEntry {
                     name,
+                    source: None,
                     bytes: 1024,
                     record_count: 1,
                     min_key: Bytes::from_static(b"a"),

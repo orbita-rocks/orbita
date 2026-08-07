@@ -19,7 +19,7 @@ use crate::record::{self, RecordValue, SegmentRecord};
 use crate::segment::{SegmentFooter, SegmentIndex};
 
 use bytes::Bytes;
-use orbita_core::{Lamport, Record};
+use orbita_core::{Lamport, PartitionId, Record};
 use orbita_objectstore::ObjectStore;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -106,7 +106,9 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
 
     async fn build(&mut self) -> Result<()> {
         for (position, entry) in self.manifest.segments.iter().enumerate() {
-            let key = self.path.object(&entry.name);
+            // A shared segment (a split's cross-partition reference) lives under
+            // the source partition's directory, not this one's. See ADR 0009.
+            let key = self.path.resolve_segment(entry);
 
             let tail = self
                 .store
@@ -130,6 +132,13 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
             let index = SegmentIndex::decode(&raw, &footer)?;
 
             for candidate in index.entries() {
+                // A shared segment physically holds keys on both sides of the
+                // split boundary; a child indexes only the keys in its own
+                // range, so it serves exactly what it owns. For a self-written
+                // segment every key is already in range, so this is a no-op.
+                if !self.manifest.range.contains(&candidate.key) {
+                    continue;
+                }
                 let mut located = Location {
                     segment: position,
                     offset: candidate.offset,
@@ -203,7 +212,7 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
         }
         let key = self
             .path
-            .object(&self.manifest.segments[located.segment].name);
+            .resolve_segment(&self.manifest.segments[located.segment]);
         let head = self
             .store
             .get_range(
@@ -268,10 +277,12 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
         let Some(located) = self.index.get(key).copied() else {
             return Ok(None);
         };
-        let name = &self.manifest.segments[located.segment].name;
+        let entry = &self.manifest.segments[located.segment];
+        let name = &entry.name;
+        // A shared segment lives under the source partition's directory.
         let raw = self
             .store
-            .get_range(&self.path.object(name), located.range())
+            .get_range(&self.path.resolve_segment(entry), located.range())
             .await
             .map_err(FormatError::Store)?;
         let (record, consumed) = SegmentRecord::decode(&raw)?;
@@ -301,23 +312,40 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
         if !record.is_visible_at(now_millis) {
             return Ok(None);
         }
-        let value = self.value(&record).await?;
+        // An external value written by a shared segment's owner lives under the
+        // source partition's directory, so resolve it the same way the record
+        // was resolved.
+        let source = self
+            .index
+            .get(key)
+            .and_then(|located| self.manifest.segments.get(located.segment))
+            .and_then(|entry| entry.source);
+        let value = self.value(&record, source).await?;
         Ok(Some(record.to_record(value)))
     }
 
     /// The value bytes for a record, fetching an external value if that is
     /// where they live and checking it against the record's own length and
     /// checksum.
-    pub async fn value(&self, record: &SegmentRecord) -> Result<Bytes> {
+    ///
+    /// `source` is the partition whose directory the value object lives under,
+    /// which differs from this snapshot's own partition only for a value
+    /// reached through a shared (split) segment. `None` resolves relative to
+    /// this partition, which is correct for every value it wrote itself.
+    pub async fn value(
+        &self,
+        record: &SegmentRecord,
+        source: Option<PartitionId>,
+    ) -> Result<Bytes> {
         match &record.value {
             RecordValue::Tombstone => Ok(Bytes::new()),
             RecordValue::Inline(value) => Ok(value.clone()),
             RecordValue::External(external) => {
-                let (bytes, _) = self
-                    .store
-                    .get(&self.path.object(&external.name))
-                    .await
-                    .map_err(FormatError::Store)?;
+                let owner = match source {
+                    None => self.path.object(&external.name),
+                    Some(source) => self.path.for_partition(source).object(&external.name),
+                };
+                let (bytes, _) = self.store.get(&owner).await.map_err(FormatError::Store)?;
                 if bytes.len() as u64 != external.length {
                     return Err(FormatError::Corrupt(format!(
                         "{} is {} bytes where its record claims {}",

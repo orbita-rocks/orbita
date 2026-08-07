@@ -116,6 +116,39 @@ impl PartitionPath {
         self.keyspace_id
     }
 
+    /// The directory of a sibling partition in the same keyspace, under the
+    /// same bucket root.
+    ///
+    /// A split's child references the parent's segment objects in place per
+    /// [ADR 0009](../../../docs/adr/0009-a-split-shares-the-parents-segments.md),
+    /// so a reader holding a child's path needs the parent's path to resolve a
+    /// shared object under the directory it actually lives in. The root is
+    /// recovered from this path's own prefix rather than stored, so the two
+    /// stay in step by construction.
+    #[must_use]
+    pub fn for_partition(&self, partition_id: PartitionId) -> Self {
+        let marker = format!("partitions/{}/", hex16(self.partition_id.get()));
+        let head = self
+            .prefix
+            .strip_suffix(&marker)
+            .expect("a partition path ends with its own partition id");
+        Self {
+            prefix: format!("{head}partitions/{}/", hex16(partition_id.get())),
+            keyspace_id: self.keyspace_id,
+            partition_id,
+        }
+    }
+
+    /// The full object key for a segment entry, resolving a shared reference
+    /// under the partition its object physically lives in.
+    #[must_use]
+    pub fn resolve_segment(&self, entry: &crate::manifest::SegmentEntry) -> String {
+        match entry.source {
+            None => self.object(&entry.name),
+            Some(source) => self.for_partition(source).object(&entry.name),
+        }
+    }
+
     #[must_use]
     pub fn partition_id(&self) -> PartitionId {
         self.partition_id
