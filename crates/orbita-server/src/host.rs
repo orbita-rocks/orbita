@@ -536,6 +536,18 @@ impl<R: Runtime> PartitionHost<R> {
         }
     }
 
+    /// The highest Lamport this owner's log handed back, or zero.
+    ///
+    /// Asked before a partition is reopened in place, because a reopen above
+    /// this mark reissues versions a replica may still hold different bytes
+    /// for, and only a higher epoch makes a replica give that tail up. See
+    /// [`orbita_wal::Wal::surrendered_lamport`].
+    pub(crate) fn surrendered_lamport(&self) -> Lamport {
+        self.wal
+            .as_ref()
+            .map_or(Lamport::ZERO, |wal| wal.surrendered_lamport())
+    }
+
     /// Quiesces this partition and durably prepares both split children over
     /// its segments, returning the committed prefix the children inherit.
     ///
@@ -1364,11 +1376,26 @@ impl<R: Runtime> PartitionHost<R> {
     }
 
     /// A newer owner said this replica's history ends at `above`.
+    ///
+    /// The withheld queue is cut to match, and that half is load-bearing rather
+    /// than tidy. An entry sits withheld from the moment it is durable until
+    /// the owner says it was acknowledged, so a tail the log just dropped is
+    /// still queued here — waiting on a commit watermark that is never coming.
+    /// The new owner resumes from the cut and reissues those Lamports with
+    /// different bytes, and both copies would end up in this queue. Applies run
+    /// in Lamport order and storage ignores a mutation at or below its
+    /// committed Lamport, so the stale copy would apply first and the
+    /// replacement would be silently discarded — this replica would serve the
+    /// value the cluster threw away.
     pub(crate) fn truncated(&self, above: Lamport) {
         self.read_state
             .lock()
             .expect("read state poisoned")
             .truncated(above);
+        self.withheld
+            .lock()
+            .expect("withheld entries poisoned")
+            .retain(|entry| entry.lamport <= above);
     }
 
     /// Takes an entry this node received as a replica.
@@ -1887,6 +1914,66 @@ mod tests {
         assert_eq!(manifest.segments.len(), 1);
         assert_eq!(checkpoint, manifest.committed_lamport);
         assert_eq!(segment.records()[0].key, Bytes::from_static(b"key"));
+    }
+
+    #[test]
+    fn a_truncation_drops_the_entries_a_replica_was_holding_for_release() {
+        // A replica keeps an entry between "durable in my log" and "the owner
+        // says it was acknowledged". A truncation cuts the log, and this queue
+        // has to go with it: the new owner resumes from the cut and reissues
+        // those Lamports, so both copies would sit here, applies run in order,
+        // and storage ignores a mutation at or below its committed Lamport. The
+        // surrendered entry would win and the reissue would be dropped without
+        // a word — this replica serving the value the cluster discarded, and
+        // missing the one it kept.
+        let sim = Simulation::new(16);
+        let store = Arc::new(FaultStore::new());
+        let replica = start_replica(&sim, sim.add_node(NodeId(1)), Arc::clone(&store));
+        let entry = |lamport: u64, key: &'static str| WalEntry {
+            lamport: Lamport(lamport),
+            epoch: Epoch(1),
+            partition: PartitionId(1),
+            op: WalOp::Put {
+                key: Bytes::from_static(key.as_bytes()),
+                value: Bytes::from_static(b"value"),
+                expires_at_millis: None,
+            },
+        };
+        let queue = |entry: WalEntry| {
+            let replica = Arc::clone(&replica);
+            sim.block_on(async move { replica.apply_replicated(&entry).await.unwrap() });
+        };
+        let release = |through: u64| {
+            let replica = Arc::clone(&replica);
+            sim.block_on(async move { replica.commit_through(Lamport(through)).await });
+        };
+        let holds = |key: &'static str| {
+            let replica = Arc::clone(&replica);
+            sim.block_on(async move { replica.get(key.as_bytes()).await.unwrap().is_some() })
+        };
+
+        queue(entry(1, "committed"));
+        queue(entry(2, "surrendered"));
+        release(1);
+        assert_eq!(
+            replica.withheld_len(),
+            1,
+            "the entry above the owner's watermark is held, not applied"
+        );
+
+        // The owner gave Lamport 2 back and reopened above this replica's
+        // epoch, so it says history ends at 1.
+        replica.truncated(Lamport(1));
+        queue(entry(2, "reissued"));
+        release(2);
+
+        assert!(holds("reissued"), "the reissued entry must reach storage");
+        assert!(
+            !holds("surrendered"),
+            "a replica that applied the entry its owner handed back is serving a value no client \
+             was ever told about, under a version that now means something else"
+        );
+        assert!(holds("committed"), "and committed history is untouched");
     }
 
     #[test]

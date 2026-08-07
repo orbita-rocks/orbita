@@ -74,6 +74,18 @@ Concretely:
   drops the cross-partition references. Once no live manifest names a parent
   segment, the sweep reclaims it under the cross-partition liveness rule above.
 
+- **Abandoning a split raises the parent's epoch, in the same replicated entry
+  that abandons it.** Preparing the children quiesces the parent, which hands
+  back every Lamport above the committed prefix. A reopened parent resumes
+  assigning from that prefix, so it will issue those Lamports again. They can
+  still be on a replica — the append landed and only the reply was lost — and a
+  replica gives its tail up for a strictly higher epoch and nothing else. Every
+  path that drops a pending split therefore bumps the epoch: `AbortSplit`,
+  `SetReplicas` when it displaces a required holder, and `FencePartition`, which
+  already did. The holder reopening the parent fences its replicas back to the
+  horizon it resumes from before it admits a write, and refuses to reopen at all
+  if it surrendered Lamports and the epoch has not moved.
+
 ## Consequences
 
 **The orphan sweep becomes cross-partition, and this is the dangerous part.**
@@ -93,6 +105,17 @@ delete a segment its about-to-exist children already reference.
 inherits the parent's committed horizon and allocates above it. No key's version
 is reissued or moved backward by a split, because the records themselves are the
 same objects with the same Lamports.
+
+**An abandoned split costs the parent an epoch, and that is the price of
+preserving ADR 0002 on the way back.** The quiesce that makes the split safe is
+one-way by construction: it drops the uncommitted tail so the children's horizon
+is final. Coming back from it means resuming below where the log once stood,
+which is the one situation in Orbita where a version can be issued twice. The
+epoch is what buys the truncation that makes it safe, so the abort pays for it.
+The reopen is otherwise in place: same owner, same replicas, same whole range —
+only the epoch moves. An abort therefore invalidates a caller's cached epoch,
+and a retried split re-reads the map rather than reusing the epoch it opened the
+first attempt against.
 
 **ADR 0006 is extended, not contradicted.** Partitions remain an index over
 immutable objects. The one sentence in ADR 0006's model that this changes is the

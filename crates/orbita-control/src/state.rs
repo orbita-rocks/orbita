@@ -930,10 +930,22 @@ impl ClusterState {
         // replace it — but that replacement can never be one of the holders the
         // split is still waiting on, so a split held open against a dead
         // replica would wedge forever. A replica-set change therefore *aborts*
-        // the split rather than being blocked by it. The parent is untouched
-        // and still covers its whole range, so nothing is lost; the split is
-        // simply reopened once the set has settled. This is the P1-review's P2.
-        self.pending_splits.remove(&partition);
+        // the split rather than being blocked by it. The parent still covers
+        // its whole range, so nothing is lost; the split is simply reopened
+        // once the set has settled. This is the P1-review's P2.
+        //
+        // Abandoning it here carries the same epoch bump `abort_split` does,
+        // and for the same reason: a parent that was quiesced for the split has
+        // handed Lamports back, and it cannot reissue them at an epoch its
+        // replicas already hold. Every path that drops a pending split bumps
+        // the parent's epoch — this one, `abort_split`, and `fence_partition` —
+        // so a holder can treat "my split is gone" and "my epoch moved" as one
+        // event. Conditioned on there having *been* a split, so an ordinary
+        // replica placement still costs no reopen.
+        let abandoned_split = self.pending_splits.remove(&partition).is_some();
+        if abandoned_split {
+            info.epoch = info.epoch.next();
+        }
         if info.owner.is_some_and(|o| replicas.contains(&o)) {
             return Err(Error::InvalidArgument(
                 "the owner must not also be listed as a replica".into(),
@@ -1179,14 +1191,39 @@ impl ClusterState {
         Ok(())
     }
 
-    /// Abandons a pending split, leaving the parent exactly as it was.
+    /// Abandons a pending split, leaving the parent covering its whole range at
+    /// a new epoch.
+    ///
+    /// The epoch bump is the point of this entry, not bookkeeping around it,
+    /// and it is in the same entry as the abandonment for the same reason
+    /// [`ClusterState::fence_partition`] puts one there: there must be no
+    /// committed state in which the split is off and the parent's epoch still
+    /// stands.
+    ///
+    /// The owner quiesced its log to prepare the children, which hands back
+    /// every Lamport above the committed prefix. Those Lamports can still be on
+    /// a replica — the append landed and the reply was lost — and the reopened
+    /// parent resumes assigning from the prefix, so it is about to issue them
+    /// again with different bytes under them. A replica gives its tail up for a
+    /// strictly higher epoch and nothing else; at an unchanged epoch it would
+    /// skip the replacement as a retransmission without comparing bytes,
+    /// acknowledge it, and go on holding the original. That is two values at
+    /// one version, a divergent replica read, and the replacement lost if that
+    /// replica is later promoted. The bump is what lets the reopening owner
+    /// fence its replicas back to the horizon it resumes from.
+    ///
+    /// Ownership is untouched, unlike a fence: the parent was never in doubt,
+    /// only its split was. The holder reopens itself at the new epoch through
+    /// the ordinary reconcile path.
     fn abort_split(&mut self, parent: PartitionId, expect_epoch: Epoch) -> Result<()> {
-        self.check_epoch(parent, expect_epoch)?;
+        let mut info = self.check_epoch(parent, expect_epoch)?;
         if self.pending_splits.remove(&parent).is_none() {
             return Err(Error::InvalidArgument(format!(
                 "partition {parent} is not splitting"
             )));
         }
+        info.epoch = info.epoch.next();
+        self.replace_partition(info);
         self.bump_map_version();
         Ok(())
     }
@@ -1929,11 +1966,10 @@ mod tests {
     }
 
     #[test]
-    fn an_aborted_split_leaves_the_parent_exactly_as_it_was() {
+    fn an_aborted_split_leaves_the_parent_covering_its_range_at_a_new_epoch() {
         let mut state = bootstrapped();
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
-        let before_partition = state.map().partition(parent.id).unwrap().clone();
         state
             .apply(&ControlCommand::BeginSplit {
                 parent: parent.id,
@@ -1951,10 +1987,67 @@ mod tests {
             .unwrap();
 
         assert!(!state.is_splitting(parent.id));
-        assert_eq!(state.map().partition(parent.id).unwrap(), &before_partition);
+        let after = state.map().partition(parent.id).unwrap().clone();
+        // Everything about the parent is as it was except the epoch. Nothing
+        // moved, nothing was handed to anyone else, and the range is whole.
+        assert_eq!(after.range, parent.range);
+        assert_eq!(after.owner, parent.owner);
+        assert_eq!(after.replicas, parent.replicas);
+        assert_eq!(state.map().check_coverage(), Ok(()));
+        assert_eq!(
+            after.epoch,
+            parent.epoch.next(),
+            "the owner quiesced its log for this split and gave Lamports back; it may only \
+             reissue them under an epoch that lets it truncate its replicas first"
+        );
         // The child ids were reserved and are not reused, so a fresh split
         // takes new numbers rather than the abandoned ones.
         assert!(state.next_partition_id().get() > 11);
+    }
+
+    #[test]
+    fn every_way_of_dropping_a_pending_split_raises_the_parents_epoch() {
+        // The invariant a reopening holder relies on: "my split is gone" and
+        // "my epoch moved" are one event, whichever entry did the dropping. A
+        // path that abandoned a split at an unchanged epoch would let the
+        // parent resume assigning Lamports its quiesce handed back, under an
+        // epoch no replica will truncate for.
+        for drop_it in [
+            &(|parent: &PartitionInfo| ControlCommand::AbortSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            }) as &dyn Fn(&PartitionInfo) -> ControlCommand,
+            &|parent: &PartitionInfo| ControlCommand::SetReplicas {
+                partition: parent.id,
+                replicas: vec![parent.replicas[0]],
+                expect_epoch: parent.epoch,
+            },
+            &|parent: &PartitionInfo| ControlCommand::FencePartition {
+                partition: parent.id,
+                expect_epoch: parent.epoch,
+            },
+        ] {
+            let mut state = bootstrapped();
+            set_version(&mut state, PROTOCOL_0_1);
+            let parent = state.map().partitions().next().unwrap().clone();
+            state
+                .apply(&ControlCommand::BeginSplit {
+                    parent: parent.id,
+                    at: Bytes::from_static(b"m"),
+                    lower: PartitionId(10),
+                    upper: PartitionId(11),
+                    expect_epoch: parent.epoch,
+                })
+                .unwrap();
+            let command = drop_it(&parent);
+            state.apply(&command).unwrap();
+            assert!(!state.is_splitting(parent.id), "{command:?} dropped it");
+            assert_eq!(
+                state.map().partition(parent.id).unwrap().epoch,
+                parent.epoch.next(),
+                "{command:?} dropped a pending split without raising the parent's epoch"
+            );
+        }
     }
 
     #[test]
@@ -1962,8 +2055,8 @@ mod tests {
         // The P2 from the split review: if a required replica dies after the
         // split began, it can never be marked prepared. Repair replaces it with
         // a SetReplicas, and that has to be able to proceed — so it aborts the
-        // split rather than being blocked by it. The parent is left exactly as
-        // it was, ready for the split to be reopened once the set settles.
+        // split rather than being blocked by it. The parent keeps its whole
+        // range, ready for the split to be reopened once the set settles.
         let mut state = bootstrapped();
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();

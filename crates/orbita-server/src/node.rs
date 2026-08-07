@@ -43,8 +43,8 @@ use bytes::Bytes;
 use orbita_control::Permission;
 use orbita_control::{SplitIntentSnapshot, WireSplitIntent};
 use orbita_core::{
-    Error, KeyspaceId, KeyspaceInfo, NodeId, PartitionId, PartitionInfo, PartitionMap, Result,
-    Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
+    Error, KeyspaceId, KeyspaceInfo, Lamport, NodeId, PartitionId, PartitionInfo, PartitionMap,
+    Result, Version, MAX_KEY_BYTES, MAX_LIST_BYTES, MAX_LIST_LIMIT, MAX_VALUE_BYTES,
     MESSAGE_OVERHEAD_BYTES,
 };
 use orbita_format::{load_manifest, PartitionPath};
@@ -1861,6 +1861,23 @@ impl<R: Runtime> Node<R> {
 
     /// Recreates an aborted split parent because WAL quiescence is deliberately
     /// irreversible within one host incarnation.
+    ///
+    /// Refuses to do it at the epoch the parent quiesced under, once that
+    /// quiesce actually handed Lamports back. Those Lamports can be on a
+    /// replica whose acknowledgement was lost on the way home, and a reopened
+    /// owner resumes assigning from the committed prefix, so reissuing them at
+    /// an unchanged epoch would put new bytes under a version a replica already
+    /// holds — which it would skip as a retransmission without comparing bytes,
+    /// acknowledge, and keep the original for. The abandoning control-plane
+    /// entry bumps the parent's epoch for exactly this reason (see
+    /// `orbita_control` state machine's `abort_split`); until that entry is visible here the
+    /// parent stays closed, which costs availability on one partition and is
+    /// the only direction that cannot reissue a version.
+    ///
+    /// A quiesce that dropped nothing is not affected. Nothing was handed back,
+    /// so nothing can be reissued, and the parent reopens in place — which is
+    /// the ordinary case, since the tail only exists when a write was in flight
+    /// to a replica that never answered.
     async fn reopen_aborted_split_parent(&self, parent: PartitionId) -> Result<()> {
         let map = self.map();
         let info = map
@@ -1878,6 +1895,15 @@ impl<R: Runtime> Node<R> {
         if held.is_admitting_writes() && held.is_admitting_leases() && !held.is_maintenance_frozen()
         {
             return Ok(());
+        }
+        let surrendered = held.surrendered_lamport();
+        if surrendered > Lamport::ZERO && info.epoch <= held.epoch() {
+            return Err(Error::Unavailable(format!(
+                "partition {parent} gave up its log through {surrendered} while quiescing for a \
+                 split and cannot reopen at epoch {} without reissuing those versions; waiting \
+                 for the abort to raise its epoch",
+                info.epoch
+            )));
         }
         hosts.remove(&parent);
         self.wal_service.unregister(parent);

@@ -1150,12 +1150,12 @@ fn an_aborted_generations_acknowledgement_does_not_prepare_its_retry() {
     let parent = cluster.only_partition();
     let info = cluster.map().partition(parent).unwrap().clone();
     let owner = info.owner.unwrap();
-    let begin = move |lower, upper| ControlCommand::BeginSplit {
+    let begin = move |lower, upper, expect_epoch| ControlCommand::BeginSplit {
         parent,
         at: Bytes::from_static(b"m"),
         lower,
         upper,
-        expect_epoch: info.epoch,
+        expect_epoch,
     };
 
     cluster
@@ -1164,7 +1164,7 @@ fn an_aborted_generations_acknowledgement_does_not_prepare_its_retry() {
             let controller = cluster.controller.clone();
             async move {
                 controller
-                    .submit(begin(PartitionId(10), PartitionId(11)))
+                    .submit(begin(PartitionId(10), PartitionId(11), info.epoch))
                     .await
             }
         })
@@ -1202,13 +1202,19 @@ fn an_aborted_generations_acknowledgement_does_not_prepare_its_retry() {
             }
         })
         .unwrap();
+    // The abort raised the parent's epoch, because a parent that quiesced for
+    // the split gave Lamports back and may not reissue them under an epoch its
+    // replicas still hold. A retry therefore re-reads the map rather than
+    // reusing the epoch it opened the first attempt against.
+    let after_abort = cluster.map().partition(parent).unwrap().epoch;
+    assert_eq!(after_abort, info.epoch.next());
     cluster
         .sim
         .block_on({
             let controller = cluster.controller.clone();
             async move {
                 controller
-                    .submit(begin(PartitionId(12), PartitionId(13)))
+                    .submit(begin(PartitionId(12), PartitionId(13), after_abort))
                     .await
             }
         })
