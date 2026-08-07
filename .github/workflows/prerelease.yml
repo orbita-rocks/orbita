@@ -4,10 +4,14 @@ name: Prerelease
 #
 # The point is that there is always something to install that is newer than the
 # last release, without paying for an emulated ARM build after every merge. A
-# bug report can still be answered with "try develop", and a build needed
+# bug report can still be answered with "try 0.2.0-dev", and a build needed
 # sooner can be dispatched by hand. These artifacts are deliberately less than
 # a release: no GitHub release, no chart. They are for people who already know
 # what develop is.
+#
+# Every tag carries a version. There is no branch-named tag, because a tag
+# called `develop` says nothing about what is inside it: two pulls a release
+# apart get incompatible binaries with no way to tell from the name.
 #
 # The version does not change per commit. develop sits at the next version with
 # a -dev suffix, and the commit is identified by the sha in the image tag and
@@ -53,12 +57,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The -dev version has to exist as a tag because develop's own install
-      # paths pin it: bump-version.sh writes the workspace version into the
-      # image tags in deploy/manifests/orbita.yaml and into the chart's
-      # appVersion, which values.yaml defaults the image tag to. Without this
-      # step both of those resolve to something never pushed, so applying the
-      # manifests straight off develop is an ImagePullBackOff.
+      # The -dev version is the only human-readable tag this workflow pushes,
+      # and develop's own install paths pin it: bump-version.sh writes the
+      # workspace version into the image tags in deploy/manifests/orbita.yaml
+      # and into the chart's appVersion, which values.yaml defaults the image
+      # tag to. Without this step both of those resolve to something never
+      # pushed, so applying the manifests straight off develop is an
+      # ImagePullBackOff.
       - id: version
         name: Read the version develop's manifests pin
         run: |
@@ -71,26 +76,31 @@ jobs:
           fi
           echo "version=$version" >>"$GITHUB_OUTPUT"
 
-          # Only a prerelease version gets a version tag. This workflow can be
-          # dispatched against any ref, and on a released version that would
-          # push a develop build to the name of a real release, silently
-          # replacing it.
+          # A non-dev version would put a develop build at the name of a real
+          # release, silently replacing it. This workflow takes a bare
+          # workflow_dispatch and does not pin its checkout, so that is a ref
+          # away rather than impossible. Failing is right: the version tag is
+          # the only one anybody reads, so publishing without it would leave a
+          # build reachable solely by sha and look like nothing happened.
           case "$version" in
-            *-dev) echo "dev=true" >>"$GITHUB_OUTPUT" ;;
-            *)     echo "dev=false" >>"$GITHUB_OUTPUT"
-                   echo "::notice::$version is not a -dev version, so no version tag was published" ;;
+            *-dev) ;;
+            *)
+              echo "::error::$version is not a -dev version. Prerelease publishes"
+              echo "::error::versioned tags only, and pushing this one would replace a release."
+              exit 1
+              ;;
           esac
 
-      # `develop` and the -dev version both float; `sha-` is immutable.
-      # Anything reproducing a problem should be quoting the sha tag, because
-      # the other two will have moved by the time anybody reads the report.
+      # The -dev version floats, because it names a cycle rather than a build,
+      # and `sha-` is immutable. Anything reproducing a problem should quote
+      # the sha tag, since the version tag will have moved by the time anybody
+      # reads the report.
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=develop
-            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.dev }}
+            type=raw,value=${{ steps.version.outputs.version }}
             type=sha,prefix=sha-,format=short
 
       - uses: docker/build-push-action@v6
