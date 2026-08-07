@@ -1863,6 +1863,102 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_merge_preserves_equal_source_versions_and_allocates_above_both_horizons() {
+        // ADR 0002 deliberately permits two keys inherited from independent
+        // parents to carry the same version. Merge must preserve both tokens,
+        // then continue strictly above the greatest source horizon.
+        let (parent, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        parent
+            .put(b"a", bytes("parent-low"), None, WriteCondition::None)
+            .await
+            .unwrap();
+        parent
+            .put(b"z", bytes("parent-high"), None, WriteCondition::None)
+            .await
+            .unwrap();
+        let (low_range, high_range) = parent.range().clone().split_at(bytes("m")).unwrap();
+        parent
+            .prepare_child_partitions(&[
+                ChildSpec {
+                    id: PartitionId(2),
+                    epoch: Epoch(2),
+                    range: low_range.clone(),
+                },
+                ChildSpec {
+                    id: PartitionId(3),
+                    epoch: Epoch(2),
+                    range: high_range.clone(),
+                },
+            ])
+            .await
+            .unwrap();
+        let low = open_child(&store, &clock, PartitionId(2), Epoch(2), low_range).await;
+        let high = open_child(&store, &clock, PartitionId(3), Epoch(2), high_range).await;
+
+        low.put(
+            Lamport(3),
+            b"b",
+            bytes("equal-low"),
+            None,
+            WriteCondition::None,
+        )
+        .await
+        .unwrap();
+        high.put(
+            Lamport(3),
+            b"y",
+            bytes("equal-high"),
+            None,
+            WriteCondition::None,
+        )
+        .await
+        .unwrap();
+        low.flush().await.unwrap();
+        high.flush().await.unwrap();
+
+        let merged = ChildSpec {
+            id: PartitionId(4),
+            epoch: Epoch(3),
+            range: KeyRange::unbounded(),
+        };
+        let horizon = low
+            .prepare_merged_partition(&high, &merged)
+            .await
+            .expect("prepare a shared-segment merge");
+        assert_eq!(horizon, Lamport(3));
+
+        let merged = open_child(
+            &store,
+            &clock,
+            PartitionId(4),
+            Epoch(3),
+            KeyRange::unbounded(),
+        )
+        .await;
+        assert_eq!(merged.get(b"b").await.unwrap().unwrap().version, Version(3));
+        assert_eq!(merged.get(b"y").await.unwrap().unwrap().version, Version(3));
+        assert_eq!(merged.get(b"a").await.unwrap().unwrap().version, Version(1));
+        assert_eq!(merged.get(b"z").await.unwrap().unwrap().version, Version(2));
+        merged
+            .put(
+                Lamport(4),
+                b"n",
+                bytes("first-after-merge"),
+                None,
+                WriteCondition::None,
+            )
+            .await
+            .expect("the first merged write is above both source horizons");
+        assert_eq!(merged.get(b"n").await.unwrap().unwrap().version, Version(4));
+
+        assert!(
+            segment_objects(&store, 4).is_empty(),
+            "merge preparation copies no source segment bytes"
+        );
+    }
+
     /// The relative names of the segment objects physically under one
     /// partition's directory, for a test that watches compaction delete them.
     fn segment_objects(store: &orbita_format::testing::MemoryStore, id: u64) -> Vec<String> {

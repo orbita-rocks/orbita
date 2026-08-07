@@ -1836,6 +1836,148 @@ mod tests {
         }
     }
 
+    fn merge_generation(
+        lower: &PartitionInfo,
+        upper: &PartitionInfo,
+        merged: u64,
+    ) -> crate::command::MergeGeneration {
+        crate::command::MergeGeneration {
+            lower: lower.id,
+            upper: upper.id,
+            lower_epoch: lower.epoch,
+            upper_epoch: upper.epoch,
+            merged: PartitionId(merged),
+            boundary: Bytes::from_static(b"m"),
+            range: KeyRange::unbounded(),
+        }
+    }
+
+    #[test]
+    fn a_merge_prepares_before_atomically_replacing_both_adjacent_parents() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        let generation = merge_generation(&lower, &upper, 12);
+        let before = state.map().clone();
+
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: generation.clone(),
+            })
+            .unwrap();
+        assert_eq!(state.map().check_coverage(), Ok(()));
+        assert_eq!(state.map(), &before, "beginning a merge moves no key");
+        assert!(state.is_merging(lower.id));
+        assert!(state.is_merging(upper.id));
+
+        let holders = holders(&lower);
+        for holder in &holders[..holders.len() - 1] {
+            state
+                .apply(&ControlCommand::MarkMergePrepared {
+                    generation: generation.clone(),
+                    node: *holder,
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            state.apply(&ControlCommand::CompleteMerge {
+                generation: generation.clone(),
+            }),
+            Err(Error::Unavailable(_))
+        ));
+        assert_eq!(state.map(), &before);
+
+        state
+            .apply(&ControlCommand::MarkMergePrepared {
+                generation: generation.clone(),
+                node: *holders.last().unwrap(),
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::CompleteMerge {
+                generation: generation.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(state.map().check_coverage(), Ok(()));
+        assert!(state.map().partition(lower.id).is_none());
+        assert!(state.map().partition(upper.id).is_none());
+        let merged = state.map().partition(generation.merged).unwrap();
+        assert_eq!(merged.range, KeyRange::unbounded());
+        assert_eq!(
+            state.map().lookup(parent.keyspace, b"a").unwrap().id,
+            merged.id
+        );
+        assert_eq!(
+            state.map().lookup(parent.keyspace, b"z").unwrap().id,
+            merged.id
+        );
+    }
+
+    #[test]
+    fn a_delayed_merge_ack_cannot_apply_to_a_retried_generation() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        let stale = merge_generation(&lower, &upper, 12);
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: stale.clone(),
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::AbortMerge {
+                generation: stale.clone(),
+            })
+            .unwrap();
+
+        let lower = state.map().partition(lower.id).unwrap().clone();
+        let upper = state.map().partition(upper.id).unwrap().clone();
+        let current = merge_generation(&lower, &upper, 13);
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: current,
+            })
+            .unwrap();
+        assert!(state
+            .apply(&ControlCommand::MarkMergePrepared {
+                generation: stale,
+                node: lower.owner.unwrap(),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn split_and_merge_decisions_are_mutually_exclusive() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            })
+            .unwrap();
+
+        assert!(state
+            .apply(&ControlCommand::BeginSplit {
+                parent: lower.id,
+                at: Bytes::from_static(b"g"),
+                lower: PartitionId(13),
+                upper: PartitionId(14),
+                expect_epoch: lower.epoch,
+            })
+            .is_err());
+    }
+
     #[test]
     fn the_worker_prepared_split_needs_protocol_0_1_so_old_logs_still_replay() {
         // A 0.0 cluster, and every mid-rollout member behaving as one, refuses
