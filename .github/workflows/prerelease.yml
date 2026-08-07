@@ -1,12 +1,11 @@
 name: Prerelease
 
-# What the latest develop produces each night, or when requested by hand.
+# What a push to develop produces.
 #
 # The point is that there is always something to install that is newer than the
-# last release, without paying for an emulated ARM build after every merge. A
-# bug report can still be answered with "try 0.2.0-dev", and a build needed
-# sooner can be dispatched by hand. These artifacts are deliberately less than
-# a release: no GitHub release, no chart. They are for people who already know
+# last release, so a bug report can be answered with "try 0.2.0-dev" instead of
+# "wait for 0.2.0". These artifacts are deliberately less than a release: no
+# GitHub release, no `latest`, no chart. They are for people who already know
 # what develop is.
 #
 # Every tag carries a version. There is no branch-named tag, because a tag
@@ -18,15 +17,9 @@ name: Prerelease
 # by the sha the binary reports in --version.
 
 on:
-  schedule:
-    - cron: "0 8 * * *"
+  push:
+    branches: [develop]
   workflow_dispatch:
-
-# Both triggers publish the same moving tag. If somebody requests a build while
-# the nightly is still running, only the newer result is worth finishing.
-concurrency:
-  group: prerelease-develop
-  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,16 +32,81 @@ permissions:
   contents: read
 
 jobs:
+  # Each architecture builds on its own native runner and pushes an untagged
+  # image by digest; the image job below stitches the digests into one tagged
+  # multi-arch manifest. Building both platforms on one runner would put the
+  # arm64 half through QEMU emulation, which turns a minutes-long Rust build
+  # into hours.
+  image-build:
+    name: container image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: BUILD_JOBS=8
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      # The digest is the only thing the merge job needs, carried as an empty
+      # file named after it.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
   image:
     name: container image
+    needs: image-build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
+      # This job stitches digests together and would otherwise need no source,
+      # but the tag it stamps on the manifest comes from the workspace version
+      # in Cargo.toml. Checkout runs first because it cleans the workspace, and
+      # the digests land outside it in /tmp.
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digests
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -103,16 +161,12 @@ jobs:
             type=raw,value=${{ steps.version.outputs.version }}
             type=sha,prefix=sha-,format=short
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: BUILD_JOBS=8
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Merge the digests into a multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
 
   binary:
     name: linux binary
@@ -146,44 +200,5 @@ jobs:
         with:
           name: orbita-develop-x86_64-unknown-linux-gnu
           path: target/release/orbita
-          # A prerelease is a short-lived diagnostic. Releases own durable
-          # artifacts, while seven days covers the useful life of develop.
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: error
-
-  cleanup:
-    name: expire old prerelease images
-    needs: image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Delete SHA-only images older than 30 days
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-            const versions = await github.paginate(
-              github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
-              {
-                org: context.repo.owner,
-                package_type: 'container',
-                package_name: 'orbita',
-                per_page: 100,
-              },
-            );
-
-            for (const version of versions) {
-              const tags = version.metadata?.container?.tags ?? [];
-              const shaOnly = tags.length > 0 && tags.every((tag) => tag.startsWith('sha-'));
-              if (!shaOnly || Date.parse(version.updated_at) >= cutoff) {
-                continue;
-              }
-              await github.rest.packages.deletePackageVersionForOrg({
-                org: context.repo.owner,
-                package_type: 'container',
-                package_name: 'orbita',
-                package_version_id: version.id,
-              });
-            }
