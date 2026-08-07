@@ -92,15 +92,17 @@ def test_two_clients_racing_to_acquire_a_lock_produce_exactly_one_winner(node):
     the other must report `applied=False`, and must then be able to learn who
     holds the lock so it can back off rather than assume it holds.
 
-    Product finding this test pins down: under a genuine race the losing
-    `if_not_present` comes back with `applied=False` but with `current_version`
-    UNSET, even though the sequential loser in test_conditions.py is promised the
-    winner's version. So a client cannot rely on the response alone to discover
-    the holder after a contended acquire; it has to re-`Get` the key. The
-    guaranteed signal is `applied`; `current_version` on a lost `if_not_present`
-    is best-effort and absent exactly when contention is highest. This test
-    therefore asserts the durable property (one winner, loser recovers by
-    reading) rather than the version echo the uncontended path happens to give.
+    The loser learns that from `current_version` in its own response, not from
+    a follow-up `Get`. That distinction is the whole value of the primitive: a
+    second round trip to find the holder reopens the race the conditional write
+    was supposed to settle atomically, and it is exactly the round trip a client
+    cannot make safely. So this asserts the same contract the sequential loser
+    in test_conditions.py gets, because whether contention happened to be
+    concurrent or sequential is not something a client controls or should be
+    able to observe.
+
+    The follow-up `Get` is still here, checked against the same version, to
+    prove the response and the store agree about who holds the lock.
     """
     a, b = _client(node), _client(node)
     results: dict[str, object] = {}
@@ -127,18 +129,26 @@ def test_two_clients_racing_to_acquire_a_lock_produce_exactly_one_winner(node):
     assert len(losers) == 1
 
     winner = results[winners[0]]
+    loser = results[losers[0]]
 
-    # The loser observes the loss and recovers the holder by reading the key.
-    # This is the path a real client must take, because current_version on a
-    # contended if_not_present is not guaranteed (see the docstring). The held
-    # value and the winner's version are both visible on a follow-up Get.
+    # The loser identifies the holder from its own response. Without this a
+    # losing client has to re-Get the key, and between the loss and the read the
+    # lock can be released and retaken, so what it reads back is not necessarily
+    # what beat it.
+    assert loser.HasField("current_version"), (
+        "a contended if_not_present loser must be told which version beat it, "
+        "the same as a loser that arrived second"
+    )
+    assert loser.current_version == winner.version, (
+        "the version the loser is told is the one it must watch to see the lock "
+        "freed, so it has to be the winning write's"
+    )
+
+    # And the store agrees with what the loser was told.
     loser_client = a if losers[0] == "a" else b
     held = loser_client.Get(kv_pb2.GetRequest(keyspace=KS, key=b"race/lock"))
     assert held.found, "the loser must be able to see the lock is held"
-    assert held.version == winner.version, (
-        "reading after a lost acquire reveals the winning version, which is how "
-        "the loser learns which version to watch to see the lock freed"
-    )
+    assert held.version == winner.version
 
 
 def test_a_lease_holder_discovers_expiry_when_its_next_guarded_op_is_refused(node):
