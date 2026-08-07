@@ -707,6 +707,7 @@ impl<R: Runtime> PartitionHost<R> {
     /// clock-domain contract the deletion decision rests on.
     pub(crate) async fn sweep_orphans(
         &self,
+        shared: &std::collections::BTreeSet<String>,
         grace_millis: u64,
         max_skew_millis: u64,
         dry_run: bool,
@@ -718,8 +719,17 @@ impl<R: Runtime> PartitionHost<R> {
             });
         }
         self.storage
-            .sweep_orphans(grace_millis, max_skew_millis, dry_run)
+            .sweep_orphans(shared, grace_millis, max_skew_millis, dry_run)
             .await
+    }
+
+    /// The segments this host references in place under other partitions'
+    /// directories, grouped by the partition each lives under. See ADR 0009 and
+    /// [`Node::sweep_owned`].
+    pub(crate) async fn shared_segment_sources(
+        &self,
+    ) -> std::collections::BTreeMap<PartitionId, std::collections::BTreeSet<String>> {
+        self.storage.shared_segment_sources().await
     }
 
     /// Evaluates the condition, commits through the log, and answers the

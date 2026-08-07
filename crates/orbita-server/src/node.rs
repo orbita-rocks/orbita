@@ -1682,16 +1682,31 @@ impl<R: Runtime> Node<R> {
     /// survives one pass is reclaimed on the next, and a store that is refusing
     /// deletes has a louder problem than leaked space.
     pub(crate) async fn sweep_owned(&self, grace_millis: u64, skew_millis: u64, dry_run: bool) {
-        let hosts: Vec<Arc<PartitionHost<R>>> = self
-            .hosts
-            .read()
-            .await
-            .values()
-            .filter(|host| host.is_owner())
-            .cloned()
-            .collect();
-        for host in hosts {
-            match host.sweep_orphans(grace_millis, skew_millis, dry_run).await {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self.hosts.read().await.values().cloned().collect();
+
+        // Which of one partition's objects a sibling still references in place,
+        // per ADR 0009. Gathered across every partition this node holds a copy
+        // of — owner or replica — so a split child's reference to the parent's
+        // segments protects them when the parent is swept. A child owned only
+        // by another node is not visible here; the split protocol freezes a
+        // parent's sweep for the split's duration to cover that window.
+        let mut shared_by_source: std::collections::BTreeMap<
+            PartitionId,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for host in &hosts {
+            for (source, names) in host.shared_segment_sources().await {
+                shared_by_source.entry(source).or_default().extend(names);
+            }
+        }
+
+        let empty = std::collections::BTreeSet::new();
+        for host in hosts.into_iter().filter(|host| host.is_owner()) {
+            let shared = shared_by_source.get(&host.id()).unwrap_or(&empty);
+            match host
+                .sweep_orphans(shared, grace_millis, skew_millis, dry_run)
+                .await
+            {
                 Ok(report) if report.deleted.is_empty() => {}
                 Ok(report) if report.dry_run => tracing::info!(
                     partition = host.id().get(),

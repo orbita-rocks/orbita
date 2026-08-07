@@ -44,12 +44,12 @@ use orbita_core::{
 };
 use orbita_format::segment::{Segment, SegmentBuilder};
 use orbita_format::{
-    compact, load_manifest, sweep_partition, CommitPlan, FormatError, PartitionPath,
-    PartitionWriter, RecordValue, SegmentEntry, SegmentRecord, Snapshot, SweepReport,
+    compact, load_manifest, CommitPlan, FormatError, PartitionPath, PartitionWriter, RecordValue,
+    SegmentEntry, SegmentRecord, Snapshot, SweepReport,
 };
 use orbita_objectstore::{ObjectError, ObjectStore};
 use orbita_runtime::{Clock, Runtime};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1028,21 +1028,46 @@ impl<R: Runtime> Partition<R> {
     ///
     /// [`flush`]: Partition::flush
     /// [`compact`]: Partition::compact
+    /// `shared` names the objects under this partition's directory that other
+    /// live partitions still reference in place, per ADR 0009 — a split child
+    /// referencing this partition's segments. The sweep protects every one of
+    /// them as if this partition's own manifest named it, so it can never
+    /// delete a segment a sibling is serving from. The caller assembles the set
+    /// from the sibling manifests it can see; an incomplete set is a deleted
+    /// segment, so a caller that cannot be sure must pass nothing and skip.
     pub async fn sweep_orphans(
         &self,
+        shared: &std::collections::BTreeSet<String>,
         grace_millis: u64,
         max_skew_millis: u64,
         dry_run: bool,
     ) -> Result<SweepReport> {
-        sweep_partition(
+        orbita_format::sweep_partition_protecting(
             self.store.as_ref(),
             &self.path,
+            shared,
             grace_millis,
             max_skew_millis,
             dry_run,
         )
         .await
         .map_err(format_error)
+    }
+
+    /// The segments this partition references in place under other partitions'
+    /// directories, grouped by the partition each lives under.
+    ///
+    /// A node hands this to the orphan sweep so that when it sweeps a partition
+    /// P, it knows which of P's objects a sibling still needs and must not
+    /// delete. See [`Partition::sweep_orphans`] and ADR 0009.
+    pub async fn shared_segment_sources(&self) -> BTreeMap<PartitionId, BTreeSet<String>> {
+        let mut out: BTreeMap<PartitionId, BTreeSet<String>> = BTreeMap::new();
+        for entry in &self.state.read().await.segments {
+            if let Some(source) = entry.source {
+                out.entry(source).or_default().insert(entry.name.clone());
+            }
+        }
+        out
     }
 
     fn now_millis(&self) -> u64 {
@@ -3228,7 +3253,10 @@ mod tests {
             .unwrap();
         p.flush().await.unwrap();
 
-        let report = p.sweep_orphans(5_000, 0, false).await.unwrap();
+        let report = p
+            .sweep_orphans(&BTreeSet::new(), 5_000, 0, false)
+            .await
+            .unwrap();
         assert!(
             report.deleted.is_empty(),
             "the dropping manifest has not settled yet"
@@ -3249,12 +3277,18 @@ mod tests {
         clock.set_millis(20_000);
 
         // A dry run first: it names the orphan without removing it.
-        let preview = p.sweep_orphans(5_000, 0, true).await.unwrap();
+        let preview = p
+            .sweep_orphans(&BTreeSet::new(), 5_000, 0, true)
+            .await
+            .unwrap();
         assert_eq!(preview.deleted, vec![orphan.clone()]);
         assert!(store.keys().contains(&orphan), "a dry run touches nothing");
 
         // Then for real.
-        let swept = p.sweep_orphans(5_000, 0, false).await.unwrap();
+        let swept = p
+            .sweep_orphans(&BTreeSet::new(), 5_000, 0, false)
+            .await
+            .unwrap();
         assert_eq!(swept.deleted, vec![orphan.clone()]);
         assert!(
             !store.keys().contains(&orphan),

@@ -105,6 +105,14 @@ impl Referenced {
         }
     }
 
+    /// Adds the names other live partitions reference as cross-partition
+    /// segments under this prefix, so a shared object is protected exactly as
+    /// one this partition's own manifest names. See
+    /// [ADR 0009](../../../docs/adr/0009-a-split-shares-the-parents-segments.md).
+    pub fn extend_shared(&mut self, names: impl IntoIterator<Item = String>) {
+        self.names.extend(names);
+    }
+
     /// Adds the external values one live segment's records point at.
     pub fn add_records(&mut self, records: &[SegmentRecord]) {
         for record in records {
@@ -227,6 +235,41 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
     max_skew_millis: u64,
     dry_run: bool,
 ) -> Result<SweepReport> {
+    sweep_partition_protecting(
+        store,
+        path,
+        &BTreeSet::new(),
+        grace_millis,
+        max_skew_millis,
+        dry_run,
+    )
+    .await
+}
+
+/// The same sweep, told which objects under this prefix other live partitions
+/// still reference.
+///
+/// A split leaves a child referencing the parent's segments in place (ADR
+/// 0009), so an object under partition P's directory can be live because a
+/// *different* partition's manifest names it. Judging liveness from P's own
+/// manifest alone would delete a segment a child is serving from — data loss
+/// through the GC path, the most dangerous interaction the split introduces.
+///
+/// `shared` is the set of names, relative to `path`, that any other live
+/// partition in the keyspace references as a cross-partition segment. Every one
+/// is protected exactly as if this partition's own manifest named it, including
+/// the external values its records reach. The caller is responsible for making
+/// `shared` complete — for gathering every live sibling's manifest — because a
+/// missed reference here is a deleted segment; when the caller cannot be sure
+/// it has them all, it must not sweep. See the server's `sweep_owned`.
+pub async fn sweep_partition_protecting<S: ObjectStore + ?Sized>(
+    store: &S,
+    path: &PartitionPath,
+    shared: &BTreeSet<String>,
+    grace_millis: u64,
+    max_skew_millis: u64,
+    dry_run: bool,
+) -> Result<SweepReport> {
     // A time in the object store's own clock domain, read now. The grace runs
     // from when the dropping manifest was published, and measuring how long ago
     // that was needs a current time, not the manifest's own stamp. See the
@@ -234,7 +277,13 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
     let reference_now = probe_backend_now(store, path).await?;
 
     let Some((manifest, _)) = load_manifest(store, path).await? else {
-        // Nothing published: no referenced set to subtract against.
+        // Nothing published by this partition. A retired split parent lands
+        // here: its manifest is gone, so the "the dropping manifest has
+        // settled" gate cannot be evaluated and the sweep must fail closed. Its
+        // segments stay in place, still backing whatever children reference
+        // them; reclaiming a retired parent's directory is a separate,
+        // keyspace-level pass that does not exist yet (ADR 0009).
+        let _ = (reference_now, grace_millis, max_skew_millis);
         return Ok(SweepReport {
             dry_run,
             ..Default::default()
@@ -242,6 +291,9 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
     };
 
     let mut referenced = Referenced::of(&manifest);
+    // A sibling's cross-partition reference protects the object just as this
+    // partition's own manifest would.
+    referenced.extend_shared(shared.iter().cloned());
     let listing = store.list(path.prefix()).await?;
 
     let manifest_key = path.manifest();
@@ -258,8 +310,11 @@ pub async fn sweep_partition<S: ObjectStore + ?Sized>(
         .iter()
         .any(|object| object.key.starts_with(&values_prefix));
     if holds_values {
-        for entry in &manifest.segments {
-            let (bytes, _) = store.get(&path.object(&entry.name)).await?;
+        // Own segments and any a sibling shares from this prefix both reach
+        // values through their records, so both are walked to protect them.
+        let own = manifest.segments.iter().map(|entry| entry.name.clone());
+        for name in own.chain(shared.iter().cloned()).collect::<BTreeSet<_>>() {
+            let (bytes, _) = store.get(&path.object(&name)).await?;
             referenced.add_records(Segment::decode(&bytes)?.records());
         }
     }
@@ -686,6 +741,55 @@ mod tests {
         assert!(
             store.keys().contains(&path().object(&orphan.name)),
             "but the bucket is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segment_a_sibling_still_references_survives_the_sweep() {
+        // The ADR 0009 GC-safety regression. A parent compacts a segment out of
+        // its own manifest, but a split child still references that object in
+        // place. Judged against the parent's manifest alone, the object is
+        // unreferenced and old, so the sweep would delete it — and the child
+        // serves from it. Telling the sweep the child references it keeps it,
+        // and NOT telling it (the plain sweep) deletes it, which is exactly the
+        // bug this guards.
+        let clock = HandClock::default();
+        clock.set(1_000);
+        let store = Arc::new(MemoryStore::with_clock(clock.clone()));
+        let w = writer(&store).await;
+
+        let shared = w.put_segment(&built_segment("a", 1)).await.unwrap();
+        let live = w.put_segment(&built_segment("b", 2)).await.unwrap();
+        // The parent's own manifest no longer names the shared segment.
+        w.commit(|_| plan(vec![live.clone()])).await.unwrap();
+
+        // Long past the grace period: the object is a genuine candidate.
+        clock.set(1_000_000);
+
+        // With the child's reference declared, it survives.
+        let mut refs = BTreeSet::new();
+        refs.insert(shared.name.clone());
+        let report = sweep_partition_protecting(store.as_ref(), &path(), &refs, 5_000, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            !report.deleted.contains(&path().object(&shared.name)),
+            "a segment a live child still references must never be swept"
+        );
+        assert!(
+            store.keys().contains(&path().object(&shared.name)),
+            "and it is still on the store"
+        );
+
+        // Without the reference, the same object is deleted — proving the test
+        // is exercising the protection and not passing for another reason.
+        let report = sweep_partition(store.as_ref(), &path(), 5_000, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.deleted,
+            vec![path().object(&shared.name)],
+            "unprotected, the orphan is collected"
         );
     }
 
