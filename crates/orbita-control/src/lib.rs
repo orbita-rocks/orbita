@@ -3,14 +3,13 @@
 //! The nodes that hold the cluster's authoritative metadata: the partition
 //! map, worker membership, keyspace definitions and quotas, and ownership
 //! epochs. It detects dead workers, fences and replaces partition owners, and
-//! drives the worker-prepared partition split. The state machine refuses to
-//! retire a parent until every holder has *durably* prepared child storage and
-//! reported it — the prepare-before-retire ordering of ADR 0009 — and the
-//! controller turns those acknowledgements into the completion. The data-plane
-//! side that builds the child storage lives in `orbita-storage`
-//! (`Partition::prepare_child_partitions`, which shares the parent's segments in
-//! place with no copy); the worker task that runs it on a live cluster is the
-//! remaining wiring between the two.
+//! drives the worker-prepared partition split end to end. The state machine
+//! refuses to retire a parent until every holder has *durably* prepared child
+//! storage and reported it — the prepare-before-retire ordering of ADR 0009 —
+//! and the controller turns those acknowledgements into the completion. A worker
+//! fetches the split intent over the control wire, quiesces the parent, and
+//! builds the child storage with `orbita_storage::Partition::prepare_child_partitions`,
+//! which shares the parent's segments in place with no copy.
 //!
 //! Nothing here is on the data path. Workers cache what they need and keep
 //! serving reads while the leader group is unavailable, which is deliberate: a

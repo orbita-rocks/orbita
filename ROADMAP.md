@@ -23,16 +23,17 @@ DELETE, LIST with cursors, CAS and IF NOT PRESENT, TTLs), keyspaces with
 credentials and quotas, the 2-of-3 replicated WAL, owner failover with epoch
 fencing, replica reads behind leases per ADR 0001, the admin API and CLI, the
 deterministic simulator, and a Python end-to-end suite all exist and pass.
-Partition split is built in two proven halves under ADR 0009. The data plane
-shares the parent's immutable segments in place with no copy: a child indexes
-the parent's objects restricted to its range, so every pre-split key is readable
-from exactly one child, and the orphan sweep is cross-partition so it never
-reclaims a segment a child still references. The control plane drives the split
-to completion only on durable preparation acknowledgements — the parent retires
-strictly after every holder has child storage — and the Admin API answers for
-real. The remaining wiring is the worker task that connects them on a live
-cluster: fetch the split intent, quiesce the parent's writes, run the data-plane
-preparation, and report the ack. Merge remains unimplemented.
+Partition split works end to end under ADR 0009. The data plane shares the
+parent's immutable segments in place with no copy: a child indexes the parent's
+objects restricted to its range, so every pre-split key is readable from exactly
+one child, and the orphan sweep is cross-partition so it never reclaims a segment
+a child still references. A worker fetches the split intent over the control
+wire, quiesces the parent's writes — draining to the committed prefix so no
+acknowledged write can land above the horizon the children inherit — prepares
+both children, and reports the durable acknowledgement the control plane's
+completion waits on. Simulation proves no acknowledged write is lost across a
+split under contention. Automatic size-triggered splitting (issue #39) and merge
+remain unimplemented.
 
 One thing is deliberately staged rather than missing by accident: the control
 plane runs its replicated state machine over a single-node consensus log, with
