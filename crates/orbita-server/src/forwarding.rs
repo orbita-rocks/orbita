@@ -90,6 +90,7 @@ fn start(sim: &Simulation, node: NodeId) -> Arc<Node<SimRuntime>> {
             node,
             layout,
             source,
+            Vec::new(),
             crate::DEFAULT_LEASE_DURATION,
             Arc::new(crate::ReadinessGate::new()),
             authenticator,

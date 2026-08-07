@@ -207,6 +207,14 @@ pub(crate) struct PartitionHost<R: Runtime> {
     /// quiesces one partition while the rest of the node keeps serving. See
     /// [`PartitionHost::quiesce_and_prepare_children`].
     admitting_writes: std::sync::atomic::AtomicBool,
+    /// Whether this owner may issue parent read leases. Split preparation
+    /// closes this before draining existing grants, so no retired parent can
+    /// remain in the read set after its children activate.
+    admitting_leases: std::sync::atomic::AtomicBool,
+    /// Orders ordinary renewal passes against split lease drainage. Without
+    /// this, an already-started positive renewal could arrive after the
+    /// split's zero-duration revocation and resurrect the lease.
+    lease_renewal: tokio::sync::Mutex<()>,
     /// Held for a write's whole duration as a read guard; a split takes the
     /// write guard to wait for every already-admitted write to resolve before
     /// it settles the log to the committed prefix. This is the same close-then-
@@ -395,6 +403,8 @@ impl<R: Runtime> PartitionHost<R> {
             applying: tokio::sync::Mutex::new(()),
             flushing,
             admitting_writes: std::sync::atomic::AtomicBool::new(true),
+            admitting_leases: std::sync::atomic::AtomicBool::new(true),
+            lease_renewal: tokio::sync::Mutex::new(()),
             write_barrier: tokio::sync::RwLock::new(()),
         })
     }
@@ -541,15 +551,29 @@ impl<R: Runtime> PartitionHost<R> {
                 owner: None,
             });
         }
-        // Close admission, then take the barrier to wait out in-flight writes.
-        self.admitting_writes
-            .store(false, std::sync::atomic::Ordering::Release);
+        // Close write and lease admission, then wait out in-flight writes and
+        // every lease under which a replica could still serve the parent.
+        self.close_split_gates();
         let _barrier = self.write_barrier.write().await;
+        self.drain_read_leases().await;
         // Give up the uncommitted tail so the log settles to the committed
         // prefix, then let the applier carry storage up to it before capturing.
         self.quiesce().await?;
         self.wait_for_applies().await;
         self.storage.prepare_child_partitions(children).await
+    }
+
+    /// Closes the split gates without doing preparation work.
+    ///
+    /// A recovered owner is put in this state before it enters the node's host
+    /// table. The first authoritative active-intent fetch either keeps it
+    /// closed or reopens it, so restart never exposes an unchecked parent.
+    pub(crate) fn close_split_gates(&self) {
+        self.admitting_writes
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.admitting_leases
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.freeze_maintenance();
     }
 
     /// Prepares child storage over the parent's segments *without* quiescing —
@@ -572,6 +596,12 @@ impl<R: Runtime> PartitionHost<R> {
     /// only reached on an abort.
     pub(crate) fn resume_write_admission(&self) {
         self.admitting_writes
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Reopens read-lease issuance after a split aborts.
+    pub(crate) fn resume_lease_admission(&self) {
+        self.admitting_leases
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
@@ -598,6 +628,12 @@ impl<R: Runtime> PartitionHost<R> {
     /// quiescing it.
     pub(crate) fn is_admitting_writes(&self) -> bool {
         self.admitting_writes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this owner may currently issue read leases.
+    pub(crate) fn is_admitting_leases(&self) -> bool {
+        self.admitting_leases
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -985,6 +1021,7 @@ impl<R: Runtime> PartitionHost<R> {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
+        let _renewal = self.lease_renewal.lock().await;
         let replicas = self.replicas.lock().expect("replica set poisoned").clone();
         if replicas.is_empty() {
             return;
@@ -1000,19 +1037,28 @@ impl<R: Runtime> PartitionHost<R> {
         let committed = wal.committed_lamport();
         let epoch = self.epoch;
 
+        let granting = self.is_admitting_leases();
         let renewals: Vec<_> = replicas
             .iter()
-            .map(|node| self.renew_one(*node, epoch, through, committed))
+            .map(|node| self.renew_one(*node, epoch, through, committed, granting))
             .collect();
         join_all(renewals).await;
     }
 
-    async fn renew_one(&self, node: NodeId, epoch: Epoch, through: Lamport, committed: Lamport) {
-        let granting = self
-            .grantable
-            .lock()
-            .expect("grantable set poisoned")
-            .contains(&node);
+    async fn renew_one(
+        &self,
+        node: NodeId,
+        epoch: Epoch,
+        through: Lamport,
+        committed: Lamport,
+        admission_open: bool,
+    ) {
+        let granting = admission_open
+            && self
+                .grantable
+                .lock()
+                .expect("grantable set poisoned")
+                .contains(&node);
         let duration = if granting {
             self.lease.duration
         } else {
@@ -1088,6 +1134,41 @@ impl<R: Runtime> PartitionHost<R> {
                     .expect("grantable set poisoned")
                     .remove(&node);
             }
+        }
+    }
+
+    /// Revokes every parent read lease and waits out any replica that could not
+    /// confirm revocation. The wait derives from the actual grants in the
+    /// owner's lease table rather than a guessed sleep.
+    async fn drain_read_leases(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        let _renewal = self.lease_renewal.lock().await;
+        let replicas = self.replicas.lock().expect("replica set poisoned").clone();
+        let through = wal.durable_lamport();
+        let committed = wal.committed_lamport();
+        let renewals: Vec<_> = replicas
+            .iter()
+            .map(|node| self.renew_one(*node, self.epoch, through, committed, false))
+            .collect();
+        join_all(renewals).await;
+
+        loop {
+            let now = self.runtime.clock().monotonic_nanos();
+            let until = self
+                .leases
+                .lock()
+                .expect("lease table poisoned")
+                .holders_with_expiry(now)
+                .into_iter()
+                .map(|(_, until)| until)
+                .max();
+            let Some(until) = until else { return };
+            self.runtime
+                .clock()
+                .sleep(Duration::from_nanos(until.saturating_sub(now)))
+                .await;
         }
     }
 

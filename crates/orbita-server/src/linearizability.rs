@@ -300,6 +300,7 @@ fn start_node(sim: &Simulation, node: NodeId, lease: Duration) -> Arc<Node<SimRu
             node,
             layout,
             source,
+            Vec::new(),
             lease,
             Arc::new(crate::ReadinessGate::new()),
             authenticator,

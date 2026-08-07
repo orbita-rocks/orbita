@@ -273,11 +273,16 @@ impl Access {
 impl<R: Runtime> Node<R> {
     /// Fetches the map, opens every partition this node holds, and starts
     /// serving peer traffic.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "startup dependencies and the authoritative split snapshot are independent"
+    )]
     pub(crate) async fn start(
         runtime: R,
         node_id: NodeId,
         layout: DataLayout,
         source: BoxedMapSource,
+        initial_split_intents: Vec<WireSplitIntent>,
         lease_duration: Duration,
         readiness: Arc<ReadinessGate>,
         authenticator: Arc<Authenticator<R::Clock>>,
@@ -314,6 +319,7 @@ impl<R: Runtime> Node<R> {
             keyspace_miss_repaired_at: AtomicU64::new(0),
         });
         node.reconcile_hosts().await?;
+        node.apply_active_split_gates(&initial_split_intents).await;
         // Nothing is known to be stranded before a single heartbeat has gone
         // out, and a node held unready for a verdict it has not reached would
         // never start. The heartbeat corrects this within one interval.
@@ -335,6 +341,16 @@ impl<R: Runtime> Node<R> {
             },
         );
         Ok(node)
+    }
+
+    /// Restores split gates before startup publishes peer or client handlers.
+    async fn apply_active_split_gates(&self, intents: &[WireSplitIntent]) {
+        let active: HashSet<PartitionId> = intents.iter().map(|intent| intent.parent).collect();
+        for host in self.hosts.read().await.values() {
+            if host.is_owner() && active.contains(&host.id()) {
+                host.close_split_gates();
+            }
+        }
     }
 
     #[must_use]
@@ -1717,9 +1733,12 @@ impl<R: Runtime> Node<R> {
         // what restarts its flush, compaction, and sweep once the children it
         // was protecting will never exist.
         for host in self.hosts.read().await.values() {
-            let was_splitting = !host.is_admitting_writes() || host.is_maintenance_frozen();
+            let was_splitting = !host.is_admitting_writes()
+                || !host.is_admitting_leases()
+                || host.is_maintenance_frozen();
             if host.is_owner() && was_splitting && !pending.contains(&host.id()) {
                 host.resume_write_admission();
+                host.resume_lease_admission();
                 host.resume_maintenance();
                 tracing::info!(
                     partition = host.id().get(),
@@ -1752,7 +1771,10 @@ impl<R: Runtime> Node<R> {
                 // maintenance pass can delete a segment the children are about
                 // to reference. The freeze is idempotent, so re-running it every
                 // poll while the split is pending costs nothing. See ADR 0009.
-                host.freeze_maintenance();
+                host.close_split_gates();
+                if intent.prepared_by_this_node {
+                    continue;
+                }
                 let specs = [
                     ChildSpec {
                         id: intent.lower,
@@ -1773,6 +1795,8 @@ impl<R: Runtime> Node<R> {
                     );
                     continue;
                 }
+            } else if intent.prepared_by_this_node {
+                continue;
             }
 
             // Acknowledge only once both child manifests are durable — the
@@ -2214,6 +2238,7 @@ mod tests {
                     NodeId(1),
                     layout,
                     source,
+                    Vec::new(),
                     crate::DEFAULT_LEASE_DURATION,
                     gate,
                     authenticator,
@@ -2278,6 +2303,7 @@ mod tests {
                 NodeId(1),
                 layout,
                 source,
+                Vec::new(),
                 crate::DEFAULT_LEASE_DURATION,
                 gate,
                 authenticator,

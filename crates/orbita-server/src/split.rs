@@ -99,6 +99,16 @@ fn start_node(
     source: &StaticMapSource,
     store: Arc<MemoryStore>,
 ) -> Arc<Node<SimRuntime>> {
+    start_node_with_intents(sim, node, source, store, Vec::new())
+}
+
+fn start_node_with_intents(
+    sim: &Simulation,
+    node: NodeId,
+    source: &StaticMapSource,
+    store: Arc<MemoryStore>,
+    intents: Vec<WireSplitIntent>,
+) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
         store,
@@ -119,6 +129,7 @@ fn start_node(
             node,
             layout,
             source,
+            intents,
             Duration::from_millis(150),
             gate,
             authenticator,
@@ -231,6 +242,7 @@ fn intent() -> WireSplitIntent {
         at: bytes::Bytes::from_static(BOUNDARY),
         lower: LOWER,
         upper: UPPER,
+        prepared_by_this_node: false,
     }
 }
 
@@ -357,6 +369,17 @@ fn the_flush_loop_does_not_compact_a_split_parent_while_it_is_pending() {
         sim.block_on(async move { owner.prepare_pending_splits(&[intent()]).await })
     };
     assert_eq!(prepared, vec![PARENT]);
+    let mut acknowledged = intent();
+    acknowledged.prepared_by_this_node = true;
+    for _ in 0..3 {
+        let owner = Arc::clone(&owner);
+        let acknowledged = acknowledged.clone();
+        assert!(
+            sim.block_on(async move { owner.prepare_pending_splits(&[acknowledged]).await })
+                .is_empty(),
+            "an acknowledged holder does not prepare or report the split again"
+        );
+    }
     assert!(
         sim.block_on({
             let owner = Arc::clone(&owner);
@@ -381,6 +404,118 @@ fn the_flush_loop_does_not_compact_a_split_parent_while_it_is_pending() {
             "pre-split key {i} is still readable from its child after a long pending split"
         );
     }
+}
+
+#[test]
+fn a_restarted_acknowledged_owner_is_gated_before_it_can_serve() {
+    let sim = Simulation::new(17);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(parent_map());
+    let owner = start_node(&sim, OWNER, &source, Arc::clone(&store));
+    let replica = start_node(&sim, REPLICA, &source, Arc::clone(&store));
+    poll(&sim, &[&owner, &replica]);
+    for i in 0..4 {
+        assert!(write_one(&sim, &owner, i));
+    }
+    let prepared = {
+        let owner = Arc::clone(&owner);
+        sim.block_on(async move { owner.prepare_pending_splits(&[intent()]).await })
+    };
+    assert_eq!(prepared, vec![PARENT]);
+
+    drop(owner);
+    let mut acknowledged = intent();
+    acknowledged.prepared_by_this_node = true;
+    let restarted = start_node_with_intents(
+        &sim,
+        OWNER,
+        &source,
+        Arc::clone(&store),
+        vec![acknowledged.clone()],
+    );
+    assert!(
+        !write_one(&sim, &restarted, 999),
+        "startup restores the active split gate before the first write can arrive"
+    );
+    let host = sim.block_on({
+        let restarted = Arc::clone(&restarted);
+        async move { restarted.host(PARENT).await.unwrap() }
+    });
+    assert!(!host.is_admitting_writes());
+    assert!(!host.is_admitting_leases());
+    assert!(host.is_maintenance_frozen());
+
+    for _ in 0..200 {
+        flush_owned(&sim, &restarted);
+    }
+    source.set(children_map());
+    poll(&sim, &[&restarted, &replica]);
+    for i in 0..4 {
+        assert_eq!(read(&sim, &restarted, key_at(i)), Some(value_at(i)));
+    }
+    assert!(read(&sim, &restarted, key_at(999)).is_none());
+}
+
+#[test]
+fn split_preparation_revokes_parent_read_leases_before_acknowledging() {
+    let sim = Simulation::new(23);
+    let store = Arc::new(MemoryStore::new());
+    let source = StaticMapSource::new(parent_map());
+    let owner = start_node(&sim, OWNER, &source, Arc::clone(&store));
+    let replica = start_node(&sim, REPLICA, &source, Arc::clone(&store));
+    poll(&sim, &[&owner, &replica]);
+    assert!(write_one(&sim, &owner, 0));
+    sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.renew_leases().await }
+    });
+    let replica_host = sim.block_on({
+        let replica = Arc::clone(&replica);
+        async move { replica.host(PARENT).await.unwrap() }
+    });
+    assert!(
+        replica_host.might_serve(&key_at(0)),
+        "the replica holds a parent lease"
+    );
+
+    let prepared = sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.prepare_pending_splits(&[intent()]).await }
+    });
+    assert_eq!(prepared, vec![PARENT]);
+    assert!(
+        !replica_host.might_serve(&key_at(0)),
+        "the durable prepared ack follows explicit parent-lease revocation"
+    );
+    sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.renew_leases().await }
+    });
+    assert!(
+        !replica_host.might_serve(&key_at(0)),
+        "heartbeat cannot reissue a lease while the split remains active"
+    );
+
+    let owner_host = sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.host(PARENT).await.unwrap() }
+    });
+    sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.prepare_pending_splits(&[]).await }
+    });
+    assert!(
+        owner_host.is_admitting_leases(),
+        "abort reopens lease issuance"
+    );
+    sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.renew_leases().await }
+    });
+    assert!(
+        replica_host.might_serve(&key_at(0)),
+        "the live parent may grant read leases again after abort"
+    );
 }
 
 #[test]
@@ -415,6 +550,10 @@ fn an_aborted_split_reopens_the_parents_maintenance() {
         }),
         "an abandoned split reopens the parent's maintenance"
     );
+    assert!(sim.block_on({
+        let owner = Arc::clone(&owner);
+        async move { owner.host(PARENT).await.unwrap().is_admitting_leases() }
+    }));
 }
 
 /// Runs one flush pass over every partition `node` owns.

@@ -878,25 +878,28 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         }
     }
 
-    /// The splits a node still has to prepare for: those it holds the parent of
-    /// and has not yet been recorded as having prepared.
+    /// Every active split whose parent this node holds, including work it has
+    /// already prepared.
     ///
     /// A worker polls this, prepares durable child storage for each, and calls
-    /// [`Controller::record_split_prepared`]. Returning the intents it has
-    /// already acknowledged too would be harmless; filtering them keeps a
-    /// worker from re-preparing every poll.
-    pub async fn pending_split_intents_for(&self, node: NodeId) -> Vec<crate::SplitIntent> {
+    /// [`Controller::record_split_prepared`]. The boolean distinguishes work
+    /// remaining from lifecycle: an acknowledged intent stays visible until a
+    /// replicated CompleteSplit or AbortSplit removes it, so workers keep the
+    /// parent's gates closed without needlessly preparing it again.
+    pub async fn active_split_intents_for(&self, node: NodeId) -> Vec<(crate::SplitIntent, bool)> {
         let inner = self.inner.lock().await;
         inner
             .state
             .split_intents()
             .into_iter()
-            .filter(|intent| {
-                intent.required.contains(&node)
-                    && !inner
+            .filter(|intent| intent.required.contains(&node))
+            .map(|intent| {
+                let prepared = intent.prepared.contains(&node)
+                    || inner
                         .prepared_splits
                         .get(&intent.parent)
-                        .is_some_and(|set| set.contains(&node))
+                        .is_some_and(|set| set.contains(&node));
+                (intent, prepared)
             })
             .collect()
     }

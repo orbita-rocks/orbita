@@ -309,11 +309,20 @@ impl Server {
             readiness.mark(ReadinessCondition::ClusterVersionCompatible);
         }
 
+        // Split lifecycle state is fetched before hosts enter routing. A
+        // restarted parent must never be published with write, maintenance, or
+        // lease gates open while its children already capture an older horizon.
+        let initial_split_intents = match &control {
+            Some(client) => client.fetch_split_intents(config.node_id).await?,
+            None => Vec::new(),
+        };
+
         let node = Node::start(
             runtime.clone(),
             config.node_id,
             layout,
             map_source,
+            initial_split_intents,
             config.lease_duration,
             Arc::clone(&readiness),
             Arc::clone(&authenticator),

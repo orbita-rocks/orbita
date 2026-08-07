@@ -202,14 +202,15 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
             METHOD_FETCH_SPLIT_INTENTS => match FetchSplitIntentsRequest::decode(&call.payload) {
                 Ok(request) => ControlResponse::SplitIntents(
                     self.controller
-                        .pending_split_intents_for(request.node)
+                        .active_split_intents_for(request.node)
                         .await
                         .into_iter()
-                        .map(|intent| WireSplitIntent {
+                        .map(|(intent, prepared_by_this_node)| WireSplitIntent {
                             parent: intent.parent,
                             at: intent.at,
                             lower: intent.lower,
                             upper: intent.upper,
+                            prepared_by_this_node,
                         })
                         .collect(),
                 ),

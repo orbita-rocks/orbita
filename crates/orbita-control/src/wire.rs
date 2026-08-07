@@ -332,15 +332,15 @@ impl ReportSplitPreparedRequest {
     }
 }
 
-/// One split a worker must prepare: which parent, at what boundary, into which
-/// two child ids. The worker derives the child ranges and epoch from the map it
-/// already caches, so only the fields it cannot compute travel.
+/// One active split a worker holds: which parent, at what boundary, into which
+/// two child ids, and whether this node still owes preparation work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireSplitIntent {
     pub parent: PartitionId,
     pub at: Bytes,
     pub lower: PartitionId,
     pub upper: PartitionId,
+    pub prepared_by_this_node: bool,
 }
 
 /// The one response shape both methods share.
@@ -489,7 +489,8 @@ impl ControlResponse {
                     w.u64(intent.parent.get())
                         .bytes(&intent.at)
                         .u64(intent.lower.get())
-                        .u64(intent.upper.get());
+                        .u64(intent.upper.get())
+                        .u8(u8::from(intent.prepared_by_this_node));
                 });
             }
             ControlResponse::SplitPrepared => {
@@ -548,6 +549,7 @@ impl ControlResponse {
                     at: r.bytes()?,
                     lower: PartitionId(r.u64()?),
                     upper: PartitionId(r.u64()?),
+                    prepared_by_this_node: r.u8()? != 0,
                 })
             })?),
             STATUS_SPLIT_PREPARED => ControlResponse::SplitPrepared,
@@ -753,12 +755,14 @@ mod tests {
                     at: Bytes::from_static(b"m"),
                     lower: PartitionId(20),
                     upper: PartitionId(21),
+                    prepared_by_this_node: true,
                 },
                 WireSplitIntent {
                     parent: PartitionId(8),
                     at: Bytes::new(),
                     lower: PartitionId(22),
                     upper: PartitionId(23),
+                    prepared_by_this_node: false,
                 },
             ]),
             ControlResponse::SplitIntents(Vec::new()),

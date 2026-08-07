@@ -1067,7 +1067,10 @@ impl Cluster {
             let clock = self.sim.runtime(LEADER).clock().clone();
             self.sim.runtime(LEADER).spawn(async move {
                 loop {
-                    for intent in controller.pending_split_intents_for(node).await {
+                    for (intent, prepared) in controller.active_split_intents_for(node).await {
+                        if prepared {
+                            continue;
+                        }
                         controller.record_split_prepared(node, intent.parent).await;
                     }
                     clock.sleep(Duration::from_millis(50)).await;
@@ -1075,6 +1078,62 @@ impl Cluster {
             });
         }
     }
+}
+
+#[test]
+fn an_acknowledged_holder_still_sees_a_multi_holder_split_as_active() {
+    let cluster = Cluster::start(31);
+    let parent = cluster.only_partition();
+    let info = cluster.map().partition(parent).unwrap().clone();
+    let owner = info.owner.unwrap();
+    let waiting = info.replicas[0];
+    let outcome = Arc::new(std::sync::Mutex::new(None));
+    let recording = Arc::clone(&outcome);
+    let controller = cluster.controller.clone();
+    cluster.sim.spawn(async move {
+        *recording.lock().expect("split outcome poisoned") = Some(
+            controller
+                .split_partition(parent, Some(Bytes::from_static(b"m")))
+                .await,
+        );
+    });
+    cluster.sim.run_for(Duration::from_millis(100));
+
+    let first = cluster.sim.block_on({
+        let controller = cluster.controller.clone();
+        async move { controller.active_split_intents_for(owner).await }
+    });
+    assert_eq!(first.len(), 1);
+    assert!(!first[0].1);
+    cluster.sim.block_on({
+        let controller = cluster.controller.clone();
+        async move { controller.record_split_prepared(owner, parent).await }
+    });
+
+    for _ in 0..3 {
+        let owner_active = cluster.sim.block_on({
+            let controller = cluster.controller.clone();
+            async move { controller.active_split_intents_for(owner).await }
+        });
+        assert_eq!(owner_active.len(), 1);
+        assert!(
+            owner_active[0].1,
+            "the owner has no work left but the split is active"
+        );
+        let waiting_active = cluster.sim.block_on({
+            let controller = cluster.controller.clone();
+            async move { controller.active_split_intents_for(waiting).await }
+        });
+        assert_eq!(waiting_active.len(), 1);
+        assert!(
+            !waiting_active[0].1,
+            "another holder still owes preparation"
+        );
+    }
+    assert!(
+        outcome.lock().expect("split outcome poisoned").is_none(),
+        "the split cannot complete while another required holder remains unacknowledged"
+    );
 }
 
 #[test]
@@ -1175,7 +1234,10 @@ fn a_split_aborts_rather_than_wedging_when_a_required_holder_dies() {
         let clock = cluster.sim.runtime(LEADER).clock().clone();
         cluster.sim.runtime(LEADER).spawn(async move {
             loop {
-                for intent in controller.pending_split_intents_for(node).await {
+                for (intent, prepared) in controller.active_split_intents_for(node).await {
+                    if prepared {
+                        continue;
+                    }
                     controller.record_split_prepared(node, intent.parent).await;
                 }
                 clock.sleep(Duration::from_millis(50)).await;
