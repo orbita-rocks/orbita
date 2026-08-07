@@ -1327,6 +1327,10 @@ impl Render for crate::config::Config {
             line(&format!("telemetry.resource.{key}"), value.clone());
         }
         line("client.endpoint", self.client.endpoint.clone());
+        line(
+            "client.keyspace",
+            self.client.keyspace.clone().unwrap_or_default(),
+        );
         out.push_str(
             "\nSecrets are omitted. Precedence, lowest first: defaults, file, environment, flags.",
         );

@@ -24,37 +24,43 @@ use crate::cli::{
     ClusterCommand, CredentialCommand, KeyspaceCommand, KeyspaceConfigArgs, PartitionCommand,
     PermissionArg,
 };
-use crate::client::{authed, channel};
-use crate::config::Config;
+use crate::client::authed;
 use crate::output::{
     render, Ack, Blob, ClusterView, CredentialView, FinalizeUpgradeView, Format,
     KeyspaceConfigView, KeyspaceListView, KeyspaceUsageView, KeyspaceView, NodeView,
     PartitionResultView, PartitionView, PingView, ReadyConditionView, ReadyView, ReplicaView,
     SplitView,
 };
+use crate::session::Session;
 
-/// Opens an admin client against the configured endpoint.
+/// Opens an admin client over the session's channel.
 ///
-/// Sized to the Admin ceiling, not the KV one: a describe-cluster response
-/// grows with the number of partitions rather than with any value or list
-/// limit, so the smaller KV ceiling would refuse a valid description of a large
-/// cluster inside this client's own gRPC stack. See
-/// [`orbita_server::max_admin_message_bytes`].
-pub fn connect(config: &Config) -> Result<AdminClient<Channel>> {
+/// The channel is cloned from the session rather than dialed anew, so a REPL
+/// keeps one connection across every admin command. Sized to the Admin ceiling,
+/// not the KV one: a describe-cluster response grows with the number of
+/// partitions rather than with any value or list limit, so the smaller KV
+/// ceiling would refuse a valid description of a large cluster inside this
+/// client's own gRPC stack. See [`orbita_server::max_admin_message_bytes`].
+pub fn connect(channel: Channel) -> AdminClient<Channel> {
     let limit = orbita_server::max_admin_message_bytes();
-    Ok(AdminClient::new(channel(config)?)
+    AdminClient::new(channel)
         .max_decoding_message_size(limit)
-        .max_encoding_message_size(limit))
+        .max_encoding_message_size(limit)
 }
 
-/// Opens a health client against the configured endpoint.
-fn connect_health(config: &Config) -> Result<HealthClient<Channel>> {
-    Ok(HealthClient::new(channel(config)?))
+/// Opens a health client over the session's channel.
+fn connect_health(channel: Channel) -> HealthClient<Channel> {
+    HealthClient::new(channel)
 }
 
 /// Runs a `keyspace` subcommand and returns what should be printed.
-pub async fn keyspace(config: &Config, format: Format, command: KeyspaceCommand) -> Result<String> {
-    let mut client = connect(config)?;
+pub async fn keyspace(
+    session: &Session,
+    format: Format,
+    command: KeyspaceCommand,
+) -> Result<String> {
+    let config = &session.config;
+    let mut client = connect(session.channel.clone());
     match command {
         KeyspaceCommand::Create { name, config: args } => {
             let request = authed(
@@ -108,11 +114,12 @@ pub async fn keyspace(config: &Config, format: Format, command: KeyspaceCommand)
 
 /// Runs a `credential` subcommand.
 pub async fn credential(
-    config: &Config,
+    session: &Session,
     format: Format,
     command: CredentialCommand,
 ) -> Result<String> {
-    let mut client = connect(config)?;
+    let config = &session.config;
+    let mut client = connect(session.channel.clone());
     match command {
         CredentialCommand::Create {
             keyspace,
@@ -158,8 +165,9 @@ pub async fn credential(
 }
 
 /// Runs a `cluster` subcommand.
-pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -> Result<String> {
-    let mut client = connect(config)?;
+pub async fn cluster(session: &Session, format: Format, command: ClusterCommand) -> Result<String> {
+    let config = &session.config;
+    let mut client = connect(session.channel.clone());
     match command {
         ClusterCommand::Describe { keyspace } => {
             let request = authed(
@@ -210,7 +218,7 @@ pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -
             )
         }
         ClusterCommand::Ready => {
-            let mut health = connect_health(config)?;
+            let mut health = connect_health(session.channel.clone());
             let request = authed(config, CheckReadinessRequest {})?;
             // Unlike `ping`, an error here is a failure. A readiness probe
             // asks whether this node may take traffic, and a node that cannot
@@ -292,11 +300,12 @@ fn answered<T>(result: &Result<T, tonic::Status>) -> bool {
 
 /// Runs a `partition` subcommand.
 pub async fn partition(
-    config: &Config,
+    session: &Session,
     format: Format,
     command: PartitionCommand,
 ) -> Result<String> {
-    let mut client = connect(config)?;
+    let config = &session.config;
+    let mut client = connect(session.channel.clone());
     match command {
         PartitionCommand::Split { partition_id, at } => {
             let request = authed(

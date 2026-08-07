@@ -697,6 +697,31 @@ impl<R: Runtime> PartitionHost<R> {
         flush_and_checkpoint(&self.storage, &self.log, &self.flushing, true).await
     }
 
+    /// Reclaims objects this partition no longer references and is safely done
+    /// needing.
+    ///
+    /// A no-op on a replica: publishing and reclaiming a partition's objects is
+    /// the owner's job, and a deposed writer that swept would race its
+    /// replacement, exactly as it must not publish a manifest. See
+    /// [`orbita_storage::Partition::sweep_orphans`] for the grace-period and
+    /// clock-domain contract the deletion decision rests on.
+    pub(crate) async fn sweep_orphans(
+        &self,
+        grace_millis: u64,
+        max_skew_millis: u64,
+        dry_run: bool,
+    ) -> Result<orbita_storage::SweepReport> {
+        if !self.is_owner() {
+            return Ok(orbita_storage::SweepReport {
+                dry_run,
+                ..Default::default()
+            });
+        }
+        self.storage
+            .sweep_orphans(grace_millis, max_skew_millis, dry_run)
+            .await
+    }
+
     /// Evaluates the condition, commits through the log, and answers the
     /// client. Applying to storage happens afterwards, on the applier.
     pub(crate) async fn write(

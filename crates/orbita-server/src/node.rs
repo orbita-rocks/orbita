@@ -1668,6 +1668,49 @@ impl<R: Runtime> Node<R> {
             }
         }
     }
+
+    /// Sweeps orphaned objects from every partition this node currently owns.
+    ///
+    /// The backstop for objects a failed compaction or an abandoned commit
+    /// stranded: without a sweep they accumulate in the bucket forever. Run on
+    /// its own slow cadence rather than folded into the flush loop, because the
+    /// sweep lists a whole partition prefix and so should run far less often
+    /// than a flush. One pass rather than an internal timer keeps the same
+    /// production code drivable a step at a time under deterministic simulation.
+    ///
+    /// A failed sweep is logged and skipped, not retried here: an orphan that
+    /// survives one pass is reclaimed on the next, and a store that is refusing
+    /// deletes has a louder problem than leaked space.
+    pub(crate) async fn sweep_owned(&self, grace_millis: u64, skew_millis: u64, dry_run: bool) {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner())
+            .cloned()
+            .collect();
+        for host in hosts {
+            match host.sweep_orphans(grace_millis, skew_millis, dry_run).await {
+                Ok(report) if report.deleted.is_empty() => {}
+                Ok(report) if report.dry_run => tracing::info!(
+                    partition = host.id().get(),
+                    candidates = report.deleted.len(),
+                    "orphan sweep dry run: objects that would be reclaimed"
+                ),
+                Ok(report) => tracing::info!(
+                    partition = host.id().get(),
+                    reclaimed = report.deleted.len(),
+                    "orphan sweep reclaimed stranded objects"
+                ),
+                Err(error) => tracing::warn!(
+                    partition = host.id().get(),
+                    %error,
+                    "orphan sweep failed; stranded objects wait for the next pass"
+                ),
+            }
+        }
+    }
 }
 
 /// Serves requests other nodes forwarded here.
