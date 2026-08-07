@@ -53,15 +53,44 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `develop` floats and `sha-` is immutable. Anything reproducing a
-      # problem should be quoting the sha tag, because `develop` will have
-      # moved by the time anybody reads the report.
+      # The -dev version has to exist as a tag because develop's own install
+      # paths pin it: bump-version.sh writes the workspace version into the
+      # image tags in deploy/manifests/orbita.yaml and into the chart's
+      # appVersion, which values.yaml defaults the image tag to. Without this
+      # step both of those resolve to something never pushed, so applying the
+      # manifests straight off develop is an ImagePullBackOff.
+      - id: version
+        name: Read the version develop's manifests pin
+        run: |
+          # The same expression release.yml verifies the tag against, so the
+          # two cannot disagree about where the version lives.
+          version="$(perl -0ne 'print $1 if /\[workspace\.package\]\nversion = "([^"]+)"/' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read the workspace version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+          # Only a prerelease version gets a version tag. This workflow can be
+          # dispatched against any ref, and on a released version that would
+          # push a develop build to the name of a real release, silently
+          # replacing it.
+          case "$version" in
+            *-dev) echo "dev=true" >>"$GITHUB_OUTPUT" ;;
+            *)     echo "dev=false" >>"$GITHUB_OUTPUT"
+                   echo "::notice::$version is not a -dev version, so no version tag was published" ;;
+          esac
+
+      # `develop` and the -dev version both float; `sha-` is immutable.
+      # Anything reproducing a problem should be quoting the sha tag, because
+      # the other two will have moved by the time anybody reads the report.
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=develop
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.dev }}
             type=sha,prefix=sha-,format=short
 
       - uses: docker/build-push-action@v6
