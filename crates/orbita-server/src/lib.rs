@@ -114,6 +114,8 @@ mod replication;
 mod retention;
 mod runtime;
 mod service;
+#[cfg(test)]
+mod split;
 mod status;
 mod transport;
 mod validate;
@@ -307,11 +309,26 @@ impl Server {
             readiness.mark(ReadinessCondition::ClusterVersionCompatible);
         }
 
+        // Split lifecycle state is fetched before hosts enter routing. A
+        // restarted parent must never be published with write, maintenance, or
+        // lease gates open while its children already capture an older horizon.
+        //
+        // Failing start on an error is deliberate: booting blind to a split we
+        // cannot rule out is what the gates exist to prevent. The one refusal
+        // that is not blindness is a leader that predates the method at all,
+        // and `fetch_split_intents` already answers that with the empty set,
+        // so an old-binary leader does not crash-loop a new worker.
+        let initial_split_intents = match &control {
+            Some(client) => Some(client.fetch_split_intents(config.node_id).await?),
+            None => None,
+        };
+
         let node = Node::start(
             runtime.clone(),
             config.node_id,
             layout,
             map_source,
+            initial_split_intents,
             config.lease_duration,
             Arc::clone(&readiness),
             Arc::clone(&authenticator),
@@ -799,6 +816,30 @@ impl Server {
             directory.refresh().await;
             if let Err(error) = live.refresh_map().await {
                 tracing::debug!(%error, "could not refresh the partition map");
+            }
+            // Prepare durable child storage for any split this node holds the
+            // parent of, and acknowledge the ones it finished. This is the
+            // worker half of the ADR 0009 split: the owner quiesces the parent
+            // and publishes both child manifests over its segments, then this
+            // reports the ack the leader's completion waits on. Run even when
+            // there are no intents, so a partition quiesced for a split the
+            // leader later abandoned has its writes reopened.
+            match client.fetch_split_intents(node_id).await {
+                Ok(snapshot) => {
+                    for (parent, lower, upper) in live.prepare_split_snapshot(&snapshot).await {
+                        if let Err(error) = client
+                            .report_split_prepared(node_id, parent, lower, upper)
+                            .await
+                        {
+                            tracing::debug!(
+                                %error,
+                                partition = parent.get(),
+                                "could not report split preparation to the leader group"
+                            );
+                        }
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "could not fetch split intents"),
             }
             if !convergence_logged && readiness.is_ready() {
                 let map = live.map();

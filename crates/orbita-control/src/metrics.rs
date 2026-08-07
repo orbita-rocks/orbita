@@ -13,11 +13,11 @@
 //! partition that will only ever see a single increment. The `outcome` label is
 //! a fixed, small set, so the metric never grows with the cluster.
 //!
-//! Split and merge are not implemented yet (the state machine refuses a split
-//! until child storage preparation lands, and merge is unbuilt). The counters
-//! are wired now so the pipeline is complete and the series exist the day the
-//! operations do; until then the only outcome they record is `unimplemented`,
-//! which is itself the honest answer to "did that split take effect".
+//! Split and merge both record `unimplemented` today: the control-plane split
+//! protocol exists but its data-plane half (worker child-storage preparation
+//! and parent quiescing) does not, so the operator surface fails closed. The
+//! counters are wired now so the series exist the day execution does; the label
+//! set stays fixed and small, so it never grows with the cluster.
 
 use std::sync::OnceLock;
 
@@ -49,13 +49,18 @@ fn instruments() -> &'static Instruments {
 /// How a split or merge attempt resolved. A fixed set, so the label is bounded.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Outcome {
-    /// The operation is not yet built and was refused without changing the map.
+    /// The operation took effect: the parent retired and the children own its
+    /// range.
+    Committed,
+    /// The operation is not yet executable and was refused without changing the
+    /// map.
     Unimplemented,
 }
 
 impl Outcome {
     fn as_str(self) -> &'static str {
         match self {
+            Outcome::Committed => "committed",
             Outcome::Unimplemented => "unimplemented",
         }
     }

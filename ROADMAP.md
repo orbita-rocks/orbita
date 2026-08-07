@@ -22,10 +22,18 @@ More is built than the version number suggests. The KV surface (GET, SET,
 DELETE, LIST with cursors, CAS and IF NOT PRESENT, TTLs), keyspaces with
 credentials and quotas, the 2-of-3 replicated WAL, owner failover with epoch
 fencing, replica reads behind leases per ADR 0001, the admin API and CLI, the
-deterministic simulator, and a Python end-to-end suite all exist and pass. The
-split metadata state machine exists, but the operation is deliberately disabled
-until workers can prepare child storage before the parent map entry is retired;
-merge remains unimplemented.
+deterministic simulator, and a Python end-to-end suite all exist and pass.
+Partition split works end to end under ADR 0009. The data plane shares the
+parent's immutable segments in place with no copy: a child indexes the parent's
+objects restricted to its range, so every pre-split key is readable from exactly
+one child, and the orphan sweep is cross-partition so it never reclaims a segment
+a child still references. A worker fetches the split intent over the control
+wire, quiesces the parent's writes — draining to the committed prefix so no
+acknowledged write can land above the horizon the children inherit — prepares
+both children, and reports the durable acknowledgement the control plane's
+completion waits on. Simulation proves no acknowledged write is lost across a
+split under contention. Automatic size-triggered splitting (issue #39) and merge
+remain unimplemented.
 
 One thing is deliberately staged rather than missing by accident: the control
 plane runs its replicated state machine over a single-node consensus log, with

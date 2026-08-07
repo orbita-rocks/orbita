@@ -63,10 +63,22 @@
 //! was ever told it was written.
 //!
 //! So the peer's extra entries are discarded rather than merged. That happens
-//! in two places: the fence message sent on promotion, and, for a peer that
-//! was unreachable at the time, the first append it receives at the new epoch,
-//! which truncates above the point the new owner says its history ends. There
-//! is no path where a divergent entry survives and is later replayed.
+//! in two places: the fence message, sent whenever an owner takes the
+//! partition above the epoch its own log records — `Wal::open` and
+//! `Wal::promote` both send it — and, for a peer that was unreachable at the
+//! time, the first append it receives at the new epoch, which truncates above
+//! the point the new owner says its history ends. There is no path where a
+//! divergent entry survives and is later replayed.
+//!
+//! Both legs rest on the epoch having moved: a replica only gives up its tail
+//! for a strictly higher epoch, because that rule is also what stops a deposed
+//! owner truncating a live one. So an owner that has handed Lamports back —
+//! `Wal::quiesce` is the only thing that can — may not reopen at the epoch it
+//! surrendered under. It would resume assigning from the committed prefix,
+//! reissuing versions a replica still holds different bytes for, and a replica
+//! skips an entry at or below its durable position without comparing bytes, so
+//! it would acknowledge the replacement and keep the original.
+//! `Wal::surrendered_lamport` is what a reopening caller asks.
 //!
 //! ## A catch-up carries the committed prefix, and not one entry more
 //!
