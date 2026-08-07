@@ -1,4 +1,4 @@
-# 0010: Combined nodes form one automatically managed voter set
+# 0011: Combined nodes form one automatically managed voter set
 
 Status: Accepted, 2026-08-07.
 
