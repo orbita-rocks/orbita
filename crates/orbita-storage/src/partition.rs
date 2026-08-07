@@ -44,8 +44,8 @@ use orbita_core::{
 };
 use orbita_format::segment::{Segment, SegmentBuilder};
 use orbita_format::{
-    compact, load_manifest, CommitPlan, FormatError, PartitionPath, PartitionWriter, RecordValue,
-    SegmentEntry, SegmentRecord, Snapshot, SweepReport,
+    compact, load_manifest, CommitPlan, ExternalValue, FormatError, PartitionPath, PartitionWriter,
+    RecordValue, SegmentEntry, SegmentRecord, Snapshot, SweepReport,
 };
 use orbita_objectstore::{ObjectError, ObjectStore};
 use orbita_runtime::{Clock, Runtime};
@@ -1372,6 +1372,7 @@ impl<R: Runtime> Partition<R> {
         // host, is the known follow-up rather than an accident.
 
         let mut inputs = Vec::with_capacity(state.segments.len());
+        let mut relocated_values: BTreeMap<(PartitionId, String), ExternalValue> = BTreeMap::new();
         for entry in &state.segments {
             // A shared segment is read from the source partition's directory.
             // Compaction merges it into a new self-written segment, which is
@@ -1382,7 +1383,37 @@ impl<R: Runtime> Partition<R> {
                 .await
                 .map_err(store_error)?;
             let segment = Segment::decode(&bytes).map_err(format_error)?;
-            inputs.push(segment.records().to_vec());
+            let mut records = segment.records().to_vec();
+            if let Some(source) = entry.source {
+                for record in &mut records {
+                    let RecordValue::External(external) = &record.value else {
+                        continue;
+                    };
+                    let source_key = (source, external.name.clone());
+                    let relocated = match relocated_values.get(&source_key) {
+                        Some(relocated) => relocated.clone(),
+                        None => {
+                            let value_key = self.path.for_partition(source).object(&external.name);
+                            let (value, _) =
+                                self.store.get(&value_key).await.map_err(store_error)?;
+                            if value.len() as u64 != external.length
+                                || crc32c::crc32c(&value) != external.crc32c
+                            {
+                                return Err(Error::Internal(format!(
+                                    "external value {} does not match its record",
+                                    external.name
+                                )));
+                            }
+                            let relocated =
+                                self.writer.put_value(value).await.map_err(format_error)?;
+                            relocated_values.insert(source_key, relocated.clone());
+                            relocated
+                        }
+                    };
+                    record.value = RecordValue::External(relocated);
+                }
+            }
+            inputs.push(records);
         }
         // A whole-partition merge, whose tombstone rule is time-based: an
         // unexpired tombstone still answers a retrying deleter, so it
@@ -1977,6 +2008,114 @@ mod tests {
                 "the compacted child still serves {k}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn child_compaction_relocates_an_external_value_out_of_a_shared_parent_segment() {
+        let (parent, store, clock) = owner_with_clocked_store().await;
+        clock.set_millis(1);
+        let value = Bytes::from(vec![0x5a; 4096]);
+        let source_external = parent.writer.put_value(value.clone()).await.unwrap();
+        let source_value_key = parent.path.object(&source_external.name);
+        let mut builder = SegmentBuilder::new(KeyspaceId(1), PartitionId(1), Epoch(1));
+        builder
+            .push(&SegmentRecord {
+                key: bytes("a"),
+                lamport: Lamport(1),
+                expires_at_millis: None,
+                value: RecordValue::External(source_external),
+            })
+            .unwrap();
+        let built = builder.finish().unwrap();
+        let segment = parent.writer.put_segment(&built).await.unwrap();
+        let range = KeyRange::unbounded();
+        parent
+            .writer
+            .commit(|_| CommitPlan {
+                committed_lamport: Lamport(1),
+                range: range.clone(),
+                segments: vec![segment.clone()],
+            })
+            .await
+            .unwrap();
+        parent.hydrate().await.unwrap();
+
+        let (low, high) = parent.range().clone().split_at(bytes("m")).unwrap();
+        parent
+            .prepare_child_partitions(&[
+                ChildSpec {
+                    id: PartitionId(2),
+                    epoch: Epoch(2),
+                    range: low.clone(),
+                },
+                ChildSpec {
+                    id: PartitionId(3),
+                    epoch: Epoch(2),
+                    range: high,
+                },
+            ])
+            .await
+            .unwrap();
+        let child = open_child(&store, &clock, PartitionId(2), Epoch(2), low.clone()).await;
+        assert_eq!(child.get(b"a").await.unwrap().unwrap().value, value);
+
+        let shared = child
+            .shared_segment_sources()
+            .await
+            .remove(&PartitionId(1))
+            .unwrap();
+        clock.set_millis(10_000);
+        parent
+            .sweep_orphans(&shared, 1_000, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            store.keys().contains(&source_value_key),
+            "the source external value stays live while a child shares its segment"
+        );
+
+        child.compact().await.unwrap();
+        let reopened = open_child(&store, &clock, PartitionId(2), Epoch(2), low).await;
+        assert_eq!(reopened.get(b"a").await.unwrap().unwrap().value, value);
+        let child_values: Vec<_> = store
+            .keys()
+            .into_iter()
+            .filter(|key| key.starts_with(&child_prefix(2)) && key.ends_with(".oval"))
+            .collect();
+        assert_eq!(
+            child_values.len(),
+            1,
+            "compaction materialized one child-owned value"
+        );
+        reopened
+            .sweep_orphans(&BTreeSet::new(), 1_000, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            store.keys().contains(&child_values[0]),
+            "the child segment keeps its relocated external value live"
+        );
+
+        let range = KeyRange::unbounded();
+        parent
+            .writer
+            .commit(|_| CommitPlan {
+                committed_lamport: Lamport(1),
+                range: range.clone(),
+                segments: Vec::new(),
+            })
+            .await
+            .unwrap();
+        clock.set_millis(12_000);
+        parent
+            .sweep_orphans(&BTreeSet::new(), 1_000, 0, false)
+            .await
+            .unwrap();
+        assert!(
+            !store.keys().contains(&source_value_key),
+            "the source value is collectible after no manifest references its segment"
+        );
+        assert!(store.keys().contains(&child_values[0]));
     }
 
     #[tokio::test]
