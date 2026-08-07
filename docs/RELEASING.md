@@ -17,14 +17,14 @@ There are two branches. `develop` is where work lands and where prerelease
 artifacts come from. `main` only ever contains released code, and a tag on
 `main` is what publishes.
 
-|                | `develop`                | `main`                       |
-| -------------- | ------------------------ | ---------------------------- |
-| Version        | `0.2.0-dev`              | `0.1.0`                      |
-| Built on       | nightly or by hand        | a pushed tag                 |
-| Image tags     | `develop`, `sha-abc1234` | `0.1.0`, `0.1`, `latest`     |
-| Binaries       | workflow artifacts, 7d   | attached to the release      |
-| Chart          | not published            | pushed to GHCR as OCI        |
-| GitHub release | none                     | yes                          |
+|                | `develop`                  | `main`                   |
+| -------------- | -------------------------- | ------------------------ |
+| Version        | `0.2.0-dev`                | `0.1.0`                  |
+| Built on       | nightly or by hand         | a pushed tag             |
+| Image tags     | `0.2.0-dev`, `sha-abc1234` | `0.1.0`, `0.1`, `latest` |
+| Binaries       | workflow artifacts, 7d     | attached to the release  |
+| Chart          | not published              | pushed to GHCR as OCI    |
+| GitHub release | none                       | yes                      |
 
 The `-dev` suffix is a real semver prerelease, so `0.2.0-dev` sorts before
 `0.2.0` and Cargo is happy with it. It does not change per commit. A commit is
@@ -37,8 +37,27 @@ The nightly cadence is deliberate. A multi-architecture image compiles ARM
 under emulation and costs far more than the merge gate, while prerelease users
 need a recent build rather than one artifact per commit. The workflow can be
 dispatched when a particular commit is needed sooner. SHA-only image versions
-expire after 30 days; release tags and the moving `develop` tag are never
-selected by that cleanup.
+expire after 30 days; release tags and the moving `-dev` tag are never selected
+by that cleanup, because it only deletes an image whose tags are all `sha-`
+prefixed.
+
+Every published tag carries a version. There is no branch-named `develop` tag,
+because the name would say nothing about what is inside it: two pulls a release
+cycle apart would hand you incompatible binaries with no way to tell them apart
+before running one. `0.2.0-dev` still floats, since it names a cycle rather than
+a build, but it at least tells you which cycle, and it sorts against the
+releases either side of it.
+
+That tag is also what `develop`'s own install paths pin. `bump-version.sh`
+writes the workspace version into the image tags in
+`deploy/manifests/orbita.yaml` and into the chart's `appVersion`, which
+`values.yaml` defaults the image tag to. If nothing published `0.2.0-dev`,
+applying the manifests off `develop` would fail to pull. Because it floats, a
+bug report should still quote the `sha-` tag.
+
+Dispatching the Prerelease workflow against a ref whose version has no `-dev`
+suffix fails on purpose. `main` carries a released version, and publishing it
+from this workflow would put a develop build at the name of a real release.
 
 ## Cutting a release
 

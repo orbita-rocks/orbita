@@ -18,13 +18,22 @@
 //! the Lamport is what the version is, and the log hands that back at the end
 //! of the round trip rather than the start.
 //!
-//! While a key has an in-flight write, every conditional write against it
-//! fails. That is safe rather than merely convenient: a client can only hold a
-//! version it was told about, it is only told about a version once the write
-//! was acknowledged, and an acknowledged write is resolved. So a
-//! compare-and-swap that arrives while the key is uncertain is necessarily
-//! comparing against a version the in-flight write is about to supersede, and
-//! failing it is the answer the client would have got a moment later anyway.
+//! While a key has an in-flight write, no condition against it can hold. That
+//! is safe rather than merely convenient: a client can only hold a version it
+//! was told about, it is only told about a version once the write was
+//! acknowledged, and an acknowledged write is resolved. So a compare-and-swap
+//! that arrives while the key is uncertain is necessarily comparing against a
+//! version the in-flight write is about to supersede.
+//!
+//! Failing it on the spot is a different question, and the answer is no. The
+//! owner waits for the key to stop being uncertain and then decides — see
+//! [`PartitionHost::await_settled`](crate::host) — because a refusal issued
+//! from inside this window has no version to report, and the same client
+//! arriving a moment later would have been told exactly which write beat it.
+//! Uncertainty is this module's problem to describe and the write path's
+//! problem to wait out. Uncertainty it cannot wait out becomes a retryable
+//! error, never a condition failure: the difference between "you lost" and "I
+//! do not know yet" is the whole reason this state has a name.
 
 use bytes::Bytes;
 use orbita_core::{Lamport, Record, Version};

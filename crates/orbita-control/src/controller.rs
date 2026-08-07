@@ -565,6 +565,13 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                     role: status.role,
                     address: status.address.clone(),
                     speaks: status.speaks,
+                    // Both claims are withheld until the active version
+                    // carries them, and it is the encoding that requires it: a
+                    // `RegisterNode` with either bool set encodes under a tag
+                    // the previous binary truncates its log at. So the state
+                    // machine cannot learn a node's readiness during the
+                    // upgrade window, and `lifecycle_enabled` is what stops it
+                    // reading that silence as a node that said no.
                     ready: lifecycle_enabled && status.ready,
                     draining: lifecycle_enabled && status.draining,
                 })

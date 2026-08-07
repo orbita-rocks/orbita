@@ -28,7 +28,9 @@
 use crate::command::ControlCommand;
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Credential, Keyspace, KeyspaceConfig};
-use crate::version::{ClusterVersion, CompatibilityRefusal, VersionRange};
+use crate::version::{
+    lifecycle_protocol_active, ClusterVersion, CompatibilityRefusal, VersionRange, PROTOCOL_0_1,
+};
 
 use orbita_core::{
     Epoch, Error, KeyRange, KeyspaceId, KeyspaceName, MapVersion, NodeId, PartitionId,
@@ -36,8 +38,6 @@ use orbita_core::{
 };
 
 use std::collections::{BTreeMap, BTreeSet};
-
-const PROTOCOL_0_1: ClusterVersion = ClusterVersion::new(0, 1);
 
 /// A split that has begun but not finished.
 ///
@@ -318,10 +318,40 @@ impl ClusterState {
         self.new_ownership_eligibility(node).is_ok()
     }
 
-    /// Whether the finalized cluster protocol carries worker lifecycle state.
+    /// Whether the finalized cluster protocol carries worker lifecycle state,
+    /// and so whether a node without a `ready` claim is being told apart from
+    /// one that is genuinely not ready.
+    ///
+    /// Gated on the active cluster version for the same determinism reason as
+    /// `fenced_owner_stays_a_replica` below, and it has to be, since
+    /// this decides how `AssignOwner` and every other ownership command
+    /// applies. A member that answered this from its own binary version would
+    /// accept a committed entry its peers reject.
+    ///
+    /// The gate reads `>= 0.1` rather than "the cluster is on my version",
+    /// which is what it used to read and what issue #105 was. Equality holds
+    /// for a leader whose binary is exactly the finalized one and fails for
+    /// every other binary in the n-1 window, so a cluster still on the old
+    /// version put its old-binary leader on the new rule and its new-binary
+    /// workers on the old one. The worker then suppressed the `ready` claim it
+    /// knew the protocol could not carry, the leader read that suppression as
+    /// "not ready", and the node sat in membership owning nothing for as long
+    /// as the cluster stayed un-finalized. Reading the version the way every
+    /// other gate reads it puts both binaries on the same rule: before 0.1 no
+    /// lifecycle claim is expected of anyone, after it every node makes one.
+    ///
+    /// Not asking is the only available answer below 0.1, rather than a
+    /// lenient one. The claim cannot be on the log for the leader to read: a
+    /// `RegisterNode` carrying it encodes under a tag the previous binary
+    /// truncates its log at, so recording it during the upgrade window would
+    /// trade the rollback window for the placement. Below 0.1 the leader
+    /// genuinely cannot tell "not ready" from "could not say", and treating
+    /// silence as consent is right because that is the pre-0.1 behaviour the
+    /// window promises: no readiness gate, no planned handoff, ordinary
+    /// failover.
     #[must_use]
     pub fn lifecycle_enabled(&self) -> bool {
-        self.version_initialized && self.version == crate::version::binary_version()
+        self.version_initialized && lifecycle_protocol_active(self.version)
     }
 
     /// Whether the finalized cluster protocol keeps a fenced owner in the
@@ -1268,13 +1298,17 @@ mod tests {
             .unwrap();
     }
 
+    /// Registers a worker whose only interesting property is the range it
+    /// speaks. It claims readiness, because these are compatibility tests and
+    /// a node held out of placement for being unready would prove the version
+    /// rule by accident.
     fn register_with(state: &mut ClusterState, id: u64, speaks: VersionRange) -> Result<()> {
         state.apply(&ControlCommand::RegisterNode {
             node: NodeId(id),
             role: NodeRole::Worker,
             address: format!("10.0.0.{id}:7000"),
             speaks,
-            ready: false,
+            ready: true,
             draining: false,
         })
     }
@@ -2266,6 +2300,133 @@ mod tests {
             expect_epoch: Epoch(2),
         });
         assert!(result.is_err());
+    }
+
+    /// The active version of a cluster one finalization ahead of this binary.
+    ///
+    /// A member reaches this state legitimately: `finalize-upgrade` counts
+    /// only live nodes, so a member that was down or partitioned during the
+    /// finalize comes back on the old binary and replays entries committed at
+    /// the newer active version. It must apply them the way its peers did.
+    fn one_finalization_ahead() -> ClusterVersion {
+        let own = crate::version::binary_version();
+        ClusterVersion::new(own.major, own.minor + 1)
+    }
+
+    /// Registers a worker that made no lifecycle claim, which is what the
+    /// leader records for a worker whose protocol cannot carry one.
+    fn register_without_a_lifecycle_claim(state: &mut ClusterState, id: u64, speaks: VersionRange) {
+        state
+            .apply(&ControlCommand::RegisterNode {
+                node: NodeId(id),
+                role: NodeRole::Worker,
+                address: format!("10.0.0.{id}:7000"),
+                speaks,
+                ready: false,
+                draining: false,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn the_lifecycle_gate_reads_the_finalized_cluster_version_not_the_running_binary() {
+        // Every member of the leader group answers this question while
+        // applying the same committed entry, and during an upgrade they do not
+        // all run the same binary. So the answer has to come out of the
+        // replicated state alone. Reading the running binary — which is what
+        // issue #105 was — makes it depend on which process asked.
+        let mut before = bootstrapped();
+        set_version(&mut before, ClusterVersion::ZERO);
+        assert!(
+            !before.lifecycle_enabled(),
+            "no lifecycle protocol exists below 0.1, whatever binary is asking"
+        );
+
+        let mut at = bootstrapped();
+        set_version(&mut at, PROTOCOL_0_1);
+        assert!(at.lifecycle_enabled(), "0.1 is the version that carries it");
+
+        let mut ahead = bootstrapped();
+        set_version(&mut ahead, one_finalization_ahead());
+        assert!(
+            ahead.lifecycle_enabled(),
+            "a cluster past 0.1 still carries lifecycle state, and a member \
+             whose binary is not the finalized one has to agree"
+        );
+
+        assert!(
+            !ClusterState::new().lifecycle_enabled(),
+            "a state machine that has never been given a version has no \
+             finalized protocol to speak"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_makes_no_lifecycle_claim_can_still_own_before_the_lifecycle_version() {
+        // The #105 shape, from the leader's side. A worker on a newer binary
+        // knows the active protocol cannot carry `ready`, so it does not
+        // claim it. Withholding placement from that worker leaves an operator
+        // who grew the cluster mid-upgrade with a node that joined, reports
+        // healthy, and silently owns nothing.
+        let mut state = bootstrapped();
+        set_version(&mut state, ClusterVersion::ZERO);
+        register_without_a_lifecycle_claim(&mut state, 4, crate::version::binary_speaks());
+
+        assert!(
+            state.placement_candidates().contains(&NodeId(4)),
+            "before 0.1 no node makes a lifecycle claim, so the absence of \
+             one cannot be read as unreadiness"
+        );
+        assert!(state.new_ownership_eligibility(NodeId(4)).is_ok());
+    }
+
+    #[test]
+    fn a_worker_that_makes_no_lifecycle_claim_cannot_own_once_the_lifecycle_version_is_active() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        register_without_a_lifecycle_claim(&mut state, 4, crate::version::binary_speaks());
+
+        assert!(
+            !state.placement_candidates().contains(&NodeId(4)),
+            "once the protocol carries readiness, a node that does not claim \
+             it is genuinely not ready"
+        );
+    }
+
+    #[test]
+    fn ownership_eligibility_is_the_same_on_a_binary_that_predates_the_active_version() {
+        // The determinism guarantee stated as an outcome rather than as a
+        // predicate: this process is running the 0.1 binary, and it must
+        // refuse the same assignment a binary from the finalized version
+        // would refuse. Deciding from `binary_version()` made it accept.
+        let ahead = one_finalization_ahead();
+        let mut state = bootstrapped();
+        set_version(&mut state, ahead);
+        // Node 4 runs the binary the cluster finalized on, so it is admitted;
+        // this process is the member that has not been upgraded yet.
+        register_without_a_lifecycle_claim(
+            &mut state,
+            4,
+            VersionRange::new(crate::version::binary_version(), ahead),
+        );
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: PartitionId(1),
+                expect_epoch: Epoch(1),
+            })
+            .unwrap();
+
+        let assigned = state.apply(&ControlCommand::AssignOwner {
+            partition: PartitionId(1),
+            owner: NodeId(4),
+            replicas: vec![],
+            expect_epoch: Epoch(2),
+        });
+        assert!(
+            assigned.is_err(),
+            "a member behind the finalized version must apply the finalized \
+             rule, or one committed entry produces two different maps"
+        );
     }
 
     #[test]

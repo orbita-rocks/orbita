@@ -29,6 +29,15 @@
 //! lock is held. The first poll is what reserves the Lamport; everything after
 //! it is the fsync and the round trip to the replicas, which happens after the
 //! lock is gone.
+//!
+//! The overlay carries a third state the ADR did not have to name: a write
+//! that has been submitted and has not yet been told its Lamport. Nothing
+//! conditional can be decided against a key in that state, so a conditional
+//! write that finds one waits for it — outside the submission lock, which is
+//! the part that keeps ADR 0003's promise. See
+//! [`PartitionHost::await_settled`]. A wait that runs out of budget fails the
+//! call `Unavailable` rather than answering from outside the window, because
+//! the owner still does not know who won.
 
 use crate::lease::{LeaseTable, ReplicaReadState, DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
 use crate::pending::{self, PendingRecord, PendingSet};
@@ -60,6 +69,26 @@ use std::time::Duration;
 /// because the queue drains in the time an apply takes, and a scan is already
 /// the expensive path.
 const SCAN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a conditional write waits for an in-flight write to the same key
+/// to come back from the log before giving up on deciding the condition.
+///
+/// The wait is normally one replication round trip, because that is all it
+/// takes for the other write to learn its Lamport. This bound exists for the
+/// case where that never happens — a log that has stopped answering — and it
+/// is set at the same five seconds a scan waits for the same reason: long
+/// enough that a healthy cluster never reaches it, short enough that a client
+/// gets an answer rather than a hung call.
+///
+/// Reaching it means the owner still does not know, and *still does not know*
+/// is the answer the client gets: [`Error::Unavailable`], which is retryable.
+/// This bound is not an upper bound on the thing being waited for. A peer call
+/// timeout is configurable well past five seconds and a local disk write has
+/// no timeout at all, so the write parked on here can and does resolve
+/// afterwards. Answering `applied: false` from a stale read at expiry would
+/// claim the caller lost to a write that may yet fail, and would report a
+/// version that may not be the one that ends up winning.
+const CONDITION_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many keys a replica may hold unreadable before it is worth saying so.
 ///
@@ -175,6 +204,16 @@ pub(crate) struct PartitionHost<R: Runtime> {
     /// Serialises condition evaluation and Lamport assignment, and nothing
     /// else. See the module docs.
     submit: tokio::sync::Mutex<()>,
+    /// Fires whenever a submitted write learns its Lamport or gives up on
+    /// getting one, which is when a key stops being uncertain.
+    ///
+    /// A conditional write that finds the key it is about to decide on already
+    /// in flight has nothing truthful to say about it yet, so it waits here
+    /// rather than answering. One partition-wide signal instead of one per
+    /// key: waking a handful of waiters that then re-check costs nothing
+    /// beside the round trip they were waiting on, and a map of notifiers
+    /// keyed by key would have to be reaped.
+    settled: tokio::sync::Notify,
     applies: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<Option<Mutation>>>,
     drained: Arc<tokio::sync::Notify>,
     read_state: Mutex<ReplicaReadState>,
@@ -403,6 +442,7 @@ impl<R: Runtime> PartitionHost<R> {
             log,
             pending,
             submit: tokio::sync::Mutex::new(()),
+            settled: tokio::sync::Notify::new(),
             applies,
             drained,
             read_state: Mutex::new(ReplicaReadState::new(Lamport::ZERO)),
@@ -880,6 +920,18 @@ impl<R: Runtime> PartitionHost<R> {
 
     /// Evaluates the condition, commits through the log, and answers the
     /// client. Applying to storage happens afterwards, on the applier.
+    ///
+    /// A conditional write whose key already has a write in flight cannot be
+    /// decided yet, and this waits for that write rather than refusing on the
+    /// spot. See [`PartitionHost::await_settled`] for why that is the answer
+    /// and not just a nicer error message.
+    ///
+    /// If that wait runs out the call fails [`Error::Unavailable`] rather than
+    /// answering. A conditional write therefore has three outcomes on the
+    /// wire, not two: applied, definitively not applied, and *undecided*. The
+    /// third is retryable and is the only honest thing to say, because the
+    /// owner never learned whether the caller lost. See
+    /// [`CONDITION_SETTLE_TIMEOUT`].
     pub(crate) async fn write(
         &self,
         key: Bytes,
@@ -919,18 +971,82 @@ impl<R: Runtime> PartitionHost<R> {
             )));
         }
 
-        let guard = self.submit.lock().await;
-        let now = self.runtime.clock().now_millis();
+        // The whole call gets one waiting budget, not one per attempt, so a
+        // key under constant conditional traffic cannot hold a caller here
+        // indefinitely by staying uncertain.
+        //
+        // The admission guard above is deliberately held across that wait. A
+        // conditional write parked on an in-flight neighbour is an already
+        // admitted write, and waiting for those to resolve is exactly what the
+        // quiesce is for, so a split drains it rather than racing it. The wait
+        // is bounded, so the drain is too.
+        let settle_by = self
+            .runtime
+            .clock()
+            .monotonic_nanos()
+            .saturating_add(CONDITION_SETTLE_TIMEOUT.as_nanos() as u64);
 
-        let overlay = self
-            .pending
-            .lock()
-            .expect("pending set poisoned")
-            .overlay(&key);
-        let committed = self.storage.get(&key).await?;
-        let visible = pending::visible(committed, &overlay, now);
+        let (guard, overlay, visible, now) = loop {
+            let guard = self.submit.lock().await;
+            let now = self.runtime.clock().now_millis();
+
+            let overlay = self
+                .pending
+                .lock()
+                .expect("pending set poisoned")
+                .overlay(&key);
+            let committed = self.storage.get(&key).await?;
+            let visible = pending::visible(committed, &overlay, now);
+
+            // An unconditional write does not read the key, so nothing about
+            // it is uncertain and it never waits.
+            if !overlay.uncertain || matches!(condition, WriteCondition::None) {
+                break (guard, overlay, visible, now);
+            }
+            let remaining = Duration::from_nanos(
+                settle_by.saturating_sub(self.runtime.clock().monotonic_nanos()),
+            );
+            if remaining.is_zero() {
+                // Undecided, and said as such. `visible` here is state from
+                // outside the in-flight window, so evaluating against it would
+                // manufacture a definitive `applied: false` out of a question
+                // this node never got an answer to — the exact dishonesty the
+                // wait exists to remove, on a slower path. The write parked on
+                // may still fail, in which case the caller never lost, or land
+                // with a version this response would have got wrong.
+                drop(guard);
+                tracing::warn!(
+                    partition = self.id.get(),
+                    "a conditional write is undecided: the in-flight write to the same key did \
+                     not settle within the budget"
+                );
+                return Err(Error::Unavailable(format!(
+                    "partition {} still has a write in flight on this key after {} seconds, so \
+                     the condition is undecided; retry",
+                    self.id,
+                    CONDITION_SETTLE_TIMEOUT.as_secs()
+                )));
+            }
+            // Released first, and deliberately. Waiting under the submission
+            // lock would hold a lock across replication, which is the one
+            // thing ADR 0003 forbids; only this caller waits, and every other
+            // write to the partition keeps going.
+            drop(guard);
+            self.await_settled(&key, remaining).await;
+        };
 
         if let Some(failure) = evaluate(condition, visible.as_ref(), overlay.uncertain) {
+            // Naming a version is as good as acknowledging the write that
+            // produced it, and the version being reported here may still be
+            // sitting in the overlay, committed but not yet invalidated on the
+            // replicas. So it waits for the same coherence an applied write
+            // waits for. Otherwise a client told which version holds the lock
+            // could turn around, read a replica, and be told the lock is free.
+            let revealing = overlay.top.as_ref().map(|(lamport, _)| *lamport);
+            drop(guard);
+            if let Some(lamport) = revealing {
+                self.await_coherence(wal, lamport).await;
+            }
             return Ok(failure);
         }
         let existed = visible.is_some();
@@ -978,6 +1094,9 @@ impl<R: Runtime> PartitionHost<R> {
                     .lock()
                     .expect("pending set poisoned")
                     .resolve(&ticket, lamport, record);
+                // The key has a version again, so anyone who parked on it can
+                // now be told the truth about it.
+                self.settled.notify_waiters();
                 if queued {
                     let _ = resolved.send(Some(mutation_of_op(lamport, &key, &wal_op)));
                 }
@@ -1005,6 +1124,10 @@ impl<R: Runtime> PartitionHost<R> {
                     .lock()
                     .expect("pending set poisoned")
                     .abandon(&ticket);
+                // Nothing landed, so the key is back to whatever it was. A
+                // waiter parked on this write must be released to win rather
+                // than left losing to a write that never happened.
+                self.settled.notify_waiters();
                 let _ = resolved.send(None);
                 Err(error)
             }
@@ -1177,6 +1300,60 @@ impl<R: Runtime> PartitionHost<R> {
                 .sleep(Duration::from_nanos(until.saturating_sub(now)))
                 .await;
         }
+    }
+
+    /// Waits for the writes already in flight on `key` to come back from the
+    /// log, so a condition against it can be decided on facts.
+    ///
+    /// A key with an unresolved write has no version yet, because the Lamport
+    /// is the version and the log hands it back at the end of the round trip.
+    /// Refusing every condition in that window keeps two compare-and-swaps
+    /// against one version from both winning, which is the property that
+    /// matters, but it answers a losing `if_not_present` with no version to
+    /// report — and the same loser arriving a moment later would have been
+    /// told exactly which version beat it. A client cannot control whether its
+    /// contention was concurrent or sequential, so it should not be able to
+    /// see the difference.
+    ///
+    /// Waiting removes the difference instead of papering over it, and it is
+    /// the only mechanism that stays honest in both directions. The in-flight
+    /// write either lands, in which case its version is the true answer to
+    /// "who holds this", or it fails, in which case it was never acknowledged,
+    /// must not be visible to anyone, and the caller is free to win. Guessing
+    /// the version the pending write is about to get would answer the first
+    /// case and lie about the second.
+    ///
+    /// Returning is not the same as settling. The budget can expire with the
+    /// key still uncertain, and the caller re-checks rather than trusting
+    /// this, because expiry is not an answer to the condition — see
+    /// [`CONDITION_SETTLE_TIMEOUT`] for what the caller does with it instead.
+    ///
+    /// This must not be called with the submission lock held. It waits on a
+    /// replication round trip, and ADR 0003 exists precisely to keep that out
+    /// from under a lock.
+    async fn await_settled(&self, key: &Bytes, budget: Duration) {
+        let notified = self.settled.notified();
+        let mut notified = std::pin::pin!(notified);
+        // Registered before the check, so a write that resolves between the
+        // two is not missed and the wait cannot park on a key that has already
+        // settled.
+        notified.as_mut().enable();
+
+        if !self
+            .pending
+            .lock()
+            .expect("pending set poisoned")
+            .overlay(key)
+            .uncertain
+        {
+            return;
+        }
+
+        // The expiry is not logged here. A budget that runs out on a key that
+        // settled a moment earlier is a non-event, and only the caller — which
+        // re-reads the overlay — can tell that case from the one worth
+        // warning about.
+        let _ = timeout(self.runtime.clock(), budget, notified).await;
     }
 
     /// Waits until no replica that could still be serving reads is missing
@@ -1581,6 +1758,12 @@ fn evaluate(
         WriteCondition::None => true,
         // A key with a write in flight has no version anyone can hold, so no
         // condition against it can be satisfied. See the pending module.
+        //
+        // The write path never reaches this arm any more: it waits the window
+        // out, and if the wait expires it fails the call `Unavailable` rather
+        // than deciding. The arm stays because the property it protects —
+        // never letting two swaps against one version both win — must not
+        // depend on a caller upstream remembering to check first.
         _ if uncertain => false,
         WriteCondition::IfNotPresent => visible.is_none(),
         WriteCondition::IfVersion(expected) => found == Some(expected),

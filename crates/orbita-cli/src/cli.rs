@@ -81,7 +81,9 @@ show` to see what was resolved and `orbita config env` for the variables that
 are read.
 
 Exit codes: 0 success, 1 error, 2 the key was not found, 3 a conditional write
-was not applied.";
+was not applied. Code 3 means the cluster decided against you. A conditional
+write the cluster could not decide at all is an error, exits 1, and is safe to
+retry.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -656,7 +658,12 @@ positionals are only the key and an optional value.
 Conditions are what make this usable for locks and catalog pointers.
 --if-not-present takes a lock; --if-version swings a pointer only if nobody
 else moved it first. A condition that is not met is not an error: the command
-exits 3 and reports the version it found instead.")]
+exits 3 and reports the version it found instead.
+
+Exit 3 is a verdict, so it is the one answer a script may act on without
+retrying. A conditional write that collides with another write the cluster has
+not finished landing is refused as UNAVAILABLE and exits 1 instead, because
+nobody yet knows who won; retry it.")]
 pub struct SetArgs {
     /// The keyspace to write to, or the key when a default keyspace is set.
     pub keyspace: Option<String>,

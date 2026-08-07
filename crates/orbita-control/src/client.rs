@@ -369,6 +369,19 @@ impl<R: Runtime> ControlClient<R> {
     /// undecodable and drop out of the failure detector for the whole
     /// rollout. Delete alongside the legacy method when the window moves
     /// past 0.0.
+    ///
+    /// # Why the lifecycle claim is withheld rather than merely ignored
+    ///
+    /// It would be tempting to send the claim always and let the leader decide
+    /// what to do with it, which would make issue #105 impossible on this end.
+    /// The encoding forbids it. A `RegisterNode` carrying either bool goes on
+    /// the log under a tag the previous binary cannot decode, and that binary
+    /// truncates its log at the first entry it cannot read, so one such entry
+    /// written during the upgrade window would take the rollback window with
+    /// it. Withholding here is what keeps the log rollback-readable, and the
+    /// cost — that a leader cannot tell "not ready" from "could not say" — is
+    /// paid on the other side, by `ClusterState::lifecycle_enabled` declining
+    /// to ask the question at all below 0.1.
     async fn send_status(
         &self,
         node: NodeId,
