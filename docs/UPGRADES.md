@@ -199,6 +199,33 @@ plane during a control-plane transition. It is excluded from placement and
 cannot be promoted or added as a new replica until it reports a compatible
 range again.
 
+## Growing a cluster mid-upgrade
+
+Adding a worker while the rollout is half done works, and the new worker is
+placed. A node inside the window speaks the active cluster version rather than
+its own binary version, so a newer worker in a cluster that has not finalized
+yet is a node of the active version in every respect the leader group reasons
+about: the same status protocol, the same on-disk formats, and ordinary
+failover rather than a planned handoff on shutdown. There is nothing about it
+an un-upgraded leader has to understand and cannot.
+
+The readiness a worker reports is the exception, and it is not a gap in what
+the leader knows so much as one in what it is allowed to write down. That claim
+travels in a registration shape the previous binary cannot decode, so it stays
+off the replicated log until you finalize, which is what keeps the rollback
+below real. Before finalization no node makes the claim and no node is judged
+on it; after finalization every node makes it and every node is judged on it.
+Both binaries decide which of those they are in from the active cluster
+version, not from their own, so they never disagree about a node they are both
+looking at.
+
+The practical consequence is that placement during the upgrade window ignores
+readiness and uses health, role, and version compatibility, which is the
+pre-0.1 rule. A worker that is up but still recovering can therefore be given a
+partition during the window; it opens it when it can, the same as it would have
+before any of this existed. Finalize when the rollout is done and the stricter
+rule comes back.
+
 The v0.0.1 heartbeat remains a deliberate special case. Its registration has
 no version field, so the control plane treats it as speaking exactly version
 0.0. It is accepted only while 0.0 is active. A newer worker can still fall

@@ -135,6 +135,41 @@ impl std::fmt::Display for CompatibilityRefusal {
     }
 }
 
+/// The first cluster version whose control protocol carries worker lifecycle
+/// state: the `ready` and `draining` claims on a status report, and the
+/// planned handoff built on them.
+pub const PROTOCOL_0_1: ClusterVersion = ClusterVersion::new(0, 1);
+
+/// Whether `active` is a cluster version whose protocol carries worker
+/// lifecycle state.
+///
+/// The comparison is against the *active cluster version* and never against
+/// the local binary's version, and that distinction is the whole point of
+/// this function existing rather than being written out at each call site.
+///
+/// Two sides consult this and they run different binaries during an upgrade:
+/// a worker deciding whether to put a lifecycle claim on its heartbeat, and
+/// the state machine deciding whether to hold a node without one out of
+/// placement. If either side asked "is the active version *mine*", the two
+/// would disagree the moment a node's binary is not the one the cluster
+/// finalized on — a worker one minor ahead would suppress its readiness while
+/// a leader on the finalized binary still demanded it, and the leader would
+/// then withhold placement from a node that is perfectly able to serve. That
+/// is issue #105. Asking whether the *cluster* has reached the version that
+/// carries the claim gives every node the same answer from the one piece of
+/// state they all agree on, which is what `docs/UPGRADES.md` says a cluster
+/// version is for.
+///
+/// It matters twice over for the state machine, where the same question
+/// decides how a committed entry applies. See
+/// [ADR 0008](../../../docs/adr/0008-a-fenced-owner-stays-a-replica.md) on
+/// gating an apply-time rule: a decision that reads the running binary lets
+/// one committed entry produce divergent state on two members.
+#[must_use]
+pub fn lifecycle_protocol_active(active: ClusterVersion) -> bool {
+    active >= PROTOCOL_0_1
+}
+
 /// The cluster version this binary was built to speak, taken from the crate
 /// version, which is the workspace version.
 #[must_use]
@@ -154,7 +189,14 @@ pub fn binary_speaks() -> VersionRange {
     speaks_for(binary_version())
 }
 
-fn speaks_for(own: ClusterVersion) -> VersionRange {
+/// The window [`binary_speaks`] would return for a binary built at `own`.
+///
+/// Public because the rule, not the current build, is what callers reason
+/// about. Anything gating on compatibility has to be testable at the version
+/// pairs a rolling upgrade actually produces, and `binary_speaks` can only
+/// ever describe the one version this workspace happens to be at today.
+#[must_use]
+pub fn speaks_for(own: ClusterVersion) -> VersionRange {
     if own.minor == 0 {
         VersionRange::exactly(own)
     } else {

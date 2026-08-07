@@ -176,6 +176,16 @@ struct Cluster {
     /// The committed prefix each worker reports, where `None` is a node whose
     /// status method has no room for one.
     committed: Arc<Mutex<HashMap<NodeId, Option<u64>>>>,
+    /// The cluster versions each worker's heartbeat claims it can speak,
+    /// defaulting to this binary's own window.
+    ///
+    /// A per-node override is what lets one scenario run two adjacent cluster
+    /// versions at once, which
+    /// [ADR 0005](../../../docs/adr/0005-upgrades-follow-kubernetes-rollouts.md)
+    /// asks the simulator for and a harness that hardcodes `binary_speaks()`
+    /// on every heartbeat cannot do: the claim a scenario made would be
+    /// overwritten a heartbeat later.
+    speaks: Arc<Mutex<HashMap<NodeId, VersionRange>>>,
     /// Nodes an operator asked to hand their partitions off. A drain is not
     /// something the sweep starts on its own, so nothing can be said about one
     /// finishing unless the harness remembers that it was asked for.
@@ -279,6 +289,7 @@ impl Cluster {
             )),
             index_bytes: Arc::new(Mutex::new(HashMap::new())),
             committed: Arc::new(Mutex::new(HashMap::new())),
+            speaks: Arc::new(Mutex::new(HashMap::new())),
             drains_requested: Arc::new(Mutex::new(BTreeSet::new())),
             log_progress: Arc::new(Mutex::new((0, 0))),
             wiring,
@@ -342,14 +353,20 @@ impl Cluster {
         let mut held = PartitionMap::default();
         // Readiness only travels on the wire shape the finalized protocol
         // enables, so a worker cannot report it until a reply has told it the
-        // active cluster version matches its own binary. `ControlConnection`
-        // in orbita-server does exactly this, and getting it wrong here left
-        // every worker permanently ineligible to own anything, which is how
-        // the convergence check earned its keep before it had shipped.
+        // active cluster version carries lifecycle state.
+        // `StatusReporter::can_handoff` in orbita-server does exactly this,
+        // and getting it wrong here left every worker permanently ineligible
+        // to own anything, which is how the convergence check earned its keep
+        // before it had shipped. Testing the active version against this
+        // binary's own version rather than against the version that
+        // introduced the claim is issue #105, and it is wrong in both
+        // directions: a worker ahead of the cluster and a worker behind it
+        // both stop claiming readiness their leader is still waiting for.
         let mut lifecycle = false;
         let reporting = Arc::clone(&self.reporting);
         let index_bytes = Arc::clone(&self.index_bytes);
         let committed = Arc::clone(&self.committed);
+        let speaks = Arc::clone(&self.speaks);
 
         runtime.spawn(async move {
             loop {
@@ -452,7 +469,11 @@ impl Cluster {
                         role: NodeRole::Worker,
                         address: format!("10.0.0.{node}:7000"),
                         map_version: held.version(),
-                        speaks: orbita_control::binary_speaks(),
+                        speaks: *speaks
+                            .lock()
+                            .expect("speaks lock poisoned")
+                            .get(&node)
+                            .unwrap_or(&orbita_control::binary_speaks()),
                         ready: *readiness
                             .lock()
                             .expect("readiness lock poisoned")
@@ -480,7 +501,7 @@ impl Cluster {
                                 ..
                             }) = sent
                             {
-                                lifecycle = active == orbita_control::binary_version();
+                                lifecycle = orbita_control::lifecycle_protocol_active(active);
                             }
                         }
                     }
@@ -606,7 +627,16 @@ impl Cluster {
     /// is what a node whose binary was replaced under it does. Applied
     /// synchronously, with no virtual time advanced, so the harness's own
     /// heartbeat loops cannot overwrite it before an assertion runs.
+    ///
+    /// The claim is remembered as well as reported. A replaced binary does not
+    /// revert on its next heartbeat, and a scenario that has to keep a node at
+    /// a version for longer than one interval would otherwise be relying on
+    /// the compatibility refusal to swallow the contradicting reports.
     fn report_speaks(&self, node: NodeId, role: NodeRole, speaks: VersionRange) {
+        self.speaks
+            .lock()
+            .expect("speaks lock poisoned")
+            .insert(node, speaks);
         let controller = self.controller.clone();
         self.sim
             .block_on(async move {
@@ -1516,6 +1546,146 @@ fn a_deposed_owner_that_came_back_short_loses_to_a_replica_that_did_not() {
                 )));
             }
             cluster.set_ready(*behind, true);
+            cluster.converged()
+        },
+    );
+}
+
+#[test]
+fn a_worker_stays_placeable_when_its_binary_is_not_the_finalized_one() {
+    check_seeds(
+        "a_worker_stays_placeable_when_its_binary_is_not_the_finalized_one",
+        16,
+        |seed| {
+            // Issue #105, over the wire: a worker whose binary is not the one
+            // the cluster finalized on has to end up owning something. Both
+            // ends of the heartbeat decide independently whether the active
+            // protocol carries a readiness claim — the worker when it chooses
+            // what to send, the state machine when it decides who may own —
+            // and if the two disagree the worker joins, reports healthy, and
+            // is never placed. It has to be the networked wiring: under the
+            // direct one the harness hands the controller a status the worker
+            // never had to decide the shape of, which is the half of the
+            // disagreement this is here to catch.
+            let cluster = Cluster::start_networked(SimConfig::new(seed));
+            let partition = cluster.only_partition();
+            let deposed = cluster.owner_of(partition).expect("an owner");
+
+            cluster.report_speaks(LEADER, NodeRole::Leader, upgraded_speaks());
+            for worker in WORKERS {
+                cluster.report_speaks(worker, NodeRole::Worker, upgraded_speaks());
+            }
+            let previous = binary_speaks().max;
+            let controller = cluster.controller.clone();
+            cluster
+                .sim
+                .block_on(async move {
+                    controller
+                        .submit(ControlCommand::SetClusterVersion {
+                            version: upgraded_speaks().max,
+                            expect: previous,
+                        })
+                        .await
+                })
+                .expect("advancing the test cluster version");
+            cluster.sim.run_for(Duration::from_secs(2));
+
+            // Losing the owner is what forces the question to be answered out
+            // loud: a promotion needs a node the state machine agrees is
+            // eligible, and there is none if every worker's claim is being
+            // read through a different rule than it was written with.
+            cluster.sim.crash(deposed);
+            let promoted = cluster.run_until(Duration::from_secs(30), |c| {
+                c.owner_of(partition).is_some_and(|owner| owner != deposed)
+            });
+            if !promoted {
+                return Err(cluster.sim.failure(
+                    "no surviving worker was ever placed; the leader and its workers disagree \
+                     about whether the active protocol carries a readiness claim",
+                ));
+            }
+            cluster.converged()
+        },
+    );
+}
+
+#[test]
+fn a_member_behind_the_finalized_version_still_applies_the_lifecycle_rule() {
+    check_seeds(
+        "a_member_behind_the_finalized_version_still_applies_the_lifecycle_rule",
+        16,
+        |seed| {
+            // This process runs the current binary and the cluster is
+            // finalized one version past it, which is what a member that was
+            // down during a finalize comes back to: `finalize-upgrade` counts
+            // only live nodes, so it can advance without this one's vote. The
+            // member is refused registration afterwards, but it is still a
+            // controller, still applying committed entries, and still deciding
+            // ownership from them. If it decides the lifecycle question from
+            // its own binary version rather than the cluster's, it promotes a
+            // node its up-to-date peers refuse, and one committed entry has
+            // produced two maps.
+            let cluster = Cluster::start(seed);
+            let partition = cluster.only_partition();
+            let before = cluster.map().partition(partition).unwrap().clone();
+            let deposed = before.owner.expect("an owner");
+            let [behind, ahead] = before.replicas.as_slice() else {
+                return Err(cluster
+                    .sim
+                    .failure("expected two replicas to choose between"));
+            };
+
+            cluster.report_speaks(LEADER, NodeRole::Leader, upgraded_speaks());
+            for worker in WORKERS {
+                cluster.report_speaks(worker, NodeRole::Worker, upgraded_speaks());
+            }
+            let previous = binary_speaks().max;
+            let controller = cluster.controller.clone();
+            cluster
+                .sim
+                .block_on(async move {
+                    controller
+                        .submit(ControlCommand::SetClusterVersion {
+                            version: upgraded_speaks().max,
+                            expect: previous,
+                        })
+                        .await
+                })
+                .expect("advancing the test cluster version");
+
+            // The one replica holding the durable tail is not ready, so there
+            // is exactly one node promotion could pick and exactly one rule
+            // stopping it.
+            cluster.set_progress(*ahead, 900);
+            cluster.set_ready(*ahead, false);
+            cluster.sim.run_for(Duration::from_secs(1));
+
+            cluster.sim.crash(deposed);
+            cluster.sim.run_for(Duration::from_secs(10));
+            if cluster.owner_of(partition) == Some(*ahead) {
+                return Err(cluster.sim.failure(
+                    "an unready worker was promoted by a member whose binary is not the \
+                     finalized one; the lifecycle gate read the binary version",
+                ));
+            }
+            if cluster.owner_of(partition) == Some(*behind) {
+                return Err(cluster.sim.failure(
+                    "a replica behind the durable tail was promoted while the tail was held \
+                     by an unready node",
+                ));
+            }
+
+            // And the exclusion is the readiness claim rather than anything
+            // structural: the same node is promoted the moment it claims it.
+            cluster.set_ready(*ahead, true);
+            let promoted = cluster.run_until(Duration::from_secs(10), |c| {
+                c.owner_of(partition) == Some(*ahead)
+            });
+            if !promoted {
+                return Err(cluster
+                    .sim
+                    .failure("the ready replica holding the durable tail was never promoted"));
+            }
             cluster.converged()
         },
     );

@@ -280,6 +280,17 @@ fn put(key: &'static [u8]) -> WalOp {
     }
 }
 
+/// Why a lifecycle claim cannot simply be recorded early.
+///
+/// This is the constraint that decides the shape of the fix for issue #105.
+/// A `RegisterNode` carrying a readiness or draining claim encodes under
+/// `TAG_REGISTER_NODE_V3`, a tag the previous binary does not know, and
+/// recovery treats an entry it cannot decode as the end of the trustworthy log
+/// and truncates there. So "record the claim anyway, and let an old leader
+/// judge the node on it" is not available: it would buy placement during the
+/// upgrade window by destroying the rollback window, which is the trade
+/// `docs/UPGRADES.md` exists to refuse. The claim has to stay off the log
+/// until finalization, which is why the *gate* is what moves instead.
 #[test]
 fn pre_finalization_raft_log_remains_readable_by_the_previous_binary() {
     const PREVIOUS_BINARY_MAX_TAG: u8 = 14;
