@@ -1,4 +1,4 @@
-# 0011: Merge commands require cluster protocol 0.2
+# 0012: Merge commands require cluster protocol 0.2
 
 Status: Accepted, 2026-08-09.
 

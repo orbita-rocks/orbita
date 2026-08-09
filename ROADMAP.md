@@ -155,7 +155,7 @@ The cost is said out loud: the release gets longer, and if the date starts to
 matter these two are the cut line back to the previous plan.
 
 Upgrade review found that merge adds replicated command tags a 0.1 voter cannot
-decode. ADR 0011 therefore puts the operation behind cluster protocol 0.2. The
+decode. ADR 0012 therefore puts the operation behind cluster protocol 0.2. The
 implementation can roll out while 0.1 remains active, but merge is unavailable
 until every node speaks 0.2 and the operator finalizes. It cannot be an enabled
 v0.1.0 feature without replacing the durable merge protocol.
