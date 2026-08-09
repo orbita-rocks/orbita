@@ -1007,6 +1007,49 @@ impl<R: Runtime> Partition<R> {
     /// hydrated in order to serve somebody claiming to own the partition has
     /// to be able to check that claim against it. See [`Hydration`].
     pub async fn hydrate(&self) -> Result<Hydration> {
+        // The manifest first, on its own. It is one small object, where opening
+        // a snapshot reads the footer and key index of every segment the
+        // manifest names -- bytes proportional to the partition's keys.
+        //
+        // That distinction is the whole point of doing this in two steps. A
+        // replica with a gap the bucket cannot close asks for a rebuild on
+        // *every* append it refuses, and the answer is almost always that
+        // nothing moved. Paying a full index rebuild to discover that turns one
+        // behind replica into a loop that saturates the node and the object
+        // store, and it does not stop when the writes do: measured at issue
+        // \#141 as three workers and MinIO all burning CPU on a completely idle
+        // cluster, with reads of the bucket and no writes to it.
+        //
+        // So the cheap read decides whether the expensive one is worth doing.
+        let Some((manifest, _)) = load_manifest(self.store.as_ref(), &self.path)
+            .await
+            .map_err(format_error)?
+        else {
+            // Never flushed, so there is nothing to download.
+            return Ok(self.hydration().await);
+        };
+
+        {
+            let mut state = self.state.write().await;
+            if manifest.committed_lamport <= state.flushed {
+                // Nothing to adopt but the epoch. A manifest can be republished
+                // by a newer owner without the horizon moving, most obviously by
+                // a compaction, and that manifest is no less proof of who owns
+                // this partition than one that added records. Taking it here
+                // rather than after a rebuild is what makes the common case one
+                // small GET.
+                state.flushed_epoch = state.flushed_epoch.max(manifest.epoch);
+                return Ok(Hydration {
+                    epoch: state.flushed_epoch,
+                    through: state.flushed,
+                });
+            }
+        }
+
+        // The manifest is genuinely ahead, so the rebuild is worth its cost.
+        // Re-read rather than building from the manifest just fetched: between
+        // the two reads the bucket can move again, and a snapshot is the thing
+        // that resolves segments and their shared sources consistently.
         let Some(snapshot) = Snapshot::open(Arc::clone(&self.store), self.path.clone())
             .await
             .map_err(format_error)?
@@ -1015,10 +1058,6 @@ impl<R: Runtime> Partition<R> {
         };
         let mut state = self.state.write().await;
         if snapshot.committed_lamport() <= state.flushed {
-            // Still adopt the epoch. A manifest can be republished by a newer
-            // owner without the horizon moving, most obviously by a
-            // compaction, and that manifest is no less proof of who owns this
-            // partition than one that added records.
             state.flushed_epoch = state.flushed_epoch.max(snapshot.manifest().epoch);
         } else {
             adopt(&mut state, &snapshot);
@@ -3852,6 +3891,58 @@ mod tests {
         assert!(
             owner.get(b"b").await.unwrap().is_some(),
             "the unflushed write is still there"
+        );
+    }
+
+    // The loop behind issue #141. A replica with a gap the bucket cannot close
+    // asks for a rebuild on every append it refuses, and the answer is almost
+    // always that nothing moved. Rebuilding to discover that reads the footer
+    // and key index of every segment, so one behind replica saturates itself
+    // and the object store, and it does not stop when the writes do.
+    //
+    // Asserting on reads rather than on the horizon, because a hydrate that
+    // rebuilt and one that did not return the same value. The cost is the
+    // behaviour.
+    #[tokio::test]
+    async fn hydrating_against_an_unchanged_manifest_does_not_rebuild_the_index() {
+        let (owner, replica, store) = crate::testing::counting_partition_pair().await;
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("a"), bytes("v"), None))
+            .await
+            .unwrap();
+        owner.flush().await.unwrap();
+
+        // First hydrate: the manifest is ahead of a partition that has adopted
+        // nothing, so a rebuild is the correct, expensive answer.
+        store.reset();
+        let first = replica.hydrate().await.unwrap();
+        assert_eq!(first.through, Lamport(1));
+        assert!(
+            store.segment_reads() > 0,
+            "a manifest genuinely ahead has to be read into the index"
+        );
+
+        // Second and third, with nothing republished. This is the state a
+        // gapped replica is in on every refused append.
+        store.reset();
+        for _ in 0..2 {
+            assert_eq!(
+                replica.hydrate().await.unwrap(),
+                first,
+                "the horizon is unchanged, which is why the cost is invisible \
+                 from the return value"
+            );
+        }
+        assert_eq!(
+            store.segment_reads(),
+            0,
+            "an unchanged manifest must not cost an index rebuild"
+        );
+        assert_eq!(
+            store.manifest_reads(),
+            2,
+            "one small read each, which is what decides the expensive one is \
+             not worth doing"
         );
     }
 }
