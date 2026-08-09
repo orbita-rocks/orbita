@@ -56,7 +56,20 @@ struct Certificate {
 pub(crate) struct BootstrapCertificate {
     pub cluster_identity: String,
     pub node_identity: String,
-    pub voters: Vec<(NodeId, String)>,
+    pub voters: Vec<BootstrapVoter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BootstrapVoter {
+    pub node: NodeId,
+    pub address: String,
+    pub node_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootstrapOutcome {
+    Joined(BootstrapCertificate),
+    IdentityMismatch(String),
 }
 
 /// Joins the object-store identity and waits for one three-node certificate.
@@ -71,7 +84,7 @@ pub(crate) async fn bootstrap(
     address: &str,
     failure_domain: &str,
     eligible: bool,
-) -> Result<BootstrapCertificate> {
+) -> Result<BootstrapOutcome> {
     let mut local = load_or_create_local(data_dir, node_id)?;
     let prefix = format!("clusters/{cluster_name}");
     let identity_key = format!("{prefix}/identity");
@@ -103,7 +116,7 @@ pub(crate) async fn bootstrap(
     }
     if let Some(held) = &local.cluster_identity {
         if held != &cluster.cluster_identity {
-            return Err(Error::InvalidArgument(format!(
+            return Ok(BootstrapOutcome::IdentityMismatch(format!(
                 "data directory belongs to cluster {held}, but object storage names {}; use the original bucket or an empty data directory",
                 cluster.cluster_identity
             )));
@@ -137,8 +150,20 @@ pub(crate) async fn bootstrap(
             Ok((bytes, _)) => {
                 let certificate = decode::<Certificate>(&bytes, "bootstrap certificate")?;
                 let mut certificate = validate_certificate(certificate, &cluster.cluster_identity)?;
+                if let Some(certified) = certificate
+                    .voters
+                    .iter()
+                    .find(|claim| claim.node == node_id)
+                {
+                    if certified.node_identity != local.node_identity {
+                        return Ok(BootstrapOutcome::IdentityMismatch(format!(
+                            "node id {node_id} is certified for durable identity {}, not {}",
+                            certified.node_identity, local.node_identity
+                        )));
+                    }
+                }
                 certificate.node_identity = local.node_identity.clone();
-                return Ok(certificate);
+                return Ok(BootstrapOutcome::Joined(certificate));
             }
             Err(ObjectError::NotFound(_)) => {}
             Err(error) => return Err(object_error(error)),
@@ -239,7 +264,11 @@ fn validate_certificate(
         voters: certificate
             .voters
             .into_iter()
-            .map(|claim| (NodeId(claim.node_id), claim.address))
+            .map(|claim| BootstrapVoter {
+                node: NodeId(claim.node_id),
+                address: claim.address,
+                node_identity: claim.node_identity,
+            })
             .collect(),
     })
 }
@@ -362,6 +391,60 @@ mod tests {
         assert!(validate_certificate(repeated, "cluster").is_err());
     }
 
+    #[tokio::test]
+    async fn a_certified_numeric_id_cannot_be_reused_by_another_disk() {
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let root = std::env::temp_dir().join(format!(
+            "orbita-bootstrap-certified-id-{}-{}",
+            std::process::id(),
+            random_identity().unwrap()
+        ));
+        let cluster_identity = ClusterIdentity {
+            version: IDENTITY_VERSION,
+            cluster_identity: "cluster-identity".into(),
+        };
+        store
+            .put_if(
+                "clusters/test/identity",
+                encode(&cluster_identity).unwrap(),
+                Precondition::NotExists,
+            )
+            .await
+            .unwrap();
+        let claim = |node_id, node_identity: &str| Claim {
+            version: IDENTITY_VERSION,
+            cluster_identity: cluster_identity.cluster_identity.clone(),
+            node_identity: node_identity.into(),
+            node_id,
+            address: format!("n{node_id}:7101"),
+            failure_domain: String::new(),
+            eligible: true,
+        };
+        store
+            .put_if(
+                "clusters/test/bootstrap/certificate",
+                encode(&Certificate {
+                    version: IDENTITY_VERSION,
+                    cluster_identity: cluster_identity.cluster_identity.clone(),
+                    voters: vec![
+                        claim(1, "original-disk"),
+                        claim(2, "disk-2"),
+                        claim(3, "disk-3"),
+                    ],
+                })
+                .unwrap(),
+                Precondition::NotExists,
+            )
+            .await
+            .unwrap();
+
+        let outcome = bootstrap(store, &root, "test", NodeId(1), "n1:7101", "", true)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, BootstrapOutcome::IdentityMismatch(_)));
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn bootstrap_voters_maximize_failure_domain_spread_before_identity_order() {
         let claim = |identity: &str, id, domain: &str| Claim {
@@ -390,6 +473,13 @@ mod tests {
 
     #[tokio::test]
     async fn three_concurrent_fresh_nodes_form_exactly_one_cluster() {
+        fn joined(outcome: BootstrapOutcome) -> BootstrapCertificate {
+            match outcome {
+                BootstrapOutcome::Joined(certificate) => certificate,
+                BootstrapOutcome::IdentityMismatch(error) => panic!("unexpected mismatch: {error}"),
+            }
+        }
+
         let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
         let root = std::env::temp_dir().join(format!(
             "orbita-bootstrap-three-{}-{}",
@@ -425,7 +515,11 @@ mod tests {
             true,
         );
         let (first, second, third) = tokio::join!(first, second, third);
-        let certificates = [first.unwrap(), second.unwrap(), third.unwrap()];
+        let certificates = [
+            joined(first.unwrap()),
+            joined(second.unwrap()),
+            joined(third.unwrap()),
+        ];
         assert!(
             certificates.windows(2).all(|pair| {
                 pair[0].cluster_identity == pair[1].cluster_identity
@@ -434,21 +528,23 @@ mod tests {
             "every concurrent node must read the one conditional certificate"
         );
 
-        let fourth = bootstrap(
-            Arc::clone(&store),
-            &directories[3],
-            "test",
-            NodeId(4),
-            "n4:7101",
-            "d",
-            true,
-        )
-        .await
-        .unwrap();
+        let fourth = joined(
+            bootstrap(
+                Arc::clone(&store),
+                &directories[3],
+                "test",
+                NodeId(4),
+                "n4:7101",
+                "d",
+                true,
+            )
+            .await
+            .unwrap(),
+        );
         assert_eq!(fourth.cluster_identity, certificates[0].cluster_identity);
         assert_eq!(fourth.voters, certificates[0].voters);
         assert!(
-            !fourth.voters.iter().any(|(node, _)| *node == NodeId(4)),
+            !fourth.voters.iter().any(|voter| voter.node == NodeId(4)),
             "a later worker cannot rewrite the immutable three-voter certificate"
         );
         std::fs::remove_dir_all(root).ok();

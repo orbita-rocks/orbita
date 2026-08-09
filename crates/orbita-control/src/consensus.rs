@@ -44,14 +44,25 @@ pub struct LogEntry {
 }
 
 /// One safe Raft membership operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MembershipChange {
     /// Add a non-voting member so it can catch up before promotion.
     AddLearner(NodeId),
+    /// Adds a learner and durably binds the address and node identity every
+    /// voter needs to rediscover it after a full restart.
+    AddLearnerMember(RaftMember),
     /// Promote a caught-up learner into the voting set.
     Promote(NodeId),
     /// Remove a voter or learner through the replicated Raft configuration.
     Remove(NodeId),
+}
+
+/// One Raft participant and the durable discovery identity bound to its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftMember {
+    pub node: NodeId,
+    pub address: String,
+    pub node_identity: String,
 }
 
 /// An ordered, durable, agreed-upon sequence of commands.

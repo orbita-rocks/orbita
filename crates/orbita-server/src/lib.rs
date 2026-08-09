@@ -138,10 +138,11 @@ pub use transport::{PeerListener, PeerTransport, DEFAULT_PEER_CALL_TIMEOUT};
 
 use crate::node::{DataLayout, Node};
 use crate::service::{HealthService, KvService};
+use bootstrap::BootstrapOutcome;
 
 use orbita_control::{
     AdminService, BootstrapSpec, ConsensusLog, ControlClient, ControlConfig, ControlService,
-    Controller, KeyspaceConfig, RaftLog,
+    Controller, KeyspaceConfig, RaftLog, RaftMember,
 };
 use orbita_core::{Error, Result};
 use orbita_objectstore::s3::{HttpTransport, HyperTransport, NowMillis, S3Config, S3Store};
@@ -238,13 +239,14 @@ impl Server {
             }
         };
         let mut node_identity = String::new();
+        let mut recovered_membership = None;
         if config.automatic_cluster {
             let address = config.peer_advertise_addr.as_deref().ok_or_else(|| {
                 Error::InvalidArgument(
                     "combined clustered nodes need a peer advertise address".into(),
                 )
             })?;
-            let certificate = bootstrap::bootstrap(
+            let outcome = bootstrap::bootstrap(
                 Arc::clone(&store),
                 &config.data_dir,
                 &config.cluster_name,
@@ -254,10 +256,47 @@ impl Server {
                 config.voter_eligible,
             )
             .await?;
+            let certificate = match outcome {
+                BootstrapOutcome::Joined(certificate) => certificate,
+                BootstrapOutcome::IdentityMismatch(diagnostic) => {
+                    return serve_identity_mismatch(config.listen_addr, &diagnostic).await;
+                }
+            };
             tracing::info!(cluster_identity = %certificate.cluster_identity, "joined the durable cluster identity");
             node_identity = certificate.node_identity.clone();
-            config.peers = certificate.voters.clone();
-            config.leader_group = certificate.voters.iter().map(|(node, _)| *node).collect();
+            let bootstrap: Vec<_> = certificate
+                .voters
+                .into_iter()
+                .map(|voter| RaftMember {
+                    node: voter.node,
+                    address: voter.address,
+                    node_identity: voter.node_identity,
+                })
+                .collect();
+            let membership = RaftLog::recover_membership(&runtime, &bootstrap).await?;
+            if let Some(member) = membership
+                .voters
+                .iter()
+                .chain(&membership.learners)
+                .find(|member| member.node == config.node_id)
+            {
+                if !member.node_identity.is_empty() && member.node_identity != node_identity {
+                    let diagnostic = format!(
+                        "node id {} is committed for durable identity {}, not {}",
+                        config.node_id, member.node_identity, node_identity
+                    );
+                    return serve_identity_mismatch(config.listen_addr, &diagnostic).await;
+                }
+            }
+            config.peers = membership
+                .voters
+                .iter()
+                .chain(&membership.learners)
+                .filter(|member| !member.address.is_empty())
+                .map(|member| (member.node, member.address.clone()))
+                .collect();
+            config.leader_group = membership.voters.iter().map(|member| member.node).collect();
+            recovered_membership = Some(membership);
             // Every combined node hosts a dormant Raft state machine. A worker
             // has to be reachable as a learner before the current voters can
             // catch it up and promote it.
@@ -271,6 +310,13 @@ impl Server {
             .leader_member
             .then(runtime::ControlExecutor::start)
             .transpose()?;
+        if let Some(executor) = &control_executor {
+            for service in [ServiceId::Raft, ServiceId::Control] {
+                runtime
+                    .transport()
+                    .route_service(service, executor.handle());
+            }
+        }
         let control_runtime = control_executor.as_ref().map_or_else(
             || runtime.clone(),
             |executor| runtime.for_control(executor.handle()),
@@ -278,7 +324,10 @@ impl Server {
         let mut raft = None;
         let mut controller = None;
         if config.leader_member {
-            let log = RaftLog::open(&control_runtime, &config.leader_group).await?;
+            let log = match recovered_membership.take() {
+                Some(membership) => RaftLog::open_membership(&control_runtime, membership).await?,
+                None => RaftLog::open(&control_runtime, &config.leader_group).await?,
+            };
             let mut control_config =
                 ControlConfig::default().with_voter_target(config.voter_target)?;
             if config.automatic_cluster {
@@ -298,9 +347,7 @@ impl Server {
         // defer binding until their partition handlers are registered below.
         let mut peer_listener = if config.leader_member {
             Some(
-                runtime
-                    .transport()
-                    .listen(config.peer_listen_addr)
+                listen_peer_transport(&runtime, control_executor.as_ref(), config.peer_listen_addr)
                     .await
                     .map_err(|e| {
                         Error::Internal(format!(
@@ -343,6 +390,7 @@ impl Server {
         };
 
         let readiness = Arc::new(ReadinessGate::new());
+        readiness.mark(ReadinessCondition::ClusterIdentityMatched);
         readiness.mark(ReadinessCondition::AcceptingOwnership);
         // Auth-policy agreement starts met and is cleared only on a positive
         // disagreement with the leader group, so a cluster that cannot advertise
@@ -389,16 +437,16 @@ impl Server {
         // service this node does serve is missing.
         let peers = match peer_listener.take() {
             Some(listener) => listener,
-            None => runtime
-                .transport()
-                .listen(config.peer_listen_addr)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!(
-                        "binding peer port {}: {e}",
-                        config.peer_listen_addr
-                    ))
-                })?,
+            None => {
+                listen_peer_transport(&runtime, control_executor.as_ref(), config.peer_listen_addr)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!(
+                            "binding peer port {}: {e}",
+                            config.peer_listen_addr
+                        ))
+                    })?
+            }
         };
         let peer_addr = peers.local_addr();
         let peer_advertise_addr = config
@@ -1158,6 +1206,53 @@ fn connect_object_store(
     .map(|store| store.with_credentials_provider(credentials))
 }
 
+async fn listen_peer_transport(
+    runtime: &ServerRuntime,
+    control_executor: Option<&runtime::ControlExecutor>,
+    address: SocketAddr,
+) -> std::io::Result<PeerListener> {
+    match control_executor {
+        Some(executor) => {
+            runtime
+                .transport()
+                .listen_on(address, executor.handle())
+                .await
+        }
+        None => runtime.transport().listen(address).await,
+    }
+}
+
+async fn serve_identity_mismatch(addr: SocketAddr, diagnostic: &str) -> Result<Server> {
+    let readiness = Arc::new(ReadinessGate::new());
+    for condition in ReadinessCondition::ALL {
+        if condition != ReadinessCondition::ClusterIdentityMatched {
+            readiness.mark(condition);
+        }
+    }
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+        Error::Internal(format!("binding diagnostic health port {addr}: {error}"))
+    })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|error| Error::Internal(format!("reading diagnostic health address: {error}")))?;
+    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+        .map_err(|error| {
+            Error::Internal(format!(
+                "serving diagnostic health on {local_addr}: {error}"
+            ))
+        })?;
+    tracing::error!(%diagnostic, %local_addr, "cluster identity mismatch; serving health only");
+    let health = HealthServer::new(HealthService::new(readiness));
+    let stopped = tonic::transport::Server::builder()
+        .add_service(health)
+        .serve_with_incoming(incoming)
+        .await;
+    Err(Error::Internal(match stopped {
+        Ok(()) => "diagnostic health listener stopped".into(),
+        Err(error) => format!("diagnostic health listener stopped: {error}"),
+    }))
+}
+
 async fn start_control_plane(
     runtime: &ServerRuntime,
     log: &Arc<RaftLog>,
@@ -1277,6 +1372,45 @@ fn update_auth_policy_readiness(readiness: &ReadinessGate, local: bool, cluster:
 #[cfg(test)]
 mod leader_readiness_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_identity_mismatch_binds_health_and_reports_only_that_condition() {
+        let address = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let serving = tokio::spawn(async move {
+            serve_identity_mismatch(address, "wrong cluster identity").await
+        });
+        let endpoint = format!("http://{address}");
+        let mut health = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match orbita_proto::v1::health_client::HealthClient::connect(endpoint.clone()).await
+                {
+                    Ok(client) => break client,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("diagnostic health listener binds");
+
+        let response = health
+            .check_readiness(orbita_proto::v1::CheckReadinessRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.ready);
+        let unmet: Vec<_> = response
+            .conditions
+            .into_iter()
+            .filter(|condition| !condition.met)
+            .map(|condition| condition.name)
+            .collect();
+        assert_eq!(unmet, ["cluster-identity-matched"]);
+
+        serving.abort();
+    }
 
     #[test]
     fn an_accepted_leader_report_does_not_make_a_lagging_voter_ready() {
