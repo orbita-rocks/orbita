@@ -106,7 +106,7 @@ fn handle_line(runtime: &tokio::runtime::Runtime, session: &mut Session, line: &
         Ok(Line::Meta(meta)) => apply_meta(session, meta),
         Ok(Line::Command { command, format }) => {
             let format = format.unwrap_or(session.format);
-            match runtime.block_on(dispatch(session, format, command)) {
+            match runtime.block_on(dispatch(session, format, *command)) {
                 Ok(outcome) => {
                     print(&outcome.text);
                     // The screen answer for a missed get or a lost CAS: the same
@@ -138,7 +138,7 @@ enum Line {
     /// is the line's own `--output`, which overrides the session default for
     /// this line only.
     Command {
-        command: Command,
+        command: Box<Command>,
         format: Option<Format>,
     },
 }
@@ -209,7 +209,7 @@ fn parse_line(line: &str) -> Result<Line> {
     }
 
     Ok(Line::Command {
-        command: cli.command,
+        command: Box::new(cli.command),
         format: cli.global.output,
     })
 }
@@ -460,7 +460,7 @@ mod tests {
             panic!("expected a command");
         };
         assert!(format.is_none());
-        let Command::Get(args) = command else {
+        let Command::Get(args) = *command else {
             panic!("expected get");
         };
         assert_eq!(args.keyspace.as_deref(), Some("demo"));
@@ -543,7 +543,7 @@ mod tests {
                 panic!("{line} should parse");
             };
             let error = runtime
-                .block_on(dispatch(&session, Format::Human, command))
+                .block_on(dispatch(&session, Format::Human, *command))
                 .unwrap_err();
             let message = format!("{error:#}");
             assert!(
@@ -562,7 +562,7 @@ mod tests {
             panic!("expected set");
         };
         let error = runtime
-            .block_on(dispatch(&session, Format::Human, command))
+            .block_on(dispatch(&session, Format::Human, *command))
             .unwrap_err();
         assert!(
             format!("{error:#}").contains("standard input is not read in the REPL"),
@@ -583,7 +583,7 @@ mod tests {
         // dial, so a wrong keyspace resolution would change which request is
         // built. Assert on the parsed shape instead: one positional, which the
         // default fills.
-        let Command::Get(args) = command else {
+        let Command::Get(args) = *command else {
             panic!("expected get");
         };
         assert_eq!(args.keyspace.as_deref(), Some("greeting"));

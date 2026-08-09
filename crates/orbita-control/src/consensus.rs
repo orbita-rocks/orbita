@@ -43,6 +43,28 @@ pub struct LogEntry {
     pub command: ControlCommand,
 }
 
+/// One safe Raft membership operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// Add a non-voting member so it can catch up before promotion.
+    AddLearner(NodeId),
+    /// Adds a learner and durably binds the address and node identity every
+    /// voter needs to rediscover it after a full restart.
+    AddLearnerMember(RaftMember),
+    /// Promote a caught-up learner into the voting set.
+    Promote(NodeId),
+    /// Remove a voter or learner through the replicated Raft configuration.
+    Remove(NodeId),
+}
+
+/// One Raft participant and the durable discovery identity bound to its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftMember {
+    pub node: NodeId,
+    pub address: String,
+    pub node_identity: String,
+}
+
 /// An ordered, durable, agreed-upon sequence of commands.
 ///
 /// Implementations decide how agreement is reached. Everything above this
@@ -83,6 +105,38 @@ pub trait ConsensusLog: Send + Sync + 'static {
 
     /// Who to redirect a proposal to, when this node is not the leader.
     fn leader(&self) -> impl Future<Output = Option<NodeId>> + Send;
+
+    /// The applied Raft voters, which are authoritative over node roles.
+    fn voters(&self) -> impl Future<Output = Vec<NodeId>> + Send {
+        async { Vec::new() }
+    }
+
+    /// The applied non-voting members available for safe promotion.
+    fn learners(&self) -> impl Future<Output = Vec<NodeId>> + Send {
+        async { Vec::new() }
+    }
+
+    /// Whether a learner has replicated the leader's current log.
+    fn learner_caught_up(&self, _node: NodeId) -> impl Future<Output = bool> + Send {
+        async { false }
+    }
+
+    /// Applies one configuration change and resolves after it is committed.
+    fn change_membership(
+        &self,
+        change: MembershipChange,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            Err(Error::InvalidArgument(format!(
+                "this consensus log cannot apply membership change {change:?}"
+            )))
+        }
+    }
+
+    /// Whether this implementation hosts a mutable Raft configuration.
+    fn manages_membership(&self) -> bool {
+        false
+    }
 }
 
 const FRAME_HEADER_BYTES: usize = 8;
@@ -222,6 +276,24 @@ impl<R: Runtime> ConsensusLog for SingleNodeLog<R> {
 
     async fn leader(&self) -> Option<NodeId> {
         Some(self.node)
+    }
+
+    async fn voters(&self) -> Vec<NodeId> {
+        vec![self.node]
+    }
+
+    async fn learners(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    async fn learner_caught_up(&self, _node: NodeId) -> bool {
+        false
+    }
+
+    async fn change_membership(&self, change: MembershipChange) -> Result<()> {
+        Err(Error::InvalidArgument(format!(
+            "a single-node development log cannot apply membership change {change:?}"
+        )))
     }
 }
 

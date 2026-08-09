@@ -101,6 +101,9 @@ impl Group {
                             speaks: binary_speaks(),
                             ready: true,
                             draining: false,
+                            voter_eligible: false,
+                            failure_domain: String::new(),
+                            node_identity: String::new(),
                             partitions: vec![],
                         },
                     )
@@ -332,6 +335,9 @@ fn pre_0_2_raft_log_never_exposes_a_0_1_voter_to_merge_tags() {
                     speaks: binary_speaks(),
                     ready: true,
                     draining: true,
+                    voter_eligible: false,
+                    failure_domain: String::new(),
+                    node_identity: String::new(),
                     partitions: vec![],
                 },
             )
@@ -597,9 +603,12 @@ fn a_majority_election_wins_an_inflight_epoch_race_and_fences_the_stale_leader()
             group.sim.run_for(REPLICATION_GRACE);
 
             let stale = stale_result.lock().expect("stale result poisoned").clone();
-            if !matches!(stale, Some(Err(Error::NotLeader { .. }))) {
+            if !matches!(
+                stale,
+                Some(Err(Error::NotLeader { .. } | Error::Unavailable(_)))
+            ) {
                 return Err(group.sim.failure(format!(
-                    "the stale control leader did not step down cleanly: {stale:?}"
+                    "the stale control leader did not refuse lost authority: {stale:?}"
                 )));
             }
             let commands = group.commands(new_leader);

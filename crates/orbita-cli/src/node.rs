@@ -246,7 +246,14 @@ fn server_config(
         .with_root_credential(config.cluster.root_credential.clone());
 
     let peers = parse_leader_peers(&config.cluster.leader_peers)?;
-    if !peers.is_empty() {
+    if config.node.role == Role::Node && !options.dev {
+        server_config = server_config.with_automatic_cluster(
+            config.cluster.name.clone(),
+            config.cluster.voter_target,
+            config.cluster.voter_eligible,
+            config.cluster.failure_domain.clone(),
+        );
+    } else if !peers.is_empty() {
         let voters = peers.iter().map(|(node, _)| *node).collect();
         server_config = server_config
             .with_peers(peers)
@@ -1164,6 +1171,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Layer {
             node: NodeLayer {
+                role: Some(Role::Worker),
                 advertise: Some("127.0.0.1:0".to_owned()),
                 listen: Some("127.0.0.1:0".to_owned()),
                 // Port 0 for the peer listener too, or two runs of this test

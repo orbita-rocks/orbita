@@ -30,6 +30,12 @@ variable "github_repo" {
   default     = "orbita"
 }
 
+variable "github_oidc_subject_prefix" {
+  description = "GitHub OIDC subject before the ref or environment suffix. Leave null for repo:<owner>/<repo>; set it when GitHub reports an immutable subject containing owner and repository ids."
+  type        = string
+  default     = null
+}
+
 variable "workflow_ref_path" {
   description = "Path to the workflow allowed to assume the role, matched against the OIDC job_workflow_ref claim. Pinning this means a new workflow added to the same repository cannot assume the role by accident."
   type        = string

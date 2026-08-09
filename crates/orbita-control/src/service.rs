@@ -23,7 +23,7 @@ use crate::wire::{
     METHOD_FETCH_SPLIT_INTENTS, METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_MERGE_PREPARED,
     METHOD_REPORT_SPLIT_PREPARED, METHOD_REPORT_SPLIT_PREPARED_V2, METHOD_REPORT_STATUS,
     METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
-    METHOD_REPORT_STATUS_V5,
+    METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
 };
 
 use bytes::Bytes;
@@ -157,7 +157,7 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
             },
-            METHOD_REPORT_STATUS_V5 => match ReportStatusRequest::decode(&call.payload) {
+            METHOD_REPORT_STATUS_V5 => match ReportStatusRequest::decode_v5(&call.payload) {
                 Ok(request) => match self
                     .controller
                     .record_status(request.node, request.status)
@@ -173,6 +173,41 @@ impl<R: Runtime, L: ConsensusLog> ControlService<R, L> {
                     Err(e) => ControlResponse::Error(e.to_string()),
                 },
                 Err(e) => ControlResponse::Error(format!("undecodable status: {e}")),
+            },
+            METHOD_REPORT_STATUS_V6 => match ReportStatusRequest::decode(&call.payload) {
+                Ok(request) => match self
+                    .controller
+                    .record_status(request.node, request.status)
+                    .await
+                {
+                    Ok(RegistrationOutcome::Accepted(map_version)) => ControlResponse::Accepted {
+                        map_version,
+                        cluster_version: Some(self.controller.cluster_version().await),
+                    },
+                    Ok(RegistrationOutcome::Incompatible(refusal)) => {
+                        ControlResponse::Incompatible(refusal)
+                    }
+                    Err(e) => ControlResponse::Error(e.to_string()),
+                },
+                // Pre-union merge builds used method 17 for this fetch. Its
+                // exact one-node payload cannot decode as a V6 status report.
+                Err(status_error) => match FetchMergeIntentsRequest::decode(&call.payload) {
+                    Ok(request) => {
+                        let (map_version, intents) =
+                            self.controller.active_merge_intents_for(request.node).await;
+                        ControlResponse::MergeIntents(crate::MergeIntentSnapshot {
+                            map_version,
+                            intents: intents
+                                .into_iter()
+                                .map(|(intent, prepared_by_this_node)| WireMergeIntent {
+                                    generation: intent.generation,
+                                    prepared_by_this_node,
+                                })
+                                .collect(),
+                        })
+                    }
+                    Err(_) => ControlResponse::Error(format!("undecodable status: {status_error}")),
+                },
             },
             METHOD_DRAIN_NODE => match DrainNodeRequest::decode(&call.payload) {
                 Ok(request) => match self.controller.drain_node(request.node).await {

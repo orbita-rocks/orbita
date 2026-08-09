@@ -1,33 +1,19 @@
-# A three member leader group and three workers, with no templating.
+# Three combined nodes, with no templating.
 #
 #   kubectl apply -f deploy/manifests/orbita.yaml
 #
-# This is the same topology the Helm chart produces, written out so that it can
-# be read, diffed, and edited by anyone who does not want Helm in the loop. If
-# you are going to change more than the image tag and the object store, use the
-# chart instead: keeping two copies of a StatefulSet in sync by hand is how
-# they end up different.
+# This is the same topology the Helm chart produces. Every node serves the data
+# path, while Orbita keeps three of them in the Raft voter set. Scale this
+# StatefulSet to add worker capacity without editing existing nodes.
 #
-# Before this holds anything that matters, fill in the object store block in
-# the ConfigMap. Without an endpoint the workers keep everything on local
-# disks.
+# Before this holds anything that matters, configure the shared object store.
+# Combined nodes use its conditional writes to agree on one durable cluster
+# identity and bootstrap certificate. As written, credentials use the AWS
+# default chain. Use the Secret and set credential_source = "static" for MinIO,
+# R2, or another S3-compatible store that only accepts access keys.
 #
-# As written, the nodes resolve AWS credentials at startup — IRSA on EKS, the
-# task role on ECS, the EC2 instance profile otherwise — and the Secret below
-# stays empty; on AWS that is the shape to keep, and the Secret and the two
-# environment variables that read it can be deleted outright. Fill the Secret
-# in and set credential_source = "static" for MinIO, R2, or anything else that
-# only speaks access keys.
-#
-# Every node binds two listeners: 7100 for client and admin gRPC, and 7101 for
-# peer traffic. The headless Services carry both so that pods can reach each
-# other by name. The client Service carries 7100 only, and it must stay that
-# way: peer traffic uses a private framing that is compatible only within a
-# cluster version window, and a peer port behind a LoadBalancer is a hole. See
-# docs/adr/0004-peer-traffic-uses-private-framing.md.
-#
-# Nothing here stops another pod in the cluster from connecting to 7101. The
-# Helm chart has a NetworkPolicy for that, under networkPolicy.enabled.
+# Port 7100 is client and admin gRPC. Port 7101 is private peer traffic and is
+# exposed only by the headless Service; see ADR 0004.
 ---
 apiVersion: v1
 kind: Namespace
@@ -39,7 +25,6 @@ kind: ServiceAccount
 metadata:
   name: orbita
   namespace: orbita
-# Orbita does not talk to the Kubernetes API, so no token is mounted.
 automountServiceAccountToken: false
 ---
 apiVersion: v1
@@ -61,75 +46,29 @@ data:
   orbita.toml: |
     [node]
     listen = "0.0.0.0:7100"
-    # The peer listener. It is reachable through the headless Services only,
-    # which is where it belongs: peer traffic uses a private framing that is
-    # compatible only within a cluster version window.
     peer_listen = "0.0.0.0:7101"
     data_dir = "/var/lib/orbita"
 
     [cluster]
     name = "orbita"
-    # The fixed leader ids and peer addresses, identical on every node. The ids
-    # are persisted with the Raft log and checked on restart. These are peer
-    # addresses: a list on the client port would look almost right and never
-    # form a quorum.
-    leader_peers = [
-      "1=orbita-leader-0.orbita-leader.orbita.svc.cluster.local:7101",
-      "2=orbita-leader-1.orbita-leader.orbita.svc.cluster.local:7101",
-      "3=orbita-leader-2.orbita-leader.orbita.svc.cluster.local:7101",
-    ]
+    voter_target = 3
     allow_version_skew = false
-    # A worker that starts before the leader group retries rather than failing,
-    # because pod start order is not something anyone controls. It gives up
-    # eventually so that a worker which will never join is a restarting pod
-    # rather than a process waiting silently. Use "0" to retry forever.
     join_backoff_initial = "250ms"
     join_backoff_max = "10s"
     join_timeout = "5m"
-    # The pod allows 300 seconds. Keeping ten seconds outside the process
-    # budget makes a failed drain visible before Kubernetes sends SIGKILL.
     drain_timeout = "290s"
 
     [object_store]
     # endpoint = "https://s3.us-east-1.amazonaws.com"
     bucket = "orbita"
     region = "us-east-1"
-    # Where the credentials come from. "default" resolves one at startup in the
-    # order the AWS SDKs use — environment, then EKS IRSA, then the ECS or Pod
-    # Identity container endpoint, then the EC2 instance profile over IMDSv2 —
-    # and logs which one it picked. Name a source instead ("web-identity",
-    # "container", "instance-profile", "environment", "static") when you want a
-    # missing one to be a startup error rather than a fallthrough.
-    #
-    # On EKS, note that IRSA and the instance profile are different principals:
-    # pinning this to "instance-profile" in a pod makes it authenticate as the
-    # node group's role rather than the service account's.
-    #
-    # "static" uses the key pair in the Secret below, which is what MinIO and
-    # R2 need because they offer nothing else. Left out, this follows the keys.
     credential_source = "default"
-    # The role that carries the bucket policy. Assuming it, rather than
-    # granting the instance profile direct access, is what lets an operator
-    # re-scope storage access without touching the instances.
     # role_arn = "arn:aws:iam::123456789012:role/orbita"
-    # The STS endpoint is derived from the region's partition, which is right
-    # in the commercial partition, in GovCloud, and in China. Override it for a
-    # PrivateLink endpoint or an isolated partition.
     # sts_endpoint = "https://sts.us-east-1.amazonaws.com"
-    # AWS S3 wants false here. MinIO and most other S3-compatible stores want
-    # true.
     force_path_style = false
 
     [telemetry]
-    # The OTLP collector to push traces and metrics to. Orbita exports rather
-    # than being scraped, so setting this is the whole switch: uncomment it and
-    # the node ships spans and per-keyspace, per-partition metrics to the
-    # collector, which fans them out to Prometheus, Tempo, or wherever. Left
-    # commented, export is off and logs still go to stderr, because a node that
-    # cannot reach a collector still has to start.
     # otlp_endpoint = "http://otel-collector.observability:4317"
-    # The fraction of traces to sample, decided once at the node that starts the
-    # trace. A forwarded hop inherits that decision rather than re-rolling it.
     trace_sample_ratio = 1.0
     service_name = "orbita"
     log_level = "info"
@@ -137,20 +76,19 @@ data:
     [telemetry.resource_attributes]
     "k8s.namespace.name" = "orbita"
 ---
-# Headless, so every leader has a stable DNS name. Not-ready addresses are
-# published because the group cannot form if every member is waiting for the
-# others to become ready first.
+# Stable discovery names are published before readiness so three fresh nodes
+# can bootstrap concurrently rather than waiting on one another's probes.
 apiVersion: v1
 kind: Service
 metadata:
-  name: orbita-leader
+  name: orbita-nodes
   namespace: orbita
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: orbita
-    app.kubernetes.io/component: leader
+    app.kubernetes.io/component: node
   ports:
     - name: grpc
       port: 7100
@@ -159,27 +97,7 @@ spec:
       port: 7101
       targetPort: peer
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: orbita-worker
-  namespace: orbita
-spec:
-  clusterIP: None
-  publishNotReadyAddresses: true
-  selector:
-    app.kubernetes.io/name: orbita
-    app.kubernetes.io/component: worker
-  ports:
-    - name: grpc
-      port: 7100
-      targetPort: grpc
-    - name: peer
-      port: 7101
-      targetPort: peer
----
-# What clients connect to. Any worker answers any request, forwarding to the
-# owner internally, so plain round robin is correct here.
+# Any combined node can answer a client request and forward it to the owner.
 apiVersion: v1
 kind: Service
 metadata:
@@ -189,10 +107,8 @@ spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: orbita
-    app.kubernetes.io/component: worker
+    app.kubernetes.io/component: node
   ports:
-    # The client port only. Do not add the peer port here: it must not end up
-    # behind a LoadBalancer or an Ingress.
     - name: grpc
       port: 7100
       targetPort: grpc
@@ -200,182 +116,42 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: orbita-leader
+  name: orbita
   namespace: orbita
   labels:
     app.kubernetes.io/name: orbita
-    app.kubernetes.io/component: leader
+    app.kubernetes.io/component: node
 spec:
-  serviceName: orbita-leader
+  serviceName: orbita-nodes
   replicas: 3
-  # A fixed-voter group needs a quorum before any member can become Ready.
   podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: orbita
-      app.kubernetes.io/component: leader
+      app.kubernetes.io/component: node
   template:
     metadata:
       labels:
         app.kubernetes.io/name: orbita
-        app.kubernetes.io/component: leader
+        app.kubernetes.io/component: node
     spec:
       serviceAccountName: orbita
-      # Room for a Raft leader to step down and hand off rather than being
-      # failed over. A deploy is not an unexpected failure and should not be
-      # paid for as one. The server does not do the handoff yet.
-      terminationGracePeriodSeconds: 120
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        fsGroup: 10001
-      containers:
-        - name: orbita
-          image: ghcr.io/orbita-rocks/orbita:0.2.0-dev
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          # A StatefulSet cannot give each pod its own environment variable,
-          # and a node id has to be stable and unique. The ordinal in the
-          # hostname is both. `exec` keeps the binary as pid 1 so that it
-          # receives the termination signal directly.
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -eu
-              ordinal="${HOSTNAME##*-}"
-              fqdn="${HOSTNAME}.orbita-leader.orbita.svc.cluster.local"
-              export ORBITA_NODE_ID="$((1 + ordinal))"
-              export ORBITA_ADVERTISE="${fqdn}:7100"
-              # Other nodes reach this one here, and it has to match what the
-              # leader peer list says.
-              export ORBITA_PEER_ADVERTISE="${fqdn}:7101"
-              exec /usr/local/bin/orbita serve --role leader
-          env:
-            - name: ORBITA_CONFIG
-              value: /etc/orbita/orbita.toml
-            - name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: orbita-object-store
-                  key: access_key_id
-            - name: ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: orbita-object-store
-                  key: secret_access_key
-          ports:
-            - name: grpc
-              containerPort: 7100
-            - name: peer
-              containerPort: 7101
-          # Readiness is what gates the next pod in a rolling update, so it is
-          # the safety mechanism of an upgrade rather than a formality.
-          # `cluster ready` exits non-zero and names the unmet conditions
-          # until the node has recovered its log, opened its partitions, caught
-          # up, and joined the control plane. A leader satisfies the last part
-          # only after its durable Raft state joins an elected quorum.
-          #
-          # Liveness stays conservative, because failing it kills the pod. It
-          # runs `cluster ping`, which never asks anything about the cluster
-          # or about reaching peers: a liveness probe that did would turn a
-          # network partition into every pod being killed at once. Slow starts
-          # belong to the startup probe, whose budget is long because
-          # recovering a large log legitimately takes time and a worker that
-          # starts before the leader group retries until it can join.
-          startupProbe:
-            exec:
-              command: &leader-ready-probe
-                - /usr/local/bin/orbita
-                - --endpoint
-                - http://127.0.0.1:7100
-                - cluster
-                - ready
-            periodSeconds: 5
-            failureThreshold: 60
-          readinessProbe:
-            exec:
-              command: *leader-ready-probe
-            periodSeconds: 10
-            failureThreshold: 3
-          livenessProbe:
-            exec:
-              command:
-                - /usr/local/bin/orbita
-                - --endpoint
-                - http://127.0.0.1:7100
-                - cluster
-                - ping
-            periodSeconds: 30
-            failureThreshold: 4
-          resources:
-            requests:
-              cpu: 500m
-              memory: 1Gi
-            limits:
-              memory: 2Gi
-          volumeMounts:
-            - name: config
-              mountPath: /etc/orbita
-              readOnly: true
-            - name: data
-              mountPath: /var/lib/orbita
-            - name: tmp
-              mountPath: /tmp
-      volumes:
-        - name: config
-          configMap:
-            name: orbita
-        - name: tmp
-          emptyDir: {}
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 10Gi
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: orbita-worker
-  namespace: orbita
-  labels:
-    app.kubernetes.io/name: orbita
-    app.kubernetes.io/component: worker
-spec:
-  serviceName: orbita-worker
-  replicas: 3
-  # Workers can start together, because one that finds no leader group yet
-  # retries rather than failing.
-  podManagementPolicy: Parallel
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: orbita
-      app.kubernetes.io/component: worker
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: orbita
-        app.kubernetes.io/component: worker
-    spec:
-      serviceAccountName: orbita
-      # Long enough for this worker to hand each partition to a caught-up
-      # replica before the process goes away. A rolling restart of three
-      # workers is an ordinary weekly event and must not cost three separate
-      # failover windows. The process uses 290 seconds of this budget and
-      # reports failure before the final ten seconds are exhausted.
       terminationGracePeriodSeconds: 300
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: orbita
+              app.kubernetes.io/component: node
       containers:
         - name: orbita
           image: ghcr.io/orbita-rocks/orbita:0.2.0-dev
@@ -384,23 +160,24 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-          # Worker ids start at 101 so a worker id and a leader id can never
-          # collide, however either group is scaled.
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
               ordinal="${HOSTNAME##*-}"
-              fqdn="${HOSTNAME}.orbita-worker.orbita.svc.cluster.local"
-              export ORBITA_NODE_ID="$((101 + ordinal))"
+              fqdn="${HOSTNAME}.orbita-nodes.orbita.svc.cluster.local"
+              export ORBITA_NODE_ID="$((1 + ordinal))"
               export ORBITA_ADVERTISE="${fqdn}:7100"
-              # Other nodes reach this one here, and it has to match what the
-              # leader peer list says.
               export ORBITA_PEER_ADVERTISE="${fqdn}:7101"
-              exec /usr/local/bin/orbita serve --role worker
+              export ORBITA_FAILURE_DOMAIN="${NODE_NAME}"
+              exec /usr/local/bin/orbita serve --role node
           env:
             - name: ORBITA_CONFIG
               value: /etc/orbita/orbita.toml
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: ORBITA_OBJECT_STORE_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -416,22 +193,9 @@ spec:
               containerPort: 7100
             - name: peer
               containerPort: 7101
-          # Readiness is what gates the next pod in a rolling update, so it is
-          # the safety mechanism of an upgrade rather than a formality.
-          # `cluster ready` exits non-zero and names the unmet conditions
-          # until the node has recovered its log, opened its partitions, caught
-          # up, and had its registration accepted by the leader group.
-          #
-          # Liveness stays conservative, because failing it kills the pod. It
-          # runs `cluster ping`, which never asks anything about the cluster
-          # or about reaching peers: a liveness probe that did would turn a
-          # network partition into every pod being killed at once. Slow starts
-          # belong to the startup probe, whose budget is long because
-          # recovering a large log legitimately takes time and a worker that
-          # starts before the leader group retries until it can join.
           startupProbe:
             exec:
-              command: &worker-ready-probe
+              command: &ready-probe
                 - /usr/local/bin/orbita
                 - --endpoint
                 - http://127.0.0.1:7100
@@ -441,7 +205,7 @@ spec:
             failureThreshold: 120
           readinessProbe:
             exec:
-              command: *worker-ready-probe
+              command: *ready-probe
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
@@ -483,31 +247,16 @@ spec:
           requests:
             storage: 100Gi
 ---
-# A node drain or a rolling upgrade must not take the leader group below
-# quorum. Two of three is a majority. If you change the leader replica count
-# here, change this to match: the Helm chart computes it, this file cannot.
+# One voluntary disruption preserves both the two-of-three voter quorum and
+# the two-of-three data durability quorum in the default deployment.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: orbita-leader
-  namespace: orbita
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: orbita
-      app.kubernetes.io/component: leader
----
-# Every partition is an owner plus two replicas, so losing two workers at once
-# can take a partition below the 2-of-3 a write needs.
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: orbita-worker
+  name: orbita
   namespace: orbita
 spec:
   maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: orbita
-      app.kubernetes.io/component: worker
+      app.kubernetes.io/component: node

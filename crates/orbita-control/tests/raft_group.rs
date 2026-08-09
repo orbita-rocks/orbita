@@ -7,8 +7,11 @@
 //! outcome, because "every node holds the same entries at the same indices"
 //! is the claim the trait actually makes.
 
-use orbita_control::{ConsensusLog, ControlCommand, NodeRole, RaftLog};
-use orbita_core::{Error, NodeId};
+use orbita_control::{
+    BootstrapSpec, ConsensusLog, ControlCommand, ControlConfig, Controller, KeyspaceConfig,
+    MembershipChange, NodeRole, NodeStatus, RaftLog,
+};
+use orbita_core::{Error, MapVersion, NodeId};
 use orbita_sim::{check_seeds, Failure, Simulation};
 
 use std::sync::Arc;
@@ -91,6 +94,27 @@ fn three_nodes_elect_exactly_one_leader() {
         let logs = start(&sim);
         elect(&sim, &logs).map(|_| ())
     });
+}
+
+#[test]
+fn a_quorum_barrier_expires_instead_of_pinning_a_restart_forever() {
+    let sim = Simulation::new(91);
+    let logs = start(&sim);
+    let leader = elect(&sim, &logs).expect("the initial group elects a leader");
+    for node in NODES {
+        if node != leader {
+            sim.crash(node);
+        }
+    }
+
+    let log = Arc::clone(&logs[(leader.get() - 1) as usize]);
+    let error = sim
+        .block_on(async move { log.leader_barrier().await })
+        .expect_err("a barrier without quorum must expire");
+    assert!(
+        matches!(error, Error::Unavailable(ref message) if message.contains("did not reach quorum")),
+        "the caller needs a retryable, diagnostic timeout, got {error}"
+    );
 }
 
 #[test]
@@ -314,6 +338,359 @@ fn a_one_node_group_elects_itself_and_survives_a_restart() {
             let commands: Vec<_> = entries.iter().map(|e| e.command.clone()).collect();
             if commands != vec![register(1), register(2), register(3)] {
                 return Err(sim.failure(format!("restart replayed {commands:?}")));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn target_five_expands_three_to_five_one_safe_transition_at_a_time() {
+    check_seeds(
+        "target_five_expands_three_to_five_one_safe_transition_at_a_time",
+        10,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let all = [NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+            for node in all {
+                sim.add_node(node);
+            }
+            let logs: Vec<_> = all
+                .iter()
+                .map(|node| {
+                    let runtime = sim.runtime(*node);
+                    sim.block_on(async move {
+                        RaftLog::open(&runtime, &NODES)
+                            .await
+                            .expect("open voter or dormant learner")
+                    })
+                })
+                .collect();
+            sim.run_for(ELECTION_GRACE);
+            let elected: Vec<_> = NODES
+                .iter()
+                .zip(&logs[..3])
+                .filter_map(|(node, log)| {
+                    let log = Arc::clone(log);
+                    sim.block_on(async move { log.is_leader().await })
+                        .then_some(*node)
+                })
+                .collect();
+            let [leader] = elected[..] else {
+                return Err(sim.failure(format!("expected one leader, got {elected:?}")));
+            };
+            for (node, log) in all[3..].iter().zip(&logs[3..]) {
+                let log = Arc::clone(log);
+                if sim.block_on(async move { log.is_leader().await }) {
+                    return Err(sim.failure(format!(
+                        "dormant learner {node} campaigned before admission"
+                    )));
+                }
+            }
+            let leader_log =
+                Arc::clone(&logs[all.iter().position(|node| *node == leader).expect("member")]);
+
+            for joining in [NodeId(4), NodeId(5)] {
+                let log = Arc::clone(&leader_log);
+                sim.block_on(async move {
+                    log.change_membership(MembershipChange::AddLearner(joining))
+                        .await
+                })
+                .map_err(|error| sim.failure(format!("add learner {joining}: {error}")))?;
+                sim.run_for(REPLICATION_GRACE);
+                let log = Arc::clone(&leader_log);
+                if !sim.block_on(async move { log.learner_caught_up(joining).await }) {
+                    return Err(sim.failure(format!("learner {joining} never caught up")));
+                }
+                let log = Arc::clone(&leader_log);
+                sim.block_on(async move {
+                    log.change_membership(MembershipChange::Promote(joining))
+                        .await
+                })
+                .map_err(|error| sim.failure(format!("promote {joining}: {error}")))?;
+                let log = Arc::clone(&leader_log);
+                let voters = sim.block_on(async move { log.voters().await });
+                let expected = if joining == NodeId(4) { 4 } else { 5 };
+                if voters.len() != expected || !voters.contains(&joining) {
+                    return Err(
+                        sim.failure(format!("promotion of {joining} produced voters {voters:?}"))
+                    );
+                }
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn target_three_contracts_five_healthy_voters_one_transition_at_a_time() {
+    check_seeds(
+        "target_three_contracts_five_healthy_voters_one_transition_at_a_time",
+        10,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let all = [NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+            for node in all {
+                sim.add_node(node);
+            }
+            let logs: Vec<_> = all
+                .iter()
+                .map(|node| {
+                    let runtime = sim.runtime(*node);
+                    sim.block_on(async move { RaftLog::open(&runtime, &all).await.unwrap() })
+                })
+                .collect();
+            sim.run_for(ELECTION_GRACE);
+            let leader = all
+                .iter()
+                .copied()
+                .find(|node| {
+                    let log = Arc::clone(&logs[all.iter().position(|item| item == node).unwrap()]);
+                    sim.block_on(async move { log.is_leader().await })
+                })
+                .ok_or_else(|| sim.failure("the five-voter set elected no leader"))?;
+            let leader_index = all.iter().position(|node| *node == leader).unwrap();
+            let config = ControlConfig {
+                suspect_after: Duration::from_secs(60),
+                dead_after: Duration::from_secs(120),
+                voter_management_enabled: true,
+                ..ControlConfig::default()
+            };
+            let controller =
+                Controller::new(sim.runtime(leader), Arc::clone(&logs[leader_index]), config);
+            let bootstrapping = controller.clone();
+            sim.block_on(async move {
+                bootstrapping
+                    .bootstrap(&BootstrapSpec {
+                        keyspace: "default".into(),
+                        config: KeyspaceConfig::default(),
+                        leaders: Vec::new(),
+                        workers: all
+                            .iter()
+                            .map(|node| (*node, format!("10.0.0.{node}:7000")))
+                            .collect(),
+                    })
+                    .await
+            })
+            .map_err(|error| sim.failure(format!("bootstrap failed: {error}")))?;
+
+            let establishing = controller.clone();
+            sim.block_on(async move { establishing.tick().await })
+                .map_err(|error| sim.failure(format!("initial voter sweep failed: {error}")))?;
+            for node in all {
+                let reporting = controller.clone();
+                sim.block_on(async move {
+                    reporting
+                        .record_status(
+                            node,
+                            NodeStatus {
+                                role: NodeRole::Worker,
+                                address: format!("10.0.0.{node}:7000"),
+                                map_version: MapVersion::default(),
+                                speaks: orbita_control::binary_speaks(),
+                                ready: true,
+                                draining: false,
+                                voter_eligible: true,
+                                failure_domain: format!("zone-{node}"),
+                                node_identity: format!("identity-{node}"),
+                                partitions: Vec::new(),
+                            },
+                        )
+                        .await
+                })
+                .map_err(|error| sim.failure(format!("status for {node} failed: {error}")))?;
+            }
+
+            let mut sizes = Vec::new();
+            for _ in 0..2 {
+                let contracting = controller.clone();
+                sim.block_on(async move { contracting.tick().await })
+                    .map_err(|error| sim.failure(format!("voter contraction failed: {error}")))?;
+                let log = Arc::clone(&logs[leader_index]);
+                sizes.push(sim.block_on(async move { log.voters().await }).len());
+            }
+            if sizes != [4, 3] {
+                return Err(sim.failure(format!(
+                    "healthy voter contraction did not commit one removal per sweep: {sizes:?}"
+                )));
+            }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_permanently_lost_voter_is_replaced_add_first_with_an_eligible_node() {
+    check_seeds(
+        "a_permanently_lost_voter_is_replaced_add_first_with_an_eligible_node",
+        10,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let all = [NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)];
+            for node in NODES {
+                sim.add_node(node);
+            }
+            let mut logs: Vec<_> = NODES
+                .iter()
+                .map(|node| {
+                    let runtime = sim.runtime(*node);
+                    sim.block_on(async move { RaftLog::open(&runtime, &NODES).await.unwrap() })
+                })
+                .collect();
+            sim.run_for(ELECTION_GRACE);
+            let leader = NODES
+                .iter()
+                .copied()
+                .find(|node| {
+                    let log = Arc::clone(&logs[all.iter().position(|item| item == node).unwrap()]);
+                    sim.block_on(async move { log.is_leader().await })
+                })
+                .ok_or_else(|| sim.failure("the initial voter set elected no leader"))?;
+            let leader_index = all.iter().position(|node| *node == leader).unwrap();
+            let config = ControlConfig {
+                suspect_after: Duration::from_secs(60),
+                dead_after: Duration::from_secs(120),
+                voter_management_enabled: true,
+                ..ControlConfig::default()
+            };
+            let controller = Controller::new(
+                sim.runtime(leader),
+                Arc::clone(&logs[leader_index]),
+                config.clone(),
+            );
+            let bootstrapping = controller.clone();
+            sim.block_on(async move {
+                bootstrapping
+                    .bootstrap(&BootstrapSpec {
+                        keyspace: "default".into(),
+                        config: KeyspaceConfig::default(),
+                        leaders: Vec::new(),
+                        workers: NODES
+                            .iter()
+                            .map(|node| (*node, format!("10.0.0.{node}:7000")))
+                            .collect(),
+                    })
+                    .await
+            })
+            .map_err(|error| sim.failure(format!("bootstrap failed: {error}")))?;
+
+            for node in all {
+                let reporting = controller.clone();
+                sim.block_on(async move {
+                    reporting
+                        .record_status(
+                            node,
+                            NodeStatus {
+                                role: NodeRole::Worker,
+                                address: format!("10.0.0.{node}:7000"),
+                                map_version: MapVersion::default(),
+                                speaks: orbita_control::binary_speaks(),
+                                ready: true,
+                                draining: false,
+                                voter_eligible: node != NodeId(4),
+                                failure_domain: format!("zone-{node}"),
+                                node_identity: format!("identity-{node}"),
+                                partitions: Vec::new(),
+                            },
+                        )
+                        .await
+                })
+                .map_err(|error| sim.failure(format!("status for {node} failed: {error}")))?;
+            }
+            let observing = controller.clone();
+            sim.block_on(async move { observing.tick().await })
+                .map_err(|error| sim.failure(format!("initial voter sweep failed: {error}")))?;
+
+            let lost = NODES.iter().copied().find(|node| *node != leader).unwrap();
+            sim.crash(lost);
+            sim.run_for(config.voter_replacement_after);
+
+            for node in [NodeId(4), NodeId(5)] {
+                let runtime = sim.add_node(node);
+                logs.push(
+                    sim.block_on(async move { RaftLog::open(&runtime, &NODES).await.unwrap() }),
+                );
+            }
+
+            // Refresh every surviving observation so only the crashed voter has
+            // been continuously dead for the replacement window.
+            for node in all.into_iter().filter(|node| *node != lost) {
+                let reporting = controller.clone();
+                sim.block_on(async move {
+                    reporting
+                        .record_status(
+                            node,
+                            NodeStatus {
+                                role: NodeRole::Worker,
+                                address: format!("10.0.0.{node}:7000"),
+                                map_version: MapVersion::default(),
+                                speaks: orbita_control::binary_speaks(),
+                                ready: true,
+                                draining: false,
+                                voter_eligible: node != NodeId(4),
+                                failure_domain: format!("zone-{node}"),
+                                node_identity: format!("identity-{node}"),
+                                partitions: Vec::new(),
+                            },
+                        )
+                        .await
+                })
+                .map_err(|error| sim.failure(format!("refresh for {node} failed: {error}")))?;
+            }
+
+            let repairing = controller.clone();
+            sim.block_on(async move { repairing.tick().await })
+                .map_err(|error| sim.failure(format!("adding learner failed: {error}")))?;
+            let log = Arc::clone(&logs[leader_index]);
+            let after_add = sim.block_on(async move { (log.voters().await, log.learners().await) });
+            if after_add.0.len() != 3 || after_add.1 != vec![NodeId(5)] {
+                return Err(sim.failure(format!(
+                    "replacement did not add only eligible node 5 first: {after_add:?}"
+                )));
+            }
+
+            sim.run_for(ELECTION_GRACE);
+            for node in all.into_iter().filter(|node| *node != lost) {
+                let reporting = controller.clone();
+                sim.block_on(async move {
+                    reporting
+                        .record_status(
+                            node,
+                            NodeStatus {
+                                role: NodeRole::Worker,
+                                address: format!("10.0.0.{node}:7000"),
+                                map_version: MapVersion::default(),
+                                speaks: orbita_control::binary_speaks(),
+                                ready: true,
+                                draining: false,
+                                voter_eligible: node != NodeId(4),
+                                failure_domain: format!("zone-{node}"),
+                                node_identity: format!("identity-{node}"),
+                                partitions: Vec::new(),
+                            },
+                        )
+                        .await
+                })
+                .map_err(|error| {
+                    sim.failure(format!("catch-up heartbeat for {node} failed: {error}"))
+                })?;
+            }
+            sim.run_for(ELECTION_GRACE);
+            let mut transitions = Vec::new();
+            for stage in ["promotion", "removal"] {
+                let repairing = controller.clone();
+                sim.block_on(async move { repairing.tick().await })
+                    .map_err(|error| sim.failure(format!("{stage} failed: {error}")))?;
+                let log = Arc::clone(&logs[leader_index]);
+                transitions
+                    .push(sim.block_on(async move { (log.voters().await, log.learners().await) }));
+            }
+            let log = Arc::clone(&logs[leader_index]);
+            let voters = sim.block_on(async move { log.voters().await });
+            if voters.len() != 3 || voters.contains(&lost) || !voters.contains(&NodeId(5)) {
+                return Err(sim.failure(format!(
+                    "replacement did not finish at three voters: {voters:?}; transitions: {transitions:?}"
+                )));
             }
             Ok(())
         },

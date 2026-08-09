@@ -1,43 +1,16 @@
 {{- if .Values.podDisruptionBudget.enabled }}
-{{/*
-A voluntary disruption, such as draining a node for maintenance or a rolling
-upgrade, must not take the leader group below quorum. minAvailable is computed
-as a majority of leader.replicas rather than fixed, so three members give two
-and five give three, and resizing the group does not silently leave the budget
-wrong.
-*/}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: {{ include "orbita.fullname" . }}-leader
+  name: {{ include "orbita.fullname" . }}
   labels:
     {{- include "orbita.labels" . | nindent 4 }}
-    app.kubernetes.io/component: leader
-spec:
-  minAvailable: {{ div (add (int .Values.leader.replicas) 2) 2 }}
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: {{ include "orbita.name" . }}
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: leader
----
-{{/*
-Every partition has an owner and two replicas, so losing more than one worker
-at a time can take a partition below the 2-of-3 it needs to acknowledge a
-write.
-*/}}
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: {{ include "orbita.fullname" . }}-worker
-  labels:
-    {{- include "orbita.labels" . | nindent 4 }}
-    app.kubernetes.io/component: worker
+    app.kubernetes.io/component: node
 spec:
   maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "orbita.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: worker
+      app.kubernetes.io/component: node
 {{- end }}

@@ -8,9 +8,18 @@ use orbita_proto::v1::{
 use orbita_server::{Server, ServerConfig};
 use tonic::Code;
 
+use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::time::Duration;
+
+const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn bounded<T>(stage: &str, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(STEP_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| panic!("{stage} did not complete within {STEP_TIMEOUT:?}"))
+}
 
 fn unused_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
@@ -99,93 +108,115 @@ async fn two_of_three_configured_leaders_form_replicate_and_restart() {
 
     // Node three is deliberately unavailable. Two fixed voters are still a
     // quorum, and no special bootstrap mode should be needed.
-    let (one, two) = tokio::join!(
-        Server::start(config(NodeId(1), &dirs[0], peer_addrs[0], &peers)),
-        Server::start(config(NodeId(2), &dirs[1], peer_addrs[1], &peers)),
-    );
+    let (one, two) = bounded("initial voter startup", async {
+        tokio::join!(
+            Server::start(config(NodeId(1), &dirs[0], peer_addrs[0], &peers)),
+            Server::start(config(NodeId(2), &dirs[1], peer_addrs[1], &peers)),
+        )
+    })
+    .await;
     let one = one.expect("the first voter starts");
     let mut two = two.expect("the second voter starts");
     wait_until_ready(&one).await;
     wait_until_ready(&two).await;
 
-    let mut created = false;
-    for server in [&one, &two] {
-        let mut client = AdminClient::connect(format!("http://{}", server.local_addr()))
-            .await
-            .expect("connect to a leader voter");
-        if client
-            .create_keyspace(CreateKeyspaceRequest {
-                name: "replicated".to_string(),
-                config: None,
-            })
-            .await
-            .is_ok()
-        {
-            created = true;
-            break;
+    let created = bounded("replicated keyspace proposal", async {
+        for server in [&one, &two] {
+            let mut client = AdminClient::connect(format!("http://{}", server.local_addr()))
+                .await
+                .expect("connect to a leader voter");
+            if client
+                .create_keyspace(CreateKeyspaceRequest {
+                    name: "replicated".to_string(),
+                    config: None,
+                })
+                .await
+                .is_ok()
+            {
+                return true;
+            }
         }
-    }
+        false
+    })
+    .await;
     assert!(created, "one voter must accept the control-plane proposal");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(leader_keyspace_names(&[&one, &two])
-        .await
-        .contains(&"replicated".to_string()));
+    assert!(bounded(
+        "replicated keyspace read",
+        leader_keyspace_names(&[&one, &two])
+    )
+    .await
+    .contains(&"replicated".to_string()));
 
     // Split is wired to the real worker-prepared protocol now. This leader
     // group runs no workers, so the bootstrap partition has no owner to prepare
     // child storage, and the honest answer is InvalidArgument — never
     // Unimplemented, which would mean the RPC never reached the protocol.
-    let mut split_reached_the_protocol = false;
-    for server in [&one, &two] {
-        let mut client = AdminClient::connect(format!("http://{}", server.local_addr()))
-            .await
-            .expect("connect to a leader voter");
-        let Ok(description) = client
-            .describe_cluster(DescribeClusterRequest {
-                keyspace: String::new(),
-            })
-            .await
-        else {
-            continue;
-        };
-        let partition = description
-            .into_inner()
-            .partitions
-            .into_iter()
-            .next()
-            .expect("the bootstrap partition");
-        let error = client
-            .split_partition(SplitPartitionRequest {
-                partition_id: partition.id,
-                split_key: b"m".to_vec(),
-            })
-            .await
-            .expect_err("a partition with no owner cannot prepare child storage");
-        assert_ne!(
-            error.code(),
-            Code::Unimplemented,
-            "split is no longer stubbed; it runs the worker-prepared protocol"
-        );
-        assert_eq!(error.code(), Code::InvalidArgument);
-        split_reached_the_protocol = true;
-        break;
-    }
+    let split_reached_the_protocol = bounded("split protocol request", async {
+        for server in [&one, &two] {
+            let mut client = AdminClient::connect(format!("http://{}", server.local_addr()))
+                .await
+                .expect("connect to a leader voter");
+            let Ok(description) = client
+                .describe_cluster(DescribeClusterRequest {
+                    keyspace: String::new(),
+                })
+                .await
+            else {
+                continue;
+            };
+            let partition = description
+                .into_inner()
+                .partitions
+                .into_iter()
+                .next()
+                .expect("the bootstrap partition");
+            let error = client
+                .split_partition(SplitPartitionRequest {
+                    partition_id: partition.id,
+                    split_key: b"m".to_vec(),
+                })
+                .await
+                .expect_err("a partition with no owner cannot prepare child storage");
+            assert_ne!(
+                error.code(),
+                Code::Unimplemented,
+                "split is no longer stubbed; it runs the worker-prepared protocol"
+            );
+            assert_eq!(error.code(), Code::InvalidArgument);
+            return true;
+        }
+        false
+    })
+    .await;
     assert!(
         split_reached_the_protocol,
         "the control leader must run the split protocol"
     );
 
-    two.shutdown().await.expect("the second voter stops");
+    bounded("second voter shutdown", two.shutdown())
+        .await
+        .expect("the second voter stops");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    two = Server::start(config(NodeId(2), &dirs[1], peer_addrs[1], &peers))
-        .await
-        .expect("the second voter restarts from durable identity");
+    two = bounded(
+        "second voter restart",
+        Server::start(config(NodeId(2), &dirs[1], peer_addrs[1], &peers)),
+    )
+    .await
+    .expect("the second voter restarts from durable identity");
     wait_until_ready(&two).await;
-    assert!(leader_keyspace_names(&[&one, &two])
-        .await
-        .contains(&"replicated".to_string()));
+    assert!(bounded(
+        "restarted keyspace read",
+        leader_keyspace_names(&[&one, &two])
+    )
+    .await
+    .contains(&"replicated".to_string()));
 
-    one.shutdown().await.expect("the first voter stops");
-    two.shutdown().await.expect("the second voter stops");
+    bounded("first voter shutdown", one.shutdown())
+        .await
+        .expect("the first voter stops");
+    bounded("restarted voter shutdown", two.shutdown())
+        .await
+        .expect("the second voter stops");
 }

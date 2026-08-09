@@ -16,64 +16,29 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# The leader group runs Raft and owns the partition map. Three is the smallest
-# number that survives losing one node, which is the point of having a group.
-# Use an odd number: a group of four tolerates the same single failure as three
-# and needs one more vote to agree.
-leader:
+# Every process serves the worker data path. The voter target below selects an
+# automatically managed subset for Raft, so adding replicas adds capacity
+# without enlarging quorum.
+node:
   replicas: 3
-  # Set this only for the first upgrade from a release whose leader pods do not
-  # run Raft. It switches this StatefulSet to OnDelete so an operator can
-  # replace two voters together, wait for their first quorum, then replace the
-  # third. Follow the exact procedure printed by `helm upgrade` and in
-  # docs/UPGRADES.md, then set it back to false. Ordinary upgrades leave this
-  # false and use readiness-gated RollingUpdate per ADR 0005.
-  firstRaftUpgrade: false
-  # Long enough for a Raft leader to step down and hand off before it goes
-  # away, so that a rolling restart does not spend an election per pod. The
-  # server does not perform that handoff yet, and until it does this is only
-  # headroom. See docs/adr/0005-upgrades-follow-kubernetes-rollouts.md.
-  terminationGracePeriodSeconds: 120
-  persistence:
-    enabled: true
-    size: 10Gi
-    # Empty uses the cluster's default StorageClass.
-    storageClass: ""
-  resources:
-    requests:
-      cpu: 500m
-      memory: 1Gi
-    limits:
-      memory: 2Gi
-  nodeSelector: {}
-  tolerations: []
-  # Spread the group across nodes, because three Raft members on one machine is
-  # a single point of failure wearing a quorum as a disguise.
-  topologySpreadEnabled: true
-
-# Workers own partitions and serve reads and writes. This is the number to
-# raise when the cluster needs more capacity.
-worker:
-  replicas: 3
-  # A planned shutdown should hand each partition to a caught-up replica rather
-  # than going through failure detection and promotion, because a rolling
-  # restart of three workers is an ordinary weekly event and should not cost
-  # three failover windows. Three hundred seconds is room for a handoff of a
-  # large partition set. The process uses 290 seconds and leaves ten seconds
-  # for a clear timeout exit before Kubernetes sends SIGKILL.
   terminationGracePeriodSeconds: 300
   persistence:
     enabled: true
     size: 100Gi
+    # Empty uses the cluster's default StorageClass.
     storageClass: ""
   resources:
     requests:
-      cpu: "1"
+      # One CPU remains available for the dedicated control executor even when
+      # the worker data path is busy.
+      cpu: "2"
       memory: 4Gi
     limits:
       memory: 8Gi
   nodeSelector: {}
   tolerations: []
+  # Spread the group across nodes, because three Raft members on one machine is
+  # a single point of failure wearing a quorum as a disguise.
   topologySpreadEnabled: true
 
 # The client-facing Service, in front of the workers. Any worker can answer any
@@ -105,6 +70,8 @@ networkPolicy:
 
 cluster:
   name: orbita
+  # Independent from node.replicas. Supported values are 3 and 5.
+  voterTarget: 3
   # Inert, and kept only so that a values file carrying it does not break.
   # Refusing to start on a version mismatch was replaced by a cluster version
   # window: a node outside the window starts, reports itself not ready, and
@@ -290,5 +257,4 @@ probes:
     # Five minutes for a leader, ten for a worker. A worker that starts before
     # the leader group retries until it can join, and killing it for that would
     # turn an ordinary rollout into a crash loop.
-    leaderFailureThreshold: 60
-    workerFailureThreshold: 120
+    nodeFailureThreshold: 120

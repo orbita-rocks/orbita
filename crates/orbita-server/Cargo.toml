@@ -36,6 +36,7 @@ crc32c.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+getrandom = "0.2"
 # The API crate only. Instruments come from the global meter, which is a no-op
 # until orbita-cli installs an exporter, so this adds no collector connection to
 # a test or a single-node run that never configures one.

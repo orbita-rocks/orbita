@@ -4,8 +4,11 @@ advertise address are per-pod and come from the environment instead, which is
 exactly the split the configuration precedence was designed for.
 */}}
 {{- include "orbita.validateObjectStore" . -}}
-{{- if lt (int .Values.leader.replicas) 3 -}}
-{{- fail "leader.replicas must be at least 3; use `orbita dev` for a supported single-node cluster" -}}
+{{- if lt (int .Values.node.replicas) 3 -}}
+{{- fail "node.replicas must be at least 3; use `orbita dev` for a supported single-node cluster" -}}
+{{- end }}
+{{- if not (has (int .Values.cluster.voterTarget) (list 3 5)) -}}
+{{- fail "cluster.voterTarget must be 3 or 5" -}}
 {{- end }}
 apiVersion: v1
 kind: ConfigMap
@@ -25,7 +28,7 @@ data:
 
     [cluster]
     name = {{ .Values.cluster.name | quote }}
-    leader_peers = [{{ range $i, $peer := splitList "," (include "orbita.leaderPeers" .) }}{{ if $i }}, {{ end }}{{ $peer | quote }}{{ end }}]
+    voter_target = {{ .Values.cluster.voterTarget }}
     allow_version_skew = {{ .Values.cluster.allowVersionSkew }}
     join_backoff_initial = {{ .Values.cluster.joinBackoffInitial | quote }}
     join_backoff_max = {{ .Values.cluster.joinBackoffMax | quote }}

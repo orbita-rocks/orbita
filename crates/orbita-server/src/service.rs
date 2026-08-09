@@ -190,6 +190,7 @@ mod tests {
         assert_eq!(
             unmet,
             [
+                "cluster-identity-matched",
                 "cluster-version-compatible",
                 "control-plane-joined",
                 "partitions-caught-up",
