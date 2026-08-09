@@ -20,25 +20,58 @@ set -euo pipefail
 # shellcheck disable=SC1091  # sourced by absolute path resolved at runtime
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
-require_tools aws kubectl
+require_tools aws kubectl jq
 resolve_config
 
 ORBITA_BIN="${ORBITA_BIN:-orbita}"
 command -v "$ORBITA_BIN" >/dev/null 2>&1 || die "orbita CLI not found; set ORBITA_BIN to its path"
 
-export ORBITA_ENDPOINT="http://127.0.0.1:7100"
 KEYSPACE="smoke"
 KEY="greeting"
 VALUE="hello-from-eks"
 
 # Port-forward the client Service, and make sure it is torn down however this
 # script exits. A leaked port-forward is a confusing failure on the next run.
+#
+# kubectl picks the local port (the empty half of `:7100`) rather than this
+# script naming 7100. Anyone running this is an Orbita developer, and both
+# `orbita dev` and docker-compose already hold 127.0.0.1:7100 on exactly that
+# machine. Binding a port that is already taken fails, and a backgrounded
+# port-forward fails quietly, so the CLI would connect to the local cluster
+# instead and every check below would pass against a laptop while reporting on
+# EKS. A false green here is worse than no smoke test at all.
 log "port-forwarding svc/${ORBITA_EKS_RELEASE} 7100"
-kubectl port-forward "svc/${ORBITA_EKS_RELEASE}" 7100:7100 \
-  --namespace "$ORBITA_EKS_NAMESPACE" >/dev/null 2>&1 &
+PORT_FORWARD_LOG="$(mktemp)"
+kubectl port-forward "svc/${ORBITA_EKS_RELEASE}" :7100 \
+  --namespace "$ORBITA_EKS_NAMESPACE" >"$PORT_FORWARD_LOG" 2>&1 &
 PORT_FORWARD_PID=$!
-cleanup() { kill "$PORT_FORWARD_PID" 2>/dev/null || true; }
+# Detach it from job control so that killing it in cleanup does not make bash
+# print "Terminated" after the result line. On a passing run that trailing
+# notice reads as a failure, which defeats the point of a script whose whole
+# job is to give an unambiguous answer.
+disown "$PORT_FORWARD_PID" 2>/dev/null || true
+cleanup() {
+  kill "$PORT_FORWARD_PID" 2>/dev/null || true
+  rm -f "$PORT_FORWARD_LOG"
+}
 trap cleanup EXIT
+
+# Read the port kubectl chose back out of its own output. Waiting for that line
+# is also what proves the tunnel came up: if the forward died, there is no port
+# and this fails with kubectl's reason rather than silently testing whatever
+# else happens to be listening.
+log "waiting for the port-forward"
+local_port=""
+for _ in $(seq 1 30); do
+  local_port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' \
+    "$PORT_FORWARD_LOG" | head -1)"
+  [ -n "$local_port" ] && break
+  kill -0 "$PORT_FORWARD_PID" 2>/dev/null \
+    || die "port-forward exited: $(cat "$PORT_FORWARD_LOG")"
+  sleep 1
+done
+[ -n "$local_port" ] || die "port-forward never came up: $(cat "$PORT_FORWARD_LOG")"
+export ORBITA_ENDPOINT="http://127.0.0.1:${local_port}"
 
 # Wait for the forward to carry a live connection. cluster ping asks only whether
 # the process answers, which is exactly the right question for "is the tunnel up
@@ -48,7 +81,8 @@ for _ in $(seq 1 30); do
   if "$ORBITA_BIN" cluster ping >/dev/null 2>&1; then break; fi
   sleep 2
 done
-"$ORBITA_BIN" cluster ping >/dev/null 2>&1 || die "endpoint never answered on 127.0.0.1:7100"
+"$ORBITA_BIN" cluster ping >/dev/null 2>&1 \
+  || die "endpoint never answered on 127.0.0.1:${local_port}"
 
 # 1. Quorum. describe is served by the Raft leader, so a description that names
 # a leader and reports every node healthy is proof the group formed.
@@ -87,7 +121,12 @@ for _ in $(seq 1 15); do
   sleep 2
 done
 [ -n "$wrote" ] || die "write never succeeded; the partition may not have opened"
-got="$("$ORBITA_BIN" get "$KEYSPACE" "$KEY")"
+# Read back through the json output, not the human one. `get` renders the value
+# and a trailing "version N" line together on stdout, so comparing the human
+# output against the value fails on every healthy cluster. The CLI documents
+# json as the interface for scripts and the human tables as unstable; this asks
+# for the one field it means rather than parsing prose that is free to change.
+got="$("$ORBITA_BIN" get "$KEYSPACE" "$KEY" --output json | jq -r '.value.value')"
 [ "$got" = "$VALUE" ] || die "read back '${got}', expected '${VALUE}'"
 
 # 4. A NEW segment in the bucket. The flush timer is 30 seconds, so poll for up
