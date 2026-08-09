@@ -63,8 +63,8 @@ const ABOUT: &str = "A strongly consistent, multitenant key-value store.";
 const LONG_ABOUT: &str = "\
 A strongly consistent, multitenant key-value store.
 
-One binary does everything. `orbita serve` runs a node, as a leader group
-member or as a worker depending on configuration. Every other command is a
+One binary does everything. `orbita serve` runs a combined node. Every node
+serves worker traffic and an automatically managed subset votes in Raft. Every other command is a
 client that talks to a running cluster over the same gRPC API a program would
 use, so anything you can do here you can script.
 
@@ -172,22 +172,19 @@ impl GlobalArgs {
 pub enum Command {
     /// Run a node.
     #[command(long_about = "\
-Run a node, in whichever role the configuration says.
+Run a combined clustered node.
 
-A leader group member runs Raft and owns the partition map, keyspace metadata,
-and failover. A worker owns partitions and serves reads and writes. Both are
-this binary; nothing else is installed.
+Every node owns or replicates partitions and serves reads and writes. Three or
+five eligible nodes additionally vote in Raft, and one voter is elected leader.
 
 A node binds two listeners. --listen carries client and admin gRPC, and is the
 one to expose. --peer-listen carries traffic from other nodes in a private
 framing, and belongs on a private network: it is compatible only within a
 cluster version window, and a peer port reachable from the internet is a hole.
 
-cluster.leader_peers is the complete leader group as NODE_ID=ADDR entries,
-identical on every node. The ids are the durable Raft identities and the
-addresses are peer advertise addresses. A worker uses the same list to find a
-leader to register with, and retries until one answers or --join-timeout runs
-out.")]
+Fresh nodes agree on a durable identity and initial three-voter certificate
+through the shared object store. --leader-peers remains only for migration from
+the old fixed-role topology.")]
     Serve(ServeArgs),
 
     /// Run a single node cluster with no configuration at all.
@@ -297,7 +294,7 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ID")]
     pub node_id: Option<u64>,
 
-    /// Whether this node joins the leader group or serves partitions.
+    /// The node role. Use node; leader and worker are migration spellings.
     #[arg(long, value_name = "ROLE")]
     pub role: Option<Role>,
 
@@ -337,6 +334,18 @@ pub struct ServeArgs {
     #[arg(long, value_name = "NODE_ID=ADDR", value_delimiter = ',')]
     pub leader_peers: Option<Vec<String>>,
 
+    /// Desired Raft voters, independent from worker count. Must be 3 or 5.
+    #[arg(long, value_name = "3|5")]
+    pub voter_target: Option<usize>,
+
+    /// Failure domain used to spread voters, such as an availability zone.
+    #[arg(long, value_name = "NAME")]
+    pub failure_domain: Option<String>,
+
+    /// Keep this node out of automatic voter placement.
+    #[arg(long)]
+    pub voter_ineligible: bool,
+
     /// How long to keep trying to reach the leader group before giving up,
     /// such as 5m. Use 0 to retry forever.
     ///
@@ -374,6 +383,9 @@ impl ServeArgs {
             },
             cluster: ClusterLayer {
                 leader_peers: self.leader_peers.clone(),
+                voter_target: self.voter_target,
+                voter_eligible: self.voter_ineligible.then_some(false),
+                failure_domain: self.failure_domain.clone(),
                 allow_version_skew: self.allow_version_skew.then_some(true),
                 join_timeout: self.join_timeout.clone(),
                 ..ClusterLayer::default()

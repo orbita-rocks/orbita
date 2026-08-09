@@ -31,7 +31,7 @@
 use orbita_control::{
     binary_speaks, BootstrapSpec, ClusterVersion, ControlCommand, ControlConfig, ControlService,
     Controller, KeyspaceConfig, SingleNodeLog, METHOD_FETCH_SPLIT_INTENTS,
-    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS_V5,
+    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
 };
 use orbita_core::{NodeId, PartitionMap};
 use orbita_proto::v1::kv_client::KvClient;
@@ -120,6 +120,9 @@ impl PeerHandler for PreSplitControl {
                 };
                 Ok(legacy_control_error(&message))
             }
+            METHOD_REPORT_STATUS_V6 if self.refuse_version => Ok(legacy_control_error(&format!(
+                "unknown control method {METHOD_REPORT_STATUS_V6}"
+            ))),
             METHOD_REPORT_STATUS_V5 if self.refuse_version => {
                 self.status_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(incompatible_response())

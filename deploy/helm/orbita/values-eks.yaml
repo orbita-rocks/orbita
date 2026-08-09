@@ -59,11 +59,8 @@ objectStore:
   # that resolves to the wrong name rather than a clear error.
   forcePathStyle: false
 
-# gp3 for both roles, provisioned by the StorageClass deploy/eks/up.sh applies.
+# gp3 for combined node state, provisioned by the StorageClass deploy/eks/up.sh applies.
 # The chart default is empty, which would fall back to the cluster's gp2 default.
-leader:
-  persistence:
-    storageClass: gp3
-worker:
+node:
   persistence:
     storageClass: gp3

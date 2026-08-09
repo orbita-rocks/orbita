@@ -1130,6 +1130,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "crc32c",
+ "getrandom 0.2.17",
  "opentelemetry",
  "orbita-control",
  "orbita-core",

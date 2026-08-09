@@ -46,6 +46,15 @@ pub struct ControlConfig {
     /// is the automatic-split work tracked by issue #39. Kept here so the number
     /// and its reasoning live with the rest of the control-plane timing.
     pub split_threshold_bytes: u64,
+
+    /// Desired control-plane voters, independent from worker count.
+    pub voter_target: usize,
+
+    /// Whether this cluster has crossed into automatically managed membership.
+    pub voter_management_enabled: bool,
+
+    /// Continuous dead time before a voter may be replaced.
+    pub voter_replacement_after: Duration,
 }
 
 impl Default for ControlConfig {
@@ -97,6 +106,9 @@ impl ControlConfig {
             lease_margin: Duration::from_millis(50),
             replication_factor: 3,
             split_threshold_bytes: 512 * 1024 * 1024,
+            voter_target: 3,
+            voter_management_enabled: false,
+            voter_replacement_after: Duration::from_secs(5 * 60),
         };
         // A caller asking for a tighter budget than the defaults fit gets the
         // detection window scaled down rather than a silent overrun, because
@@ -194,6 +206,24 @@ impl ControlConfig {
     #[must_use]
     pub fn convergence_bound(&self) -> Duration {
         self.failover_budget() + 4 * self.sweep_interval + 8 * self.heartbeat_interval
+    }
+
+    /// Sets the supported odd voter target.
+    pub fn with_voter_target(mut self, target: usize) -> orbita_core::Result<Self> {
+        if !matches!(target, 3 | 5) {
+            return Err(orbita_core::Error::InvalidArgument(format!(
+                "voter target must be 3 or 5, got {target}"
+            )));
+        }
+        self.voter_target = target;
+        Ok(self)
+    }
+
+    /// Enables leader-driven voter repair after combined-node bootstrap.
+    #[must_use]
+    pub fn with_voter_management(mut self) -> Self {
+        self.voter_management_enabled = true;
+        self
     }
 }
 

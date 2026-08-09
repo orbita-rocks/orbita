@@ -60,7 +60,8 @@ holds up before you push it.
 
 ## A cluster on Docker Compose
 
-Three leader group members, three workers, and MinIO standing in for S3.
+Three combined nodes and MinIO standing in for S3. Every node serves data, and
+the same three nodes form the initial Raft voter set.
 
 ```
 docker compose up --build -d
@@ -68,9 +69,8 @@ docker compose --profile smoke run --rm smoke
 ```
 
 The smoke service creates a keyspace, writes a key, reads it back, and prints
-the cluster description. It runs against `worker-1`, which is not a member of
-the leader group, so it is also a check that an admin call reaches the leader
-from wherever it was sent.
+the cluster description. It runs against `node-1`; that node forwards control
+work when another voter is the elected Raft leader.
 
 It retries that first write, and the reason is worth knowing before you write
 your own script. A keyspace exists as soon as the control plane commits it, but
@@ -85,15 +85,16 @@ docker compose run --rm cli set demo greeting hello
 docker compose run --rm cli get demo greeting
 ```
 
-Worker 1 publishes its client port to 127.0.0.1:7100, so a binary on your
+Node 1 publishes its client port to 127.0.0.1:7100, so a binary on your
 machine works too:
 
 ```
 orbita --endpoint http://127.0.0.1:7100 cluster describe
 ```
 
-Check that everything is up with `docker compose ps`. All seven services should
-say healthy within a minute.
+Check that everything is up with `docker compose ps`. MinIO and all three nodes
+should say healthy within a minute. The one-shot `minio-init` service should
+have exited successfully.
 
 The first build compiles the workspace from source and takes a few minutes.
 Everything after that is cached.
@@ -120,9 +121,9 @@ orbita get demo greeting
 If you would rather not have Helm in the loop, `kubectl apply -f
 deploy/manifests/orbita.yaml` produces the same topology with no templating.
 
-Set `objectStore.endpoint` and the credentials before this holds anything you
-care about. Without an object store, compacted data stays on local disks and
-replacing a worker means rehydrating it from its replicas.
+Set the object store endpoint and credentials before installing either shape.
+Clustered nodes require a shared object store because its conditional writes
+prevent two fresh groups from bootstrapping under the same cluster name.
 
 Upgrading is a StatefulSet rolling update and nothing else. `docs/UPGRADES.md`
 has the procedure and is honest about which parts of it the server does not

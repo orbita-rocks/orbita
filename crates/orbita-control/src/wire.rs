@@ -98,6 +98,8 @@ pub const METHOD_REPORT_SPLIT_PREPARED: u16 = 14;
 pub const METHOD_FETCH_SPLIT_INTENTS_V2: u16 = 15;
 /// Reports preparation for one exact pair of child ids.
 pub const METHOD_REPORT_SPLIT_PREPARED_V2: u16 = 16;
+/// Status reporting with combined-node voter eligibility and placement data.
+pub const METHOD_REPORT_STATUS_V6: u16 = 17;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
@@ -157,6 +159,21 @@ impl ReportStatusRequest {
         let mut r = Reader::new(buf);
         let node = NodeId(r.u64()?);
         let status = NodeStatus::decode(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
+    pub(crate) fn encode_v5(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v5(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v5(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v5(&mut r)?;
         r.done()?;
         Ok(Self { node, status })
     }
@@ -906,6 +923,9 @@ mod tests {
                 speaks: crate::version::binary_speaks(),
                 ready: true,
                 draining: false,
+                voter_eligible: true,
+                failure_domain: "zone-a".into(),
+                node_identity: "node-7".into(),
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),
@@ -936,6 +956,9 @@ mod tests {
                 speaks: crate::version::binary_speaks(),
                 ready: true,
                 draining: false,
+                voter_eligible: false,
+                failure_domain: String::new(),
+                node_identity: String::new(),
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),
@@ -978,6 +1001,9 @@ mod tests {
                 speaks: crate::version::VersionRange::exactly(crate::version::ClusterVersion::ZERO),
                 ready: false,
                 draining: false,
+                voter_eligible: false,
+                failure_domain: String::new(),
+                node_identity: String::new(),
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),

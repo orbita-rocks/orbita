@@ -53,13 +53,19 @@ use serde::{Deserialize, Serialize};
 pub const ENVIRONMENT: &[(&str, &str)] = &[
     ("ORBITA_CONFIG", "path to the configuration file"),
     ("ORBITA_NODE_ID", "node.id"),
-    ("ORBITA_NODE_ROLE", "node.role, one of leader or worker"),
+    (
+        "ORBITA_NODE_ROLE",
+        "node.role; node is the combined clustered role",
+    ),
     ("ORBITA_LISTEN", "node.listen"),
     ("ORBITA_ADVERTISE", "node.advertise"),
     ("ORBITA_PEER_LISTEN", "node.peer_listen"),
     ("ORBITA_PEER_ADVERTISE", "node.peer_advertise"),
     ("ORBITA_DATA_DIR", "node.data_dir"),
     ("ORBITA_CLUSTER_NAME", "cluster.name"),
+    ("ORBITA_VOTER_TARGET", "cluster.voter_target, either 3 or 5"),
+    ("ORBITA_VOTER_ELIGIBLE", "cluster.voter_eligible"),
+    ("ORBITA_FAILURE_DOMAIN", "cluster.failure_domain"),
     (
         "ORBITA_LEADER_PEERS",
         "cluster.leader_peers, comma separated NODE_ID=ADDR entries",
@@ -185,8 +191,12 @@ pub const DEFAULT_PEER_PORT: u16 = 7101;
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum Role {
+    /// Serves worker traffic and may be selected as a Raft voter.
+    Node,
+    /// Legacy rolling-upgrade spelling for a fixed Raft voter.
     /// Runs Raft, owns the partition map, keyspace metadata, and failover.
     Leader,
+    /// Legacy rolling-upgrade spelling for a data-only process.
     /// Owns partitions and serves client reads and writes.
     Worker,
 }
@@ -194,6 +204,7 @@ pub enum Role {
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Node => f.write_str("node"),
             Self::Leader => f.write_str("leader"),
             Self::Worker => f.write_str("worker"),
         }
@@ -249,6 +260,9 @@ pub struct ClusterConfig {
     /// addresses and an operator keeping two lists in sync will not.
     /// See [`crate::node`] for why.
     pub leader_peers: Vec<String>,
+    pub voter_target: usize,
+    pub voter_eligible: bool,
+    pub failure_domain: String,
     pub allow_version_skew: bool,
     /// Whether this cluster requires a credential on every client request.
     ///
@@ -486,6 +500,9 @@ pub struct NodeLayer {
 pub struct ClusterLayer {
     pub name: Option<String>,
     pub leader_peers: Option<Vec<String>>,
+    pub voter_target: Option<usize>,
+    pub voter_eligible: Option<bool>,
+    pub failure_domain: Option<String>,
     pub allow_version_skew: Option<bool>,
     pub require_auth: Option<bool>,
     pub root_credential: Option<String>,
@@ -574,6 +591,9 @@ impl Layer {
             other.cluster,
             name,
             leader_peers,
+            voter_target,
+            voter_eligible,
+            failure_domain,
             allow_version_skew,
             require_auth,
             root_credential,
@@ -665,9 +685,10 @@ impl Layer {
 
         let role = get("ORBITA_NODE_ROLE")
             .map(|v| match v.to_ascii_lowercase().as_str() {
+                "node" => Ok(Role::Node),
                 "leader" => Ok(Role::Leader),
                 "worker" => Ok(Role::Worker),
-                other => bail!("ORBITA_NODE_ROLE must be leader or worker, got {other:?}"),
+                other => bail!("ORBITA_NODE_ROLE must be node, leader, or worker, got {other:?}"),
             })
             .transpose()?;
 
@@ -713,6 +734,9 @@ impl Layer {
             cluster: ClusterLayer {
                 name: get("ORBITA_CLUSTER_NAME").map(str::to_owned),
                 leader_peers: get("ORBITA_LEADER_PEERS").map(parse_list),
+                voter_target: parse("ORBITA_VOTER_TARGET")?.map(|value| value as usize),
+                voter_eligible: flag("ORBITA_VOTER_ELIGIBLE")?,
+                failure_domain: get("ORBITA_FAILURE_DOMAIN").map(str::to_owned),
                 allow_version_skew: flag("ORBITA_ALLOW_VERSION_SKEW")?,
                 require_auth: flag("ORBITA_REQUIRE_AUTH")?,
                 root_credential: get("ORBITA_ROOT_CREDENTIAL").map(str::to_owned),
@@ -896,10 +920,15 @@ impl Layer {
             bail!("client.endpoint must start with http:// or https://, got {endpoint:?}");
         }
 
+        let voter_target = self.cluster.voter_target.unwrap_or(3);
+        if !matches!(voter_target, 3 | 5) {
+            bail!("cluster.voter_target must be 3 or 5, got {voter_target}");
+        }
+
         Ok(Config {
             node: NodeConfig {
                 id: self.node.id.unwrap_or(1),
-                role: self.node.role.unwrap_or(Role::Worker),
+                role: self.node.role.unwrap_or(Role::Node),
                 listen,
                 advertise,
                 peer_listen,
@@ -912,6 +941,9 @@ impl Layer {
             cluster: ClusterConfig {
                 name: self.cluster.name.unwrap_or_else(|| "orbita".to_owned()),
                 leader_peers: self.cluster.leader_peers.unwrap_or_default(),
+                voter_target,
+                voter_eligible: self.cluster.voter_eligible.unwrap_or(true),
+                failure_domain: self.cluster.failure_domain.unwrap_or_default(),
                 allow_version_skew: self.cluster.allow_version_skew.unwrap_or(false),
                 require_auth: self.cluster.require_auth.unwrap_or(false),
                 root_credential: self.cluster.root_credential,
@@ -1105,7 +1137,7 @@ pub fn dev_defaults(port: u16, data_dir: PathBuf) -> Layer {
     Layer {
         node: NodeLayer {
             id: Some(1),
-            role: Some(Role::Leader),
+            role: Some(Role::Node),
             listen: Some(format!("127.0.0.1:{port}")),
             advertise: Some(format!("127.0.0.1:{port}")),
             peer_listen: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
@@ -1137,7 +1169,7 @@ mod tests {
     fn every_option_has_a_default_so_dev_needs_no_configuration() {
         let config = Layer::default().resolve().expect("defaults must resolve");
         assert_eq!(config.node.id, 1);
-        assert_eq!(config.node.role, Role::Worker);
+        assert_eq!(config.node.role, Role::Node);
         assert_eq!(config.node.listen, "0.0.0.0:7100");
         assert_eq!(config.node.advertise, "0.0.0.0:7100");
         assert_eq!(config.node.peer_listen, "0.0.0.0:7101");
@@ -1145,6 +1177,30 @@ mod tests {
         assert_eq!(config.client.endpoint, "http://127.0.0.1:7100");
         assert_eq!(config.telemetry.log_level, "info");
         assert!(config.object_store.endpoint.is_none());
+    }
+
+    #[test]
+    fn voter_target_accepts_only_three_or_five() {
+        for target in [3, 5] {
+            let layer = Layer {
+                cluster: ClusterLayer {
+                    voter_target: Some(target),
+                    ..ClusterLayer::default()
+                },
+                ..Layer::default()
+            };
+            assert_eq!(layer.resolve().unwrap().cluster.voter_target, target);
+        }
+        for target in [0, 1, 4, 7] {
+            let layer = Layer {
+                cluster: ClusterLayer {
+                    voter_target: Some(target),
+                    ..ClusterLayer::default()
+                },
+                ..Layer::default()
+            };
+            assert!(layer.resolve().is_err(), "target {target} must be refused");
+        }
     }
 
     #[test]
@@ -1484,7 +1540,10 @@ mod tests {
     #[test]
     fn a_role_the_binary_does_not_have_is_rejected_with_the_valid_ones_named() {
         let err = Layer::from_env(&env(&[("ORBITA_NODE_ROLE", "coordinator")])).unwrap_err();
-        assert!(format!("{err:#}").contains("leader or worker"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("node, leader, or worker"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1686,7 +1745,7 @@ mod tests {
         let config = dev_defaults(7100, PathBuf::from(".orbita/dev"))
             .resolve()
             .unwrap();
-        assert_eq!(config.node.role, Role::Leader);
+        assert_eq!(config.node.role, Role::Node);
         assert!(config.cluster.leader_peers.is_empty());
         assert_eq!(config.node.listen, "127.0.0.1:7100");
         // Both listeners are on the loopback address, because nothing outside

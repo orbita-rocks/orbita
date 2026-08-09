@@ -121,14 +121,16 @@ pub use client::{AdminOutcome, ControlClient, LocalControlClient, StatusReportRe
 pub use codec::CodecError;
 pub use command::ControlCommand;
 pub use config::ControlConfig;
-pub use consensus::{ConsensusLog, LogEntry, LogIndex, SingleNodeLog};
+pub use consensus::{
+    ConsensusLog, LogEntry, LogIndex, MembershipChange, RaftMember, SingleNodeLog,
+};
 pub use controller::{
     BootstrapSpec, ClusterView, Controller, FinalizedUpgrade, NodeView, PartitionView,
     RegistrationOutcome, ReplicaProgressView,
 };
 pub use membership::{NodeHealth, NodeRole, NodeStatus, PartitionProgress};
 pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
-pub use raft::RaftLog;
+pub use raft::{RaftLog, RaftMembership};
 pub use service::ControlService;
 pub use state::{ClusterState, NodeRecord, PartitionPhase, SplitIntent};
 pub use version::{
@@ -140,4 +142,5 @@ pub use wire::{
     METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
     METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS, METHOD_REPORT_STATUS_V2,
     METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5,
+    METHOD_REPORT_STATUS_V6,
 };

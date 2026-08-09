@@ -18,6 +18,9 @@ use tokio::sync::watch;
 /// One thing that must have happened before this node may call itself ready.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadinessCondition {
+    /// The data directory and shared object store name the same durable
+    /// cluster, and a certified voter is using the node identity in its claim.
+    ClusterIdentityMatched,
     /// This binary can speak the active cluster version. Kept separate from
     /// registration so a stopped rollout names version skew directly.
     ClusterVersionCompatible,
@@ -77,7 +80,8 @@ pub enum ReadinessCondition {
 
 impl ReadinessCondition {
     /// Every condition, in the order reports list them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::ClusterIdentityMatched,
         Self::ClusterVersionCompatible,
         Self::ControlPlaneJoined,
         Self::WalRecovered,
@@ -92,6 +96,7 @@ impl ReadinessCondition {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            Self::ClusterIdentityMatched => "cluster-identity-matched",
             Self::ClusterVersionCompatible => "cluster-version-compatible",
             Self::ControlPlaneJoined => "control-plane-joined",
             Self::WalRecovered => "wal-recovered",
@@ -115,6 +120,7 @@ impl std::fmt::Display for ReadinessCondition {
 /// moment rather than about state that moves under it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadinessState {
+    identity_matched: bool,
     compatible: bool,
     joined: bool,
     recovered: bool,
@@ -129,6 +135,7 @@ impl ReadinessState {
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.compatible
+            && self.identity_matched
             && self.joined
             && self.recovered
             && self.caught_up
@@ -141,6 +148,7 @@ impl ReadinessState {
     #[must_use]
     pub fn is_met(&self, condition: ReadinessCondition) -> bool {
         match condition {
+            ReadinessCondition::ClusterIdentityMatched => self.identity_matched,
             ReadinessCondition::ClusterVersionCompatible => self.compatible,
             ReadinessCondition::ControlPlaneJoined => self.joined,
             ReadinessCondition::WalRecovered => self.recovered,
@@ -162,6 +170,7 @@ impl ReadinessState {
 
     fn set(&mut self, condition: ReadinessCondition, met: bool) {
         match condition {
+            ReadinessCondition::ClusterIdentityMatched => self.identity_matched = met,
             ReadinessCondition::ClusterVersionCompatible => self.compatible = met,
             ReadinessCondition::ControlPlaneJoined => self.joined = met,
             ReadinessCondition::WalRecovered => self.recovered = met,

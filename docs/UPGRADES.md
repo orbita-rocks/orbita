@@ -117,6 +117,36 @@ sequence can create the first quorum. The worker data plane remains available
 on its last map while the leader group forms. It is not a general permission to
 restart two Raft voters together after this transition.
 
+## Migrating to combined nodes
+
+The first release implementing ADR 0011 reads the old `ORBITA_LEADER_PEERS`
+configuration and the durable `control/raft-voters` file for one compatibility
+window. Old leader processes remain the three voters and old workers remain
+data-only while old and new binaries coexist. A new binary started with
+`--role leader` or `--role worker` preserves that old role and logs that the
+spelling is transitional; it does not automatically change Raft membership
+during the rollout.
+
+Roll the old leader and worker StatefulSets under their existing names and
+volumes first. Do not switch to the combined chart shape in the same Helm
+operation, because Kubernetes cannot automatically reattach six old claims to
+three new pod names. Once every process runs the new binary, finalize the
+cluster version, drain the old workers, and move the three voter volumes to the
+combined node StatefulSet. The voter volumes already contain the authoritative
+Raft membership and cluster identity, so the object-store bootstrap certificate
+is migration metadata rather than permission to form another group.
+
+After finalization, new combined nodes use the shared object store and cluster
+name to discover the durable identity and voter certificate. They join as
+workers and learners. `ORBITA_LEADER_PEERS` may then be removed; changing it no
+longer changes membership. A volume whose persisted cluster identity disagrees
+with the bucket starts unready and names `cluster-identity-matched` rather than
+exiting, which keeps rollback diagnostics available per ADR 0005.
+
+The elected leader, voters, and workers are deliberately separate terms after
+this migration. There is one elected leader, three or five voters, and every
+node is a worker even when it is also one of those voters.
+
 ## The rollout
 
 Upgrade the image. With Helm:

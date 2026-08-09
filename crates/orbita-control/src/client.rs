@@ -18,7 +18,7 @@ use crate::wire::{
     METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_FETCH_SPLIT_INTENTS,
     METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_SPLIT_PREPARED_V2, METHOD_REPORT_STATUS,
     METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
-    METHOD_REPORT_STATUS_V5,
+    METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
 };
 
 use orbita_core::{Error, MapVersion, NodeId, PartitionId, PartitionMap, Result};
@@ -406,6 +406,36 @@ impl<R: Runtime> ControlClient<R> {
             status: status.clone(),
         }
         .encode();
+        match self.call(METHOD_REPORT_STATUS_V6, payload).await {
+            Ok(ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            }) => Ok(StatusReportResponse::Accepted {
+                map_version,
+                cluster_version,
+            }),
+            Ok(ControlResponse::Incompatible(refusal)) => {
+                Ok(StatusReportResponse::Incompatible(refusal))
+            }
+            Ok(other) => Err(unexpected(&other)),
+            Err(CallError::UnsupportedMethod(METHOD_REPORT_STATUS_V6)) => {
+                self.send_status_v5(node, status, lifecycle).await
+            }
+            Err(error) => Err(error.into_error()),
+        }
+    }
+
+    async fn send_status_v5(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+        lifecycle: bool,
+    ) -> Result<StatusReportResponse> {
+        let payload = ReportStatusRequest {
+            node,
+            status: status.clone(),
+        }
+        .encode_v5();
         match self.call(METHOD_REPORT_STATUS_V5, payload).await {
             Ok(ControlResponse::Accepted {
                 map_version,
@@ -720,7 +750,7 @@ fn unexpected(response: &ControlResponse) -> Error {
 mod tests {
     use super::*;
     use crate::membership::{NodeRole, NodeStatus};
-    use crate::wire::{METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V5};
+    use crate::wire::{METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4, METHOD_REPORT_STATUS_V6};
 
     use orbita_runtime::{PeerCall, PeerHandler, ServiceId, TransportResult};
     use orbita_sim::Simulation;
@@ -1037,7 +1067,7 @@ mod tests {
                 call: PeerCall,
             ) -> TransportResult<bytes::Bytes> {
                 let response = match call.method {
-                    METHOD_REPORT_STATUS_V5 => ControlResponse::Error("no".into()),
+                    METHOD_REPORT_STATUS_V6 => ControlResponse::Error("no".into()),
                     other => panic!("an older method must not be tried, got {other}"),
                 };
                 Ok(response.encode())
