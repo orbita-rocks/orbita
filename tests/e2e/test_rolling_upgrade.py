@@ -27,10 +27,10 @@ implementation (or `ORBITA_PREV_BINARY` to a prior release binary) to make it a
 true cross-version test; the harness validates that side speaks the previous
 minor. When the previous minor is not expressible (a minor-zero workspace) the
 whole test skips with the reason rather than pretending to cover the upgrade.
-In particular, the synthetic old binary already knows split-intent method 13,
-so it cannot reproduce that method's legacy unknown-method response. The exact
-pre-split service integration in `orbita-server/tests/multi_node.rs` covers that
-wire compatibility case.
+    In particular, the synthetic old binary already knows newer method and command
+    decoders, so it cannot reproduce a real old binary's unknown-method response.
+    Exact service integration and pre-append log tests cover those compatibility
+    boundaries; set `ORBITA_PREV_REV` for the real cross-version-code path.
 
 # The shape
 
@@ -325,6 +325,26 @@ class Cluster:
             time.sleep(0.25)
         raise AssertionError(f"no leader served {args!r}: {last}")
 
+    def refused_by_leader(self, *args: str) -> str:
+        """Run a command that the current leader must reject."""
+        last = ""
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            for node in self.leaders:
+                result = subprocess.run(
+                    [str(self.new), "--endpoint", node.endpoint, *args],
+                    capture_output=True,
+                    text=True,
+                )
+                last = result.stdout + result.stderr
+                if "not the leader" in last:
+                    continue
+                if result.returncode != 0:
+                    return last
+                raise AssertionError(f"leader accepted {args!r} before finalization: {last}")
+            time.sleep(0.25)
+        raise AssertionError(f"no leader rejected {args!r}: {last}")
+
     def describe(self) -> dict:
         """`cluster describe` as data, so an assertion reads a field rather
         than a rendered column that exists to be read by a person."""
@@ -534,7 +554,7 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
                 node.roll(cluster.new)
                 cluster.wait_ready(node)
 
-            # The old control log, written by 0.0 leaders, has now been
+            # The old control log has now been
             # recovered by three new-binary leaders in turn. If any of them had
             # truncated it, the keyspace created above would be gone.
             assert KS in cluster.on_leader("keyspace", "list")
@@ -548,6 +568,14 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
             )
         finally:
             writer.stop()
+
+        # Merge adds new replicated tags and must stay off the log until
+        # finalization proves every voter can decode them. The protocol refusal
+        # comes before id validation, so even a malformed request cannot enter
+        # merge logic during the rollback window.
+        refused = cluster.refused_by_leader("partition", "merge", "1", "2")
+        assert "active cluster protocol 0.2" in refused
+        assert "finalize-upgrade" in refused
 
         # Every acknowledged write is still readable. This is the no-lost-writes
         # guarantee stated as the client sees it.
@@ -568,7 +596,7 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
         assert f"advanced from {old_version} to {new_version}" in finalized, finalized
         assert cluster.cluster_version() == new_version
 
-        # The old binary is now locked out. A node that speaks only 0.0 starts,
+        # The old binary is now locked out. A node that speaks only the previous minor starts,
         # registers, is refused admission by the control plane, and stays not
         # ready with the version condition named. It must not silently join.
         rejoin_port = cluster.free_pair()

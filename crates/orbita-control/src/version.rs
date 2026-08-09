@@ -140,6 +140,11 @@ impl std::fmt::Display for CompatibilityRefusal {
 /// planned handoff built on them.
 pub const PROTOCOL_0_1: ClusterVersion = ClusterVersion::new(0, 1);
 
+/// The first cluster version whose replicated vocabulary includes partition
+/// merge commands. Keeping it separate from 0.1 preserves rollback until every
+/// voter can decode merge tags 22 through 25.
+pub const PROTOCOL_0_2: ClusterVersion = ClusterVersion::new(0, 2);
+
 /// Whether `active` is a cluster version whose protocol carries worker
 /// lifecycle state.
 ///
@@ -233,6 +238,13 @@ mod tests {
         // the test is what keeps that panic a build-time impossibility.
         let own = binary_version();
         assert_eq!(own, binary_speaks().max);
+    }
+
+    #[test]
+    fn this_binary_keeps_protocol_0_1_rollback_until_0_2_is_finalized() {
+        let speaks = binary_speaks();
+        assert_eq!(speaks.max, PROTOCOL_0_2);
+        assert!(speaks.contains(PROTOCOL_0_1));
     }
 
     #[test]

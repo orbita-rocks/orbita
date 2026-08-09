@@ -17,9 +17,11 @@ finished.
   `cluster-version-compatible` and `control-plane-joined` as unmet readiness
   conditions, and logs both its range and the active version. No behaviour
   actually changes with the version yet because no format has two versions to
-  choose between. Planned worker handoff is the first version-gated behavior:
-  workers continue using the previous status protocol and ordinary failover
-  until the operator finalizes the new cluster version.
+  choose between. Worker handoff and partition merge are version-gated
+  behaviors. Workers continue using the previous status protocol and ordinary
+  failover until the operator finalizes protocol 0.1. Merge commands remain
+  unavailable until every live node speaks protocol 0.2 and the operator
+  finalizes it, because a 0.1 voter cannot decode their replicated log tags.
 Readiness is otherwise real: a node reports Ready only once it has recovered
 its write-ahead log and opened and caught up the partitions the map says it
 holds, and it turns unready again if a map change hands it a partition it
@@ -245,6 +247,10 @@ orbita cluster finalize-upgrade
 Only after that do nodes start writing new formats or using new behaviour.
 Until then the rollback above is available and cheap. After it, rolling back is
 not supported, and the command says so before it proceeds.
+
+Partition merge specifically requires active protocol 0.2. A 0.2 binary rolled
+into an active 0.1 cluster refuses merge before appending anything to the
+control log. Finalizing 0.2 enables it and closes rollback to a 0.1 binary.
 
 Finalization is not automatic on purpose. Doing it automatically would close
 the rollback window at the exact moment an operator is most likely to want it,

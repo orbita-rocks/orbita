@@ -30,6 +30,7 @@ use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Credential, Keyspace, KeyspaceConfig};
 use crate::version::{
     lifecycle_protocol_active, ClusterVersion, CompatibilityRefusal, VersionRange, PROTOCOL_0_1,
+    PROTOCOL_0_2,
 };
 
 use orbita_core::{
@@ -535,15 +536,31 @@ impl ClusterState {
                 | ControlCommand::MarkSplitPrepared { .. }
                 | ControlCommand::CompleteSplit { .. }
                 | ControlCommand::AbortSplit { .. }
-                | ControlCommand::BeginMerge { .. }
-                | ControlCommand::MarkMergePrepared { .. }
-                | ControlCommand::CompleteMerge { .. }
-                | ControlCommand::AbortMerge { .. }
         );
         if is_protocol_0_1 && (!self.version_initialized || self.version < PROTOCOL_0_1) {
             return Err(Error::Unavailable(
                 "the worker-prepared split and replicated fence-drain require active cluster \
                  protocol 0.1"
+                    .into(),
+            ));
+        }
+        let is_protocol_0_2 = matches!(
+            command,
+            ControlCommand::BeginMerge { .. }
+                | ControlCommand::MarkMergePrepared { .. }
+                | ControlCommand::CompleteMerge { .. }
+                | ControlCommand::AbortMerge { .. }
+        );
+        if is_protocol_0_2 {
+            self.ensure_merge_permitted()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_merge_permitted(&self) -> Result<()> {
+        if !self.version_initialized || self.version < PROTOCOL_0_2 {
+            return Err(Error::Unavailable(
+                "partition merge requires active cluster protocol 0.2; roll every node forward and run `orbita cluster finalize-upgrade`"
                     .into(),
             ));
         }
@@ -1527,7 +1544,11 @@ mod tests {
             node: NodeId(id),
             role: NodeRole::Worker,
             address: format!("10.0.0.{id}:7000"),
-            speaks: crate::version::binary_speaks(),
+            // Most state tests exercise routing rather than compatibility and
+            // move the active version explicitly. Keep their fixture eligible
+            // across that range; compatibility tests below register exact
+            // production windows with `register_with`.
+            speaks: VersionRange::new(ClusterVersion::ZERO, crate::version::binary_speaks().max),
             ready: true,
             draining: false,
         }
@@ -2080,6 +2101,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn merge_commands_require_protocol_0_2() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        let generation = merge_generation(&lower, &upper, 12);
+        let commands = [
+            ControlCommand::BeginMerge {
+                generation: generation.clone(),
+            },
+            ControlCommand::MarkMergePrepared {
+                generation: generation.clone(),
+                node: lower.owner.unwrap(),
+            },
+            ControlCommand::CompleteMerge {
+                generation: generation.clone(),
+            },
+            ControlCommand::AbortMerge { generation },
+        ];
+
+        for command in commands {
+            assert!(
+                matches!(
+                    state.ensure_command_permitted(&command),
+                    Err(Error::Unavailable(_))
+                ),
+                "active protocol 0.1 permitted {command:?}"
+            );
+        }
+
+        state
+            .apply(&ControlCommand::SetClusterVersion {
+                version: PROTOCOL_0_2,
+                expect: PROTOCOL_0_1,
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            })
+            .expect("finalized protocol 0.2 enables merge");
+    }
+
     fn merge_generation(
         lower: &PartitionInfo,
         upper: &PartitionInfo,
@@ -2099,7 +2166,7 @@ mod tests {
     #[test]
     fn a_merge_prepares_before_atomically_replacing_both_adjacent_parents() {
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_1);
+        set_version(&mut state, PROTOCOL_0_2);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
@@ -2171,7 +2238,7 @@ mod tests {
     #[test]
     fn a_delayed_merge_ack_cannot_apply_to_a_retried_generation() {
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_1);
+        set_version(&mut state, PROTOCOL_0_2);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
@@ -2207,7 +2274,7 @@ mod tests {
     #[test]
     fn split_and_merge_decisions_are_mutually_exclusive() {
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_1);
+        set_version(&mut state, PROTOCOL_0_2);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
@@ -2232,7 +2299,7 @@ mod tests {
     #[test]
     fn owner_failure_mid_merge_aborts_and_raises_both_parent_epochs() {
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_1);
+        set_version(&mut state, PROTOCOL_0_2);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
@@ -2799,7 +2866,7 @@ mod tests {
         // healthy, and silently owns nothing.
         let mut state = bootstrapped();
         set_version(&mut state, ClusterVersion::ZERO);
-        register_without_a_lifecycle_claim(&mut state, 4, crate::version::binary_speaks());
+        register_without_a_lifecycle_claim(&mut state, 4, crate::version::speaks_for(PROTOCOL_0_1));
 
         assert!(
             state.placement_candidates().contains(&NodeId(4)),

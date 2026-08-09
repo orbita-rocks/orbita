@@ -127,7 +127,7 @@ pub use service::ControlService;
 pub use state::{ClusterState, MergeIntent, NodeRecord, PartitionPhase, SplitIntent};
 pub use version::{
     binary_speaks, binary_version, lifecycle_protocol_active, speaks_for, ClusterVersion,
-    CompatibilityRefusal, VersionRange, PROTOCOL_0_1,
+    CompatibilityRefusal, VersionRange, PROTOCOL_0_1, PROTOCOL_0_2,
 };
 pub use wire::{
     MergeIntentSnapshot, SplitIntentSnapshot, WireMergeIntent, WireSplitIntent, METHOD_DRAIN_NODE,

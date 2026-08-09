@@ -62,9 +62,9 @@ const TAG_BEGIN_SPLIT: u8 = 18;
 const TAG_MARK_SPLIT_PREPARED: u8 = 19;
 const TAG_COMPLETE_SPLIT: u8 = 20;
 const TAG_ABORT_SPLIT: u8 = 21;
-// The dual-parent worker-prepared merge protocol. Like split, these tags are
-// emitted only after the active cluster protocol has been finalized to a
-// version whose binaries all understand them.
+// The dual-parent worker-prepared merge protocol, introduced in protocol 0.2.
+// These tags stay off the replicated log until finalization proves every live
+// voter understands them.
 const TAG_BEGIN_MERGE: u8 = 22;
 const TAG_MARK_MERGE_PREPARED: u8 = 23;
 const TAG_COMPLETE_MERGE: u8 = 24;

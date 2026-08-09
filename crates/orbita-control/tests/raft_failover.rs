@@ -5,10 +5,10 @@
 
 use orbita_control::{
     binary_speaks, BootstrapSpec, ClusterState, ClusterVersion, ConsensusLog, ControlClient,
-    ControlCommand, ControlConfig, ControlService, Controller, KeyspaceConfig, NodeRole,
-    NodeStatus, RaftLog,
+    ControlCommand, ControlConfig, ControlService, Controller, KeyspaceConfig, MergeGeneration,
+    NodeRole, NodeStatus, RaftLog, PROTOCOL_0_1,
 };
-use orbita_core::{Epoch, Error, Lamport, MapVersion, NodeId, PartitionId};
+use orbita_core::{Epoch, Error, KeyRange, Lamport, MapVersion, NodeId, PartitionId};
 use orbita_runtime::{Runtime, ServiceId, Transport};
 use orbita_sim::{check_seeds, Failure, SimRuntime, Simulation};
 use orbita_wal::{PartitionLog, Wal, WalConfig, WalOp, WalService, DEFAULT_SEGMENT_TARGET_BYTES};
@@ -280,20 +280,16 @@ fn put(key: &'static [u8]) -> WalOp {
     }
 }
 
-/// Why a lifecycle claim cannot simply be recorded early.
+/// Why merge commands cannot simply be recorded early.
 ///
-/// This is the constraint that decides the shape of the fix for issue #105.
-/// A `RegisterNode` carrying a readiness or draining claim encodes under
-/// `TAG_REGISTER_NODE_V3`, a tag the previous binary does not know, and
-/// recovery treats an entry it cannot decode as the end of the trustworthy log
-/// and truncates there. So "record the claim anyway, and let an old leader
-/// judge the node on it" is not available: it would buy placement during the
-/// upgrade window by destroying the rollback window, which is the trade
-/// `docs/UPGRADES.md` exists to refuse. The claim has to stay off the log
-/// until finalization, which is why the *gate* is what moves instead.
+/// A 0.1 voter decodes through tag 21. Recovery treats a later unknown tag as
+/// the end of the trustworthy log and truncates there, so emitting merge tags
+/// 22 through 25 before 0.2 finalization would destroy both mixed-version apply
+/// and rollback. The proposal gate must keep those bytes out of the real Raft
+/// log, not merely reject them after commit.
 #[test]
-fn pre_finalization_raft_log_remains_readable_by_the_previous_binary() {
-    const PREVIOUS_BINARY_MAX_TAG: u8 = 14;
+fn pre_0_2_raft_log_never_exposes_a_0_1_voter_to_merge_tags() {
+    const PREVIOUS_BINARY_MAX_TAG: u8 = 21;
 
     let sim = Simulation::new(6);
     for node in CONTROL {
@@ -322,7 +318,7 @@ fn pre_finalization_raft_log_remains_readable_by_the_previous_binary() {
     sim.block_on(async move {
         setup
             .submit(ControlCommand::SetClusterVersion {
-                version: ClusterVersion::ZERO,
+                version: PROTOCOL_0_1,
                 expect: ClusterVersion::ZERO,
             })
             .await?;
@@ -342,13 +338,27 @@ fn pre_finalization_raft_log_remains_readable_by_the_previous_binary() {
             .await?;
         orbita_core::Result::Ok(())
     })
-    .expect("establish a pre-finalization cluster");
+    .expect("establish an active 0.1 cluster");
 
-    let draining = controller.clone();
-    let refused = sim.block_on(async move { draining.drain_node(NodeId(11)).await });
+    let merging = controller.clone();
+    let refused = sim.block_on(async move {
+        merging
+            .submit(ControlCommand::BeginMerge {
+                generation: MergeGeneration {
+                    lower: PartitionId(1),
+                    upper: PartitionId(2),
+                    lower_epoch: Epoch(1),
+                    upper_epoch: Epoch(1),
+                    merged: PartitionId(3),
+                    boundary: Bytes::from_static(b"m"),
+                    range: KeyRange::unbounded(),
+                },
+            })
+            .await
+    });
     assert!(
-        matches!(refused, Err(Error::InvalidArgument(_))),
-        "planned handoff must remain disabled before finalization: {refused:?}"
+        matches!(refused, Err(Error::Unavailable(_))),
+        "merge must remain disabled before 0.2 finalization: {refused:?}"
     );
 
     sim.run_for(REPLICATION_GRACE);
@@ -362,17 +372,6 @@ fn pre_finalization_raft_log_remains_readable_by_the_previous_binary() {
             .iter()
             .all(|entry| entry.command.encode()[0] <= PREVIOUS_BINARY_MAX_TAG),
         "pre-finalization committed a command the previous binary cannot decode: {entries:?}"
-    );
-    assert!(
-        entries.iter().any(|entry| matches!(
-            entry.command,
-            ControlCommand::RegisterNode {
-                ready: false,
-                draining: false,
-                ..
-            }
-        )),
-        "the lifecycle report must be persisted in the V2 registration shape"
     );
 }
 

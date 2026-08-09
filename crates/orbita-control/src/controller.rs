@@ -1036,8 +1036,13 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         lower: PartitionId,
         upper: PartitionId,
     ) -> Result<PartitionId> {
+        self.ensure_leader_ready().await?;
         let generation = {
             let inner = self.inner.lock().await;
+            // Check the protocol before validating the requested ids so an
+            // unavailable feature has one honest public refusal and cannot be
+            // probed into doing any merge work during the rollback window.
+            inner.state.ensure_merge_permitted()?;
             let lower_info = inner
                 .state
                 .map()
@@ -2015,5 +2020,51 @@ mod tests {
         let outcome = sim.block_on(async move { controller.outcome_at(target).await });
 
         assert!(matches!(outcome, Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn a_merge_refused_by_protocol_never_reaches_the_log() {
+        let sim = Simulation::new(125);
+        let runtime = sim.add_node(NodeId(1));
+        let opening = runtime.clone();
+        let log = sim
+            .block_on(async move { SingleNodeLog::open(&opening).await })
+            .unwrap();
+        let controller = Controller::new(runtime, Arc::clone(&log), ControlConfig::default());
+        let initializing = controller.clone();
+        sim.block_on(async move {
+            initializing
+                .submit(ControlCommand::SetClusterVersion {
+                    version: crate::PROTOCOL_0_1,
+                    expect: ClusterVersion::ZERO,
+                })
+                .await
+        })
+        .unwrap();
+        let before = sim.block_on({
+            let log = Arc::clone(&log);
+            async move { log.commit_index().await }
+        });
+
+        let merging = controller.clone();
+        let refused = sim.block_on(async move {
+            merging
+                .submit(ControlCommand::BeginMerge {
+                    generation: crate::MergeGeneration {
+                        lower: PartitionId(1),
+                        upper: PartitionId(2),
+                        lower_epoch: Epoch(1),
+                        upper_epoch: Epoch(1),
+                        merged: PartitionId(3),
+                        boundary: Bytes::from_static(b"m"),
+                        range: orbita_core::KeyRange::unbounded(),
+                    },
+                })
+                .await
+        });
+        let after = sim.block_on(async move { log.commit_index().await });
+
+        assert!(matches!(refused, Err(Error::Unavailable(_))));
+        assert_eq!(after, before, "a 0.2 command reached a 0.1 log");
     }
 }
