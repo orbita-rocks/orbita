@@ -27,7 +27,7 @@ use orbita_core::{
     PartitionId, PartitionInfo, PartitionMap,
 };
 use orbita_format::testing::MemoryStore;
-use orbita_proto::v1::{GetRequest, SetRequest};
+use orbita_proto::v1::{GetRequest, ListRequest, SetRequest};
 use orbita_runtime::{Clock, Runtime};
 use orbita_sim::{harness, Failure, SimRuntime, Simulation};
 
@@ -1271,6 +1271,85 @@ fn one_merge_holder_acked_and_one_pending_keeps_both_parents_closed() {
         }));
     }
     assert!(read(&sim, &owner, b"a-stale-route".to_vec()).is_none());
+}
+
+#[test]
+fn a_stale_parent_route_refuses_list_after_the_merged_child_accepts_a_write() {
+    let sim = Simulation::new(128);
+    let store = Arc::new(MemoryStore::new());
+    let stale_source = StaticMapSource::new(children_map());
+    let stale = start_merge_node(&sim, OWNER, &stale_source, Arc::clone(&store));
+    let child_source = StaticMapSource::new(children_map());
+    let child = start_merge_node(&sim, REPLICA, &child_source, Arc::clone(&store));
+    poll(&sim, &[&stale, &child]);
+
+    let old = Arc::clone(&stale);
+    sim.block_on(async move {
+        old.set(
+            SetRequest {
+                keyspace: KEYSPACE.into(),
+                key: b"a-before-merge".to_vec(),
+                value: b"old".to_vec(),
+                ttl_millis: None,
+                condition: None,
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("the parent accepts the old row")
+    });
+    let splits = SplitIntentSnapshot {
+        map_version: MapVersion(3),
+        intents: Vec::new(),
+    };
+    let preparing = Arc::clone(&stale);
+    sim.block_on(async move {
+        preparing
+            .prepare_transition_snapshots(&splits, &merge_snapshot(false))
+            .await
+    });
+
+    child_source.set(merged_map_owned(REPLICA, Vec::new()));
+    poll(&sim, &[&child]);
+    let writing = Arc::clone(&child);
+    sim.block_on(async move {
+        writing
+            .set(
+                SetRequest {
+                    keyspace: KEYSPACE.into(),
+                    key: b"z-after-merge".to_vec(),
+                    value: b"new".to_vec(),
+                    ttl_millis: None,
+                    condition: None,
+                },
+                false,
+                None,
+            )
+            .await
+            .expect("the merged child accepts a newer row")
+    });
+
+    let listing = Arc::clone(&stale);
+    let refused = sim.block_on(async move {
+        listing
+            .list(
+                ListRequest {
+                    keyspace: KEYSPACE.into(),
+                    prefix: Vec::new(),
+                    cursor: Vec::new(),
+                    limit: 10,
+                    include_values: true,
+                },
+                false,
+                None,
+            )
+            .await
+    });
+    assert!(
+        matches!(refused, Err(orbita_core::Error::Unavailable(_))),
+        "the stale parent returned rows after the child moved ahead: {refused:?}"
+    );
 }
 
 #[test]

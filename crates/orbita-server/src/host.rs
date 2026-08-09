@@ -826,8 +826,21 @@ impl<R: Runtime> PartitionHost<R> {
         cursor: Option<&[u8]>,
         budget: ScanBudget,
     ) -> Result<ScanPage> {
+        if !self.is_admitting_reads() {
+            return Err(Error::Unavailable(format!(
+                "partition {} is quiescing for a lifecycle transition",
+                self.id
+            )));
+        }
         self.wait_for_applies().await;
-        self.storage.scan(prefix, cursor, budget).await
+        let page = self.storage.scan(prefix, cursor, budget).await?;
+        if !self.is_admitting_reads() {
+            return Err(Error::Unavailable(format!(
+                "partition {} is quiescing for a lifecycle transition",
+                self.id
+            )));
+        }
+        Ok(page)
     }
 
     /// The highest Lamport this partition has applied, which is what a replica
@@ -2080,6 +2093,35 @@ mod tests {
             .await
             .expect("the WAL commit succeeds")
         });
+    }
+
+    #[test]
+    fn a_merge_parent_refuses_scans_after_read_admission_closes() {
+        let sim = Simulation::new(125);
+        let store = Arc::new(FaultStore::new());
+        let host = start_host(&sim, sim.add_node(NodeId(1)), store);
+        write_one(&sim, &host);
+        host.close_merge_gates();
+
+        let scanning = Arc::clone(&host);
+        let result = sim.block_on(async move {
+            scanning
+                .scan(
+                    b"",
+                    None,
+                    ScanBudget {
+                        max_entries: 10,
+                        max_bytes: 1024,
+                        include_values: true,
+                    },
+                )
+                .await
+        });
+
+        assert!(
+            matches!(result, Err(Error::Unavailable(_))),
+            "a stale LIST route must not read a retired merge parent: {result:?}"
+        );
     }
 
     fn publish_horizon(
