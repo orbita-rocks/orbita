@@ -803,13 +803,10 @@ impl<R: Runtime> Partition<R> {
         if !state.segments.is_empty() {
             state.timer_flushes_since_compaction += 1;
         }
-        self.flush_locked(&mut state, false).await?;
-        if !state.segments.is_empty()
-            && state.timer_flushes_since_compaction >= COMPACT_TRIGGER_TIMER_FLUSHES
-        {
-            self.compact_locked(&mut state).await?;
-        }
-        Ok(())
+        // Compaction is no longer spilled out of a flush. Both triggers are
+        // counters now, and [`Partition::compact_if_needed`] is the one place
+        // that acts on them, so a flush costs a flush whoever asked for it.
+        self.flush_locked(&mut state, false).await
     }
 
     /// Flushes only when the mutable table has crossed the size trigger.
@@ -1341,20 +1338,44 @@ impl<R: Runtime> Partition<R> {
             state.full_flushes_since_compaction += 1;
         }
 
-        // The flush's own promise, meaning the horizon advance, has already
-        // held by here; compaction is space reclamation on top of it. A
-        // failed compaction therefore does not fail the flush: the segments
-        // stay as they are and the next flush crosses the threshold again.
-        if state.full_flushes_since_compaction >= COMPACT_TRIGGER_FULL_FLUSHES {
-            if let Err(error) = self.compact_locked(state).await {
-                tracing::warn!(
-                    %error,
-                    segments = state.segments.len(),
-                    "compaction failed; the segments stand until the next trigger"
-                );
-            }
-        }
+        // Compaction used to run here, from inside whichever client write
+        // crossed the flush trigger. It rewrites the whole partition, so that
+        // put a stall proportional to the partition's size on one unlucky
+        // request: measured at issue \#143 as p99 spikes to 1.26s and
+        // throughput swinging between 47 and 2406 ops/s at a fixed
+        // concurrency, purely on where the trigger happened to land.
+        //
+        // The counter still moves here, because a flush is what makes
+        // compaction worth doing. Deciding to act on it belongs to
+        // [`Partition::compact_if_needed`], which the host calls on its own
+        // cadence.
         Ok(())
+    }
+
+    /// Compacts if enough has been flushed since the last one to make it worth
+    /// the work, and does nothing otherwise.
+    ///
+    /// The counterpart to [`Partition::flush_if_needed`]: one pass, no timer,
+    /// no task. The host owns the cadence, which is what keeps a simulated run
+    /// able to drive maintenance a step at a time rather than racing a timer
+    /// this crate started for itself.
+    ///
+    /// This does not make compaction cheap, only unscheduled by a client. The
+    /// merge still takes the partition's write lock for its duration, so a
+    /// large partition still stalls writes while it runs -- it just no longer
+    /// happens inside a request. Bounding the work per merge is issue \#143 and
+    /// is what actually shortens the stall.
+    pub async fn compact_if_needed(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        if self.is_maintenance_frozen() {
+            return Ok(());
+        }
+        if state.full_flushes_since_compaction < COMPACT_TRIGGER_FULL_FLUSHES
+            && state.timer_flushes_since_compaction < COMPACT_TRIGGER_TIMER_FLUSHES
+        {
+            return Ok(());
+        }
+        self.compact_locked(&mut state).await
     }
 
     async fn compact_locked(&self, state: &mut State) -> Result<()> {
@@ -3536,6 +3557,15 @@ mod tests {
         for _ in 0..COMPACT_TRIGGER_TIMER_FLUSHES {
             p.flush().await.unwrap();
         }
+        // The flushes arm the trigger; the host's maintenance pass is what acts
+        // on it. Compaction no longer spills out of a flush, so a test that
+        // only flushed would be asserting the coupling this change removed
+        // rather than the reclamation it is about.
+        assert!(
+            p.stored_entry(b"expired").await.unwrap().is_some(),
+            "flushing alone must not compact, or a client write would pay for it"
+        );
+        p.compact_if_needed().await.unwrap();
 
         assert_eq!(
             p.stored_entry(b"expired").await.unwrap(),

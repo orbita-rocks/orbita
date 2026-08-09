@@ -167,6 +167,7 @@ pub struct Server {
     peers: PeerListener,
     heartbeat: tokio::task::JoinHandle<()>,
     flusher: tokio::task::JoinHandle<()>,
+    compactor: tokio::task::JoinHandle<()>,
     sweeper: tokio::task::JoinHandle<()>,
     /// Present only for a node joined to a leader group.
     reporting: Option<tokio::task::JoinHandle<()>>,
@@ -368,6 +369,15 @@ impl Server {
             Arc::downgrade(&node),
             config.flush_interval,
         ));
+        // Compaction rides its own cadence rather than the flush loop, and no
+        // longer runs from inside a client write at all. It rewrites the whole
+        // partition under the write lock, so letting a request trigger it put a
+        // stall proportional to the partition on whichever write happened to
+        // cross the threshold (issue #143).
+        let compactor = tokio::spawn(Self::compact_loop(
+            Arc::downgrade(&node),
+            config.compact_interval,
+        ));
         // The orphan sweep rides its own slow cadence rather than the flush
         // loop, because it lists a whole partition prefix and so must run far
         // less often than a flush. It is off unless an operator turns it on:
@@ -552,6 +562,7 @@ impl Server {
             peers,
             heartbeat,
             flusher,
+            compactor,
             sweeper,
             reporting,
             reporter,
@@ -591,6 +602,7 @@ impl Server {
         let _ = self.shutdown.send(());
         self.heartbeat.abort();
         self.flusher.abort();
+        self.compactor.abort();
         self.sweeper.abort();
         if let Some(reporting) = &self.reporting {
             reporting.abort();
@@ -637,6 +649,20 @@ impl Server {
                 return;
             };
             live.flush_owned().await;
+        }
+    }
+
+    /// Compacts every owned partition that has earned it, on its own cadence.
+    ///
+    /// A weak reference, so a dropped node stops compacting rather than pinning
+    /// itself alive, matching the flush and sweep loops.
+    async fn compact_loop(node: std::sync::Weak<Node<ServerRuntime>>, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(live) = node.upgrade() else {
+                return;
+            };
+            live.compact_owned().await;
         }
     }
 
@@ -941,6 +967,7 @@ impl Server {
         self.readiness.clear(ReadinessCondition::AcceptingOwnership);
         self.heartbeat.abort();
         self.flusher.abort();
+        self.compactor.abort();
         self.sweeper.abort();
         if let Some(reporting) = &self.reporting {
             reporting.abort();
