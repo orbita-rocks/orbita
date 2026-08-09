@@ -6,6 +6,11 @@
 .DS_Store
 /.agents/worktrees/
 
+# Local operator credentials for infrastructure maintenance. Server
+# configuration remains explicit ORBITA_* environment variables; this file is
+# only a local source for provider credentials and must never be committed.
+/.env
+
 #
 # Rust build output
 #

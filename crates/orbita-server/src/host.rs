@@ -1238,7 +1238,7 @@ impl<R: Runtime> PartitionHost<R> {
 
         match answered {
             Ok(reply) if reply.accepted && granting => {}
-            Ok(_) => {
+            Ok(reply) => {
                 // Either the replica refused the lease, or this was a probe
                 // and it has confirmed it holds none. Both mean nothing there
                 // can serve a stale read, so the wait can stop counting it.
@@ -1246,10 +1246,39 @@ impl<R: Runtime> PartitionHost<R> {
                     .lock()
                     .expect("lease table poisoned")
                     .revoke(node);
-                self.grantable
-                    .lock()
-                    .expect("grantable set poisoned")
-                    .insert(node);
+
+                // Putting it back in the read set is a different claim, and it
+                // does not follow from the same evidence. Answering proves the
+                // replica is reachable; it does not prove it can keep up, and
+                // a replica that cannot keep up is exactly the one that will
+                // accept a lease and then miss the invalidation for the next
+                // write, stalling that write until its lease runs out.
+                //
+                // ADR 0001 bounds that at "one lease duration, once, and then
+                // the replica is out of the read set entirely". Re-admitting on
+                // reachability alone breaks the "once": the coherence timeout
+                // evicts the replica, the next heartbeat probes it, the probe
+                // is answered, it is grantable again within one renewal
+                // interval (a third of a lease), it takes a fresh lease, falls
+                // behind again, and stalls the next write. That loop is issue
+                // #136 -- a measured 1,362 lease-duration stalls in a single
+                // benchmark run, where the design says there should be one per
+                // replica that goes bad.
+                //
+                // So re-admit only on evidence of having caught up. The bar is
+                // the committed prefix rather than the owner's local log end:
+                // committed is what a linearizable read has to reflect, it is
+                // reachable while the owner keeps writing, and a replica that
+                // holds it is one the next lease will not immediately strand.
+                // A replica that stays behind keeps serving durability and
+                // keeps receiving replication; it just stops taking reads
+                // until it can carry them, which is the trade ADR 0001 makes.
+                if readmissible_to_read_set(reply.durable, committed) {
+                    self.grantable
+                        .lock()
+                        .expect("grantable set poisoned")
+                        .insert(node);
+                }
             }
             Err(error) => {
                 tracing::debug!(
@@ -1745,6 +1774,22 @@ async fn poll_once<F: Future>(future: &mut Pin<Box<F>>) -> Option<F::Output> {
         })
     })
     .await
+}
+
+/// Whether a replica that answered a heartbeat without holding a lease may be
+/// offered one again.
+///
+/// Split out from the renewal so the rule can be read and tested on its own,
+/// because it is the difference between ADR 0001's "one lease duration, once"
+/// and a stall on every heartbeat.
+///
+/// `durable` is where the replica said its log ends. `None` means a peer too
+/// old to report it, which is treated as not knowing rather than as good news,
+/// so it stays out of the read set. That is the safe direction: the cost is
+/// read capacity from a peer that cannot describe itself, and the alternative
+/// is granting a lease on no evidence at all.
+fn readmissible_to_read_set(durable: Option<Lamport>, committed: Lamport) -> bool {
+    durable.is_some_and(|durable| durable >= committed)
 }
 
 /// Checks a condition, returning the acknowledgement to send if it fails.
@@ -2549,6 +2594,40 @@ mod tests {
     fn an_unconditional_write_always_proceeds() {
         assert!(evaluate(WriteCondition::None, None, false).is_none());
         assert!(evaluate(WriteCondition::None, Some(&record(3)), true).is_none());
+    }
+
+    // The loop this closes: a replica evicted from the read set for missing an
+    // invalidation used to be re-admitted for merely answering the next probe,
+    // which arrives one renewal interval later -- a third of a lease. It would
+    // take a fresh lease, fall behind again, and stall the next write for a
+    // full lease duration. ADR 0001 allows that once per replica that goes bad,
+    // not once per heartbeat.
+    #[test]
+    fn a_replica_that_only_answers_does_not_get_back_into_the_read_set() {
+        // Behind the committed prefix: reachable, but it cannot carry a read.
+        assert!(!readmissible_to_read_set(Some(Lamport(9)), Lamport(10)));
+    }
+
+    #[test]
+    fn a_replica_that_reached_the_committed_prefix_takes_reads_again() {
+        assert!(readmissible_to_read_set(Some(Lamport(10)), Lamport(10)));
+        // Past it, because the owner keeps writing while the heartbeat is in
+        // flight and the replica may have taken entries beyond the snapshot
+        // this renewal was built from.
+        assert!(readmissible_to_read_set(Some(Lamport(11)), Lamport(10)));
+    }
+
+    #[test]
+    fn a_replica_that_cannot_say_where_its_log_ends_stays_out_of_the_read_set() {
+        assert!(!readmissible_to_read_set(None, Lamport(10)));
+        // Even against an empty log, because the absence is what is unknown,
+        // not the position.
+        assert!(!readmissible_to_read_set(None, Lamport::ZERO));
+    }
+
+    #[test]
+    fn an_owner_that_has_committed_nothing_admits_a_replica_at_zero() {
+        assert!(readmissible_to_read_set(Some(Lamport::ZERO), Lamport::ZERO));
     }
 
     #[test]

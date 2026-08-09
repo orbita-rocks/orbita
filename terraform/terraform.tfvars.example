@@ -19,4 +19,8 @@ r2_bucket_name        = "orbita-live-object-store"
 # Set false if this AWS account already has a GitHub Actions OIDC provider.
 # create_github_oidc_provider = true
 
+# Set this when the repository uses GitHub's immutable OIDC subject. Read the
+# current prefix with `gh api repos/orbita-rocks/orbita/actions/oidc/customization/sub`.
+# github_oidc_subject_prefix = "repo:orbita-rocks@OWNER_ID/orbita@REPOSITORY_ID"
+
 # cloudflare_api_token = "prefer TF_VAR_cloudflare_api_token in the environment"

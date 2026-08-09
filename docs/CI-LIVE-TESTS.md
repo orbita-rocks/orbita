@@ -70,6 +70,18 @@ other repositories is account infrastructure, not an Orbita test resource.
 AWS OIDC removes standing AWS keys from GitHub. The workflow receives a
 short-lived session by assuming the repository-scoped role at run time.
 
+GitHub can emit an immutable subject containing the organization and repository
+ids rather than the name-only default. Read the active prefix before applying:
+
+```sh
+gh api repos/orbita-rocks/orbita/actions/oidc/customization/sub
+```
+
+When `sub_claim_prefix` contains ids, copy it into
+`github_oidc_subject_prefix` in `terraform.tfvars`. The role trust must match
+the token GitHub actually emits or STS rejects the assumption even when the
+provider and audience are correct.
+
 ## Create the infrastructure
 
 Create the local variable file from the checked-in example and choose dedicated
