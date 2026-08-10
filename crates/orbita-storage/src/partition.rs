@@ -74,10 +74,15 @@ const FLUSH_TRIGGER_BYTES: u64 = 8 * 1024 * 1024;
 /// How many full, size-triggered flushes amortise one compaction.
 ///
 /// Reads never pay for segment count, so this is purely about space: every
-/// overwrite strands a shadowed record until a merge reclaims it. Sixteen
-/// flush-sized segments bound that waste at roughly the cost of one merge per
-/// sixteen flushes.
-const COMPACT_TRIGGER_FULL_FLUSHES: usize = 16;
+/// overwrite strands a shadowed record until a merge reclaims it.
+///
+/// This has to match what one pass actually merges. A pass is bounded at
+/// [`COMPACTION_INPUT_FLUSHES`] flushes' worth of segment, so triggering any
+/// later than that means segments arrive faster than they are merged and the
+/// count grows without bound. It used to be sixteen against an unbounded pass,
+/// which kept up only because a pass took everything. Compaction now runs four
+/// times as often and each one costs a quarter as much.
+const COMPACT_TRIGGER_FULL_FLUSHES: usize = COMPACTION_INPUT_FLUSHES as usize;
 
 /// How many timer passes may elapse before small segments are compacted.
 ///
@@ -88,6 +93,29 @@ const COMPACT_TRIGGER_TIMER_FLUSHES: usize = 120;
 
 /// The bookkeeping cost charged to the flush trigger per entry, on top of the
 /// key and value bytes. An estimate is all a trigger needs.
+/// How many flushes' worth of segment one compaction pass merges.
+///
+/// Named separately because [`COMPACT_TRIGGER_FULL_FLUSHES`] must equal it:
+/// what accumulates between two compactions is exactly what the next one
+/// merges. Changing one without the other either grows the segment count
+/// forever or rewrites the same bytes repeatedly.
+const COMPACTION_INPUT_FLUSHES: u64 = 4;
+
+/// How many bytes of segment a single compaction pass will read and rewrite.
+///
+/// Four flushes' worth. Compaction used to merge the whole partition, which
+/// made its cost grow with the partition rather than with what had accumulated
+/// since the last pass: measured, a 140 MiB partition stalled writes for 805ms
+/// and dropped throughput to 47 ops/s, and it only got worse as the partition
+/// grew. Bounding the input keeps that cost flat.
+///
+/// Larger reclaims more per pass and stalls longer; smaller does the opposite
+/// and leaves more segments live, which costs nothing on the read path because
+/// an exact index consults exactly one segment however many there are. Four
+/// flushes is small enough that a pass is short and large enough that a pass is
+/// worth taking the lock for. See issue #143.
+const COMPACTION_INPUT_BYTES: u64 = COMPACTION_INPUT_FLUSHES * FLUSH_TRIGGER_BYTES;
+
 const ENTRY_OVERHEAD_BYTES: u64 = 64;
 
 /// How long the orphan sweep leaves an unreferenced object alone before it is a
@@ -381,6 +409,13 @@ pub struct Partition<R: Runtime> {
     /// the children exist sees it and stands down, while one that ran before
     /// touched only segments no child had yet referenced.
     maintenance_frozen: std::sync::atomic::AtomicBool,
+    /// How many bytes of segment one compaction pass reads and rewrites.
+    ///
+    /// A field rather than the constant directly so a test can set a bound it
+    /// can actually reach. Exercising the bounded path against the production
+    /// value would mean writing tens of megabytes per test, and a bound that is
+    /// only ever tested at "merges everything" is not tested at all.
+    compaction_input_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl<R: Runtime> Partition<R> {
@@ -430,6 +465,7 @@ impl<R: Runtime> Partition<R> {
             writer,
             state: tokio::sync::RwLock::new(state),
             maintenance_frozen: std::sync::atomic::AtomicBool::new(false),
+            compaction_input_bytes: std::sync::atomic::AtomicU64::new(COMPACTION_INPUT_BYTES),
         })
     }
 
@@ -1423,17 +1459,35 @@ impl<R: Runtime> Partition<R> {
         }
         let now = self.now_millis();
 
-        // This materializes the whole partition in memory and runs under the
-        // write lock, possibly from inside the client write that crossed the
-        // flush trigger. With the current constants that is a bounded but
-        // real stall, and it grows with partition size until the split
-        // threshold caps it. The crate's no-background-tasks posture is
-        // deliberate, so a streaming merge, or handing the schedule to the
-        // host, is the known follow-up rather than an accident.
-
-        let mut inputs = Vec::with_capacity(state.segments.len());
-        let mut relocated_values: BTreeMap<(PartitionId, String), ExternalValue> = BTreeMap::new();
+        // How much of the partition this pass merges. Taking all of it made
+        // the cost of a compaction proportional to the partition rather than
+        // to what had accumulated, so it grew without bound until a split
+        // capped it: measured, a 140 MiB partition stalled writes for 805ms
+        // and dropped throughput to 47 ops/s. Bounding the input keeps the
+        // cost flat as the partition grows. See issue #143.
+        //
+        // Oldest first, because those are the segments a later write is most
+        // likely to have superseded, so they are where the reclaimable bytes
+        // are.
+        let mut take = 0usize;
+        let mut input_bytes = 0u64;
         for entry in &state.segments {
+            // At least two, or a pass merges one segment into a copy of
+            // itself and reclaims nothing while still paying for the rewrite.
+            if take >= 2 && input_bytes + entry.bytes > self.compaction_input_bytes() {
+                break;
+            }
+            input_bytes += entry.bytes;
+            take += 1;
+        }
+        // Everything this pass leaves live. When it is empty the merge rule
+        // below reduces exactly to the whole-partition one, so a partition
+        // small enough to merge in a single pass behaves as it always did.
+        let retained: Vec<SegmentEntry> = state.segments[take..].to_vec();
+
+        let mut inputs = Vec::with_capacity(take);
+        let mut relocated_values: BTreeMap<(PartitionId, String), ExternalValue> = BTreeMap::new();
+        for entry in &state.segments[..take] {
             // A shared segment is read from the source partition's directory.
             // Compaction merges it into a new self-written segment, which is
             // how a child eventually stops sharing the parent's objects.
@@ -1475,11 +1529,11 @@ impl<R: Runtime> Partition<R> {
             }
             inputs.push(records);
         }
-        // A whole-partition merge, whose tombstone rule is time-based: an
-        // unexpired tombstone still answers a retrying deleter, so it
-        // survives until its retention passes and the expiry rule reclaims
-        // it on schedule.
-        let mut merged = compact::merge_all(&inputs, now).map_err(format_error)?;
+        // Keeps anything whose removal could uncover an older record in a
+        // segment this pass is leaving behind, and otherwise keeps every
+        // unexpired tombstone so a retrying deleter still gets an answer. With
+        // nothing retained it is the whole-partition rule.
+        let mut merged = compact::merge_bounded(&inputs, now, &retained).map_err(format_error)?;
         // A shared segment physically holds keys on both sides of a split
         // boundary, so a child compacting one must keep only the keys it owns;
         // writing the rest would put keys outside its range into its own
@@ -1494,8 +1548,7 @@ impl<R: Runtime> Partition<R> {
         // the reference from this manifest but never deletes the object; the
         // cross-partition-aware orphan sweep reclaims it once no live manifest
         // names it. See ADR 0009.
-        let replaced: Vec<String> = state
-            .segments
+        let replaced: Vec<String> = state.segments[..take]
             .iter()
             .filter(|e| e.source.is_none())
             .map(|e| e.name.clone())
@@ -1531,6 +1584,39 @@ impl<R: Runtime> Partition<R> {
             }
             (vec![published], index)
         };
+
+        // The merged output goes first and everything retained follows, so a
+        // retained segment's position moves down by however many this pass
+        // replaced. Ordering matters beyond bookkeeping: `segments` is oldest
+        // first, and the merge took the oldest, so the output belongs where
+        // they were.
+        let mut segments = segments;
+        let produced = segments.len();
+        segments.extend(retained.iter().cloned());
+
+        // Rebuilt from the old index rather than from the segments, because
+        // reading the retained ones back is the cost this change exists to
+        // avoid. A key whose winner was in the merged set is relocated to the
+        // new segment, or dropped if the merge reclaimed it; every other key
+        // keeps its record and only moves position.
+        let mut remapped: BTreeMap<Bytes, Loc> = BTreeMap::new();
+        for (key, loc) in &state.index {
+            if loc.segment < take {
+                if let Some(found) = index.get(key) {
+                    remapped.insert(key.clone(), *found);
+                }
+            } else {
+                remapped.insert(
+                    key.clone(),
+                    Loc {
+                        segment: loc.segment - take + produced,
+                        offset: loc.offset,
+                        record_length: loc.record_length,
+                    },
+                );
+            }
+        }
+        let index = remapped;
 
         // Compaction republishes the same logical state, so the horizon must
         // not move: the log above it still has to replay after a crash.
@@ -1569,6 +1655,19 @@ impl<R: Runtime> Partition<R> {
             let _ = self.store.delete(&self.path.object(&name)).await;
         }
         Ok(())
+    }
+
+    fn compaction_input_bytes(&self) -> u64 {
+        self.compaction_input_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Shrinks the compaction unit so a test can reach the bounded path
+    /// without writing tens of megabytes.
+    #[cfg(test)]
+    pub(crate) fn set_compaction_input_bytes(&self, bytes: u64) {
+        self.compaction_input_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Where the merged scan should start, or `None` if this page is
@@ -1788,6 +1887,111 @@ mod tests {
                 .await
                 .expect("write a letter");
         }
+    }
+
+    /// Writes `keys`, then flushes, producing one segment.
+    async fn write_and_flush(owner: &crate::testing::Owner, keys: &[String]) {
+        for k in keys {
+            owner
+                .put(
+                    k.as_bytes(),
+                    bytes(&format!("v-{k}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .expect("write");
+        }
+        owner.flush().await.expect("flush");
+    }
+
+    #[tokio::test]
+    async fn compaction_merges_a_bounded_prefix_rather_than_the_whole_partition() {
+        let owner = owner().await;
+        // One segment per letter group, so there is something to leave behind.
+        let groups: Vec<Vec<String>> = alphabet().chunks(5).map(<[String]>::to_vec).collect();
+        for group in &groups {
+            write_and_flush(&owner, group).await;
+        }
+        let before = owner.segment_count().await;
+        assert!(
+            before >= 4,
+            "the scenario needs several segments to leave any behind, got {before}"
+        );
+
+        // Small enough that the floor of two segments is what a pass takes.
+        owner.set_compaction_input_bytes(1);
+        owner.compact().await.expect("compact");
+
+        let after = owner.segment_count().await;
+        assert_eq!(
+            after,
+            before - 1,
+            "a pass should merge two segments into one and leave the rest, \
+             but it went from {before} to {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_compaction_loses_nothing_it_did_not_merge() {
+        // The risk in merging part of a partition is the bookkeeping: the
+        // records that were not merged keep their segments, and those segments
+        // move position. An index that is not remapped points at the wrong
+        // object and reads the wrong bytes, or nothing.
+        let owner = owner().await;
+        let groups: Vec<Vec<String>> = alphabet().chunks(5).map(<[String]>::to_vec).collect();
+        for group in &groups {
+            write_and_flush(&owner, group).await;
+        }
+
+        owner.set_compaction_input_bytes(1);
+        // Repeatedly, because each pass moves every retained segment again and
+        // a remap that is wrong by one only shows up once it has been applied
+        // more than once.
+        for _ in 0..4 {
+            owner.compact().await.expect("compact");
+        }
+
+        for k in alphabet() {
+            let got = owner.get(k.as_bytes()).await.expect("read");
+            assert_eq!(
+                got.map(|r| r.value),
+                Some(bytes(&format!("v-{k}"))),
+                "{k} did not survive a bounded compaction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bounded_compaction_keeps_the_newest_record_for_an_overwritten_key() {
+        // An overwrite leaves the old record in an older segment and the new
+        // one in a newer segment. A pass that merges the old segment must not
+        // let the value it resurrects win, and the index must still point at
+        // the newer record afterwards.
+        let owner = owner().await;
+        write_and_flush(&owner, &["k".to_owned()]).await;
+        for round in 1..=4u32 {
+            owner
+                .put(
+                    b"k",
+                    bytes(&format!("v{round}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .expect("overwrite");
+            owner.flush().await.expect("flush");
+        }
+
+        owner.set_compaction_input_bytes(1);
+        owner.compact().await.expect("compact");
+
+        let got = owner.get(b"k").await.expect("read");
+        assert_eq!(
+            got.map(|r| r.value),
+            Some(bytes("v4")),
+            "the newest write must survive a pass that merged the oldest segments"
+        );
     }
 
     fn child_prefix(id: u64) -> String {
