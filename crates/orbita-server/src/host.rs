@@ -1415,6 +1415,18 @@ impl<R: Runtime> PartitionHost<R> {
     /// read set. A newly opened owner also waits one duration because its prior
     /// process may have granted a lease to a replica the current map no longer
     /// names.
+    /// How many fsyncs this partition's log has issued, and how many entries
+    /// they carried. `None` for a replica, which has no owning log.
+    ///
+    /// Exposed so a test can assert the write path actually batches rather
+    /// than infer it from throughput, which is what let issue #147 sit
+    /// undetected behind a plausible-looking flush loop.
+    #[cfg(test)]
+    #[must_use]
+    pub fn flush_stats(&self) -> Option<(u64, u64)> {
+        self.wal.as_ref().map(|wal| wal.flush_stats())
+    }
+
     async fn await_coherence(&self, wal: &Arc<Wal<R>>, lamport: Lamport) {
         self.wait_for_possible_restart_leases().await;
         loop {

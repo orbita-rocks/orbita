@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 
@@ -323,6 +324,17 @@ pub struct Wal<R: Runtime> {
     flush: tokio::sync::Mutex<()>,
     state: Mutex<OwnerState>,
     progress: tokio::sync::Notify,
+    /// How many fsyncs this owner has issued, and how many entries they
+    /// carried.
+    ///
+    /// Throughput on a real disk is entries divided by fsyncs: one fsync costs
+    /// the same whether it carries one write or a hundred, so this ratio is
+    /// the write path's efficiency expressed as a number. It is counted rather
+    /// than inferred because the batching is emergent — it depends on how many
+    /// writers happen to be queued when a flush wins the lock — and reasoning
+    /// about that from the code has already produced two wrong answers.
+    flushes: AtomicU64,
+    flushed_entries: AtomicU64,
 }
 
 impl<R: Runtime> Wal<R> {
@@ -387,6 +399,8 @@ impl<R: Runtime> Wal<R> {
                 fatal: None,
             }),
             progress: tokio::sync::Notify::new(),
+            flushes: AtomicU64::new(0),
+            flushed_entries: AtomicU64::new(0),
         });
 
         // Opening above the epoch this node's own log recorded means this
@@ -529,6 +543,21 @@ impl<R: Runtime> Wal<R> {
     #[must_use]
     pub fn committed_lamport(&self) -> Lamport {
         self.state().replicated
+    }
+
+    /// How many fsyncs this owner has issued, and how many entries they
+    /// carried.
+    ///
+    /// The ratio is what decides write throughput against a real disk, where
+    /// an fsync costs milliseconds regardless of how much it carries. One
+    /// entry per fsync means every write pays a full disk round trip on its
+    /// own. See issue #147.
+    #[must_use]
+    pub fn flush_stats(&self) -> (u64, u64) {
+        (
+            self.flushes.load(Ordering::Relaxed),
+            self.flushed_entries.load(Ordering::Relaxed),
+        )
     }
 
     /// The highest Lamport this owner handed back in [`Wal::quiesce`], or zero
@@ -1156,6 +1185,12 @@ impl<R: Runtime> Wal<R> {
         let first = batch[0].entry.lamport;
         let last = batch[batch.len() - 1].entry.lamport;
         let frames: Vec<Bytes> = batch.iter().map(|p| p.frame.clone()).collect();
+
+        // Counted here rather than around the append, because this is the
+        // point where the batch size is decided and one fsync is committed to.
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        self.flushed_entries
+            .fetch_add(frames.len() as u64, Ordering::Relaxed);
 
         if let Err(e) = self.log.append_frames(&frames, last).await {
             // A failed local write leaves the log in a state we cannot reason
