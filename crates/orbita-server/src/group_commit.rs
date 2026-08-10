@@ -62,13 +62,13 @@ fn open(sim: &Simulation, runtime: SimRuntime) -> Arc<PartitionHost<SimRuntime>>
 
 /// The minimum entries per fsync worth calling batching.
 ///
-/// Deliberately low. Measured behaviour today is 1.31 and the leader-flusher
-/// design reaches 7.4, so anything at or above two distinguishes "batching" from
-/// "not batching" without pinning the test to one implementation's ratio.
+/// Deliberately far below what the write path actually achieves, which is 16
+/// with these writers, because the exact ratio depends on the interleaving a
+/// seed produces. Two is enough to tell "batching" from "not batching" — the
+/// regression this guards is the collapse to 1.31, not a change from 16 to 12.
 const MIN_BATCH: u64 = 2;
 
 #[test]
-#[ignore = "acceptance test for #147: fails at 1.31 entries per fsync until group commit lands"]
 fn concurrent_writes_share_an_fsync() {
     harness::check_seeds(
         "group_commit::concurrent_writes_share_an_fsync",
