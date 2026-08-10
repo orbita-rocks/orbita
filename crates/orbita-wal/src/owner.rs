@@ -904,8 +904,33 @@ impl<R: Runtime> Wal<R> {
             lamport
         };
 
-        self.flush(lamport).await;
+        // Deliberately not awaited. The flush runs on a task of its own so that
+        // dropping this future — a disconnected client, an expired deadline —
+        // cancels only the waiting, never the writing. A cancelled flush used
+        // to take its batch down with it, and because those Lamports were
+        // already issued, the log kept a permanent hole that every later batch
+        // then failed to replicate across. See issue #150.
+        self.ensure_flusher();
         self.wait_for(lamport).await
+    }
+
+    /// Starts a flusher unless one is already running.
+    ///
+    /// The turn is claimed here, synchronously, rather than inside the spawned
+    /// task. Claiming it in the task would let a second committer see no
+    /// flusher and spawn another one before the first had started.
+    fn ensure_flusher(self: &Arc<Self>) {
+        {
+            let mut state = self.state();
+            if state.flushing || state.fatal.is_some() {
+                return;
+            }
+            state.flushing = true;
+        }
+        let wal = Arc::clone(self);
+        self.runtime.spawn(async move {
+            wal.flush_loop().await;
+        });
     }
 
     /// Takes ownership at a higher epoch after the control plane promoted this
@@ -1166,62 +1191,59 @@ impl<R: Runtime> Wal<R> {
         self.progress.notify_waiters();
     }
 
-    /// Writes and fsyncs whatever is pending up to `upto`, then replicates it.
+    /// Drains the pending queue, one fsync per pass, until nothing is waiting.
     ///
-    /// Every committer calls this and at most one of them is the flusher. The
-    /// rest wait for that flush to finish and are usually carried by it, which
-    /// is the batching: the cost of an fsync is paid once for everyone who
-    /// arrived while it was running.
+    /// Runs on its own task, started by [`Wal::ensure_flusher`], and holds the
+    /// flusher turn for as long as it runs. Committers only ever wait for their
+    /// own Lamport, so no request drives this and no request can cancel it.
     ///
-    /// The waiting is the part that matters, and it is why this does not just
-    /// take a lock. Under a lock, a committer that arrives while nothing is
-    /// flushing starts an fsync on its own entry immediately, and closed-loop
-    /// clients — which is what clients are — settle into exactly that: each
-    /// acknowledgement releases one writer, which arrives alone, syncs alone,
-    /// and releases one writer. Measured, that equilibrium is 1.31 entries per
-    /// sync, and it is issue #147. Parking on `progress` instead means the
-    /// entries that arrive during a flush are still queued when it ends, and
-    /// whoever takes the next turn takes all of them.
-    async fn flush(self: &Arc<Self>, upto: Lamport) {
-        // Take a turn as flusher, unless someone else's flush gets there first.
-        let mut turn = loop {
-            let notified = self.progress.notified();
-            let mut notified = std::pin::pin!(notified);
-            // Registered before the check, so a wake landing between the two is
-            // not lost and this cannot park forever on a flush that just ended.
-            notified.as_mut().enable();
-
-            {
+    /// Draining in a loop is what produces the batching. Everything that
+    /// arrives while one pass is fsyncing is still queued when the next pass
+    /// takes the queue, so a group of concurrent writers shares one sync. The
+    /// alternative — each committer flushing for itself — collapses under
+    /// closed-loop clients, which is what clients are: every acknowledgement
+    /// releases one writer, which arrives alone and syncs alone. Measured, that
+    /// equilibrium is 1.31 entries per sync, and it is issue #147.
+    async fn flush_loop(self: Arc<Self>) {
+        // The turn was claimed by `ensure_flusher`. This gives it back however
+        // this task ends, so a panic cannot wedge the partition.
+        let mut turn = FlushTurn::new(&self);
+        loop {
+            let batch = {
                 let mut state = self.state();
                 if state.fatal.is_some() {
                     return;
                 }
-                // Someone else's batch already carried this entry to the disk.
-                if state.durable_local >= upto {
-                    return;
-                }
-                if !state.flushing {
-                    state.flushing = true;
-                    // Held from here on, so every exit below — including a drop
-                    // part way through the fsync — gives the turn back.
-                    break FlushTurn::new(self);
-                }
-            }
-
-            notified.await;
-        };
-
-        let batch = {
-            let mut state = self.state();
-            if state.fatal.is_some() {
+                std::mem::take(&mut state.pending)
+            };
+            if batch.is_empty() {
                 return;
             }
-            std::mem::take(&mut state.pending)
-        };
-        if batch.is_empty() {
-            return;
+            self.flush_batch(batch).await;
+            // Nothing arrived while that pass ran, so there is no work left to
+            // hand on. Released here rather than by the guard so that the check
+            // and the release are one critical section: releasing first would
+            // let a committer see a free turn, spawn a flusher, and race this
+            // one for the same queue.
+            let idle = {
+                let mut state = self.state();
+                if state.pending.is_empty() {
+                    state.flushing = false;
+                    turn.disarm();
+                    true
+                } else {
+                    false
+                }
+            };
+            if idle {
+                self.progress.notify_waiters();
+                return;
+            }
         }
+    }
 
+    /// Writes and fsyncs one batch, then replicates it.
+    async fn flush_batch(self: &Arc<Self>, batch: Vec<Pending>) {
         let first = batch[0].entry.lamport;
         let last = batch[batch.len() - 1].entry.lamport;
         let frames: Vec<Bytes> = batch.iter().map(|p| p.frame.clone()).collect();
@@ -1234,10 +1256,10 @@ impl<R: Runtime> Wal<R> {
 
         if let Err(e) = self.log.append_frames(&frames, last).await {
             // A failed local write leaves the log in a state we cannot reason
-            // about, so this owner stops rather than guessing. `turn` gives the
-            // flag back on the way out, so the committers parked on `progress`
-            // are woken to see the fatal rather than stranded behind a flush
-            // that is never coming.
+            // about, so this owner stops rather than guessing. The flusher's
+            // guard gives the turn back on the way out, so the committers
+            // parked on `progress` are woken to see the fatal rather than
+            // stranded behind a flush that is never coming.
             self.set_fatal(e);
             return;
         }
@@ -1245,18 +1267,9 @@ impl<R: Runtime> Wal<R> {
             let mut state = self.state();
             state.durable_local = last;
             state.inflight.push(Batch { last, acked: false });
-            // Giving up the turn here is the pipelining decision made concrete:
-            // the next batch is written while this one is still in flight. It
-            // happens under the same lock as `durable_local` so that a waiter
-            // waking on the notification below cannot observe the turn as free
-            // while the entries this batch just made durable still look
-            // outstanding, and start a redundant flush of nothing.
-            state.flushing = false;
-            turn.disarm();
         }
-        // Wakes the committers this batch carried, and hands the next turn to
-        // whoever still needs one. They take everything that queued during the
-        // fsync above, which is where the batching comes from.
+        // Wakes the committers this batch carried as soon as it is on the disk,
+        // rather than making them wait out the replication below.
         self.progress.notify_waiters();
 
         let (epoch, committed) = {

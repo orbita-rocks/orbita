@@ -16,12 +16,15 @@
 //! the conditional-write machinery and this would measure that instead.
 
 use crate::host::{HostSpec, LeasePolicy, PartitionHost, PartitionPaths, WriteOp};
+use crate::replication::ReplicaBridge;
 
 use bytes::Bytes;
 use orbita_core::{Epoch, KeyRange, KeyspaceId, NodeId, PartitionId, WriteCondition};
 use orbita_format::testing::MemoryStore;
 use orbita_format::PartitionPath;
+use orbita_runtime::{Runtime, ServiceId, Transport};
 use orbita_sim::{harness, SimRuntime, Simulation};
+use orbita_wal::WalService;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -41,6 +44,64 @@ fn partition_paths() -> PartitionPaths {
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
         wal_dir: "wal/p1".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+    }
+}
+
+fn paths_in(store: Arc<MemoryStore>, wal_dir: &str) -> PartitionPaths {
+    PartitionPaths {
+        store,
+        path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
+        wal_dir: wal_dir.to_string(),
+        wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+    }
+}
+
+/// Brings up a replica that actually serves the append protocol, so a batch
+/// that would leave a hole is refused by something rather than accepted by a
+/// stub.
+fn start_replica(
+    sim: &Simulation,
+    runtime: SimRuntime,
+    store: Arc<MemoryStore>,
+) -> Arc<PartitionHost<SimRuntime>> {
+    let paths = paths_in(store, "wal/replica");
+    sim.block_on(async move {
+        let (bridge, _applies) = ReplicaBridge::start(&runtime);
+        let host = PartitionHost::open_replica(
+            runtime.clone(),
+            HostSpec {
+                id: PartitionId(1),
+                epoch: Epoch(1),
+                range: KeyRange::unbounded(),
+                lease: LeasePolicy::default(),
+            },
+            &paths,
+        )
+        .await
+        .expect("the replica opens");
+        bridge.register(&host);
+        let service = WalService::new();
+        service.register(host.log());
+        service.observe(Arc::clone(&bridge) as Arc<dyn orbita_wal::ReplicaObserver>);
+        service.hydrate_with(Arc::clone(&bridge) as Arc<dyn orbita_wal::PartitionHydrator>);
+        runtime.transport().register(ServiceId::Wal, service);
+        host
+    })
+}
+
+fn put(host: &Arc<PartitionHost<SimRuntime>>, key: &'static [u8]) -> impl Future<Output = ()> {
+    let host = Arc::clone(host);
+    async move {
+        let _ = host
+            .write(
+                Bytes::from_static(key),
+                WriteOp::Put {
+                    value: Bytes::from_static(b"v"),
+                    ttl_millis: None,
+                },
+                WriteCondition::None,
+            )
+            .await;
     }
 }
 
@@ -202,6 +263,123 @@ fn concurrent_writes_share_an_fsync() {
                     entries as f64 / flushes as f64
                 )));
             }
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_cancelled_write_does_not_wedge_replication() {
+    harness::check_seeds(
+        "group_commit::a_cancelled_write_does_not_wedge_replication",
+        20,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let owner_runtime = sim.add_node(NodeId(1));
+            let replica_runtime = sim.add_node(NodeId(2));
+            let store = Arc::new(MemoryStore::new());
+
+            let _replica = start_replica(&sim, replica_runtime, Arc::clone(&store));
+
+            let paths = paths_in(Arc::clone(&store), "wal/owner");
+            let host = sim.block_on({
+                let runtime = owner_runtime.clone();
+                async move {
+                    PartitionHost::open_owner(
+                        runtime,
+                        HostSpec {
+                            id: PartitionId(1),
+                            epoch: Epoch(1),
+                            range: KeyRange::unbounded(),
+                            lease: LeasePolicy::default(),
+                        },
+                        &paths,
+                        vec![NodeId(2)],
+                    )
+                    .await
+                    .expect("the owner opens")
+                }
+            });
+
+            // A write before the cancellation, to prove replication works.
+            let before = sim.block_on({
+                let host = Arc::clone(&host);
+                async move {
+                    host.write(
+                        Bytes::from_static(b"before"),
+                        WriteOp::Put {
+                            value: Bytes::from_static(b"v"),
+                            ttl_millis: None,
+                        },
+                        WriteCondition::None,
+                    )
+                    .await
+                }
+            });
+            sim.run_until_idle();
+
+            // Abandon a write part way through its flush.
+            poll_once_then_drop(Box::pin(put(&host, b"abandoned")));
+            sim.run_until_idle();
+
+            // And one after, which is the question.
+            let after = sim.block_on({
+                let host = Arc::clone(&host);
+                async move {
+                    host.write(
+                        Bytes::from_static(b"after"),
+                        WriteOp::Put {
+                            value: Bytes::from_static(b"v"),
+                            ttl_millis: None,
+                        },
+                        WriteCondition::None,
+                    )
+                    .await
+                }
+            });
+            sim.run_until_idle();
+
+            // Three more, because the failure this guards is not a blip: the
+            // hole a lost batch leaves is in the Lamport sequence, so every
+            // later batch replicates with a `prev_lamport` the replica cannot
+            // satisfy and the refusal never clears on its own.
+            let mut later = Vec::new();
+            for n in 0..3 {
+                let r = sim.block_on({
+                    let host = Arc::clone(&host);
+                    async move {
+                        host.write(
+                            Bytes::from(format!("later-{n}")),
+                            WriteOp::Put {
+                                value: Bytes::from_static(b"v"),
+                                ttl_millis: None,
+                            },
+                            WriteCondition::None,
+                        )
+                        .await
+                    }
+                });
+                sim.run_until_idle();
+                later.push(r.is_ok());
+            }
+
+            if before.is_err() {
+                return Err(sim.failure(
+                    "the write before the cancellation did not replicate, so this \
+                     scenario proves nothing about the one after it"
+                        .to_owned(),
+                ));
+            }
+            if after.is_err() || later.iter().any(|ok| !ok) {
+                return Err(sim.failure(format!(
+                    "a cancelled write wedged replication: the next write returned \
+                     {after:?} and the three after that returned {later:?}. Its batch \
+                     went with the dropped future, and the Lamports it had already \
+                     been issued are now a permanent hole no later batch can \
+                     replicate across (issue #150)"
+                )));
+            }
+            drop(host);
             Ok(())
         },
     );
