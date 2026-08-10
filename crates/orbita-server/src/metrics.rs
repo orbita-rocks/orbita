@@ -198,6 +198,18 @@ pub(crate) struct OwnedMetric {
 /// callbacks are registered against the installed provider even on a node that
 /// has not yet served a client request.
 pub(crate) fn publish_owned(owned_metrics: Vec<OwnedMetric>) {
+    publish_owned_into(owned(), owned_metrics);
+    instruments();
+}
+
+/// The replacement itself, against whichever set it is given.
+///
+/// Split from [`publish_owned`] so the retirement rule can be tested without
+/// the process-global set. Every `Node` in the same test binary publishes into
+/// that global through its lease heartbeat, so a test asserting on it is racing
+/// every other test that owns a partition — which is exactly what made this
+/// flake on CI while passing locally. See issue #152.
+fn publish_owned_into(target: &RwLock<Vec<OwnedSample>>, owned_metrics: Vec<OwnedMetric>) {
     let samples = owned_metrics
         .into_iter()
         .map(|metric| OwnedSample {
@@ -208,8 +220,9 @@ pub(crate) fn publish_owned(owned_metrics: Vec<OwnedMetric>) {
             storage_bytes: metric.storage_bytes,
         })
         .collect();
-    *owned().write().unwrap() = samples;
-    instruments();
+    // Wholesale, which is the whole mechanism: a partition retires by being
+    // absent from the next publish rather than by anyone retiring its series.
+    *target.write().unwrap() = samples;
 }
 
 #[cfg(test)]
@@ -235,49 +248,52 @@ mod tests {
     // The observable gauges report exactly the set `publish_owned` last handed
     // them, so a partition that stops being owned has to leave that set — this
     // is the mechanism that retires its series instead of exporting a frozen
-    // last value forever. Asserts on the live source the callbacks read rather
-    // than standing up a collector to observe them.
+    // last value forever.
+    //
+    // Against a set this test owns, not the process-global one. Every `Node` in
+    // this binary publishes into the global through its lease heartbeat, so
+    // asserting on it races every other test that owns a partition. That raced
+    // quietly for a long time and only ever failed on CI. See issue #152.
     #[test]
     fn republishing_owned_metrics_retires_a_partition_that_is_no_longer_owned() {
         let lag = orbita_wal::ReplicationLag {
             replicas_behind: 0,
             max_lamports: 0,
         };
-        publish_owned(vec![
-            OwnedMetric {
-                keyspace: "tenant".to_owned(),
-                partition: PartitionId(7),
-                replication_lag: lag,
-                storage_bytes: Some(4096),
-            },
-            OwnedMetric {
+        let published: RwLock<Vec<OwnedSample>> = RwLock::new(Vec::new());
+        let live = |set: &RwLock<Vec<OwnedSample>>| -> Vec<i64> {
+            set.read().unwrap().iter().map(|s| s.partition).collect()
+        };
+
+        publish_owned_into(
+            &published,
+            vec![
+                OwnedMetric {
+                    keyspace: "tenant".to_owned(),
+                    partition: PartitionId(7),
+                    replication_lag: lag,
+                    storage_bytes: Some(4096),
+                },
+                OwnedMetric {
+                    keyspace: "tenant".to_owned(),
+                    partition: PartitionId(8),
+                    replication_lag: lag,
+                    storage_bytes: None,
+                },
+            ],
+        );
+        assert_eq!(live(&published), vec![7, 8]);
+
+        // A later heartbeat that no longer owns partition 7.
+        publish_owned_into(
+            &published,
+            vec![OwnedMetric {
                 keyspace: "tenant".to_owned(),
                 partition: PartitionId(8),
                 replication_lag: lag,
                 storage_bytes: None,
-            },
-        ]);
-        let live: Vec<i64> = owned()
-            .read()
-            .unwrap()
-            .iter()
-            .map(|s| s.partition)
-            .collect();
-        assert!(live.contains(&7) && live.contains(&8));
-
-        // A later heartbeat that no longer owns partition 7.
-        publish_owned(vec![OwnedMetric {
-            keyspace: "tenant".to_owned(),
-            partition: PartitionId(8),
-            replication_lag: lag,
-            storage_bytes: None,
-        }]);
-        let live: Vec<i64> = owned()
-            .read()
-            .unwrap()
-            .iter()
-            .map(|s| s.partition)
-            .collect();
-        assert_eq!(live, vec![8]);
+            }],
+        );
+        assert_eq!(live(&published), vec![8]);
     }
 }
