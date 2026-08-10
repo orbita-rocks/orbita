@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 
@@ -266,6 +267,12 @@ struct OwnerState {
     /// Set when this owner has given up its uncommitted tail and will never
     /// assign another Lamport. See [`Wal::quiesce`].
     quiesced: bool,
+    /// Whether a flusher holds the turn right now.
+    ///
+    /// A flag rather than a lock because a committer that cannot flush must
+    /// park on `progress` and stay queued in `pending`, not sit in a lock's
+    /// wait list holding an entry nobody can batch. See [`Wal::flush`].
+    flushing: bool,
     /// The highest Lamport [`Wal::quiesce`] handed back, or zero if it never
     /// dropped anything.
     ///
@@ -318,11 +325,19 @@ pub struct Wal<R: Runtime> {
     /// a replication pass takes one cheap snapshot and never holds the lock
     /// across an await.
     replicas: Mutex<Arc<[NodeId]>>,
-    /// Held while a batch is written and fsynced, never while it is in flight
-    /// to the replicas. That is what allows pipelining.
-    flush: tokio::sync::Mutex<()>,
     state: Mutex<OwnerState>,
     progress: tokio::sync::Notify,
+    /// How many fsyncs this owner has issued, and how many entries they
+    /// carried.
+    ///
+    /// Throughput on a real disk is entries divided by fsyncs: one fsync costs
+    /// the same whether it carries one write or a hundred, so this ratio is
+    /// the write path's efficiency expressed as a number. It is counted rather
+    /// than inferred because the batching is emergent — it depends on how many
+    /// writers happen to be queued when a flush wins the lock — and reasoning
+    /// about that from the code has already produced two wrong answers.
+    flushes: AtomicU64,
+    flushed_entries: AtomicU64,
 }
 
 impl<R: Runtime> Wal<R> {
@@ -371,7 +386,6 @@ impl<R: Runtime> Wal<R> {
             log,
             partition: config.partition,
             replicas: Mutex::new(config.replicas.into()),
-            flush: tokio::sync::Mutex::new(()),
             state: Mutex::new(OwnerState {
                 epoch: config.epoch,
                 next_lamport: durable,
@@ -382,11 +396,14 @@ impl<R: Runtime> Wal<R> {
                 failed_through: Lamport::ZERO,
                 acked: HashMap::new(),
                 quiesced: false,
+                flushing: false,
                 surrendered: Lamport::ZERO,
                 catch_up,
                 fatal: None,
             }),
             progress: tokio::sync::Notify::new(),
+            flushes: AtomicU64::new(0),
+            flushed_entries: AtomicU64::new(0),
         });
 
         // Opening above the epoch this node's own log recorded means this
@@ -529,6 +546,21 @@ impl<R: Runtime> Wal<R> {
     #[must_use]
     pub fn committed_lamport(&self) -> Lamport {
         self.state().replicated
+    }
+
+    /// How many fsyncs this owner has issued, and how many entries they
+    /// carried.
+    ///
+    /// The ratio is what decides write throughput against a real disk, where
+    /// an fsync costs milliseconds regardless of how much it carries. One
+    /// entry per fsync means every write pays a full disk round trip on its
+    /// own. See issue #147.
+    #[must_use]
+    pub fn flush_stats(&self) -> (u64, u64) {
+        (
+            self.flushes.load(Ordering::Relaxed),
+            self.flushed_entries.load(Ordering::Relaxed),
+        )
     }
 
     /// The highest Lamport this owner handed back in [`Wal::quiesce`], or zero
@@ -872,7 +904,7 @@ impl<R: Runtime> Wal<R> {
             lamport
         };
 
-        self.flush().await;
+        self.flush(lamport).await;
         self.wait_for(lamport).await
     }
 
@@ -1134,13 +1166,50 @@ impl<R: Runtime> Wal<R> {
         self.progress.notify_waiters();
     }
 
-    /// Writes and fsyncs whatever is pending, then replicates it.
+    /// Writes and fsyncs whatever is pending up to `upto`, then replicates it.
     ///
-    /// Every committer calls this, and all but one of a concurrent group finds
-    /// the queue already taken. That is the batching: the cost of an fsync is
-    /// paid once for everyone who arrived while it was running.
-    async fn flush(self: &Arc<Self>) {
-        let guard = self.flush.lock().await;
+    /// Every committer calls this and at most one of them is the flusher. The
+    /// rest wait for that flush to finish and are usually carried by it, which
+    /// is the batching: the cost of an fsync is paid once for everyone who
+    /// arrived while it was running.
+    ///
+    /// The waiting is the part that matters, and it is why this does not just
+    /// take a lock. Under a lock, a committer that arrives while nothing is
+    /// flushing starts an fsync on its own entry immediately, and closed-loop
+    /// clients — which is what clients are — settle into exactly that: each
+    /// acknowledgement releases one writer, which arrives alone, syncs alone,
+    /// and releases one writer. Measured, that equilibrium is 1.31 entries per
+    /// sync, and it is issue #147. Parking on `progress` instead means the
+    /// entries that arrive during a flush are still queued when it ends, and
+    /// whoever takes the next turn takes all of them.
+    async fn flush(self: &Arc<Self>, upto: Lamport) {
+        // Take a turn as flusher, unless someone else's flush gets there first.
+        let mut turn = loop {
+            let notified = self.progress.notified();
+            let mut notified = std::pin::pin!(notified);
+            // Registered before the check, so a wake landing between the two is
+            // not lost and this cannot park forever on a flush that just ended.
+            notified.as_mut().enable();
+
+            {
+                let mut state = self.state();
+                if state.fatal.is_some() {
+                    return;
+                }
+                // Someone else's batch already carried this entry to the disk.
+                if state.durable_local >= upto {
+                    return;
+                }
+                if !state.flushing {
+                    state.flushing = true;
+                    // Held from here on, so every exit below — including a drop
+                    // part way through the fsync — gives the turn back.
+                    break FlushTurn::new(self);
+                }
+            }
+
+            notified.await;
+        };
 
         let batch = {
             let mut state = self.state();
@@ -1157,9 +1226,18 @@ impl<R: Runtime> Wal<R> {
         let last = batch[batch.len() - 1].entry.lamport;
         let frames: Vec<Bytes> = batch.iter().map(|p| p.frame.clone()).collect();
 
+        // Counted here rather than around the append, because this is the
+        // point where the batch size is decided and one fsync is committed to.
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        self.flushed_entries
+            .fetch_add(frames.len() as u64, Ordering::Relaxed);
+
         if let Err(e) = self.log.append_frames(&frames, last).await {
             // A failed local write leaves the log in a state we cannot reason
-            // about, so this owner stops rather than guessing.
+            // about, so this owner stops rather than guessing. `turn` gives the
+            // flag back on the way out, so the committers parked on `progress`
+            // are woken to see the fatal rather than stranded behind a flush
+            // that is never coming.
             self.set_fatal(e);
             return;
         }
@@ -1167,11 +1245,19 @@ impl<R: Runtime> Wal<R> {
             let mut state = self.state();
             state.durable_local = last;
             state.inflight.push(Batch { last, acked: false });
+            // Giving up the turn here is the pipelining decision made concrete:
+            // the next batch is written while this one is still in flight. It
+            // happens under the same lock as `durable_local` so that a waiter
+            // waking on the notification below cannot observe the turn as free
+            // while the entries this batch just made durable still look
+            // outstanding, and start a redundant flush of nothing.
+            state.flushing = false;
+            turn.disarm();
         }
-
-        // Releasing here is the pipelining decision made concrete: the next
-        // batch is written while this one is still in flight.
-        drop(guard);
+        // Wakes the committers this batch carried, and hands the next turn to
+        // whoever still needs one. They take everything that queued during the
+        // fsync above, which is where the batching comes from.
+        self.progress.notify_waiters();
 
         let (epoch, committed) = {
             let state = self.state();
@@ -1479,6 +1565,54 @@ enum Outcome {
 /// entries this node has given back. Only [`Wal::quiesce`] can lower the
 /// durable position, and only after the replies that could arrive late were
 /// already for entries no client is waiting on.
+/// Holds the flusher turn and gives it back however the flush ends.
+///
+/// The turn is a flag rather than a lock, and a flag does not unwind. A commit
+/// future dropped part way through its fsync — a disconnected client, an
+/// expired deadline, an aborted task — would otherwise leave the turn held by a
+/// flusher that no longer exists. Every later committer would queue in
+/// `pending`, park on `progress` behind a flush that is never coming, and wait
+/// forever; `quiesce` could not finish either, so the partition would stay
+/// unavailable until the process restarted. The lock this replaced released on
+/// unwind for free. This is that property put back on purpose.
+struct FlushTurn<'a, R: Runtime> {
+    wal: &'a Wal<R>,
+    held: bool,
+}
+
+impl<'a, R: Runtime> FlushTurn<'a, R> {
+    fn new(wal: &'a Wal<R>) -> Self {
+        Self { wal, held: true }
+    }
+
+    /// Gives up responsibility for the turn, because the caller has just
+    /// cleared it itself.
+    ///
+    /// The path that completes a batch releases the turn under the same lock
+    /// that publishes `durable_local`, and that pairing is load bearing: see
+    /// [`Wal::flush`]. Dropping this guard afterwards must not clear a flag a
+    /// later flusher has since taken.
+    fn disarm(&mut self) {
+        self.held = false;
+    }
+}
+
+impl<R: Runtime> Drop for FlushTurn<'_, R> {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        // Deliberately not `Wal::state`, which panics on a poisoned lock. This
+        // can run while a panic is already unwinding, and panicking there
+        // aborts the process. A poisoned owner is already finished; failing to
+        // clear a flag on it changes nothing.
+        if let Ok(mut state) = self.wal.state.lock() {
+            state.flushing = false;
+        }
+        self.wal.progress.notify_waiters();
+    }
+}
+
 fn advance(state: &mut OwnerState) {
     // A quiescing owner has already chosen the position it is truncating the
     // log down to and frozen its committed prefix there. A batch whose

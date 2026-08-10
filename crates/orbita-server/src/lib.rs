@@ -93,6 +93,8 @@ mod durability;
 mod forwarding;
 mod frame;
 mod fs_store;
+#[cfg(test)]
+mod group_commit;
 mod host;
 #[cfg(test)]
 mod hydration;
