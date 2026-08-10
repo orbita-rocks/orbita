@@ -63,6 +63,43 @@ pub fn merge(
         .collect())
 }
 
+/// Merges some of a partition's segments, keeping anything that would uncover
+/// an older record if it went.
+///
+/// This is the rule a bounded compaction needs, and it is neither of the other
+/// two. [`merge_all`] may drop an expired record because a whole-partition
+/// merge leaves nothing behind for it to have been hiding; do that with
+/// segments retained and a read finds the older record underneath, which is a
+/// resurrection. [`merge`] drops an unexpired tombstone whenever coverage says
+/// no older record exists, which loses the retry-answering property a
+/// retention period is for.
+///
+/// So this keeps the union of what both keep: a record survives unless it is
+/// expired *and* nothing retained could be revealed by dropping it. That is
+/// strictly more conservative than either, and the cost of being conservative
+/// is a record that lives until the next compaction rather than data that
+/// comes back from the dead.
+///
+/// `retained` is every segment that stays live afterwards. As in [`merge`] the
+/// coverage test is answered from the manifest alone, so it says "might" where
+/// reading the segment would say "does not".
+pub fn merge_bounded(
+    inputs: &[Vec<SegmentRecord>],
+    now_millis: u64,
+    retained: &[SegmentEntry],
+) -> Result<Vec<SegmentRecord>> {
+    Ok(winners(inputs)?
+        .into_iter()
+        .filter(|record| {
+            !record.is_expired_at(now_millis)
+                || retained
+                    .iter()
+                    .any(|entry| entry.may_hold(&record.key) && entry.min_lamport < record.lamport)
+        })
+        .cloned()
+        .collect())
+}
+
 /// Merges every segment of a partition, keeping every unexpired tombstone.
 ///
 /// This is the whole-partition compaction a storage engine runs, and its
@@ -185,6 +222,59 @@ mod tests {
         let mut record = put("a", 1, "v");
         record.expires_at_millis = Some(100);
         assert!(merge(&[vec![record]], 100, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bounded_merge_keeps_an_expired_record_that_is_hiding_a_retained_one() {
+        // The case `merge_all` cannot be used for. Whole-partition merging may
+        // drop this because nothing survives underneath it; with a segment
+        // retained, dropping it uncovers whatever that segment holds for the
+        // same key, and the value comes back after its TTL passed.
+        let retained = entry("s", "a", "z", (1, 4));
+        let mut record = put("m", 7, "v");
+        record.expires_at_millis = Some(100);
+
+        assert!(
+            merge_all(&[vec![record.clone()]], 100).unwrap().is_empty(),
+            "the whole-partition rule drops it, which is why it is the wrong rule here"
+        );
+        assert_eq!(
+            keys(&merge_bounded(&[vec![record]], 100, &[retained]).unwrap()),
+            vec![&b"m"[..]],
+        );
+    }
+
+    #[test]
+    fn a_bounded_merge_keeps_an_unexpired_tombstone_nothing_retained_covers() {
+        // The case `merge` cannot be used for. Coverage says no older record
+        // can be resurrected, so `merge` drops it — but an unexpired tombstone
+        // still has to answer a deleter that retries, exactly as it does in a
+        // whole-partition merge.
+        let far = entry("s", "x", "z", (99, 100));
+        let stone = tombstone("m", 7, u64::MAX);
+
+        assert!(
+            merge(&[vec![stone.clone()]], 0, std::slice::from_ref(&far))
+                .unwrap()
+                .is_empty(),
+            "the coverage rule drops it, which is why it is the wrong rule here"
+        );
+        assert_eq!(
+            keys(&merge_bounded(&[vec![stone]], 0, &[far]).unwrap()),
+            vec![&b"m"[..]],
+        );
+    }
+
+    #[test]
+    fn a_bounded_merge_still_reclaims_what_is_safe_to_reclaim() {
+        // Expired and nothing retained could be under it, so it goes. Without
+        // this the rule would be "keep everything" and reclaim nothing.
+        let far = entry("s", "x", "z", (99, 100));
+        let mut record = put("m", 7, "v");
+        record.expires_at_millis = Some(100);
+        assert!(merge_bounded(&[vec![record]], 100, &[far])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
