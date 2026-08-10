@@ -883,6 +883,22 @@ impl<R: Runtime> PartitionHost<R> {
         flush_and_checkpoint(&self.storage, &self.log, &self.flushing, true).await
     }
 
+    /// Compacts if enough has been flushed since the last one, and does nothing
+    /// otherwise.
+    ///
+    /// Owner-only, because compaction publishes a manifest and only the owner
+    /// may. Serialised against the flush path by the same `flushing` mutex: a
+    /// compaction republishes the manifest a flush is also trying to swap, and
+    /// the two racing is a lost compare-and-swap rather than a correctness
+    /// problem, but there is no reason to pay for it.
+    pub(crate) async fn compact_if_needed(&self) -> Result<()> {
+        if !self.is_owner() {
+            return Ok(());
+        }
+        let _ordered = self.flushing.lock().await;
+        self.storage.compact_if_needed().await
+    }
+
     /// Reclaims objects this partition no longer references and is safely done
     /// needing.
     ///

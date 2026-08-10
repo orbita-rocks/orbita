@@ -30,6 +30,15 @@ pub const DEFAULT_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// How long acknowledged writes normally wait for cluster-wide durability.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often an owner checks whether a partition has earned a compaction.
+///
+/// Deliberately slower than a flush, because compaction only becomes worth
+/// doing after many flushes and it takes the partition's write lock while it
+/// runs. Checking is cheap -- it reads two counters under the lock and returns
+/// -- so this cadence sets how promptly a partition that has crossed the
+/// threshold gets serviced, not how often work happens.
+pub const DEFAULT_COMPACT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How often an owner sweeps its partitions for orphaned objects.
 ///
 /// The sweep lists a partition's whole prefix, so it is deliberately far rarer
@@ -238,6 +247,9 @@ pub struct ServerConfig {
     /// How often owners publish their applied writes to object storage.
     pub flush_interval: Duration,
 
+    /// How often owners check whether a partition has earned a compaction.
+    pub compact_interval: Duration,
+
     /// Whether the orphan sweep runs at all.
     ///
     /// Off by default, and deliberately so: the sweep deletes objects from the
@@ -376,6 +388,7 @@ impl Default for ServerConfig {
             data_dir: PathBuf::from("data"),
             object_store: None,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            compact_interval: DEFAULT_COMPACT_INTERVAL,
             sweep_enabled: false,
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             sweep_grace_millis: orbita_storage::DEFAULT_SWEEP_GRACE_MILLIS,
@@ -514,6 +527,12 @@ impl ServerConfig {
     #[must_use]
     pub fn with_object_store(mut self, config: impl Into<S3StorageConfig>) -> Self {
         self.object_store = Some(config.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_compact_interval(mut self, interval: Duration) -> Self {
+        self.compact_interval = interval;
         self
     }
 
