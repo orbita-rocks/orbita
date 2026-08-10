@@ -1184,7 +1184,7 @@ impl<R: Runtime> Wal<R> {
     /// whoever takes the next turn takes all of them.
     async fn flush(self: &Arc<Self>, upto: Lamport) {
         // Take a turn as flusher, unless someone else's flush gets there first.
-        loop {
+        let mut turn = loop {
             let notified = self.progress.notified();
             let mut notified = std::pin::pin!(notified);
             // Registered before the check, so a wake landing between the two is
@@ -1202,28 +1202,23 @@ impl<R: Runtime> Wal<R> {
                 }
                 if !state.flushing {
                     state.flushing = true;
-                    break;
+                    // Held from here on, so every exit below — including a drop
+                    // part way through the fsync — gives the turn back.
+                    break FlushTurn::new(self);
                 }
             }
 
             notified.await;
-        }
+        };
 
         let batch = {
             let mut state = self.state();
             if state.fatal.is_some() {
-                state.flushing = false;
-                drop(state);
-                self.progress.notify_waiters();
                 return;
             }
             std::mem::take(&mut state.pending)
         };
         if batch.is_empty() {
-            {
-                self.state().flushing = false;
-            }
-            self.progress.notify_waiters();
             return;
         }
 
@@ -1239,13 +1234,10 @@ impl<R: Runtime> Wal<R> {
 
         if let Err(e) = self.log.append_frames(&frames, last).await {
             // A failed local write leaves the log in a state we cannot reason
-            // about, so this owner stops rather than guessing. The turn is
-            // given up first: a fatal owner still has committers parked on
-            // `progress`, and leaving the flag set would strand them behind a
-            // flush that is never coming.
-            {
-                self.state().flushing = false;
-            }
+            // about, so this owner stops rather than guessing. `turn` gives the
+            // flag back on the way out, so the committers parked on `progress`
+            // are woken to see the fatal rather than stranded behind a flush
+            // that is never coming.
             self.set_fatal(e);
             return;
         }
@@ -1260,6 +1252,7 @@ impl<R: Runtime> Wal<R> {
             // while the entries this batch just made durable still look
             // outstanding, and start a redundant flush of nothing.
             state.flushing = false;
+            turn.disarm();
         }
         // Wakes the committers this batch carried, and hands the next turn to
         // whoever still needs one. They take everything that queued during the
@@ -1572,6 +1565,54 @@ enum Outcome {
 /// entries this node has given back. Only [`Wal::quiesce`] can lower the
 /// durable position, and only after the replies that could arrive late were
 /// already for entries no client is waiting on.
+/// Holds the flusher turn and gives it back however the flush ends.
+///
+/// The turn is a flag rather than a lock, and a flag does not unwind. A commit
+/// future dropped part way through its fsync — a disconnected client, an
+/// expired deadline, an aborted task — would otherwise leave the turn held by a
+/// flusher that no longer exists. Every later committer would queue in
+/// `pending`, park on `progress` behind a flush that is never coming, and wait
+/// forever; `quiesce` could not finish either, so the partition would stay
+/// unavailable until the process restarted. The lock this replaced released on
+/// unwind for free. This is that property put back on purpose.
+struct FlushTurn<'a, R: Runtime> {
+    wal: &'a Wal<R>,
+    held: bool,
+}
+
+impl<'a, R: Runtime> FlushTurn<'a, R> {
+    fn new(wal: &'a Wal<R>) -> Self {
+        Self { wal, held: true }
+    }
+
+    /// Gives up responsibility for the turn, because the caller has just
+    /// cleared it itself.
+    ///
+    /// The path that completes a batch releases the turn under the same lock
+    /// that publishes `durable_local`, and that pairing is load bearing: see
+    /// [`Wal::flush`]. Dropping this guard afterwards must not clear a flag a
+    /// later flusher has since taken.
+    fn disarm(&mut self) {
+        self.held = false;
+    }
+}
+
+impl<R: Runtime> Drop for FlushTurn<'_, R> {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        // Deliberately not `Wal::state`, which panics on a poisoned lock. This
+        // can run while a panic is already unwinding, and panicking there
+        // aborts the process. A poisoned owner is already finished; failing to
+        // clear a flag on it changes nothing.
+        if let Ok(mut state) = self.wal.state.lock() {
+            state.flushing = false;
+        }
+        self.wal.progress.notify_waiters();
+    }
+}
+
 fn advance(state: &mut OwnerState) {
     // A quiescing owner has already chosen the position it is truncating the
     // log down to and frozen its committed prefix there. A batch whose

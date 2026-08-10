@@ -23,6 +23,9 @@ use orbita_format::testing::MemoryStore;
 use orbita_format::PartitionPath;
 use orbita_sim::{harness, SimRuntime, Simulation};
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Concurrent writers. Enough that a batching log has a clear opportunity to
@@ -67,6 +70,81 @@ fn open(sim: &Simulation, runtime: SimRuntime) -> Arc<PartitionHost<SimRuntime>>
 /// seed produces. Two is enough to tell "batching" from "not batching" — the
 /// regression this guards is the collapse to 1.31, not a change from 16 to 12.
 const MIN_BATCH: u64 = 2;
+
+/// Drives a future to its first suspension and then abandons it, which is what
+/// a dropped request does to the work it had in flight.
+fn poll_once_then_drop<F: Future>(mut future: Pin<Box<F>>) {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let _ = future.as_mut().poll(&mut cx);
+    drop(future);
+}
+
+#[test]
+fn a_cancelled_write_does_not_strand_the_flusher() {
+    harness::check_seeds(
+        "group_commit::a_cancelled_write_does_not_strand_the_flusher",
+        20,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let runtime = sim.add_node(NodeId(1));
+            let host = open(&sim, runtime.clone());
+
+            // A write driven far enough to claim the flusher turn and then
+            // dropped, which is what a disconnected client or an expired
+            // deadline does to the commit it was waiting on.
+            {
+                let host = Arc::clone(&host);
+                poll_once_then_drop(Box::pin(host.write(
+                    Bytes::from_static(b"abandoned"),
+                    WriteOp::Put {
+                        value: Bytes::from_static(b"v"),
+                        ttl_millis: None,
+                    },
+                    WriteCondition::None,
+                )));
+            }
+            sim.run_until_idle();
+
+            // Whether that write landed is not the question — it was abandoned,
+            // so either answer is honest. The question is whether the partition
+            // still takes writes, or whether the turn went with it.
+            let finished = Arc::new(AtomicBool::new(false));
+            {
+                let host = Arc::clone(&host);
+                let finished = Arc::clone(&finished);
+                sim.spawn(async move {
+                    let _ = host
+                        .write(
+                            Bytes::from_static(b"after"),
+                            WriteOp::Put {
+                                value: Bytes::from_static(b"v"),
+                                ttl_millis: None,
+                            },
+                            WriteCondition::None,
+                        )
+                        .await;
+                    finished.store(true, Ordering::SeqCst);
+                });
+            }
+            sim.run_until_idle();
+
+            // Checked as a flag rather than by awaiting the write, because the
+            // failure is that it never resolves. Awaiting it would hang the
+            // suite instead of reporting.
+            if !finished.load(Ordering::SeqCst) {
+                return Err(sim.failure(
+                    "a write issued after a cancelled one never resolved: the \
+                     cancelled commit took the flusher turn with it and every \
+                     later writer is parked behind a flush that will never run"
+                        .to_owned(),
+                ));
+            }
+            drop(host);
+            Ok(())
+        },
+    );
+}
 
 #[test]
 fn concurrent_writes_share_an_fsync() {
