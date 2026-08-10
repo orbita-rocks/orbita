@@ -880,6 +880,18 @@ impl<R: Runtime> Wal<R> {
     /// Appends locally, replicates, and resolves when two of three have it
     /// durably.
     pub async fn commit(self: &Arc<Self>, op: WalOp) -> Result<Lamport> {
+        let lamport = self.submit(op)?;
+        self.wait_for(lamport).await
+    }
+
+    /// Assigns a Lamport, queues the entry, and makes sure a flusher is
+    /// running, without waiting for any of it.
+    ///
+    /// Split from [`Wal::commit`] so a caller can learn the Lamport while it
+    /// still holds whatever lock orders submissions, and hand the rest of the
+    /// work to something that outlives the request. Nothing here awaits, so a
+    /// caller cannot be cancelled part way through submitting.
+    pub fn submit(self: &Arc<Self>, op: WalOp) -> Result<Lamport> {
         let lamport = {
             let mut state = self.state();
             if let Some(fatal) = &state.fatal {
@@ -905,13 +917,12 @@ impl<R: Runtime> Wal<R> {
         };
 
         // Deliberately not awaited. The flush runs on a task of its own so that
-        // dropping this future — a disconnected client, an expired deadline —
-        // cancels only the waiting, never the writing. A cancelled flush used
-        // to take its batch down with it, and because those Lamports were
-        // already issued, the log kept a permanent hole that every later batch
-        // then failed to replicate across. See issue #150.
+        // dropping a caller cancels only the waiting, never the writing. A
+        // cancelled flush used to take its batch down with it, and because
+        // those Lamports were already issued, the log kept a permanent hole
+        // that every later batch then failed to replicate across. See #150.
         self.ensure_flusher();
-        self.wait_for(lamport).await
+        Ok(lamport)
     }
 
     /// Starts a flusher unless one is already running.
@@ -1338,7 +1349,14 @@ impl<R: Runtime> Wal<R> {
         }
     }
 
-    async fn wait_for(&self, lamport: Lamport) -> Result<Lamport> {
+    /// Resolves once `lamport` is committed, or fails once it is known not to
+    /// be.
+    ///
+    /// Public because the applier waits on it independently of the request that
+    /// submitted the write. That is what lets a cancelled request lose only its
+    /// answer: the entry is still committed, resolved and applied by whoever is
+    /// waiting on it here.
+    pub async fn wait_for(&self, lamport: Lamport) -> Result<Lamport> {
         loop {
             let notified = self.progress.notified();
             let mut notified = std::pin::pin!(notified);
