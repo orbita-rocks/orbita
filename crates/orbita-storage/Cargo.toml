@@ -30,4 +30,7 @@ tokio = { workspace = true, features = ["sync"] }
 # The in-memory object store, so a test's "restart" is reopening over the
 # same objects rather than pointing at a directory.
 orbita-format = { workspace = true, features = ["testing"] }
+# `ObjectStore` is an async trait, so wrapping it to count what a test read
+# needs the same macro the trait is declared with.
+async-trait.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
