@@ -132,6 +132,13 @@ fn open(sim: &Simulation, runtime: SimRuntime) -> Arc<PartitionHost<SimRuntime>>
 /// regression this guards is the collapse to 1.31, not a change from 16 to 12.
 const MIN_BATCH: u64 = 2;
 
+/// Polls a future once without consuming it.
+fn poll_once_in_place<F: Future>(future: &mut Pin<Box<F>>) -> bool {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    future.as_mut().poll(&mut cx).is_ready()
+}
+
 /// Drives a future to its first suspension and then abandons it, which is what
 /// a dropped request does to the work it had in flight.
 fn poll_once_then_drop<F: Future>(mut future: Pin<Box<F>>) {
@@ -377,6 +384,138 @@ fn a_cancelled_write_does_not_wedge_replication() {
                      went with the dropped future, and the Lamports it had already \
                      been issued are now a permanent hole no later batch can \
                      replicate across (issue #150)"
+                )));
+            }
+            drop(host);
+            Ok(())
+        },
+    );
+}
+
+#[test]
+fn a_cancelled_write_does_not_leave_the_owner_behind_its_replica() {
+    harness::check_seeds(
+        "group_commit::a_cancelled_write_does_not_leave_the_owner_behind_its_replica",
+        20,
+        |seed| {
+            let sim = Simulation::new(seed);
+            let owner_runtime = sim.add_node(NodeId(1));
+            let replica_runtime = sim.add_node(NodeId(2));
+            let store = Arc::new(MemoryStore::new());
+            let _replica = start_replica(&sim, replica_runtime, Arc::clone(&store));
+
+            let paths = paths_in(Arc::clone(&store), "wal/owner");
+            let host = sim.block_on({
+                let runtime = owner_runtime.clone();
+                async move {
+                    PartitionHost::open_owner(
+                        runtime,
+                        HostSpec {
+                            id: PartitionId(1),
+                            epoch: Epoch(1),
+                            range: KeyRange::unbounded(),
+                            lease: LeasePolicy::default(),
+                        },
+                        &paths,
+                        vec![NodeId(2)],
+                    )
+                    .await
+                    .expect("the owner opens")
+                }
+            });
+
+            let key = Bytes::from_static(b"k");
+            let _ = sim.block_on({
+                let host = Arc::clone(&host);
+                let key = key.clone();
+                async move {
+                    host.write(
+                        key,
+                        WriteOp::Put {
+                            value: Bytes::from_static(b"v1"),
+                            ttl_millis: None,
+                        },
+                        WriteCondition::None,
+                    )
+                    .await
+                }
+            });
+            sim.run_until_idle();
+
+            // A second write, abandoned in the window that matters: after its
+            // entry is committed to the log and before the request has resolved
+            // the overlay or handed the mutation to the applier.
+            {
+                let mut write = Box::pin({
+                    let host = Arc::clone(&host);
+                    let key = key.clone();
+                    async move {
+                        let _ = host
+                            .write(
+                                key,
+                                WriteOp::Put {
+                                    value: Bytes::from_static(b"v2"),
+                                    ttl_millis: None,
+                                },
+                                WriteCondition::None,
+                            )
+                            .await;
+                    }
+                });
+                let mut completed = false;
+                for _ in 0..20 {
+                    // Checked before polling, not after. Once the log has the
+                    // entry, the next poll is the one that resolves the overlay
+                    // and hands the mutation to the applier — which is exactly
+                    // the step this is trying to skip.
+                    if host.committed_prefix().map(|l| l.get()).unwrap_or(0) >= 2 {
+                        break;
+                    }
+                    if poll_once_in_place(&mut write) {
+                        completed = true;
+                        break;
+                    }
+                    sim.run_until_idle();
+                }
+                drop(write);
+                assert!(!completed, "the write finished, so nothing was cancelled");
+            }
+            sim.run_until_idle();
+
+            let seen = sim.block_on({
+                let host = Arc::clone(&host);
+                let key = key.clone();
+                async move { host.get(&key).await }
+            });
+            let value = seen.ok().flatten().map(|r| r.value);
+            // The heartbeat is how an owner learns where its replica's log
+            // ends, so it is what moves the committed prefix after the fact.
+            for _ in 0..3 {
+                sim.block_on({
+                    let host = Arc::clone(&host);
+                    async move { host.renew_leases().await }
+                });
+                sim.run_until_idle();
+            }
+            let committed = host.committed_prefix().map(|l| l.get()).unwrap_or(0);
+            if committed < 2 {
+                return Err(sim.failure(
+                    "the abandoned write never reached the committed prefix, so this \
+                     scenario never got to the state it is about"
+                        .to_owned(),
+                ));
+            }
+
+            // The log says the entry is durable at quorum. If the owner is
+            // still serving the value underneath it, then it never applied its
+            // own committed entry: a restart would replay it and change the
+            // answer, and a replica promoted now would serve the newer value
+            // while this node served the older one.
+            if value.as_deref() != Some(&b"v2"[..]) {
+                return Err(sim.failure(format!(
+                    "the owner committed lamport {committed} and still serves {value:?}: \
+                     cancelling the request skipped the overlay resolution and the apply, \
+                     so the owner is behind its own log"
                 )));
             }
             drop(host);

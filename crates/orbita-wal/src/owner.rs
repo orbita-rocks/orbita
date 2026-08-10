@@ -1242,7 +1242,15 @@ impl<R: Runtime> Wal<R> {
         }
     }
 
-    /// Writes and fsyncs one batch, then replicates it.
+    /// Writes and fsyncs one batch, then hands its replication to a task of
+    /// its own.
+    ///
+    /// The hand-off is what keeps the disk and the network from taking turns.
+    /// Awaiting replication here would mean the next batch could not start its
+    /// fsync until the previous one had reached a quorum, so every cycle would
+    /// cost a sync plus a network round trip and `pending` would grow for a
+    /// whole peer timeout whenever a replica was slow. The flusher goes back
+    /// for the next batch as soon as this one is on the local disk.
     async fn flush_batch(self: &Arc<Self>, batch: Vec<Pending>) {
         let first = batch[0].entry.lamport;
         let last = batch[batch.len() - 1].entry.lamport;
@@ -1272,6 +1280,20 @@ impl<R: Runtime> Wal<R> {
         // rather than making them wait out the replication below.
         self.progress.notify_waiters();
 
+        // Replication runs on its own task so the flusher can take the next
+        // batch straight back to the disk. Ordering across batches is still the
+        // replica's to enforce: it refuses an append that would leave a hole,
+        // which is the same guarantee that held when two flushes could overlap
+        // here before.
+        let wal = Arc::clone(self);
+        self.runtime.spawn(async move {
+            wal.replicate_batch(batch, first, last).await;
+        });
+    }
+
+    /// Ships one batch to the replicas and folds the answer into the committed
+    /// prefix.
+    async fn replicate_batch(self: Arc<Self>, batch: Vec<Pending>, first: Lamport, last: Lamport) {
         let (epoch, committed) = {
             let state = self.state();
             (state.epoch, state.replicated)
