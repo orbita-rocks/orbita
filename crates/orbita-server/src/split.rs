@@ -97,10 +97,15 @@ fn parent_map_at(
     map
 }
 
-/// The map after the split: the parent retired, two children at the next epoch,
-/// same owner and replica. This is what `CompleteSplit` produces, and swapping
-/// the source to it stands in for that committed entry, whose atomicity and
-/// prepare-gating are proven in `orbita-control`.
+/// The map after the split: the parent retired, two children at the next epoch.
+/// Swapping the source to it stands in for that committed entry, whose
+/// atomicity and prepare-gating are proven in `orbita-control`.
+///
+/// Both children are placed on one owner here. `CompleteSplit` spreads them
+/// when the holder set is large enough to spread across, so this is the
+/// single-holder case — and it is also the shape the merge tests below need,
+/// because a merge cuts both parents in one process. `Controller` relocates a
+/// parent to reach it when a split did spread.
 fn children_map() -> PartitionMap {
     let (low, high) = KeyRange::unbounded()
         .split_at(bytes::Bytes::from_static(BOUNDARY))

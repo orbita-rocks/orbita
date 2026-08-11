@@ -1037,6 +1037,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         upper: PartitionId,
     ) -> Result<PartitionId> {
         self.ensure_leader_ready().await?;
+        self.colocate_merge_parents(lower, upper).await?;
         let generation = {
             let inner = self.inner.lock().await;
             // Check the protocol before validating the requested ids so an
@@ -1098,6 +1099,85 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             }
             self.runtime.clock().sleep(self.config.sweep_interval).await;
         }
+    }
+
+    /// Moves one merge parent onto the other's owner, if they differ.
+    ///
+    /// A merge needs both parents on one holder set, because the cut it makes
+    /// is a single in-process operation over two local WALs. Splits now spread
+    /// their children, so the two halves of one split — the pair an operator is
+    /// most likely to want merged back — normally have different owners. ADR
+    /// 0010 anticipated exactly this and reserved the answer: "a later protocol
+    /// can move one parent first if cross-owner merge is needed". This is that
+    /// move, done here rather than left to the operator.
+    ///
+    /// It costs nothing in data. Every holder already has the partition built
+    /// from the shared object store, and a promoted replica reopens the same
+    /// WAL directory it was already replicating into, so the transfer is a
+    /// lease change rather than a copy. What it does cost is the deposed
+    /// owner's lease drain, which is the same wait a failover pays and is
+    /// bounded by `lease_drain`.
+    ///
+    /// The merge is validated as far as possible before anything moves, so a
+    /// request that could never merge does not leave a partition relocated
+    /// behind it. A failure after the transfer is still possible — the map can
+    /// change underneath — and leaves the pair co-located but unmerged, which
+    /// the operator can retry.
+    async fn colocate_merge_parents(&self, lower: PartitionId, upper: PartitionId) -> Result<()> {
+        let (mover, target) = {
+            let inner = self.inner.lock().await;
+            inner.state.ensure_merge_permitted()?;
+            let lower_info = inner
+                .state
+                .map()
+                .partition(lower)
+                .ok_or_else(|| Error::InvalidArgument(format!("no partition {lower}")))?;
+            let upper_info = inner
+                .state
+                .map()
+                .partition(upper)
+                .ok_or_else(|| Error::InvalidArgument(format!("no partition {upper}")))?;
+            if orbita_core::KeyRange::merge(&lower_info.range, &upper_info.range).is_none() {
+                return Err(Error::InvalidArgument(
+                    "merge partitions must be adjacent and in lower/upper order".into(),
+                ));
+            }
+            let (Some(lower_owner), Some(upper_owner)) = (lower_info.owner, upper_info.owner)
+            else {
+                return Err(Error::Unavailable(
+                    "both merge parents must be owned before they can be merged".into(),
+                ));
+            };
+            if lower_owner == upper_owner {
+                return Ok(());
+            }
+            // Refused here rather than after the transfer, so a pair that was
+            // never going to merge does not pay a relocation to find out.
+            for id in [lower, upper] {
+                if inner.state.is_splitting(id) || inner.state.is_merging(id) {
+                    return Err(Error::InvalidArgument(format!(
+                        "a split or merge is already active on partition {id}"
+                    )));
+                }
+            }
+
+            // Whichever parent can move is the one that moves. A holder can
+            // only be promoted where it already replicates, so the target has
+            // to be a replica of the partition it is taking over. Both hold
+            // when the pair are siblings from one split; the fallback matters
+            // for a pair assembled some other way.
+            if upper_info.replicas.contains(&lower_owner) {
+                (upper, lower_owner)
+            } else if lower_info.replicas.contains(&upper_owner) {
+                (lower, upper_owner)
+            } else {
+                return Err(Error::InvalidArgument(format!(
+                    "partitions {lower} and {upper} share no holder that could own both, \
+                     so neither can be moved onto the other without copying data"
+                )));
+            }
+        };
+        self.transfer_ownership(mover, target).await
     }
 
     /// Active merges held by one worker, observed with the routing map version.
@@ -1257,6 +1337,11 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 replicas.push(old);
             }
         }
+        // Canonically ordered. Nothing reads a replica list positionally, but
+        // `complete_merge` compares two of them with `Vec` equality, so a pair
+        // that differs only in the order a transfer happened to leave behind
+        // would be refused a merge it should be allowed.
+        replicas.sort_unstable();
         self.submit(ControlCommand::AssignOwner {
             partition,
             owner: to,
@@ -2096,6 +2181,7 @@ fn random_hex(bytes: usize) -> Result<String> {
 mod tests {
     use super::*;
     use crate::SingleNodeLog;
+    use orbita_core::KeyspaceId;
     use orbita_sim::Simulation;
 
     #[test]
@@ -2162,6 +2248,217 @@ mod tests {
         let outcome = sim.block_on(async move { controller.outcome_at(target).await });
 
         assert!(matches!(outcome, Err(Error::InvalidArgument(_))));
+    }
+
+    /// A leader with three registered workers and one keyspace.
+    #[allow(clippy::type_complexity)]
+    fn merged_cluster(
+        seed: u64,
+    ) -> (
+        Simulation,
+        Controller<orbita_sim::SimRuntime, SingleNodeLog<orbita_sim::SimRuntime>>,
+    ) {
+        let sim = Simulation::new(seed);
+        let runtime = sim.add_node(NodeId(1));
+        let opening = runtime.clone();
+        let log = sim
+            .block_on(async move { SingleNodeLog::open(&opening).await })
+            .unwrap();
+        let controller = Controller::new(runtime, log, ControlConfig::default());
+
+        let setup = controller.clone();
+        sim.block_on(async move {
+            for id in 1..=3 {
+                setup
+                    .submit(ControlCommand::RegisterNode {
+                        node: NodeId(id),
+                        role: NodeRole::Worker,
+                        address: format!("10.0.0.{id}:7000"),
+                        speaks: crate::version::binary_speaks(),
+                        ready: true,
+                        draining: false,
+                    })
+                    .await
+                    .unwrap();
+            }
+            setup
+                .submit(ControlCommand::SetClusterVersion {
+                    version: crate::version::binary_speaks().max,
+                    expect: ClusterVersion::ZERO,
+                })
+                .await
+                .unwrap();
+            setup
+                .submit(ControlCommand::CreateKeyspace {
+                    id: KeyspaceId(1),
+                    name: "default".into(),
+                    config: Default::default(),
+                    created_at_millis: 1,
+                    first_partition: PartitionId(1),
+                    owner: Some(NodeId(1)),
+                    replicas: vec![NodeId(2), NodeId(3)],
+                })
+                .await
+                .unwrap();
+        });
+        (sim, controller)
+    }
+
+    #[test]
+    fn merging_two_split_children_moves_one_onto_the_others_owner_first() {
+        // A split now spreads its children, so the two halves of one split are
+        // the common case of an adjacent pair with different owners — and the
+        // pair an operator is most likely to want merged back. Merge still
+        // needs one holder set, because the cut it makes is a single
+        // in-process operation over two local WALs. ADR 0010 reserved this
+        // answer: "a later protocol can move one parent first if cross-owner
+        // merge is needed." The operator should not have to know that.
+        let (sim, controller) = merged_cluster(200);
+
+        let driving = controller.clone();
+        sim.block_on(async move {
+            let parent = {
+                let inner = driving.inner.lock().await;
+                let first = inner.state.map().partitions().next().unwrap().clone();
+                first
+            };
+            driving
+                .submit(ControlCommand::BeginSplit {
+                    parent: parent.id,
+                    at: Bytes::from_static(b"m"),
+                    lower: PartitionId(10),
+                    upper: PartitionId(11),
+                    expect_epoch: parent.epoch,
+                })
+                .await
+                .unwrap();
+            let mut holders = vec![parent.owner.unwrap()];
+            holders.extend(parent.replicas.iter().copied());
+            for node in holders {
+                driving
+                    .submit(ControlCommand::MarkSplitPrepared {
+                        parent: parent.id,
+                        node,
+                        expect_epoch: parent.epoch,
+                    })
+                    .await
+                    .unwrap();
+            }
+            driving
+                .submit(ControlCommand::CompleteSplit {
+                    parent: parent.id,
+                    expect_epoch: parent.epoch,
+                })
+                .await
+                .unwrap();
+
+            {
+                let inner = driving.inner.lock().await;
+                let lower = inner.state.map().partition(PartitionId(10)).unwrap();
+                let upper = inner.state.map().partition(PartitionId(11)).unwrap();
+                assert_ne!(
+                    lower.owner, upper.owner,
+                    "the split did not spread, so this test proves nothing"
+                );
+            }
+
+            driving
+                .colocate_merge_parents(PartitionId(10), PartitionId(11))
+                .await
+                .expect("siblings always share a holder that can own both");
+
+            let inner = driving.inner.lock().await;
+            let lower = inner.state.map().partition(PartitionId(10)).unwrap();
+            let upper = inner.state.map().partition(PartitionId(11)).unwrap();
+            assert_eq!(lower.owner, upper.owner, "the pair is not co-located");
+            assert_eq!(
+                lower.replicas, upper.replicas,
+                "complete_merge compares replica lists with Vec equality"
+            );
+        });
+    }
+
+    #[test]
+    fn co_locating_a_pair_that_shares_no_holder_refuses_instead_of_copying() {
+        // Ownership can only move where the data already is: a promoted holder
+        // reopens the WAL directory it was already replicating into. A pair
+        // with no common holder would need a copy, which is a different and
+        // much slower operation than the one the operator asked for, so it is
+        // refused rather than silently performed.
+        let (sim, controller) = merged_cluster(201);
+
+        let driving = controller.clone();
+        sim.block_on(async move {
+            let parent = {
+                let inner = driving.inner.lock().await;
+                let first = inner.state.map().partitions().next().unwrap().clone();
+                first
+            };
+            driving
+                .submit(ControlCommand::BeginSplit {
+                    parent: parent.id,
+                    at: Bytes::from_static(b"m"),
+                    lower: PartitionId(10),
+                    upper: PartitionId(11),
+                    expect_epoch: parent.epoch,
+                })
+                .await
+                .unwrap();
+            let mut holders = vec![parent.owner.unwrap()];
+            holders.extend(parent.replicas.iter().copied());
+            for node in holders {
+                driving
+                    .submit(ControlCommand::MarkSplitPrepared {
+                        parent: parent.id,
+                        node,
+                        expect_epoch: parent.epoch,
+                    })
+                    .await
+                    .unwrap();
+            }
+            driving
+                .submit(ControlCommand::CompleteSplit {
+                    parent: parent.id,
+                    expect_epoch: parent.epoch,
+                })
+                .await
+                .unwrap();
+
+            // Drive the pair to disjoint holder sets, which a split never
+            // produces on its own.
+            for (id, owner, replicas) in [
+                (PartitionId(10), NodeId(1), vec![NodeId(2)]),
+                (PartitionId(11), NodeId(3), Vec::new()),
+            ] {
+                let epoch = driving.epoch_of(id).await.unwrap();
+                driving
+                    .submit(ControlCommand::FencePartition {
+                        partition: id,
+                        expect_epoch: epoch,
+                    })
+                    .await
+                    .unwrap();
+                let fenced = driving.epoch_of(id).await.unwrap();
+                driving
+                    .submit(ControlCommand::AssignOwner {
+                        partition: id,
+                        owner,
+                        replicas,
+                        expect_epoch: fenced,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let refused = driving
+                .colocate_merge_parents(PartitionId(10), PartitionId(11))
+                .await;
+
+            assert!(
+                matches!(refused, Err(Error::InvalidArgument(_))),
+                "expected a refusal, got {refused:?}"
+            );
+        });
     }
 
     #[test]
