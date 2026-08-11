@@ -8,21 +8,23 @@
 
 [changelog]
 header = ""
+# The commit link is built from a hardcoded URL rather than from a
+# [remote.github] section on purpose. Configuring a remote makes git-cliff call
+# the GitHub API, which needs a token, fails on a private repository, and turns
+# changelog generation into a network operation. Both callers swallow its
+# errors, so that failure would surface as an empty release section rather than
+# as an error, which is the worst way to find out.
 body = """
+{% macro remote_url() %}https://github.com/orbita-rocks/orbita{% endmacro %}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 
-{% for commit in commits %}\
-- {{ commit.message | upper_first }}\
-{% if commit.breaking %} (**breaking**){% endif %}\
- ([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))
+{% for commit in commits %}- {{ commit.message | upper_first }}{% if commit.breaking %} (**breaking**){% endif %} ([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))
 {% endfor %}
 {% endfor %}
 """
 trim = true
 footer = ""
-
-[changelog.postprocessors]
 
 [git]
 conventional_commits = true
@@ -45,6 +47,12 @@ commit_parsers = [
   { message = "^build", skip = true },
   { message = "^ci", skip = true },
   { message = "^chore", skip = true },
+
+  # Anything else is a typo, not a new category. Without this, a commit typed
+  # `choire:` or `wip:` becomes its own heading in the published notes, which
+  # has already happened twice in this history. A new type worth publishing
+  # gets a line above rather than arriving by accident.
+  { message = ".*", skip = true },
 ]
 
 # Anything with a breaking marker is promoted regardless of its type, because a
@@ -59,7 +67,3 @@ tag_pattern = "v[0-9]*"
 skip_tags = ".*-dev.*"
 topo_order = false
 sort_commits = "oldest"
-
-[remote.github]
-owner = "orbita-rocks"
-repo = "orbita"
