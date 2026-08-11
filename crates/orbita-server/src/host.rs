@@ -1164,7 +1164,7 @@ impl<R: Runtime> PartitionHost<R> {
         // The key has a version again, so anyone who parked on it can now be
         // told the truth about it.
         self.settled.notify_waiters();
-        let _ = claimed.send(());
+        let _ = claimed.send(outcome.is_ok());
         // The write is durable at quorum by here, so its Lamport is in the
         // committed prefix a split would capture: releasing the admission guard
         // now still keeps a concurrent quiesce from capturing a horizon below
@@ -1758,22 +1758,28 @@ struct ApplyWork {
     lamport: Lamport,
     record: PendingRecord,
     mutation: Mutation,
-    /// Whether the request resolved the overlay itself.
+    /// The request's settlement, and the fact that it made one.
     ///
-    /// Exactly one of the two resolves, and this is how they agree on which.
-    /// A value means the request did it and the applier only has to apply. A
-    /// closed channel means the request went away and the applier resolves
-    /// before applying.
+    /// A value is the authoritative outcome of this write and means the request
+    /// resolved the overlay already, so the applier only has to apply. A closed
+    /// channel means the request went away and the applier owns both settling
+    /// and resolving.
     ///
-    /// Both halves are needed. Resolving on the request is what keeps an
-    /// acknowledged write visible: the overlay has to hold the record before
-    /// the client is told, or a read that follows its own write misses it.
-    /// Resolving on the applier is what keeps a cancelled request from
-    /// stranding the ticket, which leaves `unapplied` above zero and stalls
-    /// `quiesce`. Neither resolves twice, so nothing here has to be
-    /// idempotent — which matters, because `abandon` could not be made so
-    /// without giving tickets an identity they do not have.
-    claim: tokio::sync::oneshot::Receiver<()>,
+    /// The outcome travels rather than being recomputed because two waits on
+    /// one Lamport can disagree: `wait_for` fails at or below `failed_through`
+    /// and a later batch can carry the contiguous prefix past it afterwards. An
+    /// applier that latched the failure while the request observed success
+    /// would skip a mutation the client was told had landed, and a later write
+    /// moving storage past it would let flush and checkpoint drop the log entry
+    /// still holding it.
+    ///
+    /// Exactly one side resolves, so nothing here has to be idempotent — which
+    /// matters, because `abandon` could not be made so without giving tickets
+    /// an identity they do not have. Resolving on the request is what keeps an
+    /// acknowledged write visible to a client that reads it back; resolving on
+    /// the applier is what stops a cancelled request stranding its ticket and
+    /// stalling `quiesce`.
+    claim: tokio::sync::oneshot::Receiver<bool>,
 }
 
 async fn apply_loop<R: Runtime>(
@@ -1782,53 +1788,60 @@ async fn apply_loop<R: Runtime>(
     mut queue: tokio::sync::mpsc::UnboundedReceiver<ApplyWork>,
 ) {
     while let Some(work) = queue.recv().await {
-        // The applier waits for the commit rather than the request doing it.
-        // A request only ever owned the answer; letting it own the resolution
-        // too meant a cancelled one left its entry committed in the log and
-        // never applied here, so the owner served the value underneath its own
-        // committed prefix and a restart changed the answer. Waiting here costs
-        // nothing extra: this task already exists per partition and already
-        // had to run before the write was visible.
-        let committed = match &target.wal {
-            Some(wal) => match wal.upgrade() {
-                Some(wal) => wal.wait_for(work.lamport).await.is_ok(),
-                // The partition closed. Anything unapplied is in the log and
-                // recovery replays it.
-                None => return,
-            },
-            // No log of its own, so nothing to wait for.
-            None => true,
-        };
-
-        // Whoever is still here resolves. A value means the request did it
-        // already and this only has to apply; a closed channel means the
-        // request went away part way through and its ticket is this task's to
-        // settle, or `unapplied` never returns to zero and `quiesce` waits out
-        // its timeout.
-        let resolved_by_request = work.claim.await.is_ok();
-        if !resolved_by_request {
-            let (Some(pending), Some(settled)) =
-                (target.pending.upgrade(), target.settled.upgrade())
-            else {
-                return;
-            };
-            if committed {
-                pending.lock().expect("pending set poisoned").resolve(
-                    &work.ticket,
-                    work.lamport,
-                    work.record,
-                );
-            } else {
-                // Nothing landed, so the key is back to whatever it was. A
-                // waiter parked on this write must be released to win rather
-                // than left losing to a write that never happened.
-                pending
-                    .lock()
-                    .expect("pending set poisoned")
-                    .abandon(&work.ticket);
+        // One settlement decides this write, and the request's is it whenever
+        // there is a request left to have one.
+        //
+        // Waiting here as well looks harmless and is not. `wait_for` reports
+        // failure for a Lamport at or below `failed_through`, and a later batch
+        // can carry the contiguous prefix past it afterwards, so two waits on
+        // the same Lamport can legitimately disagree. If this task latched the
+        // failure while the request went on to observe success, resolve the
+        // overlay and acknowledge, the mutation would be skipped here while the
+        // client was told it landed — and once a later write moved storage past
+        // it, flush and checkpoint would drop the log entry that still held it.
+        // An acknowledged write would be gone. So the outcome travels on the
+        // claim rather than being recomputed.
+        let committed = match work.claim.await {
+            // The request settled it and has already resolved the overlay.
+            Ok(committed) => committed,
+            // The request went away. Its settlement and its ticket are both
+            // this task's now, or `unapplied` never returns to zero and
+            // `quiesce` waits out its timeout.
+            Err(_) => {
+                let committed = match &target.wal {
+                    Some(wal) => match wal.upgrade() {
+                        Some(wal) => wal.wait_for(work.lamport).await.is_ok(),
+                        // The partition closed. Anything unapplied is in the
+                        // log and recovery replays it.
+                        None => return,
+                    },
+                    // No log of its own, so nothing to wait for.
+                    None => true,
+                };
+                let (Some(pending), Some(settled)) =
+                    (target.pending.upgrade(), target.settled.upgrade())
+                else {
+                    return;
+                };
+                if committed {
+                    pending.lock().expect("pending set poisoned").resolve(
+                        &work.ticket,
+                        work.lamport,
+                        work.record,
+                    );
+                } else {
+                    // Nothing landed, so the key is back to whatever it was. A
+                    // waiter parked on this write must be released to win
+                    // rather than left losing to a write that never happened.
+                    pending
+                        .lock()
+                        .expect("pending set poisoned")
+                        .abandon(&work.ticket);
+                }
+                settled.notify_waiters();
+                committed
             }
-            settled.notify_waiters();
-        }
+        };
         if !committed {
             continue;
         }
