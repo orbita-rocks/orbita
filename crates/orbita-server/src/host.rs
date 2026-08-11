@@ -261,7 +261,13 @@ pub(crate) struct PartitionHost<R: Runtime> {
     /// write guard to wait for every already-admitted write to resolve before
     /// it settles the log to the committed prefix. This is the same close-then-
     /// drain shape the node-wide handoff drain uses, scoped to one partition.
-    write_barrier: tokio::sync::RwLock<()>,
+    /// Held shared by every write in flight and exclusively by a split.
+    ///
+    /// In an `Arc` so a write can take an owned guard and carry it onto the
+    /// task that finishes its commit. A borrowed guard would be released by a
+    /// cancelled request while its entry was still landing, which is exactly
+    /// the window a split must not capture a horizon in.
+    write_barrier: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl<R: Runtime> PartitionHost<R> {
@@ -458,7 +464,7 @@ impl<R: Runtime> PartitionHost<R> {
             admitting_writes: std::sync::atomic::AtomicBool::new(true),
             admitting_leases: std::sync::atomic::AtomicBool::new(true),
             lease_renewal: tokio::sync::Mutex::new(()),
-            write_barrier: tokio::sync::RwLock::new(()),
+            write_barrier: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -949,7 +955,7 @@ impl<R: Runtime> PartitionHost<R> {
     /// owner never learned whether the caller lost. See
     /// [`CONDITION_SETTLE_TIMEOUT`].
     pub(crate) async fn write(
-        &self,
+        self: &Arc<Self>,
         key: Bytes,
         op: WriteOp,
         condition: WriteCondition,
@@ -976,7 +982,7 @@ impl<R: Runtime> PartitionHost<R> {
                 self.id
             )));
         }
-        let admission = self.write_barrier.read().await;
+        let admission = Arc::clone(&self.write_barrier).read_owned().await;
         if !self
             .admitting_writes
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1089,7 +1095,14 @@ impl<R: Runtime> PartitionHost<R> {
         // Polling once assigns the Lamport under the submission lock. See the
         // module docs for why the order of those assignments is what keeps the
         // overlay and the storage engine agreeing with the log.
-        let mut commit = Box::pin(wal.commit(wal_op.clone()));
+        // Owns its log handle rather than borrowing this call's, because the
+        // commit outlives the request: it is driven to completion on the task
+        // below whether or not the caller is still here.
+        let mut commit = Box::pin({
+            let wal = Arc::clone(wal);
+            let wal_op = wal_op.clone();
+            async move { wal.commit(wal_op).await }
+        });
         let first = poll_once(&mut commit).await;
 
         let (resolved, applied) = tokio::sync::oneshot::channel();
@@ -1098,31 +1111,80 @@ impl<R: Runtime> PartitionHost<R> {
         let queued = self.applies.send(applied).is_ok();
         drop(guard);
 
-        let outcome = match first {
-            Some(outcome) => outcome,
-            None => commit.await,
+        // Everything from here to the resolution runs on a task of its own.
+        //
+        // The log entry is already beyond this request's control: `Wal::commit`
+        // flushes on an independent task so a dropped request cannot lose a
+        // batch (issue #150). That leaves the rest of the commit — resolving the
+        // overlay ticket and handing the mutation to the applier — as the only
+        // part a cancellation could still skip, and skipping it is worse than
+        // losing the write was. The entry would be durable at quorum and
+        // replayed on restart while this owner had never applied it, so the
+        // owner would serve the old value and a promoted replica the new one,
+        // and the same node would answer differently before and after a
+        // restart. Autonomy has to cover the whole commit or none of it.
+        //
+        // The admission guard travels with it for the same reason: it is what
+        // stops a split capturing a horizon below this write, and a guard
+        // released by a cancelled request would let that happen while the entry
+        // was still landing.
+        let (finished, outcome) = tokio::sync::oneshot::channel();
+        {
+            let host = Arc::clone(self);
+            let key = key.clone();
+            let op = op.clone();
+            let wal_op = wal_op.clone();
+            self.runtime.spawn(async move {
+                let settled = match first {
+                    Some(outcome) => outcome,
+                    None => commit.await,
+                };
+                match &settled {
+                    Ok(lamport) => {
+                        let record = pending_record_of(&op, *lamport, now);
+                        host.pending
+                            .lock()
+                            .expect("pending set poisoned")
+                            .resolve(&ticket, *lamport, record);
+                        // The key has a version again, so anyone who parked on
+                        // it can now be told the truth about it.
+                        host.settled.notify_waiters();
+                        if queued {
+                            let _ = resolved.send(Some(mutation_of_op(*lamport, &key, &wal_op)));
+                        }
+                    }
+                    Err(_) => {
+                        host.pending
+                            .lock()
+                            .expect("pending set poisoned")
+                            .abandon(&ticket);
+                        // Nothing landed, so the key is back to whatever it
+                        // was. A waiter parked on this write must be released
+                        // to win rather than left losing to a write that never
+                        // happened.
+                        host.settled.notify_waiters();
+                        let _ = resolved.send(None);
+                    }
+                }
+                // The write is durable at quorum by here, so its Lamport is in
+                // the committed prefix a split would capture.
+                drop(admission);
+                let _ = finished.send(settled);
+            });
+        }
+
+        // Only the waiting is this request's. A caller that goes away stops
+        // waiting and changes nothing about what the commit above does.
+        let outcome = match outcome.await {
+            Ok(settled) => settled,
+            Err(_) => Err(Error::Internal(format!(
+                "partition {} dropped a commit before it resolved",
+                self.id
+            ))),
         };
 
         match outcome {
             Ok(lamport) => {
-                let record = pending_record_of(&op, lamport, now);
-                self.pending
-                    .lock()
-                    .expect("pending set poisoned")
-                    .resolve(&ticket, lamport, record);
-                // The key has a version again, so anyone who parked on it can
-                // now be told the truth about it.
-                self.settled.notify_waiters();
-                if queued {
-                    let _ = resolved.send(Some(mutation_of_op(lamport, &key, &wal_op)));
-                }
-                // The write is durable at quorum by here, so its Lamport is in
-                // the committed prefix a split would capture: releasing the
-                // admission guard now still keeps a concurrent quiesce from
-                // capturing a horizon below this write, while not holding the
-                // guard across the coherence wait, which can take a lease
-                // interval and would otherwise stall a racing split on it.
-                drop(admission);
                 // Durable is not enough to answer the client. Every replica
                 // that could still serve a read has to have the invalidation
                 // too, or the client would be told about a value another node
@@ -1135,18 +1197,7 @@ impl<R: Runtime> PartitionHost<R> {
                     existed,
                 })
             }
-            Err(error) => {
-                self.pending
-                    .lock()
-                    .expect("pending set poisoned")
-                    .abandon(&ticket);
-                // Nothing landed, so the key is back to whatever it was. A
-                // waiter parked on this write must be released to win rather
-                // than left losing to a write that never happened.
-                self.settled.notify_waiters();
-                let _ = resolved.send(None);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
