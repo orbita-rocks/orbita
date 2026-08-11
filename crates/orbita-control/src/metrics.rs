@@ -13,11 +13,8 @@
 //! partition that will only ever see a single increment. The `outcome` label is
 //! a fixed, small set, so the metric never grows with the cluster.
 //!
-//! Split and merge both record `unimplemented` today: the control-plane split
-//! protocol exists but its data-plane half (worker child-storage preparation
-//! and parent quiescing) does not, so the operator surface fails closed. The
-//! counters are wired now so the series exist the day execution does; the label
-//! set stays fixed and small, so it never grows with the cluster.
+//! Both operations record only committed transitions. Validation failures are
+//! ordinary operator errors rather than lifecycle activity.
 
 use std::sync::OnceLock;
 
@@ -52,16 +49,12 @@ pub(crate) enum Outcome {
     /// The operation took effect: the parent retired and the children own its
     /// range.
     Committed,
-    /// The operation is not yet executable and was refused without changing the
-    /// map.
-    Unimplemented,
 }
 
 impl Outcome {
     fn as_str(self) -> &'static str {
         match self {
             Outcome::Committed => "committed",
-            Outcome::Unimplemented => "unimplemented",
         }
     }
 }
@@ -90,7 +83,7 @@ mod tests {
     // exporter.
     #[test]
     fn split_and_merge_counters_record_without_a_provider() {
-        record_split(Outcome::Unimplemented);
-        record_merge(Outcome::Unimplemented);
+        record_split(Outcome::Committed);
+        record_merge(Outcome::Committed);
     }
 }

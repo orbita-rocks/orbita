@@ -370,6 +370,21 @@ impl<R: Runtime> StatusReporter<R> {
             .report_split_prepared(self.node, parent, lower, upper)
             .await
     }
+
+    /// The dual-parent merges this node must keep frozen or prepare.
+    pub async fn fetch_merge_intents(&self) -> Result<orbita_control::MergeIntentSnapshot> {
+        self.client.fetch_merge_intents(self.node).await
+    }
+
+    /// Reports a durable and servable merged manifest for an exact generation.
+    pub async fn report_merge_prepared(
+        &self,
+        generation: orbita_control::MergeGeneration,
+    ) -> Result<()> {
+        self.client
+            .report_merge_prepared(self.node, generation)
+            .await
+    }
 }
 
 /// [`StatusReporter::can_handoff`] with both versions passed in.

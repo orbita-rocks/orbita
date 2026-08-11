@@ -126,25 +126,19 @@ class PreviousBinaryUnavailable(RuntimeError):
 # a lower cluster version, so the roll exercises real code differences between
 # releases, not just a changed version string.
 #
-# That is impossible in this repository today, and it was verified rather than
-# assumed. `git tag` and `gh release list` are both empty: there is no prior
-# release to download. And every revision on `develop` that carries the upgrade
-# machinery under test (`orbita-control::version`, `cluster finalize-upgrade`,
-# the readiness compatibility gate, introduced together in #24) is at workspace
-# version `0.1.0-dev` — cluster version 0.1. The only revisions that speak the
-# lower cluster version 0.0 predate that machinery entirely: they have no
-# `finalize-upgrade` command, no version gate, and cannot play the old node in
-# this test at all. So no single prior revision both speaks 0.0 *and* runs the
-# feature being tested. Cluster version 0.1 has, in effect, been the version for
-# the whole life of the feature.
+# There is still no tagged release to download by default. A caller can point
+# `ORBITA_PREV_REV` at the real 0.1 implementation now that this workspace
+# speaks 0.2, which turns the scenario into a cross-version-code test. CI keeps
+# the synthetic fallback because it cannot assume a full git history or a
+# release artifact is available in every checkout.
 #
 # Given that, the default builds the old side from the current source stamped
 # down one minor. Both binaries then share peer/WAL/storage/recovery code, so
 # this run cannot catch an incompatibility introduced *between* releases; what
-# it does cover, end to end and against a genuine 0.0-speaking peer, is the
-# compatibility GATE: bootstrap at 0.0, roll every node to 0.1 without the
-# active version moving, `finalize-upgrade`, and lockout of the 0.0 binary
-# afterwards. That coverage is real and worth keeping.
+# it does cover end to end is the compatibility gate: bootstrap one minor back,
+# roll every node without the active version moving, refuse new protocol
+# behavior before `finalize-upgrade`, finalize, and lock the old binary out.
+# That coverage is real and worth keeping.
 #
 # `ORBITA_PREV_REV` is the switch that turns this into a true cross-version
 # test the moment a prior implementation exists: point it at a real earlier

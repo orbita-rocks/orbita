@@ -775,12 +775,18 @@ impl<R: Runtime, L: ConsensusLog> pb::admin_server::Admin for AdminService<R, L>
         {
             return Ok(Response::new(response));
         }
-        crate::metrics::record_merge(crate::metrics::Outcome::Unimplemented);
-        // Answering with a clear refusal rather than a half-built merge. See
-        // the crate documentation for what a correct one has to guarantee.
-        Err(Status::unimplemented(
-            "partition merge is not implemented; see the orbita-control crate documentation",
-        ))
+        let merged = self
+            .leader()
+            .merge_partitions(
+                PartitionId(request.lower_partition_id),
+                PartitionId(request.upper_partition_id),
+            )
+            .await
+            .map_err(status)?;
+        let map = self.leader().partition_map().await;
+        Ok(Response::new(pb::MergePartitionsResponse {
+            merged: map.partition(merged).map(partition_message),
+        }))
     }
 
     async fn transfer_ownership(

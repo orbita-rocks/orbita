@@ -154,12 +154,19 @@ planning pass on 2026-08-07, put two cut items back:
 The cost is said out loud: the release gets longer, and if the date starts to
 matter these two are the cut line back to the previous plan.
 
+Upgrade review found that merge adds replicated command tags a 0.1 voter cannot
+decode, and an earlier draft of ADR 0012 therefore put the operation behind
+cluster protocol 0.2. That was withdrawn before it merged. The voter it
+protected does not exist: nothing has been released, so 0.1 is still being
+defined rather than kept compatible with, and merge tags 22 through 25 are part
+of its alphabet. Merge is an enabled v0.1.0 feature and needs no finalization.
+
 ### What v0.1.0 can still cut
 
-Merge and #84, per the paragraph above, in that order. The upgrade theme is
-the next candidate, since attended-only rollouts are a warning label rather
-than a wrong claim. The format and Raft themes are not cuttable; they are the
-difference between the pitch being true and not.
+#84 is the remaining cut item. The upgrade theme is the next candidate, since
+attended-only rollouts are a warning label rather than a wrong claim. The
+format and Raft themes are not cuttable; they are the difference between the
+pitch being true and not.
 
 ## v0.2.0: testing and correctness
 

@@ -422,6 +422,10 @@ impl Server {
             Some(client) => Some(client.fetch_split_intents(config.node_id).await?),
             None => None,
         };
+        let initial_merge_intents = match &control {
+            Some(client) => Some(client.fetch_merge_intents(config.node_id).await?),
+            None => None,
+        };
 
         let node = Node::start(
             runtime.clone(),
@@ -429,6 +433,7 @@ impl Server {
             layout,
             map_source,
             initial_split_intents,
+            initial_merge_intents,
             config.lease_duration,
             Arc::clone(&readiness),
             Arc::clone(&authenticator),
@@ -960,9 +965,14 @@ impl Server {
             // reports the ack the leader's completion waits on. Run even when
             // there are no intents, so a partition quiesced for a split the
             // leader later abandoned has its writes reopened.
-            match client.fetch_split_intents(node_id).await {
-                Ok(snapshot) => {
-                    for (parent, lower, upper) in live.prepare_split_snapshot(&snapshot).await {
+            match (
+                client.fetch_split_intents(node_id).await,
+                client.fetch_merge_intents(node_id).await,
+            ) {
+                (Ok(splits), Ok(merges)) => {
+                    let (prepared_splits, prepared_merges) =
+                        live.prepare_transition_snapshots(&splits, &merges).await;
+                    for (parent, lower, upper) in prepared_splits {
                         if let Err(error) = client
                             .report_split_prepared(node_id, parent, lower, upper)
                             .await
@@ -974,8 +984,16 @@ impl Server {
                             );
                         }
                     }
+                    for generation in prepared_merges {
+                        if let Err(error) = client.report_merge_prepared(node_id, generation).await
+                        {
+                            tracing::debug!(%error, "could not report merge preparation");
+                        }
+                    }
                 }
-                Err(error) => tracing::debug!(%error, "could not fetch split intents"),
+                (Err(error), _) | (_, Err(error)) => {
+                    tracing::debug!(%error, "could not fetch partition transition intents")
+                }
             }
             if !convergence_logged && readiness.is_ready() {
                 let map = live.map();

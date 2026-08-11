@@ -25,7 +25,7 @@
 //! [ADR 0008](../../../docs/adr/0008-a-fenced-owner-stays-a-replica.md) for
 //! why that is the safe direction rather than the risky one.
 
-use crate::command::ControlCommand;
+use crate::command::{ControlCommand, MergeGeneration};
 use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Credential, Keyspace, KeyspaceConfig};
 use crate::version::{
@@ -93,6 +93,22 @@ pub struct SplitIntent {
     pub prepared: Vec<NodeId>,
     /// The parent's current range, so a worker can derive each child's half.
     pub parent_range: KeyRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingMerge {
+    generation: MergeGeneration,
+    required: Vec<NodeId>,
+    prepared: BTreeSet<NodeId>,
+}
+
+/// A dual-parent merge in flight, projected for workers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeIntent {
+    pub generation: MergeGeneration,
+    pub keyspace: KeyspaceId,
+    pub required: Vec<NodeId>,
+    pub prepared: Vec<NodeId>,
 }
 
 /// Where a partition is in its ownership lifecycle.
@@ -166,6 +182,9 @@ pub struct ClusterState {
     /// Splits in flight, keyed by the parent being divided. A parent has at
     /// most one, because a second split is refused while the first is open.
     pending_splits: BTreeMap<PartitionId, PendingSplit>,
+    /// Merges keyed by their lower parent; lookups check both parents because
+    /// either one changing invalidates the generation.
+    pending_merges: BTreeMap<PartitionId, PendingMerge>,
     handoffs: BTreeMap<NodeId, BTreeMap<PartitionId, HandoffCheckpoint>>,
     credentials: BTreeMap<String, Credential>,
     next_keyspace_id: u64,
@@ -241,6 +260,29 @@ impl ClusterState {
     #[must_use]
     pub fn is_splitting(&self, partition: PartitionId) -> bool {
         self.pending_splits.contains_key(&partition)
+    }
+
+    #[must_use]
+    pub fn is_merging(&self, partition: PartitionId) -> bool {
+        self.pending_merges
+            .values()
+            .any(|merge| merge.generation.lower == partition || merge.generation.upper == partition)
+    }
+
+    #[must_use]
+    pub fn merge_intents(&self) -> Vec<MergeIntent> {
+        self.pending_merges
+            .values()
+            .filter_map(|merge| {
+                let lower = self.map.partition(merge.generation.lower)?;
+                Some(MergeIntent {
+                    generation: merge.generation.clone(),
+                    keyspace: lower.keyspace,
+                    required: merge.required.clone(),
+                    prepared: merge.prepared.iter().copied().collect(),
+                })
+            })
+            .collect()
     }
 
     /// Every split in flight, in the shape the controller drives and a worker
@@ -454,6 +496,12 @@ impl ClusterState {
                 parent,
                 expect_epoch,
             } => self.abort_split(*parent, *expect_epoch),
+            ControlCommand::BeginMerge { generation } => self.begin_merge(generation.clone()),
+            ControlCommand::MarkMergePrepared { generation, node } => {
+                self.mark_merge_prepared(generation, *node)
+            }
+            ControlCommand::CompleteMerge { generation } => self.complete_merge(generation),
+            ControlCommand::AbortMerge { generation } => self.abort_merge(generation),
             ControlCommand::SetClusterVersion { version, expect } => {
                 self.set_cluster_version(*version, *expect)
             }
@@ -493,6 +541,25 @@ impl ClusterState {
                 "the worker-prepared split and replicated fence-drain require active cluster \
                  protocol 0.1"
                     .into(),
+            ));
+        }
+        let is_protocol_0_2 = matches!(
+            command,
+            ControlCommand::BeginMerge { .. }
+                | ControlCommand::MarkMergePrepared { .. }
+                | ControlCommand::CompleteMerge { .. }
+                | ControlCommand::AbortMerge { .. }
+        );
+        if is_protocol_0_2 {
+            self.ensure_merge_permitted()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_merge_permitted(&self) -> Result<()> {
+        if !self.version_initialized || self.version < PROTOCOL_0_1 {
+            return Err(Error::Unavailable(
+                "partition merge requires an initialized cluster protocol of at least 0.1".into(),
             ));
         }
         Ok(())
@@ -725,10 +792,13 @@ impl ClusterState {
             .filter(|p| p.keyspace == id)
             .map(|p| p.id)
             .collect();
-        for partition in doomed {
-            self.phases.remove(&partition);
-            self.pending_splits.remove(&partition);
+        for partition in &doomed {
+            self.phases.remove(partition);
+            self.pending_splits.remove(partition);
         }
+        self.pending_merges.retain(|_, merge| {
+            !doomed.contains(&merge.generation.lower) && !doomed.contains(&merge.generation.upper)
+        });
         // `PartitionMap` can add a keyspace but not remove one, so the map is
         // rebuilt from the tables this crate owns. See the note in the crate
         // documentation about the contract gap.
@@ -809,6 +879,7 @@ impl ClusterState {
                 "partition {partition} has no owner to fence"
             )));
         };
+        self.abort_merge_for_parent_change(partition);
         // The epoch bump and the ownership removal are the same entry. There
         // is no committed state in which the old owner has been removed but
         // its epoch still stands, which is the state a returning owner could
@@ -931,6 +1002,7 @@ impl ClusterState {
                 "the owner must not also be listed as a replica".into(),
             ));
         }
+        self.abort_merge_for_parent_change(partition);
 
         info.owner = Some(to);
         info.epoch = info.epoch.next();
@@ -973,7 +1045,8 @@ impl ClusterState {
         // event. Conditioned on there having *been* a split, so an ordinary
         // replica placement still costs no reopen.
         let abandoned_split = self.pending_splits.remove(&partition).is_some();
-        if abandoned_split {
+        let abandoned_merge = self.abort_merge_for_parent_change(partition);
+        if abandoned_split || abandoned_merge {
             info.epoch = info.epoch.next();
         }
         if info.owner.is_some_and(|o| replicas.contains(&o)) {
@@ -1067,6 +1140,11 @@ impl ClusterState {
                 "partition {parent} is already splitting"
             )));
         }
+        if self.is_merging(parent) {
+            return Err(Error::InvalidArgument(format!(
+                "partition {parent} is already merging"
+            )));
+        }
         // A partition with no owner has no node holding its data, so there is
         // nobody to prepare the children. It becomes splittable the moment it
         // is placed; until then the honest answer is that it is unavailable.
@@ -1125,6 +1203,10 @@ impl ClusterState {
                 .pending_splits
                 .values()
                 .any(|split| split.lower == id || split.upper == id)
+            || self
+                .pending_merges
+                .values()
+                .any(|merge| merge.generation.merged == id)
     }
 
     /// Records that one holder has prepared storage for a pending split's
@@ -1258,6 +1340,183 @@ impl ClusterState {
         Ok(())
     }
 
+    fn begin_merge(&mut self, generation: MergeGeneration) -> Result<()> {
+        if generation.lower == generation.upper
+            || generation.lower == generation.merged
+            || generation.upper == generation.merged
+        {
+            return Err(Error::InvalidArgument(
+                "merge parents and child must have distinct ids".into(),
+            ));
+        }
+        let lower = self.check_epoch(generation.lower, generation.lower_epoch)?;
+        let upper = self.check_epoch(generation.upper, generation.upper_epoch)?;
+        if lower.keyspace != upper.keyspace {
+            return Err(Error::InvalidArgument(
+                "merge parents must belong to one keyspace".into(),
+            ));
+        }
+        let range = KeyRange::merge(&lower.range, &upper.range).ok_or_else(|| {
+            Error::InvalidArgument("merge parents must be adjacent and in lower/upper order".into())
+        })?;
+        if range != generation.range
+            || lower.range.end() != Some(generation.boundary.as_ref())
+            || upper.range.start() != generation.boundary.as_ref()
+        {
+            return Err(Error::InvalidArgument(
+                "merge generation does not match the parents' boundary and range".into(),
+            ));
+        }
+        if lower.owner.is_none()
+            || lower.owner != upper.owner
+            || lower.replicas != upper.replicas
+            || self.phase(lower.id) != Some(PartitionPhase::Serving)
+            || self.phase(upper.id) != Some(PartitionPhase::Serving)
+        {
+            return Err(Error::InvalidArgument(
+                "merge parents must be serving on the same owner and replica set".into(),
+            ));
+        }
+        if self.is_splitting(lower.id)
+            || self.is_splitting(upper.id)
+            || self.is_merging(lower.id)
+            || self.is_merging(upper.id)
+        {
+            return Err(Error::InvalidArgument(
+                "a split or merge is already active on one parent".into(),
+            ));
+        }
+        if self.child_id_in_use(generation.merged) {
+            return Err(Error::InvalidArgument(
+                "the merged partition id is already in use".into(),
+            ));
+        }
+
+        let mut required = vec![lower.owner.expect("checked")];
+        required.extend(lower.replicas.iter().copied());
+        self.next_partition_id = self.next_partition_id.max(generation.merged.get() + 1);
+        self.pending_merges.insert(
+            generation.lower,
+            PendingMerge {
+                generation,
+                required,
+                prepared: BTreeSet::new(),
+            },
+        );
+        self.bump_map_version();
+        Ok(())
+    }
+
+    fn pending_merge(&self, generation: &MergeGeneration) -> Result<&PendingMerge> {
+        self.pending_merges
+            .get(&generation.lower)
+            .filter(|pending| pending.generation == *generation)
+            .ok_or_else(|| Error::InvalidArgument("merge generation is not active".into()))
+    }
+
+    fn mark_merge_prepared(&mut self, generation: &MergeGeneration, node: NodeId) -> Result<()> {
+        self.check_epoch(generation.lower, generation.lower_epoch)?;
+        self.check_epoch(generation.upper, generation.upper_epoch)?;
+        let pending = self
+            .pending_merges
+            .get_mut(&generation.lower)
+            .filter(|pending| pending.generation == *generation)
+            .ok_or_else(|| Error::InvalidArgument("merge generation is not active".into()))?;
+        if !pending.required.contains(&node) {
+            return Err(Error::InvalidArgument(format!(
+                "node {node} is not a required holder for this merge"
+            )));
+        }
+        pending.prepared.insert(node);
+        Ok(())
+    }
+
+    fn complete_merge(&mut self, generation: &MergeGeneration) -> Result<()> {
+        let lower = self.check_epoch(generation.lower, generation.lower_epoch)?;
+        let upper = self.check_epoch(generation.upper, generation.upper_epoch)?;
+        let pending = self.pending_merge(generation)?;
+        let unprepared: Vec<_> = pending
+            .required
+            .iter()
+            .copied()
+            .filter(|node| !pending.prepared.contains(node))
+            .collect();
+        if !unprepared.is_empty() {
+            return Err(Error::Unavailable(format!(
+                "merge cannot complete until these holders prepare storage: {unprepared:?}"
+            )));
+        }
+        let range = KeyRange::merge(&lower.range, &upper.range)
+            .ok_or_else(|| Error::Internal("active merge parents are no longer adjacent".into()))?;
+        if range != generation.range
+            || lower.owner != upper.owner
+            || lower.replicas != upper.replicas
+        {
+            return Err(Error::Unavailable(
+                "merge parents changed after preparation began".into(),
+            ));
+        }
+
+        self.pending_merges.remove(&generation.lower);
+        self.map
+            .remove_partition(lower.keyspace, lower.range.start());
+        self.map
+            .remove_partition(upper.keyspace, upper.range.start());
+        let epoch = Epoch(lower.epoch.get().max(upper.epoch.get())).next();
+        self.map.insert_partition(PartitionInfo {
+            id: generation.merged,
+            keyspace: lower.keyspace,
+            range,
+            owner: lower.owner,
+            epoch,
+            replicas: lower.replicas,
+        });
+        self.phases.remove(&lower.id);
+        self.phases.remove(&upper.id);
+        self.phases
+            .insert(generation.merged, PartitionPhase::Serving);
+        self.bump_map_version();
+        Ok(())
+    }
+
+    fn abort_merge(&mut self, generation: &MergeGeneration) -> Result<()> {
+        self.pending_merge(generation)?;
+        let mut lower = self.check_epoch(generation.lower, generation.lower_epoch)?;
+        let mut upper = self.check_epoch(generation.upper, generation.upper_epoch)?;
+        self.pending_merges.remove(&generation.lower);
+        lower.epoch = lower.epoch.next();
+        upper.epoch = upper.epoch.next();
+        self.replace_partition(lower);
+        self.replace_partition(upper);
+        self.bump_map_version();
+        Ok(())
+    }
+
+    /// Drops a merge whose holder or owner is changing and raises the other
+    /// parent's epoch. The caller raises `partition` as part of its own command
+    /// (fence, transfer, or replica repair), so doing only the counterpart here
+    /// makes abandonment and both epoch changes one replicated state-machine
+    /// application without double-bumping the changed side.
+    fn abort_merge_for_parent_change(&mut self, partition: PartitionId) -> bool {
+        let Some((key, generation)) = self.pending_merges.iter().find_map(|(key, pending)| {
+            (pending.generation.lower == partition || pending.generation.upper == partition)
+                .then(|| (*key, pending.generation.clone()))
+        }) else {
+            return false;
+        };
+        self.pending_merges.remove(&key);
+        let other = if generation.lower == partition {
+            generation.upper
+        } else {
+            generation.lower
+        };
+        if let Some(mut info) = self.map.partition(other).cloned() {
+            info.epoch = info.epoch.next();
+            self.replace_partition(info);
+        }
+        true
+    }
+
     /// The map version, exposed so a caller can tell whether anything moved.
     #[must_use]
     pub fn map_version(&self) -> MapVersion {
@@ -1283,7 +1542,11 @@ mod tests {
             node: NodeId(id),
             role: NodeRole::Worker,
             address: format!("10.0.0.{id}:7000"),
-            speaks: crate::version::binary_speaks(),
+            // Most state tests exercise routing rather than compatibility and
+            // move the active version explicitly. Keep their fixture eligible
+            // across that range; compatibility tests below register exact
+            // production windows with `register_with`.
+            speaks: VersionRange::new(ClusterVersion::ZERO, crate::version::binary_speaks().max),
             ready: true,
             draining: false,
         }
@@ -1837,6 +2100,235 @@ mod tests {
     }
 
     #[test]
+    fn merge_commands_need_an_initialized_protocol_and_nothing_more() {
+        // Merge used to require 0.2 so a 0.1 voter that could not decode tags
+        // 22 through 25 stayed rollback-safe. Nothing was ever released, so
+        // there is no such voter: 0.1 is still being defined rather than kept
+        // compatible with, and merge is part of it. See ADR 0012.
+        //
+        // What is still refused is a cluster that has not agreed a version at
+        // all, because a command whose vocabulary nobody has agreed to is the
+        // one case the gate was ever protecting against.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+
+        for command in [
+            ControlCommand::MarkMergePrepared {
+                generation: merge_generation(&lower, &upper, 12),
+                node: lower.owner.unwrap(),
+            },
+            ControlCommand::CompleteMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            },
+            ControlCommand::AbortMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            },
+            ControlCommand::BeginMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            },
+        ] {
+            state
+                .ensure_command_permitted(&command)
+                .unwrap_or_else(|e| panic!("active protocol 0.1 refused {command:?}: {e}"));
+        }
+
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            })
+            .expect("protocol 0.1 enables merge");
+    }
+
+    fn merge_generation(
+        lower: &PartitionInfo,
+        upper: &PartitionInfo,
+        merged: u64,
+    ) -> crate::command::MergeGeneration {
+        crate::command::MergeGeneration {
+            lower: lower.id,
+            upper: upper.id,
+            lower_epoch: lower.epoch,
+            upper_epoch: upper.epoch,
+            merged: PartitionId(merged),
+            boundary: Bytes::from_static(b"m"),
+            range: KeyRange::unbounded(),
+        }
+    }
+
+    #[test]
+    fn a_merge_prepares_before_atomically_replacing_both_adjacent_parents() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        let generation = merge_generation(&lower, &upper, 12);
+        let before: Vec<_> = state.map().partitions().cloned().collect();
+
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: generation.clone(),
+            })
+            .unwrap();
+        assert_eq!(state.map().check_coverage(), Ok(()));
+        assert_eq!(
+            state.map().partitions().cloned().collect::<Vec<_>>(),
+            before,
+            "beginning a merge moves no key"
+        );
+        assert!(state.is_merging(lower.id));
+        assert!(state.is_merging(upper.id));
+
+        let holders = holders(&lower);
+        for holder in &holders[..holders.len() - 1] {
+            state
+                .apply(&ControlCommand::MarkMergePrepared {
+                    generation: generation.clone(),
+                    node: *holder,
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            state.apply(&ControlCommand::CompleteMerge {
+                generation: generation.clone(),
+            }),
+            Err(Error::Unavailable(_))
+        ));
+        assert_eq!(
+            state.map().partitions().cloned().collect::<Vec<_>>(),
+            before
+        );
+
+        state
+            .apply(&ControlCommand::MarkMergePrepared {
+                generation: generation.clone(),
+                node: *holders.last().unwrap(),
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::CompleteMerge {
+                generation: generation.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(state.map().check_coverage(), Ok(()));
+        assert!(state.map().partition(lower.id).is_none());
+        assert!(state.map().partition(upper.id).is_none());
+        let merged = state.map().partition(generation.merged).unwrap();
+        assert_eq!(merged.range, KeyRange::unbounded());
+        assert_eq!(
+            state.map().lookup(parent.keyspace, b"a").unwrap().id,
+            merged.id
+        );
+        assert_eq!(
+            state.map().lookup(parent.keyspace, b"z").unwrap().id,
+            merged.id
+        );
+    }
+
+    #[test]
+    fn a_delayed_merge_ack_cannot_apply_to_a_retried_generation() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        let stale = merge_generation(&lower, &upper, 12);
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: stale.clone(),
+            })
+            .unwrap();
+        state
+            .apply(&ControlCommand::AbortMerge {
+                generation: stale.clone(),
+            })
+            .unwrap();
+
+        let lower = state.map().partition(lower.id).unwrap().clone();
+        let upper = state.map().partition(upper.id).unwrap().clone();
+        let current = merge_generation(&lower, &upper, 13);
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: current,
+            })
+            .unwrap();
+        assert!(state
+            .apply(&ControlCommand::MarkMergePrepared {
+                generation: stale,
+                node: lower.owner.unwrap(),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn split_and_merge_decisions_are_mutually_exclusive() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            })
+            .unwrap();
+
+        assert!(state
+            .apply(&ControlCommand::BeginSplit {
+                parent: lower.id,
+                at: Bytes::from_static(b"g"),
+                lower: PartitionId(13),
+                upper: PartitionId(14),
+                expect_epoch: lower.epoch,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn owner_failure_mid_merge_aborts_and_raises_both_parent_epochs() {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            })
+            .unwrap();
+
+        state
+            .apply(&ControlCommand::FencePartition {
+                partition: lower.id,
+                expect_epoch: lower.epoch,
+            })
+            .unwrap();
+
+        assert!(!state.is_merging(lower.id));
+        assert!(!state.is_merging(upper.id));
+        assert_eq!(
+            state.map().partition(lower.id).unwrap().epoch,
+            lower.epoch.next(),
+            "the failed owner is fenced"
+        );
+        assert_eq!(
+            state.map().partition(upper.id).unwrap().epoch,
+            upper.epoch.next(),
+            "the other quiesced WAL is recreated under a truncating epoch too"
+        );
+        assert_eq!(state.map().check_coverage(), Ok(()));
+    }
+
+    #[test]
     fn the_worker_prepared_split_needs_protocol_0_1_so_old_logs_still_replay() {
         // A 0.0 cluster, and every mid-rollout member behaving as one, refuses
         // the new commands. That is what keeps a historical log free of tags a
@@ -2370,7 +2862,7 @@ mod tests {
         // healthy, and silently owns nothing.
         let mut state = bootstrapped();
         set_version(&mut state, ClusterVersion::ZERO);
-        register_without_a_lifecycle_claim(&mut state, 4, crate::version::binary_speaks());
+        register_without_a_lifecycle_claim(&mut state, 4, crate::version::speaks_for(PROTOCOL_0_1));
 
         assert!(
             state.placement_candidates().contains(&NodeId(4)),

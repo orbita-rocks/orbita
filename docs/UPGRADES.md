@@ -17,9 +17,10 @@ finished.
   `cluster-version-compatible` and `control-plane-joined` as unmet readiness
   conditions, and logs both its range and the active version. No behaviour
   actually changes with the version yet because no format has two versions to
-  choose between. Planned worker handoff is the first version-gated behavior:
-  workers continue using the previous status protocol and ordinary failover
-  until the operator finalizes the new cluster version.
+  choose between. Worker handoff is a version-gated behaviour: workers
+  continue using the previous status protocol and ordinary failover until the
+  operator finalizes protocol 0.1. Partition merge is part of protocol 0.1, so
+  finalizing 0.1 is all it needs; there is no second finalization to wait for.
 Readiness is otherwise real: a node reports Ready only once it has recovered
 its write-ahead log and opened and caught up the partitions the map says it
 holds, and it turns unready again if a map change hands it a partition it
@@ -275,6 +276,15 @@ orbita cluster finalize-upgrade
 Only after that do nodes start writing new formats or using new behaviour.
 Until then the rollback above is available and cheap. After it, rolling back is
 not supported, and the command says so before it proceeds.
+
+Partition merge needs nothing beyond this. Its replicated tags are part of
+protocol 0.1, so finalizing 0.1 enables it along with worker handoff. A cluster
+that has agreed no version at all still refuses a merge, and refuses it before
+appending anything to the control log, because a command whose vocabulary
+nobody has accepted is the one case that gate protects against. Merge was
+originally assigned to a later protocol to keep a 0.1 voter that could not
+decode its tags rollback-safe; ADR 0012 withdrew that, because nothing had been
+released and no such voter existed.
 
 Finalization is not automatic on purpose. Doing it automatically would close
 the rollback window at the exact moment an operator is most likely to want it,
