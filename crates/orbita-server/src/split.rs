@@ -107,19 +107,37 @@ fn parent_map_at(
 /// because a merge cuts both parents in one process. `Controller` relocates a
 /// parent to reach it when a split did spread.
 fn children_map() -> PartitionMap {
+    children_map_owned(OWNER, OWNER)
+}
+
+/// The map after a split that spread its children, which is what
+/// `CompleteSplit` produces whenever the holder set has room to spread. Each
+/// child is owned by one holder and replicated by the other, so the pair is
+/// served by two nodes instead of one. That is the whole point of splitting —
+/// one owner serialises each partition, so adding partitions without adding
+/// owners adds no write throughput. See issue #160.
+fn spread_children_map() -> PartitionMap {
+    children_map_owned(OWNER, REPLICA)
+}
+
+fn children_map_owned(lower_owner: NodeId, upper_owner: NodeId) -> PartitionMap {
     let (low, high) = KeyRange::unbounded()
         .split_at(bytes::Bytes::from_static(BOUNDARY))
         .expect("the boundary is inside the range");
     let mut map = PartitionMap::new(MapVersion(3));
     map.insert_keyspace(keyspace_info());
-    for (id, range) in [(LOWER, low), (UPPER, high)] {
+    for (id, range, owner) in [(LOWER, low, lower_owner), (UPPER, high, upper_owner)] {
+        let other = if owner == OWNER { REPLICA } else { OWNER };
         map.insert_partition(PartitionInfo {
             id,
             keyspace: KeyspaceId(1),
             range,
-            owner: Some(OWNER),
+            owner: Some(owner),
             epoch: Epoch(2),
-            replicas: vec![REPLICA],
+            // The holder set is the parent's either way; only the role
+            // assignment inside it changes. `complete_split` builds the child
+            // rows the same way, and the owner is never also a replica.
+            replicas: vec![other],
         });
     }
     map
@@ -1069,8 +1087,25 @@ fn write_one(sim: &Simulation, node: &Arc<Node<SimRuntime>>, index: u64) -> bool
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn run(seed: u64) -> Result<(), Failure> {
+    run_split(seed, children_map())
+}
+
+/// The same contention scenario against a split that spread its children.
+fn run_spread(seed: u64) -> Result<(), Failure> {
+    run_split(seed, spread_children_map())
+}
+
+/// Writes through the parent's owner while the split runs underneath, then
+/// proves every acknowledged write survived it and routes to the child that
+/// owns its half.
+///
+/// `after` is the map the split completes into, which is the only difference
+/// between the co-located and spread cases. Spreading means half the keys are
+/// no longer owned by the node the client is talking to, so the same writes now
+/// have to survive a proxy hop as well as the split.
+#[allow(clippy::too_many_lines)]
+fn run_split(seed: u64, after: PartitionMap) -> Result<(), Failure> {
     let sim = Simulation::new(seed);
     let sim = &sim;
     let store = Arc::new(MemoryStore::new());
@@ -1103,10 +1138,14 @@ fn run(seed: u64) -> Result<(), Failure> {
         )));
     }
 
+    // Everything written from here on meets the children rather than the
+    // parent, which is the half of the scenario the placement changes.
+    let after_split = log.lock().expect("write log poisoned").len();
+
     // Retire the parent and install the children, then let both nodes reconcile
     // onto them. This is the committed CompleteSplit, whose atomicity is proven
     // in orbita-control; here it is a source swap.
-    source.set(children_map());
+    source.set(after);
     poll(sim, &[&owner, &replica]);
 
     // A second wave of writes, now against the children.
@@ -1121,6 +1160,24 @@ fn run(seed: u64) -> Result<(), Failure> {
     let acknowledged = writes.iter().filter(|w| w.acknowledged).count();
     if acknowledged == 0 {
         return Err(sim.failure("no write was acknowledged, so nothing was proven"));
+    }
+    // Both children have to have taken an acknowledged write after the split
+    // installed, or the scenario never reached the placement it exists to
+    // test. Under a spread map one of these two lands on a partition this node
+    // does not own, so losing it silently would turn the whole check green
+    // while proving nothing about spreading.
+    for (child, side) in [(LOWER, false), (UPPER, true)] {
+        let landed = writes
+            .iter()
+            .skip(after_split)
+            .filter(|w| w.acknowledged)
+            .any(|w| (key_at(w.index).as_slice() >= BOUNDARY) == side);
+        if !landed {
+            return Err(sim.failure(format!(
+                "no write was acknowledged against {child} after the split, \
+                 so this seed did not exercise the post-split placement"
+            )));
+        }
     }
     for wrote in writes.iter().filter(|w| w.acknowledged) {
         let key = key_at(wrote.index);
@@ -1165,6 +1222,27 @@ fn run(seed: u64) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn no_acknowledged_write_is_lost_when_a_split_spreads_its_children() {
+    // A split only buys write throughput if its children land on different
+    // owners, because one owner serialises each partition. That placement is
+    // new, and it changes what the write path has to survive: half the keys
+    // stop being owned by the node the client is talking to at the instant the
+    // children install, so an in-flight write can find its partition moved to a
+    // peer mid-flight. This asserts the same guarantee as the co-located case
+    // — nothing acknowledged is lost, everything routes to the child that owns
+    // its half — against that harder placement. See issue #160.
+    //
+    // Reproduce a failure with:
+    //   ORBITA_SIM_SEED=<seed> cargo test -p orbita-server \
+    //     no_acknowledged_write_is_lost_when_a_split_spreads_its_children
+    harness::check_seeds(
+        "split::no_acknowledged_write_is_lost_when_a_split_spreads_its_children",
+        24,
+        run_spread,
+    );
 }
 
 #[test]
