@@ -1167,6 +1167,7 @@ dependencies = [
 name = "orbita-storage"
 version = "0.2.0-dev"
 dependencies = [
+ "async-trait",
  "bytes",
  "crc32c",
  "orbita-core",

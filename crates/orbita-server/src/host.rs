@@ -25,10 +25,16 @@
 //! wins, and the storage engine would silently drop the one that arrived with
 //! the lower Lamport second.
 //!
-//! That is why the future returned by `Wal::commit` is polled once while the
-//! lock is held. The first poll is what reserves the Lamport; everything after
-//! it is the fsync and the round trip to the replicas, which happens after the
-//! lock is gone.
+//! That is why `Wal::submit` is called while the lock is held. It assigns the
+//! Lamport and queues the entry without awaiting anything, so a caller cannot
+//! be cancelled part way through submitting; the fsync and the round trip to
+//! the replicas happen afterwards, on tasks that outlive the request.
+//!
+//! The applier is handed its work at that same moment rather than when the
+//! commit resolves, so a request that goes away loses only its answer. Which
+//! of the two resolves the overlay is settled by a claim channel: the request
+//! does it before acknowledging, because a client that reads its own write has
+//! to find it, and the applier does it only if the request never arrived.
 //!
 //! The overlay carries a third state the ADR did not have to name: a write
 //! that has been submitted and has not yet been told its Lamport. Nothing
@@ -56,10 +62,7 @@ use orbita_storage::{
 use orbita_wal::{CatchUpPass, Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
-use std::task::Poll;
 use std::time::Duration;
 
 /// How long a scan waits for acknowledged writes to reach the storage engine.
@@ -213,8 +216,8 @@ pub(crate) struct PartitionHost<R: Runtime> {
     /// key: waking a handful of waiters that then re-check costs nothing
     /// beside the round trip they were waiting on, and a map of notifiers
     /// keyed by key would have to be reaped.
-    settled: tokio::sync::Notify,
-    applies: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<Option<Mutation>>>,
+    settled: Arc<tokio::sync::Notify>,
+    applies: tokio::sync::mpsc::UnboundedSender<ApplyWork>,
     drained: Arc<tokio::sync::Notify>,
     read_state: Mutex<ReplicaReadState>,
     leases: Mutex<LeaseTable>,
@@ -265,7 +268,13 @@ pub(crate) struct PartitionHost<R: Runtime> {
     /// write guard to wait for every already-admitted write to resolve before
     /// it settles the log to the committed prefix. This is the same close-then-
     /// drain shape the node-wide handoff drain uses, scoped to one partition.
-    write_barrier: tokio::sync::RwLock<()>,
+    /// Held shared by every write in flight and exclusively by a split.
+    ///
+    /// In an `Arc` so a write can take an owned guard and carry it onto the
+    /// task that finishes its commit. A borrowed guard would be released by a
+    /// cancelled request while its entry was still landing, which is exactly
+    /// the window a split must not capture a horizon in.
+    write_barrier: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl<R: Runtime> PartitionHost<R> {
@@ -409,6 +418,7 @@ impl<R: Runtime> PartitionHost<R> {
         let (applies, queue) = tokio::sync::mpsc::unbounded_channel();
         let pending = Arc::new(Mutex::new(PendingSet::default()));
         let drained = Arc::new(tokio::sync::Notify::new());
+        let settled = Arc::new(tokio::sync::Notify::new());
         let flushing = Arc::new(tokio::sync::Mutex::new(()));
         // A same-epoch process restart cannot know which leases its previous
         // incarnation granted, including to a replica removed from the current
@@ -430,6 +440,8 @@ impl<R: Runtime> PartitionHost<R> {
                 storage: Arc::downgrade(&storage),
                 pending: Arc::downgrade(&pending),
                 drained: Arc::downgrade(&drained),
+                settled: Arc::downgrade(&settled),
+                wal: wal.as_ref().map(Arc::downgrade),
                 log: Arc::downgrade(&log),
                 flushing: Arc::downgrade(&flushing),
                 flush_on_trigger: wal.is_some(),
@@ -446,7 +458,7 @@ impl<R: Runtime> PartitionHost<R> {
             log,
             pending,
             submit: tokio::sync::Mutex::new(()),
-            settled: tokio::sync::Notify::new(),
+            settled,
             applies,
             drained,
             read_state: Mutex::new(ReplicaReadState::new(Lamport::ZERO)),
@@ -463,7 +475,7 @@ impl<R: Runtime> PartitionHost<R> {
             admitting_leases: std::sync::atomic::AtomicBool::new(true),
             admitting_reads: std::sync::atomic::AtomicBool::new(true),
             lease_renewal: tokio::sync::Mutex::new(()),
-            write_barrier: tokio::sync::RwLock::new(()),
+            write_barrier: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -953,6 +965,22 @@ impl<R: Runtime> PartitionHost<R> {
         flush_and_checkpoint(&self.storage, &self.log, &self.flushing, true).await
     }
 
+    /// Compacts if enough has been flushed since the last one, and does nothing
+    /// otherwise.
+    ///
+    /// Owner-only, because compaction publishes a manifest and only the owner
+    /// may. Serialised against the flush path by the same `flushing` mutex: a
+    /// compaction republishes the manifest a flush is also trying to swap, and
+    /// the two racing is a lost compare-and-swap rather than a correctness
+    /// problem, but there is no reason to pay for it.
+    pub(crate) async fn compact_if_needed(&self) -> Result<()> {
+        if !self.is_owner() {
+            return Ok(());
+        }
+        let _ordered = self.flushing.lock().await;
+        self.storage.compact_if_needed().await
+    }
+
     /// Reclaims objects this partition no longer references and is safely done
     /// needing.
     ///
@@ -1003,7 +1031,7 @@ impl<R: Runtime> PartitionHost<R> {
     /// owner never learned whether the caller lost. See
     /// [`CONDITION_SETTLE_TIMEOUT`].
     pub(crate) async fn write(
-        &self,
+        self: &Arc<Self>,
         key: Bytes,
         op: WriteOp,
         condition: WriteCondition,
@@ -1030,7 +1058,7 @@ impl<R: Runtime> PartitionHost<R> {
                 self.id
             )));
         }
-        let admission = self.write_barrier.read().await;
+        let admission = Arc::clone(&self.write_barrier).read_owned().await;
         if !self
             .admitting_writes
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1143,40 +1171,79 @@ impl<R: Runtime> PartitionHost<R> {
         // Polling once assigns the Lamport under the submission lock. See the
         // module docs for why the order of those assignments is what keeps the
         // overlay and the storage engine agreeing with the log.
-        let mut commit = Box::pin(wal.commit(wal_op.clone()));
-        let first = poll_once(&mut commit).await;
-
-        let (resolved, applied) = tokio::sync::oneshot::channel();
-        // Reserving the apply slot here, in submission order, is what makes
-        // the applier apply in Lamport order.
-        let queued = self.applies.send(applied).is_ok();
-        drop(guard);
-
-        let outcome = match first {
-            Some(outcome) => outcome,
-            None => commit.await,
+        // Owns its log handle rather than borrowing this call's, because the
+        // commit outlives the request: it is driven to completion on the task
+        // below whether or not the caller is still here.
+        // The Lamport is assigned here, under the submission lock, which is
+        // what orders the applier. Nothing in this call awaits between taking
+        // the lock and handing the work on, so a cancelled request cannot leave
+        // a submission half made.
+        let lamport = match wal.submit(wal_op.clone()) {
+            Ok(lamport) => lamport,
+            Err(error) => {
+                self.pending
+                    .lock()
+                    .expect("pending set poisoned")
+                    .abandon(&ticket);
+                self.settled.notify_waiters();
+                return Err(error);
+            }
         };
 
-        match outcome {
-            Ok(lamport) => {
-                let record = pending_record_of(&op, lamport, now);
+        // Handed to the applier at submission rather than on completion. The
+        // applier waits for the commit itself and resolves the overlay and
+        // applies to storage whether or not this request is still here, so a
+        // dropped request loses its answer and nothing else. Doing that work on
+        // the request meant a cancelled one left its entry committed in the log
+        // and never applied, and the owner served the value underneath its own
+        // committed prefix. Reserving the slot in submission order is what
+        // makes the applier apply in Lamport order.
+        let record = pending_record_of(&op, lamport, now);
+        let (claimed, claim) = tokio::sync::oneshot::channel();
+        let _ = self.applies.send(ApplyWork {
+            ticket: ticket.clone(),
+            lamport,
+            record: record.clone(),
+            mutation: mutation_of_op(lamport, &key, &wal_op),
+            claim,
+        });
+        drop(guard);
+
+        // Only the waiting is this request's.
+        let outcome = wal.wait_for(lamport).await;
+
+        // Resolved here, before the client is told anything, because a client
+        // that reads its own write has to find it. Leaving this to the applier
+        // means the acknowledgement can beat the overlay and the write is
+        // briefly invisible. The applier is told it is done so that it applies
+        // and does not resolve a second time.
+        match &outcome {
+            Ok(_) => {
                 self.pending
                     .lock()
                     .expect("pending set poisoned")
                     .resolve(&ticket, lamport, record);
-                // The key has a version again, so anyone who parked on it can
-                // now be told the truth about it.
-                self.settled.notify_waiters();
-                if queued {
-                    let _ = resolved.send(Some(mutation_of_op(lamport, &key, &wal_op)));
-                }
-                // The write is durable at quorum by here, so its Lamport is in
-                // the committed prefix a split would capture: releasing the
-                // admission guard now still keeps a concurrent quiesce from
-                // capturing a horizon below this write, while not holding the
-                // guard across the coherence wait, which can take a lease
-                // interval and would otherwise stall a racing split on it.
-                drop(admission);
+            }
+            Err(_) => {
+                self.pending
+                    .lock()
+                    .expect("pending set poisoned")
+                    .abandon(&ticket);
+            }
+        }
+        // The key has a version again, so anyone who parked on it can now be
+        // told the truth about it.
+        self.settled.notify_waiters();
+        let _ = claimed.send(outcome.is_ok());
+        // The write is durable at quorum by here, so its Lamport is in the
+        // committed prefix a split would capture: releasing the admission guard
+        // now still keeps a concurrent quiesce from capturing a horizon below
+        // this write, while not holding it across the coherence wait, which can
+        // take a lease interval and would otherwise stall a racing split.
+        drop(admission);
+
+        match outcome {
+            Ok(lamport) => {
                 // Durable is not enough to answer the client. Every replica
                 // that could still serve a read has to have the invalidation
                 // too, or the client would be told about a value another node
@@ -1189,18 +1256,7 @@ impl<R: Runtime> PartitionHost<R> {
                     existed,
                 })
             }
-            Err(error) => {
-                self.pending
-                    .lock()
-                    .expect("pending set poisoned")
-                    .abandon(&ticket);
-                // Nothing landed, so the key is back to whatever it was. A
-                // waiter parked on this write must be released to win rather
-                // than left losing to a write that never happened.
-                self.settled.notify_waiters();
-                let _ = resolved.send(None);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1469,6 +1525,18 @@ impl<R: Runtime> PartitionHost<R> {
     /// read set. A newly opened owner also waits one duration because its prior
     /// process may have granted a lease to a replica the current map no longer
     /// names.
+    /// How many fsyncs this partition's log has issued, and how many entries
+    /// they carried. `None` for a replica, which has no owning log.
+    ///
+    /// Exposed so a test can assert the write path actually batches rather
+    /// than infer it from throughput, which is what let issue #147 sit
+    /// undetected behind a plausible-looking flush loop.
+    #[cfg(test)]
+    #[must_use]
+    pub fn flush_stats(&self) -> Option<(u64, u64)> {
+        self.wal.as_ref().map(|wal| wal.flush_stats())
+    }
+
     async fn await_coherence(&self, wal: &Arc<Wal<R>>, lamport: Lamport) {
         self.wait_for_possible_restart_leases().await;
         loop {
@@ -1742,26 +1810,112 @@ struct ApplyTarget<R: Runtime> {
     storage: Weak<Partition<R>>,
     pending: Weak<Mutex<PendingSet>>,
     drained: Weak<tokio::sync::Notify>,
+    settled: Weak<tokio::sync::Notify>,
+    wal: Option<Weak<Wal<R>>>,
     log: Weak<PartitionLog<R>>,
     flushing: Weak<tokio::sync::Mutex<()>>,
     flush_on_trigger: bool,
 }
 
+/// One submitted write, handed to the applier at submission rather than on
+/// completion.
+///
+/// Everything here is known under the submission lock, which is the point: the
+/// applier can finish this write without the request that started it. A request
+/// that goes away loses its answer and nothing else.
+struct ApplyWork {
+    ticket: pending::Ticket,
+    lamport: Lamport,
+    record: PendingRecord,
+    mutation: Mutation,
+    /// The request's settlement, and the fact that it made one.
+    ///
+    /// A value is the authoritative outcome of this write and means the request
+    /// resolved the overlay already, so the applier only has to apply. A closed
+    /// channel means the request went away and the applier owns both settling
+    /// and resolving.
+    ///
+    /// The outcome travels rather than being recomputed because two waits on
+    /// one Lamport can disagree: `wait_for` fails at or below `failed_through`
+    /// and a later batch can carry the contiguous prefix past it afterwards. An
+    /// applier that latched the failure while the request observed success
+    /// would skip a mutation the client was told had landed, and a later write
+    /// moving storage past it would let flush and checkpoint drop the log entry
+    /// still holding it.
+    ///
+    /// Exactly one side resolves, so nothing here has to be idempotent — which
+    /// matters, because `abandon` could not be made so without giving tickets
+    /// an identity they do not have. Resolving on the request is what keeps an
+    /// acknowledged write visible to a client that reads it back; resolving on
+    /// the applier is what stops a cancelled request stranding its ticket and
+    /// stalling `quiesce`.
+    claim: tokio::sync::oneshot::Receiver<bool>,
+}
+
 async fn apply_loop<R: Runtime>(
     partition: PartitionId,
     target: ApplyTarget<R>,
-    mut queue: tokio::sync::mpsc::UnboundedReceiver<
-        tokio::sync::oneshot::Receiver<Option<Mutation>>,
-    >,
+    mut queue: tokio::sync::mpsc::UnboundedReceiver<ApplyWork>,
 ) {
-    while let Some(slot) = queue.recv().await {
-        // An error means the write was dropped before it resolved, and a
-        // `None` means it failed. Both leave the log's sequence with a hole
-        // where nothing was ever acknowledged, which the storage engine
-        // tolerates because it only requires Lamports to increase.
-        let Ok(Some(mutation)) = slot.await else {
-            continue;
+    while let Some(work) = queue.recv().await {
+        // One settlement decides this write, and the request's is it whenever
+        // there is a request left to have one.
+        //
+        // Waiting here as well looks harmless and is not. `wait_for` reports
+        // failure for a Lamport at or below `failed_through`, and a later batch
+        // can carry the contiguous prefix past it afterwards, so two waits on
+        // the same Lamport can legitimately disagree. If this task latched the
+        // failure while the request went on to observe success, resolve the
+        // overlay and acknowledge, the mutation would be skipped here while the
+        // client was told it landed — and once a later write moved storage past
+        // it, flush and checkpoint would drop the log entry that still held it.
+        // An acknowledged write would be gone. So the outcome travels on the
+        // claim rather than being recomputed.
+        let committed = match work.claim.await {
+            // The request settled it and has already resolved the overlay.
+            Ok(committed) => committed,
+            // The request went away. Its settlement and its ticket are both
+            // this task's now, or `unapplied` never returns to zero and
+            // `quiesce` waits out its timeout.
+            Err(_) => {
+                let committed = match &target.wal {
+                    Some(wal) => match wal.upgrade() {
+                        Some(wal) => wal.wait_for(work.lamport).await.is_ok(),
+                        // The partition closed. Anything unapplied is in the
+                        // log and recovery replays it.
+                        None => return,
+                    },
+                    // No log of its own, so nothing to wait for.
+                    None => true,
+                };
+                let (Some(pending), Some(settled)) =
+                    (target.pending.upgrade(), target.settled.upgrade())
+                else {
+                    return;
+                };
+                if committed {
+                    pending.lock().expect("pending set poisoned").resolve(
+                        &work.ticket,
+                        work.lamport,
+                        work.record,
+                    );
+                } else {
+                    // Nothing landed, so the key is back to whatever it was. A
+                    // waiter parked on this write must be released to win
+                    // rather than left losing to a write that never happened.
+                    pending
+                        .lock()
+                        .expect("pending set poisoned")
+                        .abandon(&work.ticket);
+                }
+                settled.notify_waiters();
+                committed
+            }
         };
+        if !committed {
+            continue;
+        }
+        let mutation = work.mutation;
         let (Some(storage), Some(pending)) = (target.storage.upgrade(), target.pending.upgrade())
         else {
             // The partition closed underneath us. Anything unapplied is still
@@ -1828,22 +1982,6 @@ async fn flush_and_checkpoint<R: Runtime>(
         log.checkpoint(checkpoint).await?;
     }
     Ok(())
-}
-
-/// Polls a future once and reports whether it finished.
-///
-/// This exists for one reason: `Wal::commit` reserves its Lamport on the first
-/// poll, and the caller needs that reservation to happen while it still holds
-/// the submission lock. Awaiting the whole future there would hold a lock
-/// across replication, which ADR 0003 rules out.
-async fn poll_once<F: Future>(future: &mut Pin<Box<F>>) -> Option<F::Output> {
-    std::future::poll_fn(|cx| {
-        Poll::Ready(match future.as_mut().poll(cx) {
-            Poll::Ready(value) => Some(value),
-            Poll::Pending => None,
-        })
-    })
-    .await
 }
 
 /// Whether a replica that answered a heartbeat without holding a lease may be
@@ -2780,14 +2918,5 @@ mod tests {
             } => assert_eq!(expires_at_millis, Some(6_000)),
             WalOp::Delete { .. } => panic!("a put became a delete"),
         }
-    }
-
-    #[tokio::test]
-    async fn polling_once_reports_a_future_that_is_not_done() {
-        let mut never = Box::pin(std::future::pending::<()>());
-        assert!(poll_once(&mut never).await.is_none());
-
-        let mut ready = Box::pin(std::future::ready(7));
-        assert_eq!(poll_once(&mut ready).await, Some(7));
     }
 }

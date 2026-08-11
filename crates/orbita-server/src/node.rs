@@ -1736,6 +1736,40 @@ impl<R: Runtime> Node<R> {
         }
     }
 
+    /// Compacts every owned partition that has flushed enough to earn it.
+    ///
+    /// Compaction used to run from inside whichever client write crossed the
+    /// flush trigger, which put a stall proportional to the whole partition on
+    /// one unlucky request. Here it is scheduled instead, on a cadence an
+    /// operator sets, so a request pays for its own work and nothing else.
+    ///
+    /// This does not make the merge cheap. It still takes the partition's write
+    /// lock for its duration, so a large partition still stalls writes while it
+    /// runs -- it just no longer ambushes a request. Bounding the work per merge
+    /// is issue #143.
+    ///
+    /// One pass rather than an internal timer, for the same reason as the flush
+    /// and sweep loops: a simulated run drives maintenance a step at a time.
+    pub(crate) async fn compact_owned(&self) {
+        let hosts: Vec<Arc<PartitionHost<R>>> = self
+            .hosts
+            .read()
+            .await
+            .values()
+            .filter(|host| host.is_owner() && !host.is_maintenance_frozen())
+            .cloned()
+            .collect();
+        for host in hosts {
+            if let Err(error) = host.compact_if_needed().await {
+                tracing::warn!(
+                    partition = host.id().get(),
+                    %error,
+                    "periodic compaction failed; the segments stand until the next pass"
+                );
+            }
+        }
+    }
+
     /// Sweeps orphaned objects from every partition this node currently owns.
     ///
     /// The backstop for objects a failed compaction or an abandoned commit

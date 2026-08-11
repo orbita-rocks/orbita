@@ -71,13 +71,16 @@ pub const TOMBSTONE_RETENTION_MILLIS: u64 = 24 * 60 * 60 * 1000;
 /// flush amortises over many writes rather than chasing each one.
 const FLUSH_TRIGGER_BYTES: u64 = 8 * 1024 * 1024;
 
-/// How many full, size-triggered flushes amortise one compaction.
+/// How many full, size-triggered flushes amortise a compaction check.
 ///
 /// Reads never pay for segment count, so this is purely about space: every
-/// overwrite strands a shadowed record until a merge reclaims it. Sixteen
-/// flush-sized segments bound that waste at roughly the cost of one merge per
-/// sixteen flushes.
-const COMPACT_TRIGGER_FULL_FLUSHES: usize = 16;
+/// overwrite strands a shadowed record until a merge reclaims it.
+///
+/// A check after four flushes keeps reclaimable bytes from accumulating far
+/// beyond one bounded pass. A check may find that every new record is live, in
+/// which case rewriting it would reclaim nothing and the debt is discharged
+/// without touching object storage.
+const COMPACT_TRIGGER_FULL_FLUSHES: usize = COMPACTION_INPUT_FLUSHES as usize;
 
 /// How many timer passes may elapse before small segments are compacted.
 ///
@@ -89,6 +92,28 @@ const COMPACT_TRIGGER_TIMER_FLUSHES: usize = 120;
 /// The bookkeeping cost charged to the flush trigger per entry, on top of the
 /// key and value bytes. An estimate is all a trigger needs.
 const ENTRY_OVERHEAD_BYTES: u64 = 64;
+
+/// How many flushes' worth of segment one compaction pass merges.
+///
+/// Named separately so the trigger cadence and per-pass budget describe the
+/// same unit. A pass may read less because it selects only segments with bytes
+/// to reclaim, and leaves its trigger armed when more candidates remain.
+const COMPACTION_INPUT_FLUSHES: u64 = 4;
+
+/// How many bytes of segment a single compaction pass will read and rewrite.
+///
+/// Four flushes' worth. Compaction used to merge the whole partition, which
+/// made its cost grow with the partition rather than with what had accumulated
+/// since the last pass: measured, a 140 MiB partition stalled writes for 805ms
+/// and dropped throughput to 47 ops/s, and it only got worse as the partition
+/// grew. Bounding the input keeps that cost flat.
+///
+/// Larger reclaims more per pass and stalls longer; smaller does the opposite
+/// and leaves more segments live, which costs nothing on the read path because
+/// an exact index consults exactly one segment however many there are. Four
+/// flushes is small enough that a pass is short and large enough that a pass is
+/// worth taking the lock for. See issue #143.
+const COMPACTION_INPUT_BYTES: u64 = COMPACTION_INPUT_FLUSHES * FLUSH_TRIGGER_BYTES;
 
 /// How long the orphan sweep leaves an unreferenced object alone before it is a
 /// deletion candidate.
@@ -347,6 +372,17 @@ struct State {
     full_flushes_since_compaction: usize,
     /// Timer passes since the last merge of a non-empty partition.
     timer_flushes_since_compaction: usize,
+    /// Original segment names the current bounded expiry sweep has not read.
+    ///
+    /// Size-triggered compaction can identify stale segments from the index,
+    /// but expiry requires reading records. Names make the sweep cohort stable
+    /// while flushes and earlier bounded outputs append new segments between
+    /// passes; neither can extend the sweep or be mistaken for examined input.
+    compaction_sweep_pending: Vec<(Option<PartitionId>, String)>,
+    /// Timer credits the current sweep covered when its cohort was captured.
+    /// Flushes between passes add credits above this snapshot and must survive
+    /// cohort completion because their segments were not swept.
+    compaction_sweep_timer_debt: usize,
     /// Memtable size at the last replica manifest refresh attempt.
     reclaim_attempted_at_bytes: u64,
 }
@@ -381,6 +417,13 @@ pub struct Partition<R: Runtime> {
     /// the children exist sees it and stands down, while one that ran before
     /// touched only segments no child had yet referenced.
     maintenance_frozen: std::sync::atomic::AtomicBool,
+    /// How many bytes of segment one compaction pass reads and rewrites.
+    ///
+    /// A field rather than the constant directly so a test can set a bound it
+    /// can actually reach. Exercising the bounded path against the production
+    /// value would mean writing tens of megabytes per test, and a bound that is
+    /// only ever tested at "merges everything" is not tested at all.
+    compaction_input_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl<R: Runtime> Partition<R> {
@@ -413,6 +456,8 @@ impl<R: Runtime> Partition<R> {
             index_bytes: 0,
             full_flushes_since_compaction: 0,
             timer_flushes_since_compaction: 0,
+            compaction_sweep_pending: Vec::new(),
+            compaction_sweep_timer_debt: 0,
             reclaim_attempted_at_bytes: 0,
         };
         if let Some(snapshot) = Snapshot::open(Arc::clone(&store), path.clone())
@@ -430,6 +475,7 @@ impl<R: Runtime> Partition<R> {
             writer,
             state: tokio::sync::RwLock::new(state),
             maintenance_frozen: std::sync::atomic::AtomicBool::new(false),
+            compaction_input_bytes: std::sync::atomic::AtomicU64::new(COMPACTION_INPUT_BYTES),
         })
     }
 
@@ -803,13 +849,10 @@ impl<R: Runtime> Partition<R> {
         if !state.segments.is_empty() {
             state.timer_flushes_since_compaction += 1;
         }
-        self.flush_locked(&mut state, false).await?;
-        if !state.segments.is_empty()
-            && state.timer_flushes_since_compaction >= COMPACT_TRIGGER_TIMER_FLUSHES
-        {
-            self.compact_locked(&mut state).await?;
-        }
-        Ok(())
+        // Compaction is no longer spilled out of a flush. Both triggers are
+        // counters now, and [`Partition::compact_if_needed`] is the one place
+        // that acts on them, so a flush costs a flush whoever asked for it.
+        self.flush_locked(&mut state, false).await
     }
 
     /// Flushes only when the mutable table has crossed the size trigger.
@@ -1086,6 +1129,49 @@ impl<R: Runtime> Partition<R> {
     /// hydrated in order to serve somebody claiming to own the partition has
     /// to be able to check that claim against it. See [`Hydration`].
     pub async fn hydrate(&self) -> Result<Hydration> {
+        // The manifest first, on its own. It is one small object, where opening
+        // a snapshot reads the footer and key index of every segment the
+        // manifest names -- bytes proportional to the partition's keys.
+        //
+        // That distinction is the whole point of doing this in two steps. A
+        // replica with a gap the bucket cannot close asks for a rebuild on
+        // *every* append it refuses, and the answer is almost always that
+        // nothing moved. Paying a full index rebuild to discover that turns one
+        // behind replica into a loop that saturates the node and the object
+        // store, and it does not stop when the writes do: measured at issue
+        // \#141 as three workers and MinIO all burning CPU on a completely idle
+        // cluster, with reads of the bucket and no writes to it.
+        //
+        // So the cheap read decides whether the expensive one is worth doing.
+        let Some((manifest, _)) = load_manifest(self.store.as_ref(), &self.path)
+            .await
+            .map_err(format_error)?
+        else {
+            // Never flushed, so there is nothing to download.
+            return Ok(self.hydration().await);
+        };
+
+        {
+            let mut state = self.state.write().await;
+            if manifest.committed_lamport <= state.flushed {
+                // Nothing to adopt but the epoch. A manifest can be republished
+                // by a newer owner without the horizon moving, most obviously by
+                // a compaction, and that manifest is no less proof of who owns
+                // this partition than one that added records. Taking it here
+                // rather than after a rebuild is what makes the common case one
+                // small GET.
+                state.flushed_epoch = state.flushed_epoch.max(manifest.epoch);
+                return Ok(Hydration {
+                    epoch: state.flushed_epoch,
+                    through: state.flushed,
+                });
+            }
+        }
+
+        // The manifest is genuinely ahead, so the rebuild is worth its cost.
+        // Re-read rather than building from the manifest just fetched: between
+        // the two reads the bucket can move again, and a snapshot is the thing
+        // that resolves segments and their shared sources consistently.
         let Some(snapshot) = Snapshot::open(Arc::clone(&self.store), self.path.clone())
             .await
             .map_err(format_error)?
@@ -1094,10 +1180,6 @@ impl<R: Runtime> Partition<R> {
         };
         let mut state = self.state.write().await;
         if snapshot.committed_lamport() <= state.flushed {
-            // Still adopt the epoch. A manifest can be republished by a newer
-            // owner without the horizon moving, most obviously by a
-            // compaction, and that manifest is no less proof of who owns this
-            // partition than one that added records.
             state.flushed_epoch = state.flushed_epoch.max(snapshot.manifest().epoch);
         } else {
             adopt(&mut state, &snapshot);
@@ -1122,8 +1204,8 @@ impl<R: Runtime> Partition<R> {
         }
     }
 
-    /// Merges every segment into one, which is what physically reclaims
-    /// expired records, aged tombstones, and shadowed versions.
+    /// Runs one bounded sweep, which physically reclaims expired records,
+    /// aged tombstones, and shadowed versions from the selected segments.
     ///
     /// Reclamation otherwise waits for the full-flush trigger, and the
     /// product promises "eventually" rather than a bound. This exists so an
@@ -1141,7 +1223,7 @@ impl<R: Runtime> Partition<R> {
             return Ok(());
         }
         self.flush_locked(&mut state, false).await?;
-        self.compact_locked(&mut state).await
+        self.compact_locked(&mut state, true).await.map(|_| ())
     }
 
     /// Reclaims objects this partition no longer references and is safely done
@@ -1420,39 +1502,154 @@ impl<R: Runtime> Partition<R> {
             state.full_flushes_since_compaction += 1;
         }
 
-        // The flush's own promise, meaning the horizon advance, has already
-        // held by here; compaction is space reclamation on top of it. A
-        // failed compaction therefore does not fail the flush: the segments
-        // stay as they are and the next flush crosses the threshold again.
-        if state.full_flushes_since_compaction >= COMPACT_TRIGGER_FULL_FLUSHES {
-            if let Err(error) = self.compact_locked(state).await {
-                tracing::warn!(
-                    %error,
-                    segments = state.segments.len(),
-                    "compaction failed; the segments stand until the next trigger"
-                );
+        // Compaction used to run here, from inside whichever client write
+        // crossed the flush trigger. It rewrites the whole partition, so that
+        // put a stall proportional to the partition's size on one unlucky
+        // request: measured at issue \#143 as p99 spikes to 1.26s and
+        // throughput swinging between 47 and 2406 ops/s at a fixed
+        // concurrency, purely on where the trigger happened to land.
+        //
+        // The counter still moves here, because a flush is what makes
+        // compaction worth doing. Deciding to act on it belongs to
+        // [`Partition::compact_if_needed`], which the host calls on its own
+        // cadence.
+        Ok(())
+    }
+
+    /// Compacts if enough has been flushed since the last one to make it worth
+    /// the work, and does nothing otherwise.
+    ///
+    /// The counterpart to [`Partition::flush_if_needed`]: one pass, no timer,
+    /// no task. The host owns the cadence, which is what keeps a simulated run
+    /// able to drive maintenance a step at a time rather than racing a timer
+    /// this crate started for itself.
+    ///
+    /// This does not make compaction cheap, only unscheduled by a client. The
+    /// merge still takes the partition's write lock for its duration, so a
+    /// large partition still stalls writes while it runs -- it just no longer
+    /// happens inside a request. Bounding the work per merge is issue \#143 and
+    /// is what actually shortens the stall.
+    pub async fn compact_if_needed(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        if self.is_maintenance_frozen() {
+            return Ok(());
+        }
+        let full_due = state.full_flushes_since_compaction >= COMPACT_TRIGGER_FULL_FLUSHES;
+        let timer_due = state.timer_flushes_since_compaction >= COMPACT_TRIGGER_TIMER_FLUSHES;
+        let sweep_pending = !state.compaction_sweep_pending.is_empty();
+        if !full_due && !timer_due && !sweep_pending {
+            return Ok(());
+        }
+        let sweep = timer_due || sweep_pending;
+        let more = self.compact_locked(&mut state, sweep).await?;
+        if more {
+            if timer_due {
+                state.timer_flushes_since_compaction = state
+                    .timer_flushes_since_compaction
+                    .max(COMPACT_TRIGGER_TIMER_FLUSHES);
+            } else if !sweep {
+                state.full_flushes_since_compaction = state
+                    .full_flushes_since_compaction
+                    .max(COMPACT_TRIGGER_FULL_FLUSHES);
             }
         }
         Ok(())
     }
 
-    async fn compact_locked(&self, state: &mut State) -> Result<()> {
+    /// Runs one bounded unit. A sweep examines every segment in turn for
+    /// expiry; an ordinary pass reads only segments the index proves contain
+    /// records shadowed by retained segments.
+    async fn compact_locked(&self, state: &mut State, sweep: bool) -> Result<bool> {
         if state.segments.is_empty() {
-            return Ok(());
+            state.full_flushes_since_compaction = 0;
+            state.timer_flushes_since_compaction = 0;
+            state.compaction_sweep_pending.clear();
+            state.compaction_sweep_timer_debt = 0;
+            return Ok(false);
         }
         let now = self.now_millis();
 
-        // This materializes the whole partition in memory and runs under the
-        // write lock, possibly from inside the client write that crossed the
-        // flush trigger. With the current constants that is a bounded but
-        // real stall, and it grows with partition size until the split
-        // threshold caps it. The crate's no-background-tasks posture is
-        // deliberate, so a streaming merge, or handing the schedule to the
-        // host, is the known follow-up rather than an accident.
+        if sweep && state.compaction_sweep_pending.is_empty() {
+            state.compaction_sweep_timer_debt = state.timer_flushes_since_compaction;
+            state.compaction_sweep_pending = state
+                .segments
+                .iter()
+                .map(|entry| (entry.source, entry.name.clone()))
+                .collect();
+        }
 
-        let mut inputs = Vec::with_capacity(state.segments.len());
+        let mut winner_counts = vec![0u64; state.segments.len()];
+        for loc in state.index.values() {
+            winner_counts[loc.segment] += 1;
+        }
+        let reclaimable: Vec<usize> = state
+            .segments
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| {
+                (entry.source.is_some() || winner_counts[position] < entry.record_count)
+                    .then_some(position)
+            })
+            .collect();
+        let candidates: Vec<usize> = if sweep {
+            state
+                .segments
+                .iter()
+                .enumerate()
+                .filter_map(|(position, entry)| {
+                    state
+                        .compaction_sweep_pending
+                        .iter()
+                        .any(|(source, name)| *source == entry.source && name == &entry.name)
+                        .then_some(position)
+                })
+                .collect()
+        } else {
+            reclaimable
+        };
+        let candidate_count = candidates.len();
+
+        // The first object is allowed to exceed the target because historical
+        // and shared segments can already be oversized. Every later admission
+        // respects it, so a pass never combines that object with more input.
+        let mut selected = Vec::new();
+        let mut input_bytes = 0u64;
+        for position in candidates {
+            let bytes = state.segments[position].bytes;
+            if !selected.is_empty() && input_bytes + bytes > self.compaction_input_bytes() {
+                break;
+            }
+            input_bytes += bytes;
+            selected.push(position);
+        }
+        let more = selected.len() < candidate_count;
+        if selected.is_empty() {
+            state.full_flushes_since_compaction = 0;
+            if sweep {
+                state.timer_flushes_since_compaction = 0;
+                state.compaction_sweep_pending.clear();
+                state.compaction_sweep_timer_debt = 0;
+            }
+            return Ok(false);
+        }
+
+        let mut selected_positions = vec![false; state.segments.len()];
+        for &position in &selected {
+            selected_positions[position] = true;
+        }
+        let retained: Vec<SegmentEntry> = state
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| !selected_positions[*position])
+            .map(|(_, entry)| entry.clone())
+            .collect();
+
+        let mut inputs = Vec::with_capacity(selected.len());
+        let mut external_sources: BTreeMap<(Bytes, Lamport), PartitionId> = BTreeMap::new();
         let mut relocated_values: BTreeMap<(PartitionId, String), ExternalValue> = BTreeMap::new();
-        for entry in &state.segments {
+        for &position in &selected {
+            let entry = &state.segments[position];
             // A shared segment is read from the source partition's directory.
             // Compaction merges it into a new self-written segment, which is
             // how a child eventually stops sharing the parent's objects.
@@ -1462,43 +1659,31 @@ impl<R: Runtime> Partition<R> {
                 .await
                 .map_err(store_error)?;
             let segment = Segment::decode(&bytes).map_err(format_error)?;
-            let mut records = segment.records().to_vec();
+            let records = segment.records().to_vec();
             if let Some(source) = entry.source {
-                for record in &mut records {
-                    let RecordValue::External(external) = &record.value else {
-                        continue;
-                    };
-                    let source_key = (source, external.name.clone());
-                    let relocated = match relocated_values.get(&source_key) {
-                        Some(relocated) => relocated.clone(),
-                        None => {
-                            let value_key = self.path.for_partition(source).object(&external.name);
-                            let (value, _) =
-                                self.store.get(&value_key).await.map_err(store_error)?;
-                            if value.len() as u64 != external.length
-                                || crc32c::crc32c(&value) != external.crc32c
-                            {
-                                return Err(Error::Internal(format!(
-                                    "external value {} does not match its record",
-                                    external.name
-                                )));
-                            }
-                            let relocated =
-                                self.writer.put_value(value).await.map_err(format_error)?;
-                            relocated_values.insert(source_key, relocated.clone());
-                            relocated
-                        }
-                    };
-                    record.value = RecordValue::External(relocated);
+                for record in &records {
+                    if matches!(record.value, RecordValue::External(_)) {
+                        external_sources.insert((record.key.clone(), record.lamport), source);
+                    }
                 }
             }
             inputs.push(records);
         }
-        // A whole-partition merge, whose tombstone rule is time-based: an
-        // unexpired tombstone still answers a retrying deleter, so it
-        // survives until its retention passes and the expiry rule reclaims
-        // it on schedule.
-        let mut merged = compact::merge_all(&inputs, now).map_err(format_error)?;
+        // Keeps anything whose removal could uncover an older record in a
+        // segment this pass is leaving behind, and otherwise keeps every
+        // unexpired tombstone so a retrying deleter still gets an answer. With
+        // nothing retained it is the whole-partition rule.
+        let mut merged = compact::merge_bounded(&inputs, now, &retained).map_err(format_error)?;
+        // Let the format merge inspect every selected record first, including
+        // duplicate losing Lamports that indicate corruption. Only then use
+        // the exact index to discard a selected winner superseded by a segment
+        // this pass retains.
+        merged.retain(|record| {
+            state
+                .index
+                .get(&record.key)
+                .is_some_and(|loc| selected_positions[loc.segment])
+        });
         // A shared segment physically holds keys on both sides of a split
         // boundary, so a child compacting one must keep only the keys it owns;
         // writing the rest would put keys outside its range into its own
@@ -1506,6 +1691,41 @@ impl<R: Runtime> Partition<R> {
         // that shares nothing this is a no-op, since its records are all in
         // range already. See ADR 0009.
         merged.retain(|record| self.range.contains(&record.key));
+        // Relocate only shared external values that survived validation,
+        // winner selection, expiry, and range filtering. A shared parent may
+        // hold large values for both children, and copying irrelevant values
+        // would make a segment-byte-bounded pass perform unbounded blob I/O.
+        for record in &mut merged {
+            let RecordValue::External(external) = &record.value else {
+                continue;
+            };
+            let Some(source) = external_sources
+                .get(&(record.key.clone(), record.lamport))
+                .copied()
+            else {
+                continue;
+            };
+            let source_key = (source, external.name.clone());
+            let relocated = match relocated_values.get(&source_key) {
+                Some(relocated) => relocated.clone(),
+                None => {
+                    let value_key = self.path.for_partition(source).object(&external.name);
+                    let (value, _) = self.store.get(&value_key).await.map_err(store_error)?;
+                    if value.len() as u64 != external.length
+                        || crc32c::crc32c(&value) != external.crc32c
+                    {
+                        return Err(Error::Internal(format!(
+                            "external value {} does not match its record",
+                            external.name
+                        )));
+                    }
+                    let relocated = self.writer.put_value(value).await.map_err(format_error)?;
+                    relocated_values.insert(source_key, relocated.clone());
+                    relocated
+                }
+            };
+            record.value = RecordValue::External(relocated);
+        }
 
         // Only self-written segments are ours to delete after the swap. A
         // shared reference's object lives under another partition's directory
@@ -1513,12 +1733,20 @@ impl<R: Runtime> Partition<R> {
         // the reference from this manifest but never deletes the object; the
         // cross-partition-aware orphan sweep reclaims it once no live manifest
         // names it. See ADR 0009.
-        let replaced: Vec<String> = state
-            .segments
+        let selected_identities: Vec<(Option<PartitionId>, String)> = selected
             .iter()
+            .map(|&position| {
+                let entry = &state.segments[position];
+                (entry.source, entry.name.clone())
+            })
+            .collect();
+        let replaced: Vec<String> = selected
+            .iter()
+            .map(|&position| &state.segments[position])
             .filter(|e| e.source.is_none())
             .map(|e| e.name.clone())
             .collect();
+        let output_position = retained.len();
         let (segments, index) = if merged.is_empty() {
             (Vec::new(), BTreeMap::new())
         } else {
@@ -1542,7 +1770,7 @@ impl<R: Runtime> Partition<R> {
                 index.insert(
                     entry.key.clone(),
                     Loc {
-                        segment: 0,
+                        segment: output_position,
                         offset: entry.offset,
                         record_length: entry.record_length,
                     },
@@ -1551,17 +1779,56 @@ impl<R: Runtime> Partition<R> {
             (vec![published], index)
         };
 
+        // A compacted output is new work, not the oldest input again. Putting
+        // it after retained entries prevents the next bounded pass from
+        // feeding the previous output straight back into itself.
+        let mut plan_segments = retained;
+        plan_segments.extend(segments);
+
+        // Rebuilt from the old index rather than from the segments, because
+        // reading the retained ones back is the cost this change exists to
+        // avoid. A key whose winner was in the merged set is relocated to the
+        // new segment, or dropped if the merge reclaimed it; every other key
+        // keeps its record and only moves position.
+        let mut remapped: BTreeMap<Bytes, Loc> = BTreeMap::new();
+        let mut retained_positions = vec![None; state.segments.len()];
+        let mut next_position = 0usize;
+        for (position, was_selected) in selected_positions.iter().enumerate() {
+            if !was_selected {
+                retained_positions[position] = Some(next_position);
+                next_position += 1;
+            }
+        }
+        for (key, loc) in &state.index {
+            if selected_positions[loc.segment] {
+                if let Some(found) = index.get(key) {
+                    remapped.insert(key.clone(), *found);
+                }
+            } else {
+                remapped.insert(
+                    key.clone(),
+                    Loc {
+                        segment: retained_positions[loc.segment]
+                            .expect("an unselected segment has a retained position"),
+                        offset: loc.offset,
+                        record_length: loc.record_length,
+                    },
+                );
+            }
+        }
+        let index = remapped;
+
         // Compaction republishes the same logical state, so the horizon must
         // not move: the log above it still has to replay after a crash.
         let flushed = state.flushed;
         let range = self.range.clone();
-        let plan_segments = segments.clone();
+        let committed_segments = plan_segments.clone();
         let manifest = self
             .writer
             .commit(|_| CommitPlan {
                 committed_lamport: flushed,
                 range: range.clone(),
-                segments: plan_segments.clone(),
+                segments: committed_segments.clone(),
             })
             .await
             .map_err(format_error)?;
@@ -1569,8 +1836,20 @@ impl<R: Runtime> Partition<R> {
         state.segments = manifest.segments;
         state.index = index;
         state.index_bytes = index_cost(&state.index);
-        state.full_flushes_since_compaction = 0;
-        state.timer_flushes_since_compaction = 0;
+        if !sweep {
+            state.full_flushes_since_compaction = 0;
+        }
+        if sweep {
+            state
+                .compaction_sweep_pending
+                .retain(|identity| !selected_identities.contains(identity));
+            if state.compaction_sweep_pending.is_empty() {
+                state.timer_flushes_since_compaction = state
+                    .timer_flushes_since_compaction
+                    .saturating_sub(state.compaction_sweep_timer_debt);
+                state.compaction_sweep_timer_debt = 0;
+            }
+        }
 
         // These deletes are why compaction is frozen during a split. The
         // replaced objects are unreferenced by *this* manifest the moment it
@@ -1587,7 +1866,20 @@ impl<R: Runtime> Partition<R> {
         for name in replaced {
             let _ = self.store.delete(&self.path.object(&name)).await;
         }
-        Ok(())
+        Ok(more)
+    }
+
+    fn compaction_input_bytes(&self) -> u64 {
+        self.compaction_input_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Shrinks the compaction unit so a test can reach the bounded path
+    /// without writing tens of megabytes.
+    #[cfg(test)]
+    pub(crate) fn set_compaction_input_bytes(&self, bytes: u64) {
+        self.compaction_input_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Where the merged scan should start, or `None` if this page is
@@ -1616,6 +1908,31 @@ impl<R: Runtime> Partition<R> {
     #[cfg(test)]
     pub(crate) async fn segment_count(&self) -> usize {
         self.state.read().await.segments.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn segment_entries(&self) -> Vec<SegmentEntry> {
+        self.state.read().await.segments.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn arm_full_compaction(&self) {
+        self.state.write().await.full_flushes_since_compaction = COMPACT_TRIGGER_FULL_FLUSHES;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn arm_timer_compaction(&self) {
+        self.state.write().await.timer_flushes_since_compaction = COMPACT_TRIGGER_TIMER_FLUSHES;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn timer_compaction_is_due(&self) -> bool {
+        self.state.read().await.timer_flushes_since_compaction >= COMPACT_TRIGGER_TIMER_FLUSHES
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn timer_flushes_since_compaction(&self) -> usize {
+        self.state.read().await.timer_flushes_since_compaction
     }
 
     #[cfg(test)]
@@ -1691,6 +2008,8 @@ fn adopt<S: ObjectStore + ?Sized>(state: &mut State, snapshot: &Snapshot<S>) {
     // just discarded would be the stalest possible answer about it.
     state.index_bytes = index_cost(&state.index);
     state.segments = snapshot.manifest().segments.clone();
+    state.compaction_sweep_pending.clear();
+    state.compaction_sweep_timer_debt = 0;
     state.flushed = horizon;
     if state.committed < horizon {
         state.committed = horizon;
@@ -1807,6 +2126,179 @@ mod tests {
                 .await
                 .expect("write a letter");
         }
+    }
+
+    /// Writes `keys`, then flushes, producing one segment.
+    async fn write_and_flush(owner: &crate::testing::Owner, keys: &[String]) {
+        for k in keys {
+            owner
+                .put(
+                    k.as_bytes(),
+                    bytes(&format!("v-{k}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .expect("write");
+        }
+        owner.flush().await.expect("flush");
+    }
+
+    #[tokio::test]
+    async fn repeated_full_flush_checks_do_not_rewrite_fully_live_segments() {
+        let owner = owner().await;
+        for cycle in 0..3 {
+            for segment in 0..COMPACTION_INPUT_FLUSHES {
+                write_and_flush(&owner, &[format!("cycle-{cycle}-segment-{segment}")]).await;
+            }
+            let before = owner.segment_entries().await;
+            owner.arm_full_compaction().await;
+
+            owner.compact_if_needed().await.expect("compact check");
+
+            assert_eq!(
+                owner.segment_entries().await,
+                before,
+                "compaction exists to reclaim stale records, not combine fully live segments"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_bounded_pass_does_not_clear_unprocessed_compaction_debt() {
+        let owner = owner().await;
+        for version in 0..=COMPACTION_INPUT_FLUSHES {
+            owner
+                .put(
+                    b"key",
+                    bytes(&format!("v{version}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .expect("overwrite");
+            owner.flush().await.expect("flush");
+        }
+        owner.set_compaction_input_bytes(1);
+        owner.arm_full_compaction().await;
+
+        for expected in (1..=COMPACTION_INPUT_FLUSHES as usize).rev() {
+            owner.compact_if_needed().await.expect("bounded compaction");
+            assert_eq!(owner.segment_count().await, expected);
+        }
+
+        assert_eq!(
+            owner
+                .get(b"key")
+                .await
+                .expect("read")
+                .map(|record| record.value),
+            Some(bytes(&format!("v{COMPACTION_INPUT_FLUSHES}")))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_timer_sweep_does_not_chase_its_own_outputs() {
+        let owner = owner().await;
+        for segment in 0..6 {
+            write_and_flush(&owner, &[format!("unique-{segment}")]).await;
+        }
+        let entries = owner.segment_entries().await;
+        owner.set_compaction_input_bytes(entries[0].bytes + entries[1].bytes);
+        owner.arm_timer_compaction().await;
+
+        owner.compact_if_needed().await.expect("first timer pass");
+        write_and_flush(&owner, &["arrived-mid-sweep".to_owned()]).await;
+        let late_segment = owner
+            .segment_entries()
+            .await
+            .last()
+            .expect("late segment")
+            .name
+            .clone();
+
+        let mut passes = 1;
+        while owner.timer_compaction_is_due().await {
+            owner.compact_if_needed().await.expect("timer compaction");
+            passes += 1;
+            assert!(passes <= 3, "the sweep started consuming its own outputs");
+        }
+
+        assert_eq!(passes, 3, "six inputs should drain as three bounded pairs");
+        let after = owner.segment_entries().await;
+        assert!(after.iter().any(|entry| entry.name == late_segment));
+        assert_eq!(
+            owner.timer_flushes_since_compaction().await,
+            1,
+            "the flush arriving mid-sweep must remain as future timer debt"
+        );
+        owner
+            .compact_if_needed()
+            .await
+            .expect("idle compaction check");
+        assert_eq!(owner.segment_entries().await, after);
+    }
+
+    #[tokio::test]
+    async fn a_bounded_compaction_loses_nothing_it_did_not_merge() {
+        // The risk in merging part of a partition is the bookkeeping: the
+        // records that were not merged keep their segments, and those segments
+        // move position. An index that is not remapped points at the wrong
+        // object and reads the wrong bytes, or nothing.
+        let owner = owner().await;
+        let groups: Vec<Vec<String>> = alphabet().chunks(5).map(<[String]>::to_vec).collect();
+        for group in &groups {
+            write_and_flush(&owner, group).await;
+        }
+
+        owner.set_compaction_input_bytes(1);
+        // Repeatedly, because each pass moves every retained segment again and
+        // a remap that is wrong by one only shows up once it has been applied
+        // more than once.
+        for _ in 0..4 {
+            owner.compact().await.expect("compact");
+        }
+
+        for k in alphabet() {
+            let got = owner.get(k.as_bytes()).await.expect("read");
+            assert_eq!(
+                got.map(|r| r.value),
+                Some(bytes(&format!("v-{k}"))),
+                "{k} did not survive a bounded compaction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bounded_compaction_keeps_the_newest_record_for_an_overwritten_key() {
+        // An overwrite leaves the old record in an older segment and the new
+        // one in a newer segment. A pass that merges the old segment must not
+        // let the value it resurrects win, and the index must still point at
+        // the newer record afterwards.
+        let owner = owner().await;
+        write_and_flush(&owner, &["k".to_owned()]).await;
+        for round in 1..=4u32 {
+            owner
+                .put(
+                    b"k",
+                    bytes(&format!("v{round}")),
+                    None,
+                    WriteCondition::None,
+                )
+                .await
+                .expect("overwrite");
+            owner.flush().await.expect("flush");
+        }
+
+        owner.set_compaction_input_bytes(1);
+        owner.compact().await.expect("compact");
+
+        let got = owner.get(b"k").await.expect("read");
+        assert_eq!(
+            got.map(|r| r.value),
+            Some(bytes("v4")),
+            "the newest write must survive a pass that merged the oldest segments"
+        );
     }
 
     fn child_prefix(id: u64) -> String {
@@ -3926,6 +4418,15 @@ mod tests {
         for _ in 0..COMPACT_TRIGGER_TIMER_FLUSHES {
             p.flush().await.unwrap();
         }
+        // The flushes arm the trigger; the host's maintenance pass is what acts
+        // on it. Compaction no longer spills out of a flush, so a test that
+        // only flushed would be asserting the coupling this change removed
+        // rather than the reclamation it is about.
+        assert!(
+            p.stored_entry(b"expired").await.unwrap().is_some(),
+            "flushing alone must not compact, or a client write would pay for it"
+        );
+        p.compact_if_needed().await.unwrap();
 
         assert_eq!(
             p.stored_entry(b"expired").await.unwrap(),
@@ -4242,6 +4743,58 @@ mod tests {
         assert!(
             owner.get(b"b").await.unwrap().is_some(),
             "the unflushed write is still there"
+        );
+    }
+
+    // The loop behind issue #141. A replica with a gap the bucket cannot close
+    // asks for a rebuild on every append it refuses, and the answer is almost
+    // always that nothing moved. Rebuilding to discover that reads the footer
+    // and key index of every segment, so one behind replica saturates itself
+    // and the object store, and it does not stop when the writes do.
+    //
+    // Asserting on reads rather than on the horizon, because a hydrate that
+    // rebuilt and one that did not return the same value. The cost is the
+    // behaviour.
+    #[tokio::test]
+    async fn hydrating_against_an_unchanged_manifest_does_not_rebuild_the_index() {
+        let (owner, replica, store) = crate::testing::counting_partition_pair().await;
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("a"), bytes("v"), None))
+            .await
+            .unwrap();
+        owner.flush().await.unwrap();
+
+        // First hydrate: the manifest is ahead of a partition that has adopted
+        // nothing, so a rebuild is the correct, expensive answer.
+        store.reset();
+        let first = replica.hydrate().await.unwrap();
+        assert_eq!(first.through, Lamport(1));
+        assert!(
+            store.segment_reads() > 0,
+            "a manifest genuinely ahead has to be read into the index"
+        );
+
+        // Second and third, with nothing republished. This is the state a
+        // gapped replica is in on every refused append.
+        store.reset();
+        for _ in 0..2 {
+            assert_eq!(
+                replica.hydrate().await.unwrap(),
+                first,
+                "the horizon is unchanged, which is why the cost is invisible \
+                 from the return value"
+            );
+        }
+        assert_eq!(
+            store.segment_reads(),
+            0,
+            "an unchanged manifest must not cost an index rebuild"
+        );
+        assert_eq!(
+            store.manifest_reads(),
+            2,
+            "one small read each, which is what decides the expensive one is \
+             not worth doing"
         );
     }
 }

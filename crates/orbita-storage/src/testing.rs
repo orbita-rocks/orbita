@@ -15,13 +15,14 @@ use orbita_core::{
 };
 use orbita_format::testing::MemoryStore;
 use orbita_format::PartitionPath;
+use orbita_objectstore::{ETag, ObjectMeta, ObjectResult, ObjectStore, Precondition};
 use orbita_runtime::{
     Clock, Disk, DiskError, File, OpenOptions, PeerCall, PeerHandler, Rng, Runtime, SeededRng,
     ServiceId, Transport, TransportError,
 };
 use std::future::Future;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -504,4 +505,120 @@ async fn open_partition(range: KeyRange, clock: ManualClock) -> (TempPartition, 
         },
         clock,
     )
+}
+
+/// An object store that counts what was read, so a test can assert on the cost
+/// of an operation rather than only on its result.
+///
+/// Hydration is the case this exists for. Reading the manifest is one small
+/// object; opening a snapshot reads the footer and key index of every segment
+/// the manifest names. Those are different enough in cost that "did it rebuild"
+/// is a behaviour worth pinning, and it is invisible from the return value --
+/// a hydrate that rebuilt and one that did not report the same horizon.
+#[derive(Debug)]
+pub(crate) struct CountingStore {
+    inner: MemoryStore,
+    manifest_reads: AtomicUsize,
+    segment_reads: AtomicUsize,
+}
+
+impl CountingStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            manifest_reads: AtomicUsize::new(0),
+            segment_reads: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many times the manifest object itself has been fetched.
+    pub(crate) fn manifest_reads(&self) -> usize {
+        self.manifest_reads.load(Ordering::Relaxed)
+    }
+
+    /// How many segment reads have happened, whole or ranged. Any of these
+    /// means a snapshot was built.
+    pub(crate) fn segment_reads(&self) -> usize {
+        self.segment_reads.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reset(&self) {
+        self.manifest_reads.store(0, Ordering::Relaxed);
+        self.segment_reads.store(0, Ordering::Relaxed);
+    }
+
+    fn note(&self, key: &str) {
+        if key.ends_with("manifest.json") {
+            self.manifest_reads.fetch_add(1, Ordering::Relaxed);
+        } else if key.contains("/segments/") {
+            self.segment_reads.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CountingStore {
+    async fn put(&self, key: &str, data: Bytes) -> ObjectResult<ETag> {
+        self.inner.put(key, data).await
+    }
+
+    async fn put_if(&self, key: &str, data: Bytes, condition: Precondition) -> ObjectResult<ETag> {
+        self.inner.put_if(key, data, condition).await
+    }
+
+    async fn get(&self, key: &str) -> ObjectResult<(Bytes, ETag)> {
+        self.note(key);
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> ObjectResult<Bytes> {
+        self.note(key);
+        self.inner.get_range(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> ObjectResult<ObjectMeta> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> ObjectResult<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> ObjectResult<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// An owner and a second reader over one [`CountingStore`], so a test can
+/// assert what hydration actually read.
+///
+/// Returns the store as well, because the assertion is on its counters rather
+/// than on either partition.
+pub(crate) async fn counting_partition_pair() -> (
+    crate::Partition<TestRuntime>,
+    crate::Partition<TestRuntime>,
+    Arc<CountingStore>,
+) {
+    let clock = ManualClock::default();
+    let store = Arc::new(CountingStore::new());
+    let runtime = TestRuntime {
+        clock,
+        disk: NoDisk,
+        transport: NoTransport,
+        rng: SharedRng(Arc::new(SeededRng::new(0))),
+    };
+    let range = KeyRange::unbounded();
+    let owner = crate::Partition::open(
+        runtime.clone(),
+        store.clone(),
+        partition_path(),
+        Epoch(1),
+        range.clone(),
+    )
+    .await
+    .expect("opening the owner");
+    let reader = crate::Partition::open(runtime, store.clone(), partition_path(), Epoch(1), range)
+        .await
+        .expect("opening the reader");
+    (owner, reader, store)
 }
