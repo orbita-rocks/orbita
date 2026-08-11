@@ -25,10 +25,16 @@
 //! wins, and the storage engine would silently drop the one that arrived with
 //! the lower Lamport second.
 //!
-//! That is why the future returned by `Wal::commit` is polled once while the
-//! lock is held. The first poll is what reserves the Lamport; everything after
-//! it is the fsync and the round trip to the replicas, which happens after the
-//! lock is gone.
+//! That is why `Wal::submit` is called while the lock is held. It assigns the
+//! Lamport and queues the entry without awaiting anything, so a caller cannot
+//! be cancelled part way through submitting; the fsync and the round trip to
+//! the replicas happen afterwards, on tasks that outlive the request.
+//!
+//! The applier is handed its work at that same moment rather than when the
+//! commit resolves, so a request that goes away loses only its answer. Which
+//! of the two resolves the overlay is settled by a claim channel: the request
+//! does it before acknowledging, because a client that reads its own write has
+//! to find it, and the applier does it only if the request never arrived.
 //!
 //! The overlay carries a third state the ADR did not have to name: a write
 //! that has been submitted and has not yet been told its Lamport. Nothing
@@ -56,10 +62,7 @@ use orbita_storage::{
 use orbita_wal::{CatchUpPass, Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
 use std::collections::{HashSet, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
-use std::task::Poll;
 use std::time::Duration;
 
 /// How long a scan waits for acknowledged writes to reach the storage engine.
@@ -1125,16 +1128,43 @@ impl<R: Runtime> PartitionHost<R> {
         // and never applied, and the owner served the value underneath its own
         // committed prefix. Reserving the slot in submission order is what
         // makes the applier apply in Lamport order.
+        let record = pending_record_of(&op, lamport, now);
+        let (claimed, claim) = tokio::sync::oneshot::channel();
         let _ = self.applies.send(ApplyWork {
-            ticket,
+            ticket: ticket.clone(),
             lamport,
-            record: pending_record_of(&op, lamport, now),
+            record: record.clone(),
             mutation: mutation_of_op(lamport, &key, &wal_op),
+            claim,
         });
         drop(guard);
 
         // Only the waiting is this request's.
         let outcome = wal.wait_for(lamport).await;
+
+        // Resolved here, before the client is told anything, because a client
+        // that reads its own write has to find it. Leaving this to the applier
+        // means the acknowledgement can beat the overlay and the write is
+        // briefly invisible. The applier is told it is done so that it applies
+        // and does not resolve a second time.
+        match &outcome {
+            Ok(_) => {
+                self.pending
+                    .lock()
+                    .expect("pending set poisoned")
+                    .resolve(&ticket, lamport, record);
+            }
+            Err(_) => {
+                self.pending
+                    .lock()
+                    .expect("pending set poisoned")
+                    .abandon(&ticket);
+            }
+        }
+        // The key has a version again, so anyone who parked on it can now be
+        // told the truth about it.
+        self.settled.notify_waiters();
+        let _ = claimed.send(());
         // The write is durable at quorum by here, so its Lamport is in the
         // committed prefix a split would capture: releasing the admission guard
         // now still keeps a concurrent quiesce from capturing a horizon below
@@ -1728,6 +1758,22 @@ struct ApplyWork {
     lamport: Lamport,
     record: PendingRecord,
     mutation: Mutation,
+    /// Whether the request resolved the overlay itself.
+    ///
+    /// Exactly one of the two resolves, and this is how they agree on which.
+    /// A value means the request did it and the applier only has to apply. A
+    /// closed channel means the request went away and the applier resolves
+    /// before applying.
+    ///
+    /// Both halves are needed. Resolving on the request is what keeps an
+    /// acknowledged write visible: the overlay has to hold the record before
+    /// the client is told, or a read that follows its own write misses it.
+    /// Resolving on the applier is what keeps a cancelled request from
+    /// stranding the ticket, which leaves `unapplied` above zero and stalls
+    /// `quiesce`. Neither resolves twice, so nothing here has to be
+    /// idempotent — which matters, because `abandon` could not be made so
+    /// without giving tickets an identity they do not have.
+    claim: tokio::sync::oneshot::Receiver<()>,
 }
 
 async fn apply_loop<R: Runtime>(
@@ -1754,28 +1800,35 @@ async fn apply_loop<R: Runtime>(
             None => true,
         };
 
-        let (Some(pending), Some(settled)) = (target.pending.upgrade(), target.settled.upgrade())
-        else {
-            return;
-        };
-        if committed {
-            pending.lock().expect("pending set poisoned").resolve(
-                &work.ticket,
-                work.lamport,
-                work.record,
-            );
-        } else {
-            // Nothing landed, so the key is back to whatever it was. A waiter
-            // parked on this write must be released to win rather than left
-            // losing to a write that never happened.
-            pending
-                .lock()
-                .expect("pending set poisoned")
-                .abandon(&work.ticket);
+        // Whoever is still here resolves. A value means the request did it
+        // already and this only has to apply; a closed channel means the
+        // request went away part way through and its ticket is this task's to
+        // settle, or `unapplied` never returns to zero and `quiesce` waits out
+        // its timeout.
+        let resolved_by_request = work.claim.await.is_ok();
+        if !resolved_by_request {
+            let (Some(pending), Some(settled)) =
+                (target.pending.upgrade(), target.settled.upgrade())
+            else {
+                return;
+            };
+            if committed {
+                pending.lock().expect("pending set poisoned").resolve(
+                    &work.ticket,
+                    work.lamport,
+                    work.record,
+                );
+            } else {
+                // Nothing landed, so the key is back to whatever it was. A
+                // waiter parked on this write must be released to win rather
+                // than left losing to a write that never happened.
+                pending
+                    .lock()
+                    .expect("pending set poisoned")
+                    .abandon(&work.ticket);
+            }
+            settled.notify_waiters();
         }
-        // The key has a version again, so anyone who parked on it can now be
-        // told the truth about it.
-        settled.notify_waiters();
         if !committed {
             continue;
         }
@@ -1846,22 +1899,6 @@ async fn flush_and_checkpoint<R: Runtime>(
         log.checkpoint(checkpoint).await?;
     }
     Ok(())
-}
-
-/// Polls a future once and reports whether it finished.
-///
-/// This exists for one reason: `Wal::commit` reserves its Lamport on the first
-/// poll, and the caller needs that reservation to happen while it still holds
-/// the submission lock. Awaiting the whole future there would hold a lock
-/// across replication, which ADR 0003 rules out.
-async fn poll_once<F: Future>(future: &mut Pin<Box<F>>) -> Option<F::Output> {
-    std::future::poll_fn(|cx| {
-        Poll::Ready(match future.as_mut().poll(cx) {
-            Poll::Ready(value) => Some(value),
-            Poll::Pending => None,
-        })
-    })
-    .await
 }
 
 /// Whether a replica that answered a heartbeat without holding a lease may be
@@ -2769,14 +2806,5 @@ mod tests {
             } => assert_eq!(expires_at_millis, Some(6_000)),
             WalOp::Delete { .. } => panic!("a put became a delete"),
         }
-    }
-
-    #[tokio::test]
-    async fn polling_once_reports_a_future_that_is_not_done() {
-        let mut never = Box::pin(std::future::pending::<()>());
-        assert!(poll_once(&mut never).await.is_none());
-
-        let mut ready = Box::pin(std::future::ready(7));
-        assert_eq!(poll_once(&mut ready).await, Some(7));
     }
 }
