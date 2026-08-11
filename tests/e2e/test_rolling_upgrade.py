@@ -569,13 +569,26 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
         finally:
             writer.stop()
 
-        # Merge adds new replicated tags and must stay off the log until
-        # finalization proves every voter can decode them. The protocol refusal
-        # comes before id validation, so even a malformed request cannot enter
-        # merge logic during the rollback window.
+        # Merge used to be gated behind protocol 0.2 so that a 0.1 voter which
+        # could not decode its tags stayed rollback-safe. ADR 0012 withdrew
+        # that: nothing was released, so no such voter exists and merge belongs
+        # to 0.1. What is asserted here now is that the operation is reachable
+        # on this cluster rather than refused by the protocol, and that a
+        # nonsense request is still refused on its own merits.
+        # The cluster is still at 0.0 here: the roll has finished but nothing
+        # has finalized. Merge is refused because no vocabulary has been agreed
+        # at all, which is the case the gate still exists for, and the refusal
+        # has to come before id validation so a malformed request cannot enter
+        # merge logic and reach the log.
         refused = cluster.refused_by_leader("partition", "merge", "1", "2")
-        assert "active cluster protocol 0.2" in refused
-        assert "finalize-upgrade" in refused
+        assert "at least 0.1" in refused, (
+            f"merge was not refused for want of an agreed protocol: {refused}"
+        )
+        # It no longer asks for finalization, because there is no later
+        # protocol to finalize to. See ADR 0012.
+        assert "finalize-upgrade" not in refused, (
+            f"merge still asks for finalization: {refused}"
+        )
 
         # Every acknowledged write is still readable. This is the no-lost-writes
         # guarantee stated as the client sees it.

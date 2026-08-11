@@ -2165,7 +2165,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_refused_by_protocol_never_reaches_the_log() {
+    fn a_merge_refused_before_a_version_is_agreed_never_reaches_the_log() {
         let sim = Simulation::new(125);
         let runtime = sim.add_node(NodeId(1));
         let opening = runtime.clone();
@@ -2173,16 +2173,10 @@ mod tests {
             .block_on(async move { SingleNodeLog::open(&opening).await })
             .unwrap();
         let controller = Controller::new(runtime, Arc::clone(&log), ControlConfig::default());
-        let initializing = controller.clone();
-        sim.block_on(async move {
-            initializing
-                .submit(ControlCommand::SetClusterVersion {
-                    version: crate::PROTOCOL_0_1,
-                    expect: ClusterVersion::ZERO,
-                })
-                .await
-        })
-        .unwrap();
+        // Deliberately not initialised. Merge is part of 0.1 now (ADR 0012), so
+        // the protocol gate no longer refuses it on a 0.1 cluster; what it
+        // still refuses is a cluster that has agreed no vocabulary at all, and
+        // that refusal must cost the log nothing.
         let before = sim.block_on({
             let log = Arc::clone(&log);
             async move { log.commit_index().await }
@@ -2207,6 +2201,6 @@ mod tests {
         let after = sim.block_on(async move { log.commit_index().await });
 
         assert!(matches!(refused, Err(Error::Unavailable(_))));
-        assert_eq!(after, before, "a 0.2 command reached a 0.1 log");
+        assert_eq!(after, before, "a refused merge reached the log");
     }
 }

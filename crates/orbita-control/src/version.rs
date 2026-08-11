@@ -136,13 +136,21 @@ impl std::fmt::Display for CompatibilityRefusal {
 }
 
 /// The first cluster version whose control protocol carries worker lifecycle
-/// state: the `ready` and `draining` claims on a status report, and the
-/// planned handoff built on them.
+/// state: the `ready` and `draining` claims on a status report, the planned
+/// handoff built on them, and the partition merge commands at tags 22 through
+/// 25.
+///
+/// Merge was originally assigned to 0.2 so that a 0.1 voter which could not
+/// decode those tags could still be rolled back to. Nothing has ever been
+/// released, so there is no such voter and no rollback to preserve: 0.1 is
+/// still being defined rather than being kept compatible with. See ADR 0012.
 pub const PROTOCOL_0_1: ClusterVersion = ClusterVersion::new(0, 1);
 
-/// The first cluster version whose replicated vocabulary includes partition
-/// merge commands. Keeping it separate from 0.1 preserves rollback until every
-/// voter can decode merge tags 22 through 25.
+/// The next cluster version, reserved rather than in use.
+///
+/// Nothing gates on this today. It is kept because the compatibility window in
+/// [`speaks_for`] is the mechanism a future protocol change will need, and a
+/// constant that names the next version is where that change starts.
 pub const PROTOCOL_0_2: ClusterVersion = ClusterVersion::new(0, 2);
 
 /// Whether `active` is a cluster version whose protocol carries worker
@@ -241,10 +249,18 @@ mod tests {
     }
 
     #[test]
-    fn this_binary_keeps_protocol_0_1_rollback_until_0_2_is_finalized() {
+    fn a_zero_minor_binary_speaks_only_its_own_version() {
+        // 0.1 has no predecessor to roll back to, so the window is a point.
+        // The two-version window is what a 0.2 binary gets, and
+        // `speaks_for` is tested at that pair directly rather than through
+        // whatever version this workspace happens to be at.
         let speaks = binary_speaks();
-        assert_eq!(speaks.max, PROTOCOL_0_2);
+        assert_eq!(speaks.max, PROTOCOL_0_1);
         assert!(speaks.contains(PROTOCOL_0_1));
+        assert!(!speaks.contains(PROTOCOL_0_2));
+
+        let next = speaks_for(PROTOCOL_0_2);
+        assert!(next.contains(PROTOCOL_0_1) && next.contains(PROTOCOL_0_2));
     }
 
     #[test]

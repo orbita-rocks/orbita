@@ -30,7 +30,6 @@ use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Credential, Keyspace, KeyspaceConfig};
 use crate::version::{
     lifecycle_protocol_active, ClusterVersion, CompatibilityRefusal, VersionRange, PROTOCOL_0_1,
-    PROTOCOL_0_2,
 };
 
 use orbita_core::{
@@ -558,10 +557,9 @@ impl ClusterState {
     }
 
     pub(crate) fn ensure_merge_permitted(&self) -> Result<()> {
-        if !self.version_initialized || self.version < PROTOCOL_0_2 {
+        if !self.version_initialized || self.version < PROTOCOL_0_1 {
             return Err(Error::Unavailable(
-                "partition merge requires active cluster protocol 0.2; roll every node forward and run `orbita cluster finalize-upgrade`"
-                    .into(),
+                "partition merge requires an initialized cluster protocol of at least 0.1".into(),
             ));
         }
         Ok(())
@@ -2102,49 +2100,47 @@ mod tests {
     }
 
     #[test]
-    fn merge_commands_require_protocol_0_2() {
+    fn merge_commands_need_an_initialized_protocol_and_nothing_more() {
+        // Merge used to require 0.2 so a 0.1 voter that could not decode tags
+        // 22 through 25 stayed rollback-safe. Nothing was ever released, so
+        // there is no such voter: 0.1 is still being defined rather than kept
+        // compatible with, and merge is part of it. See ADR 0012.
+        //
+        // What is still refused is a cluster that has not agreed a version at
+        // all, because a command whose vocabulary nobody has agreed to is the
+        // one case the gate was ever protecting against.
         let mut state = bootstrapped();
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
         let upper = state.map().partition(PartitionId(11)).unwrap().clone();
-        let generation = merge_generation(&lower, &upper, 12);
-        let commands = [
-            ControlCommand::BeginMerge {
-                generation: generation.clone(),
-            },
+
+        for command in [
             ControlCommand::MarkMergePrepared {
-                generation: generation.clone(),
+                generation: merge_generation(&lower, &upper, 12),
                 node: lower.owner.unwrap(),
             },
             ControlCommand::CompleteMerge {
-                generation: generation.clone(),
+                generation: merge_generation(&lower, &upper, 12),
             },
-            ControlCommand::AbortMerge { generation },
-        ];
-
-        for command in commands {
-            assert!(
-                matches!(
-                    state.ensure_command_permitted(&command),
-                    Err(Error::Unavailable(_))
-                ),
-                "active protocol 0.1 permitted {command:?}"
-            );
+            ControlCommand::AbortMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            },
+            ControlCommand::BeginMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            },
+        ] {
+            state
+                .ensure_command_permitted(&command)
+                .unwrap_or_else(|e| panic!("active protocol 0.1 refused {command:?}: {e}"));
         }
 
-        state
-            .apply(&ControlCommand::SetClusterVersion {
-                version: PROTOCOL_0_2,
-                expect: PROTOCOL_0_1,
-            })
-            .unwrap();
         state
             .apply(&ControlCommand::BeginMerge {
                 generation: merge_generation(&lower, &upper, 12),
             })
-            .expect("finalized protocol 0.2 enables merge");
+            .expect("protocol 0.1 enables merge");
     }
 
     fn merge_generation(
@@ -2166,7 +2162,7 @@ mod tests {
     #[test]
     fn a_merge_prepares_before_atomically_replacing_both_adjacent_parents() {
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_2);
+        set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
@@ -2238,7 +2234,7 @@ mod tests {
     #[test]
     fn a_delayed_merge_ack_cannot_apply_to_a_retried_generation() {
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_2);
+        set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
@@ -2274,7 +2270,7 @@ mod tests {
     #[test]
     fn split_and_merge_decisions_are_mutually_exclusive() {
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_2);
+        set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
@@ -2299,7 +2295,7 @@ mod tests {
     #[test]
     fn owner_failure_mid_merge_aborts_and_raises_both_parent_epochs() {
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_2);
+        set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();

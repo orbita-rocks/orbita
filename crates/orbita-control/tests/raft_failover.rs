@@ -283,16 +283,24 @@ fn put(key: &'static [u8]) -> WalOp {
     }
 }
 
-/// Why merge commands cannot simply be recorded early.
+/// Nothing reaches the Raft log carrying a tag outside the agreed vocabulary.
 ///
-/// A 0.1 voter decodes through tag 21. Recovery treats a later unknown tag as
-/// the end of the trustworthy log and truncates there, so emitting merge tags
-/// 22 through 25 before 0.2 finalization would destroy both mixed-version apply
-/// and rollback. The proposal gate must keep those bytes out of the real Raft
-/// log, not merely reject them after commit.
+/// Recovery treats an unknown tag as the end of the trustworthy log and
+/// truncates there, so a command whose bytes a voter cannot decode does not
+/// merely fail, it destroys the tail. The proposal gate has to keep such bytes
+/// out of the real log rather than reject them after commit.
+///
+/// This used to assert that merge tags 22 through 25 stayed out of a 0.1 log,
+/// because merge was assigned to 0.2 to keep a 0.1 voter rollback-safe. ADR
+/// 0012 withdrew that: nothing was ever released, so there is no 0.1 voter that
+/// cannot decode merge, and 0.1's vocabulary includes those tags. What is still
+/// worth holding is the general claim, so the bound moved to the top of what
+/// 0.1 actually speaks instead of being deleted with the decision that
+/// motivated it.
 #[test]
-fn pre_0_2_raft_log_never_exposes_a_0_1_voter_to_merge_tags() {
-    const PREVIOUS_BINARY_MAX_TAG: u8 = 21;
+fn the_raft_log_never_carries_a_tag_outside_the_agreed_vocabulary() {
+    /// The highest tag protocol 0.1 defines, which is `AbortMerge`.
+    const PROTOCOL_0_1_MAX_TAG: u8 = 25;
 
     let sim = Simulation::new(6);
     for node in CONTROL {
@@ -362,9 +370,11 @@ fn pre_0_2_raft_log_never_exposes_a_0_1_voter_to_merge_tags() {
             })
             .await
     });
+    // Refused on its own merits now rather than by the protocol gate: these
+    // partitions do not exist. The point is what the log does with it.
     assert!(
-        matches!(refused, Err(Error::Unavailable(_))),
-        "merge must remain disabled before 0.2 finalization: {refused:?}"
+        refused.is_err(),
+        "a merge naming partitions that do not exist was accepted: {refused:?}"
     );
 
     sim.run_for(REPLICATION_GRACE);
@@ -376,8 +386,8 @@ fn pre_0_2_raft_log_never_exposes_a_0_1_voter_to_merge_tags() {
     assert!(
         entries
             .iter()
-            .all(|entry| entry.command.encode()[0] <= PREVIOUS_BINARY_MAX_TAG),
-        "pre-finalization committed a command the previous binary cannot decode: {entries:?}"
+            .all(|entry| entry.command.encode()[0] <= PROTOCOL_0_1_MAX_TAG),
+        "committed a command carrying a tag outside protocol 0.1: {entries:?}"
     );
 }
 
