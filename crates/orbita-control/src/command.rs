@@ -62,9 +62,10 @@ const TAG_BEGIN_SPLIT: u8 = 18;
 const TAG_MARK_SPLIT_PREPARED: u8 = 19;
 const TAG_COMPLETE_SPLIT: u8 = 20;
 const TAG_ABORT_SPLIT: u8 = 21;
-// The dual-parent worker-prepared merge protocol, introduced in protocol 0.2.
-// These tags stay off the replicated log until finalization proves every live
-// voter understands them.
+// The dual-parent worker-prepared merge protocol. Part of protocol 0.1: these
+// tags are in the alphabet every 0.1 binary decodes, so they need no separate
+// finalization. See ADR 0012 for why they are not held back for a rollback
+// window that has no binary in it.
 const TAG_BEGIN_MERGE: u8 = 22;
 const TAG_MARK_MERGE_PREPARED: u8 = 23;
 const TAG_COMPLETE_MERGE: u8 = 24;
