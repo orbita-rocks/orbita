@@ -333,6 +333,38 @@ impl ClusterState {
         PartitionId(self.next_partition_id)
     }
 
+    /// Refuses a partition id the cluster has already handed out.
+    ///
+    /// [ADR 0010](../../../docs/adr/0010-a-merge-shares-both-parents-segments.md)
+    /// says retired parent ids are never reused, so that a stale route cannot
+    /// resolve to a live partition. Until issue #171 the only thing enforcing
+    /// it was every proposer politely reading
+    /// [`ClusterState::next_partition_id`] first. That is one wrong counter
+    /// away from a collision, and the counter is derived state: a leader whose
+    /// state machine was rebuilt from a shorter log prefix hands out an id
+    /// whose WAL and objects are still on every worker's disk at a higher
+    /// epoch. The owner then refuses to open it — correctly, the epoch check is
+    /// doing its job — forever, while `cluster describe` shows a healthy map
+    /// with an owner assigned, and the keyspace is dead on arrival with no path
+    /// out.
+    ///
+    /// Checking it here rather than at the proposer is what makes it an
+    /// invariant instead of a convention. Every member applies the same
+    /// committed entry, so every member refuses the same one, and a leader with
+    /// a damaged counter produces a loud refusal instead of a silent
+    /// collision. The counter is a high-water mark taken with `max` on every
+    /// issue, so "below it" is exactly "already issued", retired ids included.
+    fn ensure_unissued(&self, id: PartitionId) -> Result<()> {
+        if id.get() < self.next_partition_id {
+            return Err(Error::InvalidArgument(format!(
+                "partition id {id} has already been issued; ids are never reused, and the next \
+                 unused one is {}",
+                self.next_partition_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Healthy workers, ordered by how little they are already carrying.
     ///
     /// Deterministic, because a placement decision made during apply would
@@ -733,6 +765,11 @@ impl ClusterState {
                 "keyspace or partition id already in use".into(),
             ));
         }
+        // The check above only sees ids that are still *live*. A retired one —
+        // a split parent, or a partition whose keyspace was deleted — is gone
+        // from `phases` while its data is still on disk, so it needs the
+        // high-water mark to catch it.
+        self.ensure_unissued(first_partition)?;
 
         self.keyspaces.insert(
             id,
@@ -1079,6 +1116,8 @@ impl ClusterState {
                 "a child partition id is already in use".into(),
             ));
         }
+        self.ensure_unissued(lower)?;
+        self.ensure_unissued(upper)?;
         let (low_range, high_range) = info.range.split_at(at).ok_or_else(|| {
             Error::InvalidArgument(format!(
                 "the split key is not inside partition {parent}'s range"
@@ -1158,6 +1197,8 @@ impl ClusterState {
                 "a child partition id is already in use".into(),
             ));
         }
+        self.ensure_unissued(lower)?;
+        self.ensure_unissued(upper)?;
         // Validate the boundary against the parent's range without mutating
         // anything. The clone is cheap and keeps `at` for the pending record,
         // which the completion entry re-splits against the range as it stands
@@ -1471,6 +1512,7 @@ impl ClusterState {
                 "the merged partition id is already in use".into(),
             ));
         }
+        self.ensure_unissued(generation.merged)?;
 
         let mut required = vec![lower.owner.expect("checked")];
         required.extend(lower.replicas.iter().copied());
@@ -3408,5 +3450,155 @@ mod tests {
             }),
         });
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn a_partition_id_from_a_deleted_keyspace_is_never_handed_to_a_new_one() {
+        // Issue #171's visible half. Deleting a keyspace retires its partition
+        // ids but leaves every worker's WAL and objects keyed by them on disk.
+        // Minting a fresh partition on one of those ids produces a keyspace no
+        // node will ever open — the owner refuses the lower epoch, correctly
+        // and forever, while the control plane reports a healthy map. The
+        // counter is what normally prevents it; this is the state machine
+        // refusing even when the counter is wrong.
+        let mut state = bootstrapped();
+        let keyspace = state.keyspace_by_name("default").unwrap().id;
+        let retired = state.map().partitions().next().unwrap().id;
+        state
+            .apply(&ControlCommand::DeleteKeyspace { id: keyspace })
+            .unwrap();
+        assert!(
+            state.map().partition(retired).is_none(),
+            "the id is retired, so nothing live guards it any more"
+        );
+
+        let candidates = state.placement_candidates();
+        let refused = state.apply(&ControlCommand::CreateKeyspace {
+            id: state.next_keyspace_id(),
+            name: "reborn".into(),
+            config: KeyspaceConfig::default(),
+            created_at_millis: 9,
+            first_partition: retired,
+            owner: Some(candidates[0]),
+            replicas: candidates[1..3].to_vec(),
+        });
+        assert!(
+            matches!(refused, Err(Error::InvalidArgument(_))),
+            "a retired partition id must not be reissued: {refused:?}"
+        );
+        assert!(
+            state.keyspace_by_name("reborn").is_none(),
+            "and the refusal must leave nothing half-created behind"
+        );
+    }
+
+    #[test]
+    fn a_retired_split_parent_id_is_never_handed_to_a_new_keyspace() {
+        // ADR 0010 states this for splits specifically: a stale route must not
+        // resolve to a live partition. One layer down it is sharper still,
+        // because a worker's WAL and storage are keyed by partition id, so
+        // reuse collides with bytes on disk rather than merely confusing a
+        // reader.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: state.next_partition_id(),
+                upper: state.next_partition_id().next(),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        for holder in holders(&parent) {
+            state
+                .apply(&ControlCommand::MarkSplitPrepared {
+                    parent: parent.id,
+                    node: holder,
+                    expect_epoch: parent.epoch,
+                })
+                .unwrap();
+        }
+        state
+            .apply(&ControlCommand::CompleteSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        assert!(state.map().partition(parent.id).is_none(), "parent retired");
+
+        let refused = state.apply(&ControlCommand::CreateKeyspace {
+            id: state.next_keyspace_id(),
+            name: "reborn".into(),
+            config: KeyspaceConfig::default(),
+            created_at_millis: 9,
+            first_partition: parent.id,
+            owner: None,
+            replicas: vec![],
+        });
+        assert!(
+            matches!(refused, Err(Error::InvalidArgument(_))),
+            "a retired split parent id must not be reissued: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_split_cannot_name_a_child_on_an_id_that_was_already_issued() {
+        // The same rule from the split side. `child_id_in_use` only sees ids
+        // that are still live, so a retired grandparent's id looks free to it.
+        let mut state = split_once();
+        let retired = PartitionId(1);
+        let child = state.map().partitions().next().unwrap().clone();
+
+        let refused = state.apply(&ControlCommand::BeginSplit {
+            parent: child.id,
+            at: Bytes::from_static(b"d"),
+            lower: retired,
+            upper: state.next_partition_id(),
+            expect_epoch: child.epoch,
+        });
+        assert!(
+            matches!(refused, Err(Error::InvalidArgument(_))),
+            "a split child must not land on an id the cluster already spent: {refused:?}"
+        );
+        assert!(
+            !state.is_splitting(child.id),
+            "and the refusal must not leave a pending split behind"
+        );
+    }
+
+    /// A bootstrapped cluster whose one partition has been split in two, so
+    /// partition id 1 is retired and its data is notionally still on disk.
+    fn split_once() -> ClusterState {
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        assert_eq!(parent.id, PartitionId(1));
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: state.next_partition_id(),
+                upper: state.next_partition_id().next(),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        for holder in holders(&parent) {
+            state
+                .apply(&ControlCommand::MarkSplitPrepared {
+                    parent: parent.id,
+                    node: holder,
+                    expect_epoch: parent.epoch,
+                })
+                .unwrap();
+        }
+        state
+            .apply(&ControlCommand::CompleteSplit {
+                parent: parent.id,
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        state
     }
 }

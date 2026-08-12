@@ -197,7 +197,11 @@ impl<R: Runtime> SingleNodeLog<R> {
             }
         };
 
-        let (entries, good_bytes) = decode_log(&raw);
+        let recovered = decode_log(&raw);
+        if let Some(error) = &recovered.unreadable {
+            return Err(unreadable_entry(recovered.good_bytes, raw.len(), error));
+        }
+        let good_bytes = recovered.good_bytes;
         if good_bytes < raw.len() {
             tracing::warn!(
                 node = %runtime.transport().local_node(),
@@ -207,6 +211,7 @@ impl<R: Runtime> SingleNodeLog<R> {
             file.truncate(good_bytes as u64).await.map_err(disk_error)?;
             file.sync().await.map_err(disk_error)?;
         }
+        let entries = recovered.entries;
 
         Ok(Arc::new(Self {
             node: runtime.transport().local_node(),
@@ -310,10 +315,29 @@ fn encode_frame(payload: &[u8]) -> Bytes {
     buf.freeze()
 }
 
-/// Decodes as far as the bytes are trustworthy, returning the entries and how
-/// many bytes they came from.
-fn decode_log(raw: &[u8]) -> (Vec<ControlCommand>, usize) {
+/// What replaying the durable log produced, and why it stopped.
+struct RecoveredLog {
+    entries: Vec<ControlCommand>,
+    /// How many bytes the entries came from. Anything past this is a tail the
+    /// caller may truncate.
+    good_bytes: usize,
+    /// Set when reading stopped at a frame that was *whole* and passed its
+    /// checksum, and whose payload this binary still could not decode.
+    ///
+    /// This is the case that must never be confused with a torn tail. A torn
+    /// frame is a process that died mid-append and it was never acknowledged
+    /// to anybody, so dropping it costs nothing. A whole, checksummed frame is
+    /// bytes some binary deliberately wrote and fsynced, and truncating there
+    /// throws away that decision *and every decision after it* — which is how
+    /// a partition disappears from the routing map and the id counter walks
+    /// backwards at the same time. See issue #171.
+    unreadable: Option<CodecError>,
+}
+
+/// Decodes as far as the bytes are trustworthy.
+fn decode_log(raw: &[u8]) -> RecoveredLog {
     let mut entries = Vec::new();
+    let mut unreadable = None;
     let mut offset = 0;
 
     while offset + FRAME_HEADER_BYTES <= raw.len() {
@@ -343,12 +367,39 @@ fn decode_log(raw: &[u8]) -> (Vec<ControlCommand>, usize) {
             // means a binary that understood this entry wrote it and this one
             // does not. Stopping here is the only safe answer: applying the
             // entries after it would skip a decision every other member made.
-            Err(_) => break,
+            // Reported rather than silently truncated, because the frame is
+            // whole and so is everything behind it.
+            Err(error) => {
+                unreadable = Some(error);
+                break;
+            }
         }
         offset = body_end;
     }
 
-    (entries, offset)
+    RecoveredLog {
+        entries,
+        good_bytes: offset,
+        unreadable,
+    }
+}
+
+/// The refusal recovery gives rather than destroying a whole, checksummed
+/// entry to carry on.
+///
+/// Loud and fatal on purpose. The alternative that used to be here — truncate
+/// and start anyway — produces a node that looks healthy while serving a
+/// routing map rolled back to some earlier prefix, which is indistinguishable
+/// from working until an acknowledged write turns out to be unreachable. A
+/// process that will not start is a page; a process that quietly forgot is a
+/// data-loss incident nobody notices for a day.
+fn unreadable_entry(at: usize, total: usize, error: &CodecError) -> Error {
+    Error::Internal(format!(
+        "control log: the entry at byte {at} is whole, passes its checksum, and this binary \
+         cannot decode it ({error}). Refusing to start: truncating there would destroy {} bytes \
+         of committed decisions. A binary that understands this entry wrote it — run one.",
+        total - at
+    ))
 }
 
 fn disk_error(e: DiskError) -> Error {
@@ -424,11 +475,16 @@ mod tests {
         let whole = entries.freeze();
 
         for cut in 1..whole.len() {
-            let (decoded, good) = decode_log(&whole[..cut]);
+            let recovered = decode_log(&whole[..cut]);
+            let (decoded, good) = (recovered.entries, recovered.good_bytes);
             assert!(good <= cut);
             assert!(
                 decoded.len() <= 2,
                 "a truncated log must never yield more entries than were written"
+            );
+            assert!(
+                recovered.unreadable.is_none(),
+                "a frame cut short is a torn tail, not an entry this binary cannot read"
             );
             if cut >= good && good > 0 {
                 assert_eq!(decoded[0], register(1), "the intact prefix survives");
@@ -445,7 +501,56 @@ mod tests {
         let last = raw.len() - 1;
         raw[last] ^= 0xFF;
 
-        let (decoded, _) = decode_log(&raw);
-        assert_eq!(decoded, vec![register(1)]);
+        assert_eq!(decode_log(&raw).entries, vec![register(1)]);
+    }
+
+    #[test]
+    fn recovery_refuses_to_start_rather_than_truncate_an_entry_it_cannot_decode() {
+        // The upgrade shape from issue #171: a whole, checksummed entry a
+        // newer binary wrote, sitting in front of decisions this one already
+        // committed. Truncating there would have taken the tail with it and
+        // brought the node up serving a rolled-back map.
+        let sim = Simulation::new(4);
+        let runtime = sim.add_node(NodeId(1));
+        let first = runtime.clone();
+        sim.block_on(async move {
+            let log = SingleNodeLog::open(&first).await.unwrap();
+            for id in 1..=3 {
+                log.propose(register(id)).await.unwrap();
+            }
+        });
+
+        let wedging = sim.runtime(NodeId(1));
+        let before = sim.block_on(async move {
+            let file = wedging
+                .disk()
+                .open(LOG_PATH, OpenOptions::create())
+                .await
+                .unwrap();
+            file.append(encode_frame(&[200, 1, 2, 3])).await.unwrap();
+            file.sync().await.unwrap();
+            file.size().await.unwrap()
+        });
+
+        let reopening = sim.runtime(NodeId(1));
+        let error = sim
+            .block_on(async move { SingleNodeLog::open(&reopening).await })
+            .err()
+            .expect("an undecodable committed entry is fatal, not a torn tail");
+        assert!(error.to_string().contains("Refusing to start"), "{error}");
+
+        let checking = sim.runtime(NodeId(1));
+        let after = sim.block_on(async move {
+            let file = checking
+                .disk()
+                .open(LOG_PATH, OpenOptions::create())
+                .await
+                .unwrap();
+            file.size().await.unwrap()
+        });
+        assert_eq!(
+            after, before,
+            "a refusal must leave the bytes alone so a binary that can read them still can"
+        );
     }
 }
