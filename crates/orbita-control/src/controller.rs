@@ -215,6 +215,60 @@ struct Inner {
     was_leader: bool,
 }
 
+/// The Lamport a node must already hold before it may be handed `info`.
+///
+/// The owner's committed prefix — the highest Lamport a durability quorum
+/// confirmed — not its raw durable position. The two differ by exactly the tail
+/// the owner wrote to its own disk and could not replicate, whose clients were
+/// told the write failed. The WAL is not allowed to ship that tail, so
+/// requiring a replica to reach the owner's durable position asks for a Lamport
+/// no receiver can attain without inventing writes the cluster never promised;
+/// requiring the committed prefix is always satisfiable, because every replica
+/// in the durability quorum already holds it.
+///
+/// Falls back to the durable position only when the owner reported no committed
+/// prefix, which is a pre-V5 binary mid-rollout. There the older, incidental
+/// safety still holds: `quiesce` is what lowers that durable number to the
+/// committed prefix, and it does so for exactly the owners that cannot yet
+/// report the prefix directly.
+fn required_prefix(inner: &Inner, info: &PartitionInfo) -> Lamport {
+    let owner_progress = info
+        .owner
+        .and_then(|owner| inner.observations.get(&owner))
+        .and_then(|observation| observation.status.progress(info.id));
+    owner_progress
+        .and_then(|progress| progress.committed_lamport)
+        .or_else(|| owner_progress.map(|progress| progress.durable_lamport))
+        .unwrap_or(Lamport::ZERO)
+}
+
+/// Whether `candidate` may be promoted to own `info` without losing a write.
+///
+/// Every path that fences a live owner and promotes a replica goes through
+/// here, and it is one function because the cost of the paths disagreeing is
+/// silent data loss. With a replication factor of three a write is
+/// acknowledged once two holders have it, so one replica can legitimately be
+/// behind while writes keep succeeding. Promoting that replica makes its
+/// shorter log authoritative and drops writes the cluster already promised.
+///
+/// A candidate this leader has heard nothing about fails, and must: the whole
+/// point is evidence, and absence of a report is absence of evidence. That
+/// makes a rebalance decline rather than gamble, which is the right direction
+/// for work nobody asked for.
+fn caught_up_receiver(
+    inner: &Inner,
+    info: &PartitionInfo,
+    candidate: NodeId,
+    required: Lamport,
+) -> bool {
+    inner.state.is_eligible_owner(candidate)
+        && inner
+            .observations
+            .get(&candidate)
+            .and_then(|observation| observation.status.progress(info.id))
+            .is_some_and(|progress| progress.durable_lamport >= required)
+}
+
 /// One ownership move the balancer wants to make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rebalance {
@@ -1184,19 +1238,54 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 }
             }
 
+            // `BeginMerge` requires one complete holder set, not merely a
+            // shared owner, so a pair whose holders only partly overlap can
+            // never merge however ownership is arranged. Checking before
+            // moving matters because the move is not free: relocating first
+            // and discovering the mismatch afterwards costs the parent a
+            // lease-drain outage and leaves it relocated for a merge that was
+            // always going to be refused.
+            let holders = |info: &PartitionInfo| -> BTreeSet<NodeId> {
+                info.owner
+                    .into_iter()
+                    .chain(info.replicas.clone())
+                    .collect()
+            };
+            if holders(lower_info) != holders(upper_info) {
+                return Err(Error::InvalidArgument(format!(
+                    "partitions {lower} and {upper} are held by different sets of nodes, \
+                     so no ownership move can make them mergeable"
+                )));
+            }
+
             // Whichever parent can move is the one that moves. A holder can
             // only be promoted where it already replicates, so the target has
-            // to be a replica of the partition it is taking over. Both hold
-            // when the pair are siblings from one split; the fallback matters
-            // for a pair assembled some other way.
-            if upper_info.replicas.contains(&lower_owner) {
+            // to be a replica of the partition it is taking over, and it has
+            // to be caught up: this fences a live owner, and promoting a
+            // replica short of the committed prefix loses acknowledged writes
+            // whatever the reason for the promotion.
+            if upper_info.replicas.contains(&lower_owner)
+                && caught_up_receiver(
+                    &inner,
+                    upper_info,
+                    lower_owner,
+                    required_prefix(&inner, upper_info),
+                )
+            {
                 (upper, lower_owner)
-            } else if lower_info.replicas.contains(&upper_owner) {
+            } else if lower_info.replicas.contains(&upper_owner)
+                && caught_up_receiver(
+                    &inner,
+                    lower_info,
+                    upper_owner,
+                    required_prefix(&inner, lower_info),
+                )
+            {
                 (lower, upper_owner)
             } else {
-                return Err(Error::InvalidArgument(format!(
-                    "partitions {lower} and {upper} share no holder that could own both, \
-                     so neither can be moved onto the other without copying data"
+                return Err(Error::Unavailable(format!(
+                    "neither partition {lower} nor {upper} has an owner caught up enough \
+                     to take the other; retry once replication has settled"
                 )));
             }
         };
@@ -1416,47 +1505,20 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 .partitions()
                 .filter(|partition| partition.owner == Some(node))
             {
-                let owner_progress = inner
-                    .observations
-                    .get(&node)
-                    .and_then(|observation| observation.status.progress(info.id));
-                // The position a receiver must already hold. It is the owner's
-                // committed prefix — the highest Lamport a durability quorum
-                // confirmed — not its raw durable position. The two differ by
-                // exactly the tail the owner wrote to its own disk and could
-                // not replicate, whose clients were told the write failed. The
-                // WAL is not allowed to ship that tail, so requiring a replica
-                // to reach the owner's durable position asks for a Lamport no
-                // receiver can attain without inventing writes the cluster
-                // never promised; requiring the committed prefix is always
-                // satisfiable, because every replica in the durability quorum
-                // already holds it. #79's `quiesce` truncates the draining
-                // owner's tail back to this same prefix before a handoff, so
-                // today the two numbers coincide at the moment of comparison
-                // and the drain is safe by that coincidence. Comparing the
-                // committed prefix directly makes the drain safe by
+                // #79's `quiesce` truncates the draining owner's tail back to
+                // the committed prefix before a handoff, so here the two
+                // numbers coincide at the moment of comparison and the drain
+                // would be safe by that coincidence. Comparing the committed
+                // prefix directly, in [`required_prefix`], makes it safe by
                 // construction instead, whether or not quiesce has run — the
                 // #87 invariant that the receiver test names a ceiling a
                 // catch-up can actually reach.
-                //
-                // Falls back to the durable position only when the owner
-                // reported no committed prefix, which is a pre-V5 binary
-                // mid-rollout. There the older, incidental safety still holds:
-                // quiesce is what lowers that durable number to the committed
-                // prefix, and it does so for exactly the owners that cannot
-                // yet report the prefix directly.
-                let required = owner_progress
-                    .and_then(|progress| progress.committed_lamport)
-                    .or_else(|| owner_progress.map(|progress| progress.durable_lamport))
-                    .unwrap_or(Lamport::ZERO);
-                let target = info.replicas.iter().copied().find(|candidate| {
-                    inner.state.is_eligible_owner(*candidate)
-                        && inner
-                            .observations
-                            .get(candidate)
-                            .and_then(|observation| observation.status.progress(info.id))
-                            .is_some_and(|progress| progress.durable_lamport >= required)
-                });
+                let required = required_prefix(&inner, info);
+                let target = info
+                    .replicas
+                    .iter()
+                    .copied()
+                    .find(|candidate| caught_up_receiver(&inner, info, *candidate, required));
                 let Some(target) = target else {
                     return Err(Error::Unavailable(format!(
                         "partition {} has no eligible ready replica caught up through {required}",
@@ -1782,9 +1844,19 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
             if most.saturating_sub(count) < threshold.max(1) {
                 break;
             }
+            // Balance is not worth a lost write. Promoting a replica that has
+            // not reached the owner's committed prefix makes its shorter log
+            // authoritative, and with a replication factor of three one
+            // replica can lag while writes keep succeeding through the other
+            // two. A candidate this leader cannot prove is caught up is simply
+            // not moved to: rebalancing is optional work, so declining costs
+            // nothing but a little skew.
             if let Some(info) = movable
                 .iter()
-                .find(|info| info.replicas.contains(&target))
+                .find(|info| {
+                    info.replicas.contains(&target)
+                        && caught_up_receiver(inner, info, target, required_prefix(inner, info))
+                })
                 .copied()
             {
                 return Some(Rebalance {
@@ -2532,6 +2604,43 @@ mod tests {
         }
     }
 
+    /// Has every node report that it holds every partition, fully caught up.
+    ///
+    /// Ownership cannot move to a node the leader cannot prove is caught up,
+    /// so a fixture with no heartbeats has no legal destinations and every
+    /// placement decision correctly declines. Reporting progress is what makes
+    /// these clusters look like clusters rather than like maps.
+    async fn all_caught_up(
+        controller: &Controller<orbita_sim::SimRuntime, SingleNodeLog<orbita_sim::SimRuntime>>,
+        lamport: u64,
+    ) {
+        let partitions: Vec<PartitionId> = {
+            let inner = controller.inner.lock().await;
+            let out = inner.state.map().partitions().map(|p| p.id).collect();
+            out
+        };
+        for id in 1..=3u64 {
+            let mut status = NodeStatus::joining(NodeRole::Worker, format!("10.0.0.{id}:7000"));
+            status.ready = true;
+            status.speaks = crate::version::binary_speaks();
+            status.partitions = partitions
+                .iter()
+                .map(|partition| crate::membership::PartitionProgress {
+                    partition: *partition,
+                    durable_lamport: Lamport(lamport),
+                    applied_lamport: Lamport(lamport),
+                    size_bytes: 0,
+                    index_bytes: None,
+                    committed_lamport: Some(Lamport(lamport)),
+                })
+                .collect();
+            controller
+                .record_status(NodeId(id), status)
+                .await
+                .expect("a registered worker may report");
+        }
+    }
+
     /// Forces every partition onto one owner, which is the shape a failover
     /// leaves behind and the shape the balancer exists to undo.
     async fn pile_onto(
@@ -2593,6 +2702,7 @@ mod tests {
             )
             .await;
             pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+            all_caught_up(&controller, 100).await;
             assert_eq!(
                 owner_counts(&controller).await,
                 BTreeMap::from([(NodeId(1), 4)]),
@@ -2659,6 +2769,7 @@ mod tests {
             )
             .await;
             pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+            all_caught_up(&controller, 100).await;
 
             let mut moves = 0;
             loop {
@@ -2702,6 +2813,7 @@ mod tests {
             )
             .await;
             pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+            all_caught_up(&controller, 100).await;
 
             controller.rebalance_ownership().await.unwrap();
             let after_one = owner_counts(&controller).await;
@@ -2725,6 +2837,203 @@ mod tests {
     }
 
     #[test]
+    fn a_lagging_replica_is_never_promoted_for_balance() {
+        // The one way an optional optimisation can lose data. A write is
+        // acknowledged once a durability quorum holds it, so with three
+        // holders one replica can sit behind while writes keep succeeding
+        // through the other two. Fencing the owner and promoting that replica
+        // makes its shorter log authoritative, and the writes only it is
+        // missing were already promised to clients. Balance is never worth
+        // that, so a candidate the leader cannot prove is caught up is not a
+        // candidate.
+        let (sim, controller) = merged_cluster(305);
+        sim.block_on(async move {
+            split_into(
+                &controller,
+                &[(b"m", 10, 11), (b"f", 12, 13), (b"t", 14, 15)],
+            )
+            .await;
+            pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+
+            // Hand one partition to node 2, so node 3 is the emptiest node and
+            // therefore the balancer's first choice. Without that the tie
+            // break on node id would pick node 2 anyway and the lag would
+            // never be what decided anything.
+            let handed = {
+                let inner = controller.inner.lock().await;
+                let id = inner.state.map().partitions().next().unwrap().id;
+                id
+            };
+            let epoch = controller.epoch_of(handed).await.unwrap();
+            controller
+                .submit(ControlCommand::FencePartition {
+                    partition: handed,
+                    expect_epoch: epoch,
+                })
+                .await
+                .unwrap();
+            let fenced = controller.epoch_of(handed).await.unwrap();
+            controller
+                .submit(ControlCommand::AssignOwner {
+                    partition: handed,
+                    owner: NodeId(2),
+                    replicas: vec![NodeId(1), NodeId(3)],
+                    expect_epoch: fenced,
+                })
+                .await
+                .unwrap();
+            all_caught_up(&controller, 100).await;
+
+            // Node 3 falls behind the committed prefix. Node 2 stays current.
+            let partitions: Vec<PartitionId> = {
+                let inner = controller.inner.lock().await;
+                let out = inner.state.map().partitions().map(|p| p.id).collect();
+                out
+            };
+            let mut lagging = NodeStatus::joining(NodeRole::Worker, "10.0.0.3:7000");
+            lagging.ready = true;
+            lagging.speaks = crate::version::binary_speaks();
+            lagging.partitions = partitions
+                .iter()
+                .map(|partition| crate::membership::PartitionProgress {
+                    partition: *partition,
+                    durable_lamport: Lamport(40),
+                    applied_lamport: Lamport(40),
+                    size_bytes: 0,
+                    index_bytes: None,
+                    committed_lamport: Some(Lamport(40)),
+                })
+                .collect();
+            controller.record_status(NodeId(3), lagging).await.unwrap();
+
+            let inner = controller.inner.lock().await;
+            let plan =
+                TestController::rebalance_plan(&inner, 2).expect("node 2 can still take one");
+            assert_ne!(
+                plan.to,
+                NodeId(3),
+                "promoted a replica that is 60 Lamports behind the committed prefix"
+            );
+        });
+    }
+
+    #[test]
+    fn balance_waits_rather_than_promoting_when_nobody_is_proven_caught_up() {
+        // The same rule with no safe destination left. Declining is the whole
+        // behaviour: the skew stays, which costs a little throughput, and no
+        // acknowledged write is at risk, which is the trade the balancer is
+        // allowed to make.
+        let (sim, controller) = merged_cluster(306);
+        sim.block_on(async move {
+            split_into(
+                &controller,
+                &[(b"m", 10, 11), (b"f", 12, 13), (b"t", 14, 15)],
+            )
+            .await;
+            pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+            // Only the owner reports. Nothing is known about either replica,
+            // and absence of a report is absence of evidence.
+            let partitions: Vec<PartitionId> = {
+                let inner = controller.inner.lock().await;
+                let out = inner.state.map().partitions().map(|p| p.id).collect();
+                out
+            };
+            let mut owner = NodeStatus::joining(NodeRole::Worker, "10.0.0.1:7000");
+            owner.ready = true;
+            owner.speaks = crate::version::binary_speaks();
+            owner.partitions = partitions
+                .iter()
+                .map(|partition| crate::membership::PartitionProgress {
+                    partition: *partition,
+                    durable_lamport: Lamport(100),
+                    applied_lamport: Lamport(100),
+                    size_bytes: 0,
+                    index_bytes: None,
+                    committed_lamport: Some(Lamport(100)),
+                })
+                .collect();
+            controller.record_status(NodeId(1), owner).await.unwrap();
+
+            let inner = controller.inner.lock().await;
+            assert_eq!(
+                TestController::rebalance_plan(&inner, 2),
+                None,
+                "moved ownership to a node it had heard nothing from"
+            );
+        });
+    }
+
+    #[test]
+    fn a_pair_held_by_different_nodes_is_refused_before_anything_moves() {
+        // `BeginMerge` needs one complete holder set, not merely one owner, so
+        // a partly overlapping pair can never merge however ownership is
+        // arranged. Relocating first and finding out afterwards would cost the
+        // parent a lease-drain outage and leave it moved for a merge that was
+        // always going to be refused.
+        let (sim, controller) = merged_cluster(307);
+        sim.block_on(async move {
+            split_into(&controller, &[(b"m", 10, 11)]).await;
+            all_caught_up(&controller, 100).await;
+
+            // Narrow the upper child's holders so the two overlap without
+            // matching.
+            let upper = {
+                let inner = controller.inner.lock().await;
+                let found = inner
+                    .state
+                    .map()
+                    .partition(PartitionId(11))
+                    .unwrap()
+                    .clone();
+                found
+            };
+            let keep: Vec<NodeId> = upper.replicas.iter().copied().take(1).collect();
+            controller
+                .submit(ControlCommand::SetReplicas {
+                    partition: PartitionId(11),
+                    replicas: keep,
+                    expect_epoch: upper.epoch,
+                })
+                .await
+                .unwrap();
+
+            let before: Vec<(PartitionId, Option<NodeId>, Epoch)> = {
+                let inner = controller.inner.lock().await;
+                let out = inner
+                    .state
+                    .map()
+                    .partitions()
+                    .map(|p| (p.id, p.owner, p.epoch))
+                    .collect();
+                out
+            };
+
+            let refused = controller
+                .colocate_merge_parents(PartitionId(10), PartitionId(11))
+                .await;
+            assert!(
+                matches!(refused, Err(Error::InvalidArgument(_))),
+                "expected a refusal, got {refused:?}"
+            );
+
+            let after: Vec<(PartitionId, Option<NodeId>, Epoch)> = {
+                let inner = controller.inner.lock().await;
+                let out = inner
+                    .state
+                    .map()
+                    .partitions()
+                    .map(|p| (p.id, p.owner, p.epoch))
+                    .collect();
+                out
+            };
+            assert_eq!(
+                before, after,
+                "a refused merge moved ownership anyway, paying a drain for nothing"
+            );
+        });
+    }
+
+    #[test]
     fn a_partition_mid_split_is_left_alone_by_the_balancer() {
         // A transfer aborts a split in flight, throwing away preparation the
         // cluster already paid for, to correct an imbalance that is still
@@ -2733,6 +3042,7 @@ mod tests {
         sim.block_on(async move {
             split_into(&controller, &[(b"m", 10, 11)]).await;
             pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+            all_caught_up(&controller, 100).await;
 
             // Open a split on one of them and leave it open.
             let victim = {
@@ -2818,6 +3128,7 @@ mod tests {
                     "the split did not spread, so this test proves nothing"
                 );
             }
+            all_caught_up(&driving, 100).await;
 
             driving
                 .colocate_merge_parents(PartitionId(10), PartitionId(11))
