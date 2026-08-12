@@ -25,6 +25,16 @@
 /.moon/docker
 
 #
+# Coverage output. `cargo llvm-cov` writes a raw profile per test process,
+# named from the profile-file pattern rather than from the target directory,
+# so these land in whichever crate directory the process ran in and escape
+# the /target rule above. Unanchored for the same reason.
+#
+*.profraw
+*.profdata
+/codecov.json
+
+#
 # Local cluster scratch data
 #
 /data
