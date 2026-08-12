@@ -98,6 +98,7 @@ fn start_with_auth(
             None,
             None,
             crate::DEFAULT_LEASE_DURATION,
+            crate::DEFAULT_CONTROL_POLL_INTERVAL,
             Arc::new(crate::ReadinessGate::new()),
             authenticator,
         )
@@ -191,6 +192,7 @@ fn start_with_map(sim: &Simulation, map: PartitionMap) -> Arc<Node<SimRuntime>> 
             None,
             None,
             crate::DEFAULT_LEASE_DURATION,
+            crate::DEFAULT_CONTROL_POLL_INTERVAL,
             Arc::new(crate::ReadinessGate::new()),
             authenticator,
         )

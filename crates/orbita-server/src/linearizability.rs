@@ -642,6 +642,7 @@ fn start_node_with_map(
             None,
             None,
             lease,
+            crate::DEFAULT_CONTROL_POLL_INTERVAL,
             Arc::new(crate::ReadinessGate::new()),
             authenticator,
         )
