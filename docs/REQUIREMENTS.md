@@ -375,8 +375,8 @@ someone runs a bigger experiment. Only the first is a ceiling.
 | Partitions | Leader group metadata throughput, which is the real ceiling on cluster size | not characterized yet |
 | Hot data | The sum of memory across the workers | grows by adding workers |
 | Total data | Object storage, meaning effectively nothing | unbounded in practice, and independent of worker count |
-| Read throughput | Replica count, since replicas serve reads | ~100k reads/sec |
-| Write throughput | Partition count, since one owner serializes each partition | ~10k writes/sec |
+| Read throughput | Replica count, since replicas serve reads — and a keyspace has exactly `replication_factor` of them | ~100k reads/sec |
+| Write throughput | Owner count, bounded by `replication_factor`; see the note below | ~10k writes/sec |
 | Max key size | Fixed | 10KB |
 | Max value size | Per-keyspace configuration | 10MB, default far lower |
 
@@ -398,10 +398,30 @@ rather than a rewrite.
 The throughput numbers are targets rather than measurements, and they are
 cluster-wide figures for a cluster of the size we currently test. Neither is a
 ceiling. Read capacity grows with replicas per
-[ADR 0001](adr/0001-linearizable-reads-from-replicas.md), and write capacity
-grows with partitions, which split as they grow. Publishing a measured curve
-of both against worker count is a release deliverable, and it replaces these
-rows when it exists.
+[ADR 0001](adr/0001-linearizable-reads-from-replicas.md). Write capacity was
+claimed here to grow with partitions, which split as they grow. That is not what
+it grows with, and the correction is worth stating precisely because it is a
+smaller claim than it looks.
+
+One owner serialises a partition, and the owner does more work per write than a
+replica, so capacity grows with the number of *owners* a keyspace has. Splitting
+distributes owners as of #163, so it does buy throughput. But a split gives each
+child the parent's holder set, ownership can only move to a node that already
+holds a copy, and nothing widens a holder set for load — so a keyspace has
+exactly `replication_factor` holders, forever, and therefore at most that many
+owners. Measured: a six-node cluster running one keyspace split eight ways puts
+every partition on three nodes and leaves three holding nothing.
+
+So a single keyspace does not scale past `replication_factor` nodes however
+large the cluster is, for reads or for writes. A cluster spreads *keyspaces*
+across its machines, and it heals onto new capacity when a holder is lost, but
+it does not expand onto capacity that is added. Issue #170 tracks it, and the
+cost of the mechanism that would fix it has been measured: adopting a 309 MiB
+partition on a node that never held it took about three seconds, and cost the
+existing owner about three CPU-seconds.
+
+Publishing a measured curve of both against worker count is a release
+deliverable, and it replaces these rows when it exists.
 
 The partition ceiling is genuinely unknown, which is worth saying rather than
 guessing at. The simulator has no partition-count knob today, so nothing has
