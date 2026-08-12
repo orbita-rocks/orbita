@@ -251,6 +251,7 @@ fn start_node_with_snapshots(
             split_snapshot,
             merge_snapshot,
             Duration::from_millis(150),
+            crate::DEFAULT_CONTROL_POLL_INTERVAL,
             gate,
             authenticator,
         )

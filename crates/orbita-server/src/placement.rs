@@ -135,6 +135,7 @@ fn start_node_on_store(
             None,
             None,
             Duration::from_millis(150),
+            crate::DEFAULT_CONTROL_POLL_INTERVAL,
             gate,
             authenticator,
         )
@@ -180,6 +181,7 @@ fn start_node_reporting(
             None,
             None,
             Duration::from_millis(150),
+            crate::DEFAULT_CONTROL_POLL_INTERVAL,
             gate,
             authenticator,
         )

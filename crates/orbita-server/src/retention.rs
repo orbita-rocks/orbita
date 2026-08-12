@@ -200,6 +200,7 @@ fn start_node(
                 None,
                 None,
                 lease,
+                crate::DEFAULT_CONTROL_POLL_INTERVAL,
                 gate,
                 authenticator,
             )

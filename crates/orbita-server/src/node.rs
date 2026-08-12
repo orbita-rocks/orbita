@@ -175,6 +175,14 @@ pub(crate) struct Node<R: Runtime> {
     /// Whether the last attempt to match the open partitions to the map
     /// failed, which is what makes the next refresh try again.
     unreconciled: std::sync::atomic::AtomicBool,
+    /// How often this node polls the control plane, which the misroute repair
+    /// window is derived from so the two stay proportional whatever the
+    /// deployment configures.
+    control_poll_interval: Duration,
+    /// Serialises misroute repairs so one fetch serves every caller that
+    /// arrives while it is in flight, and so those callers resume against the
+    /// map it installed rather than the one that refused them.
+    repair_gate: tokio::sync::Mutex<()>,
     /// When a misroute last made this node re-read the map, on its own
     /// monotonic clock.
     ///
@@ -228,7 +236,8 @@ pub(crate) struct Node<R: Runtime> {
 /// the traffic this node already sends on its own.
 const KEYSPACE_MISS_REPAIR_INTERVAL: Duration = DEFAULT_CONTROL_POLL_INTERVAL;
 
-/// How often a misrouted request may make this node re-read the map.
+/// How much more often than its own polling a node may re-read the map because
+/// a request was misrouted.
 ///
 /// Bounded for the same reason [`KEYSPACE_MISS_REPAIR_INTERVAL`] is, but much
 /// shorter, because here the wait is the cost being removed rather than the
@@ -237,13 +246,17 @@ const KEYSPACE_MISS_REPAIR_INTERVAL: Duration = DEFAULT_CONTROL_POLL_INTERVAL;
 /// measured at 144ms past the point the split had already completed. Coalescing
 /// at the poll interval would leave that window exactly as it was.
 ///
-/// A tenth of the poll interval bounds the worst case at ten fetches per node
-/// per poll, and only while misroutes are actually happening. Against a
-/// failover that leaves a partition unowned for seconds, that is a few hundred
-/// extra fetches spread over the whole event, which is the same order as the
-/// heartbeats those nodes are already sending.
-const MISROUTE_REPAIR_INTERVAL: Duration =
-    Duration::from_nanos(DEFAULT_CONTROL_POLL_INTERVAL.as_nanos() as u64 / 10);
+/// Ten bounds the worst case at ten fetches per node per poll, and only while
+/// misroutes are actually happening. Against a failover that leaves a partition
+/// unowned for seconds, that is a few hundred extra fetches spread over the
+/// whole event, which is the same order as the heartbeats those nodes are
+/// already sending.
+///
+/// A ratio and not a duration, because the thing it has to stay proportional
+/// to is how often this node polls, which is configurable. Deriving it from the
+/// default instead would let a cluster polling every ten seconds take hundreds
+/// of repairs per poll while its comment still claimed ten.
+const MISROUTE_REPAIRS_PER_POLL: u32 = 10;
 
 /// Where a request has to go.
 enum Hop<R: Runtime> {
@@ -317,6 +330,10 @@ impl<R: Runtime> Node<R> {
         initial_split_intents: Option<SplitIntentSnapshot>,
         initial_merge_intents: Option<MergeIntentSnapshot>,
         lease_duration: Duration,
+        // How often this node polls the control plane. Carried so the
+        // misroute repair window stays proportional to it rather than to a
+        // default the deployment may not be using.
+        control_poll_interval: Duration,
         readiness: Arc<ReadinessGate>,
         authenticator: Arc<Authenticator<R::Clock>>,
     ) -> Result<Arc<Self>> {
@@ -344,6 +361,8 @@ impl<R: Runtime> Node<R> {
             },
             replica_reads: AtomicU64::new(0),
             unreconciled: std::sync::atomic::AtomicBool::new(false),
+            control_poll_interval,
+            repair_gate: tokio::sync::Mutex::new(()),
             last_repair_nanos: AtomicU64::new(0),
             readiness,
             accepting_writes: AtomicBool::new(true),
@@ -700,6 +719,46 @@ impl<R: Runtime> Node<R> {
         }
     }
 
+    /// Routes a request, re-reading the map once when the route came from a
+    /// map that looks out of date.
+    ///
+    /// The retry lives here rather than around the whole operation, and that
+    /// placement is the safety property. Every error [`Self::hop`] returns is
+    /// produced before anything is sent to a peer and before any write is
+    /// attempted, so re-routing after one cannot apply a client's request
+    /// twice. The same retry applied to the operation as a whole could: a
+    /// forwarded write that timed out may already have been committed by the
+    /// owner, and `Unavailable` cannot be told apart from that case once the
+    /// request has left this node.
+    ///
+    /// Scoping the match to `hop`'s own output is what makes `Unavailable`
+    /// unambiguous here. `hop` returns it for exactly three situations, all of
+    /// them a map this node has not caught up with yet: a partition with no
+    /// owner, one this node has been given but has not opened, and one whose
+    /// owner has closed write admission for a split.
+    async fn route(
+        &self,
+        keyspace: KeyspaceId,
+        key: &[u8],
+        purpose: Purpose,
+        forwarded: bool,
+    ) -> Result<Hop<R>> {
+        match self.hop(keyspace, key, purpose).await {
+            Err(Error::Unavailable(stale)) if !forwarded => {
+                self.repair().await;
+                match self.hop(keyspace, key, purpose).await {
+                    // Report what the first look found. The second is a
+                    // consequence of the first and describes the same
+                    // partition, and the first is the one that names why the
+                    // route was refused.
+                    Err(Error::Unavailable(_)) => Err(Error::Unavailable(stale)),
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Finds the partition owning `key` and decides whether this node can
     /// answer for it.
     async fn hop(&self, keyspace: KeyspaceId, key: &[u8], purpose: Purpose) -> Result<Hop<R>> {
@@ -712,6 +771,20 @@ impl<R: Runtime> Node<R> {
 
         let host = self.hosts.read().await.get(&info.id).cloned();
         if let Some(host) = host {
+            // A split closes the parent's write admission and ends by retiring
+            // it, so an owner that is not admitting is a partition this node's
+            // map is about to stop routing to. Recognising that here rather
+            // than inside the write makes it a routing answer, which is what
+            // lets it be retried: [`Self::route`] can re-read the map and send
+            // the request to the child, and it can do so knowing nothing has
+            // been dispatched. The host keeps its own check as the backstop
+            // for the close that lands between this look and that one.
+            if purpose == Purpose::Write && host.is_owner() && !host.is_admitting_writes() {
+                return Err(Error::Unavailable(format!(
+                    "partition {} is not admitting writes",
+                    info.id
+                )));
+            }
             // The owner answers everything. A replica answers a single-key
             // read only under the conditions in ADR 0001, and never answers a
             // write or a scan.
@@ -865,7 +938,10 @@ impl<R: Runtime> Node<R> {
     ) -> Result<GetResponse> {
         validate::key(&request.key)?;
 
-        let (owner, partition) = match self.hop(keyspace.id, &request.key, Purpose::Read).await? {
+        let (owner, partition) = match self
+            .route(keyspace.id, &request.key, Purpose::Read, forwarded)
+            .await?
+        {
             Hop::Local(host, owner, partition) => match host.read(&request.key).await? {
                 Read::Served(record) => {
                     // Charged on the node that served the read — owner or
@@ -960,7 +1036,10 @@ impl<R: Runtime> Node<R> {
             }
         }
 
-        match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
+        match self
+            .route(keyspace.id, &request.key, Purpose::Write, forwarded)
+            .await?
+        {
             Hop::Local(host, ..) => {
                 // The rate is charged here, on the owner every write converges
                 // on, and forwarded writes are charged too — see
@@ -1051,7 +1130,10 @@ impl<R: Runtime> Node<R> {
     ) -> Result<DeleteResponse> {
         validate::key(&request.key)?;
 
-        match self.hop(keyspace.id, &request.key, Purpose::Write).await? {
+        match self
+            .route(keyspace.id, &request.key, Purpose::Write, forwarded)
+            .await?
+        {
             Hop::Local(host, ..) => {
                 // A delete is a write for rate purposes and converges on the
                 // owner, charged here so forwarded deletes are metered too.
@@ -1267,51 +1349,71 @@ impl<R: Runtime> Node<R> {
     /// Whether an error means this node's map may be behind, rather than that
     /// the request was wrong.
     ///
-    /// `Unavailable` is here because it is what a partition says while a split
-    /// has its writes quiesced, and a split ends by retiring that partition. A
-    /// node still holding the retired parent goes on refusing writes it could
-    /// serve from the child until its next scheduled poll — measured at 144ms
-    /// past the point the split had already completed. The error is documented
-    /// as retryable and the map is what makes the retry succeed, so the two
-    /// belong together.
-    ///
-    /// A partition that is genuinely unavailable, mid-failover with no owner,
-    /// costs one extra attempt against a map that turns out not to have moved.
-    /// That is bounded: the repair is coalesced, and only the node the client
-    /// reached retries, never a forwarded hop.
+    /// Deliberately narrow. Both variants here are answers a node gives about
+    /// routing, before it does anything to the partition, so replaying the
+    /// request after one cannot apply it twice. `Unavailable` is not here, and
+    /// must not be: a forwarded write that timed out may already have been
+    /// committed by the owner, and resending it would consume a second
+    /// version, turn an applied conditional write into `applied: false`, or
+    /// delete a key and then report it was never there. Staleness that is
+    /// provably pre-dispatch is handled in [`Self::route`] instead, where
+    /// nothing has been sent yet.
     fn should_repair(&self, error: &Error, forwarded: bool) -> bool {
-        !forwarded
-            && matches!(
-                error,
-                Error::NotOwner { .. } | Error::StaleEpoch { .. } | Error::Unavailable(_)
-            )
+        !forwarded && matches!(error, Error::NotOwner { .. } | Error::StaleEpoch { .. })
     }
 
+    /// Re-reads the map, once per window, and does not return until whoever
+    /// is reading it has finished.
+    ///
+    /// Both halves matter. Coalescing keeps a map change that every in-flight
+    /// request notices at the same instant from becoming a fetch per request
+    /// against the leader group, at the moment it is least affordable.
+    /// Waiting is what makes the coalescing useful to the caller: a request
+    /// that skipped the fetch and retried immediately would route on the same
+    /// map that just refused it and fail again for the same reason, so the
+    /// repair would have absorbed the load without buying anyone the answer.
+    ///
+    /// The lock is held across the fetch and the reconcile it triggers, so a
+    /// waiter resumes against a map whose hosts are open rather than against
+    /// one that has only just been installed.
     async fn repair(&self) {
-        if !self.claim_repair() {
+        if self.repaired_within_window() {
+            return;
+        }
+        let _turn = self.repair_gate.lock().await;
+        // Checked again under the lock: everyone queued behind one winner is
+        // asking for the fetch that winner just did.
+        if self.repaired_within_window() {
             return;
         }
         if let Err(error) = self.refresh_map().await {
             tracing::warn!(%error, "could not refresh the partition map after a misroute");
         }
+        self.last_repair_nanos
+            .store(self.runtime.clock().monotonic_nanos(), Ordering::Relaxed);
     }
 
-    /// Takes the right to re-read the map, at most once per
-    /// [`MISROUTE_REPAIR_INTERVAL`].
+    /// How long a misroute repair suppresses the next one.
     ///
-    /// Compare-and-swap rather than a lock, so a caller that loses the race
-    /// returns immediately instead of queueing behind a fetch it would then
-    /// have to be told the result of. Losing means someone else is already
-    /// asking, and the retry that follows reads whatever they find.
-    fn claim_repair(&self) -> bool {
-        let now = self.runtime.clock().monotonic_nanos();
+    /// Proportional to this node's own polling, so the bound it promises —
+    /// [`MISROUTE_REPAIRS_PER_POLL`] fetches per poll — holds at whatever
+    /// interval the deployment configured rather than only at the default.
+    fn misroute_repair_interval(&self) -> Duration {
+        self.control_poll_interval / MISROUTE_REPAIRS_PER_POLL
+    }
+
+    /// Whether the map was re-read recently enough that another read would
+    /// tell this caller nothing new.
+    ///
+    /// Stamped after the fetch completes rather than before it starts, so the
+    /// window measures time since the map was actually current.
+    fn repaired_within_window(&self) -> bool {
         let last = self.last_repair_nanos.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < MISROUTE_REPAIR_INTERVAL.as_nanos() as u64 {
+        if last == 0 {
             return false;
         }
-        self.last_repair_nanos
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
+        let now = self.runtime.clock().monotonic_nanos();
+        now.saturating_sub(last) < self.misroute_repair_interval().as_nanos() as u64
     }
 
     /// Takes a read lease this node's owner offered for one partition.
@@ -2621,6 +2723,7 @@ mod tests {
                     None,
                     None,
                     crate::DEFAULT_LEASE_DURATION,
+                    crate::DEFAULT_CONTROL_POLL_INTERVAL,
                     gate,
                     authenticator,
                 )
@@ -2696,6 +2799,7 @@ mod tests {
                     None,
                     None,
                     crate::DEFAULT_LEASE_DURATION,
+                    crate::DEFAULT_CONTROL_POLL_INTERVAL,
                     gate,
                     authenticator,
                 )
@@ -2767,6 +2871,7 @@ mod tests {
                     None,
                     None,
                     crate::DEFAULT_LEASE_DURATION,
+                    crate::DEFAULT_CONTROL_POLL_INTERVAL,
                     gate,
                     authenticator,
                 )
@@ -2775,14 +2880,74 @@ mod tests {
             })
         };
 
-        assert!(node.claim_repair(), "the first misroute may re-read");
+        // Nothing has been repaired yet, so the first caller must go and look.
+        assert!(!node.repaired_within_window(), "no repair has happened yet");
+        let repairing = Arc::clone(&node);
+        sim.block_on(async move { repairing.repair().await });
+
+        // And every caller arriving inside the window rides on that one
+        // rather than issuing a fetch of its own.
         assert!(
-            !node.claim_repair(),
-            "a second misroute inside the window rides on the first"
+            node.repaired_within_window(),
+            "a repair inside the window did not suppress the next one"
+        );
+
+        drop(node);
+    }
+
+    /// The repair window has to follow the interval this node actually polls
+    /// on, not the default.
+    ///
+    /// The bound being promised is a number of extra fetches per poll. Fixing
+    /// the window to the default would keep that promise only for a cluster
+    /// using the default: at a ten second poll it would allow hundreds of
+    /// repairs per poll, and at a very short one it would delay a repair past
+    /// the poll that would have fixed it anyway.
+    #[test]
+    fn the_repair_window_scales_with_the_configured_poll_interval() {
+        let sim = Simulation::new(29);
+        let slow = Duration::from_secs(10);
+        let node = {
+            let runtime = sim.add_node(NodeId(1));
+            let store = Arc::new(MemoryStore::new());
+            let layout = DataLayout {
+                store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+                wal_root: "wal".to_string(),
+                wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            };
+            let source = BoxedMapSource::new(StaticMapSource::new(one_partition_map()));
+            sim.block_on(async move {
+                let authenticator = Arc::new(Authenticator::new(
+                    false,
+                    None,
+                    std::time::Duration::from_secs(86_400),
+                    runtime.clock().clone(),
+                ));
+                Node::start(
+                    runtime,
+                    NodeId(1),
+                    layout,
+                    source,
+                    None,
+                    None,
+                    crate::DEFAULT_LEASE_DURATION,
+                    slow,
+                    Arc::new(ReadinessGate::new()),
+                    authenticator,
+                )
+                .await
+                .expect("the node starts")
+            })
+        };
+
+        assert_eq!(
+            node.misroute_repair_interval(),
+            slow / MISROUTE_REPAIRS_PER_POLL,
+            "the window must be derived from the interval this node was given"
         );
         assert!(
-            !node.claim_repair(),
-            "and so does every one after it, however many arrive"
+            node.misroute_repair_interval() > crate::DEFAULT_CONTROL_POLL_INTERVAL,
+            "a ten second poll must not be coalescing on the default's window"
         );
 
         drop(node);
@@ -2821,6 +2986,7 @@ mod tests {
                     None,
                     None,
                     crate::DEFAULT_LEASE_DURATION,
+                    crate::DEFAULT_CONTROL_POLL_INTERVAL,
                     gate,
                     authenticator,
                 )
@@ -2829,11 +2995,19 @@ mod tests {
             })
         };
 
-        let quiesced = Error::Unavailable("partition 1 is splitting".into());
-        assert!(node.should_repair(&quiesced, false));
+        // The regression guard. Replaying an operation after `Unavailable`
+        // can apply a client's write twice: a forwarded SET that the owner
+        // committed and whose reply was lost comes back as a transport
+        // timeout, and resending it consumes a second version, turns an
+        // applied conditional write into `applied: false`, or deletes a key
+        // and then reports it was never there. Staleness that is provably
+        // pre-dispatch is retried in `route`, not here.
         assert!(
-            !node.should_repair(&quiesced, true),
-            "a forwarded request has already been routed by the node that owns the decision"
+            !node.should_repair(
+                &Error::Unavailable("partition 1 is splitting".into()),
+                false
+            ),
+            "replaying an operation after an ambiguous result can apply it twice"
         );
         assert!(node.should_repair(
             &Error::NotOwner {
@@ -2843,8 +3017,101 @@ mod tests {
             false
         ));
         assert!(
+            !node.should_repair(
+                &Error::NotOwner {
+                    partition: PartitionId(1),
+                    owner: None
+                },
+                true
+            ),
+            "a forwarded request has already been routed by the node that owns the decision"
+        );
+        assert!(
             !node.should_repair(&Error::NotFound, false),
             "a missing key says nothing about the map"
+        );
+
+        drop(node);
+    }
+
+    /// An owner that has closed write admission for a split is a routing
+    /// answer, not a write outcome.
+    ///
+    /// Deciding it here is what makes it safe to retry: the request has not
+    /// been dispatched, so re-reading the map and sending it to the child
+    /// cannot apply it twice. Deciding it inside the write would produce the
+    /// same message from a place where a retry is no longer safe.
+    #[test]
+    fn a_quiesced_owner_refuses_the_route_before_the_write_is_dispatched() {
+        let sim = Simulation::new(23);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(MemoryStore::new());
+        let layout = DataLayout {
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            wal_root: "wal".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        };
+        let source = StaticMapSource::new(one_partition_map());
+        let gate = Arc::new(ReadinessGate::new());
+        let node = {
+            let source = BoxedMapSource::new(source.clone());
+            sim.block_on(async move {
+                let authenticator = Arc::new(Authenticator::new(
+                    false,
+                    None,
+                    std::time::Duration::from_secs(86_400),
+                    runtime.clock().clone(),
+                ));
+                Node::start(
+                    runtime,
+                    NodeId(1),
+                    layout,
+                    source,
+                    None,
+                    None,
+                    crate::DEFAULT_LEASE_DURATION,
+                    crate::DEFAULT_CONTROL_POLL_INTERVAL,
+                    gate,
+                    authenticator,
+                )
+                .await
+                .expect("the node starts")
+            })
+        };
+
+        // Quiesce the owner the way a split does.
+        let closing = Arc::clone(&node);
+        sim.block_on(async move {
+            let host = closing
+                .hosts
+                .read()
+                .await
+                .get(&PartitionId(1))
+                .cloned()
+                .expect("the node owns partition 1");
+            host.close_split_gates();
+        });
+
+        let writing = Arc::clone(&node);
+        let write = sim
+            .block_on(async move { writing.hop(KeyspaceId(1), b"any-key", Purpose::Write).await });
+        match write {
+            Err(Error::Unavailable(message)) => assert!(
+                message.contains("not admitting writes"),
+                "expected an admission refusal from routing, got {message:?}"
+            ),
+            Err(other) => panic!("routing served a quiesced owner: {other:?}"),
+            Ok(_) => panic!("routing served a quiesced owner"),
+        }
+
+        // A read is untouched: the split closes writes, and a replica or the
+        // owner may still answer one.
+        let reading = Arc::clone(&node);
+        let read = sim
+            .block_on(async move { reading.hop(KeyspaceId(1), b"any-key", Purpose::Read).await });
+        assert!(
+            matches!(read, Ok(Hop::Local(..))),
+            "a quiesced owner still answers reads"
         );
 
         drop(node);
@@ -2882,6 +3149,7 @@ mod tests {
                 None,
                 None,
                 crate::DEFAULT_LEASE_DURATION,
+                crate::DEFAULT_CONTROL_POLL_INTERVAL,
                 gate,
                 authenticator,
             )

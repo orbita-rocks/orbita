@@ -435,6 +435,7 @@ impl Server {
             initial_split_intents,
             initial_merge_intents,
             config.lease_duration,
+            config.control_poll_interval,
             Arc::clone(&readiness),
             Arc::clone(&authenticator),
         )
