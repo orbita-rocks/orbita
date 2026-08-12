@@ -55,6 +55,40 @@ pub struct ControlConfig {
 
     /// Continuous dead time before a voter may be replaced.
     pub voter_replacement_after: Duration,
+
+    /// Whether the leader moves ownership to even it out across the cluster.
+    ///
+    /// One owner serialises a partition, and the owner does strictly more work
+    /// per write than a replica: it admits the request, assigns the version,
+    /// updates the index, evaluates conditions, coordinates the quorum, and
+    /// runs flush and compaction. A node owning every partition of a keyspace
+    /// therefore carries measurably more load than one that only replicates it
+    /// — about 50% more CPU on the three-node cluster measured for issue #160.
+    ///
+    /// Splitting places children well, but placement at split time cannot fix
+    /// skew that appears later: a failover moves every partition of a dead
+    /// owner onto one survivor and nothing moves them back.
+    pub ownership_rebalancing_enabled: bool,
+
+    /// How much owner-count skew is tolerated before ownership is moved.
+    ///
+    /// Expressed as a difference in partitions owned, between the busiest and
+    /// least busy eligible node. A move costs the partition a lease drain, so
+    /// this is deliberately not zero: a cluster whose owner counts cannot
+    /// divide evenly must not trade availability forever chasing a balance
+    /// that does not exist. Two is the smallest threshold that is stable when
+    /// partitions do not divide evenly by nodes, because a one-apart
+    /// distribution is already the best achievable.
+    pub ownership_skew_threshold: usize,
+
+    /// How long after moving a partition's ownership before it may move again.
+    ///
+    /// Rebalancing competes with failover, drains, splits, and merges, all of
+    /// which also move ownership. Without a cooldown the balancer would
+    /// immediately undo a placement one of those made deliberately, and two
+    /// mechanisms fighting over the same partition is worse than either
+    /// imbalance they are arguing about.
+    pub ownership_rebalance_cooldown: Duration,
 }
 
 impl Default for ControlConfig {
@@ -109,6 +143,12 @@ impl ControlConfig {
             voter_target: 3,
             voter_management_enabled: false,
             voter_replacement_after: Duration::from_secs(5 * 60),
+            ownership_rebalancing_enabled: true,
+            ownership_skew_threshold: 2,
+            // Comfortably longer than a failover takes end to end, so the
+            // balancer never reacts to a partition that is still settling
+            // from one.
+            ownership_rebalance_cooldown: Duration::from_secs(30),
         };
         // A caller asking for a tighter budget than the defaults fit gets the
         // detection window scaled down rather than a silent overrun, because

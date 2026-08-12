@@ -200,8 +200,30 @@ struct Inner {
     /// When this controller started observing. A node it has never heard from
     /// is timed from here rather than from the beginning of time.
     observing_since: u64,
+    /// When this leader last moved ownership to even out load, on its own
+    /// monotonic clock. Rebalancing is rate limited against this rather than
+    /// per partition: each move costs one partition a lease drain, so what has
+    /// to be bounded is how often the cluster gives up availability for
+    /// balance, not how often any single partition does.
+    ///
+    /// Not replicated, and cleared on a leadership change, for the same reason
+    /// `fenced_since` is: it times an interval only this node observed. A new
+    /// leader waiting one extra cooldown before its first move is the safe
+    /// direction to be wrong in.
+    last_rebalance_at: Option<u64>,
     /// Leadership changes invalidate every local failure-detection deadline.
     was_leader: bool,
+}
+
+/// One ownership move the balancer wants to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rebalance {
+    partition: PartitionId,
+    /// Recorded for the sake of tests and logs. The transfer reads the owner
+    /// from the map again, because it may have changed since the plan.
+    #[allow(dead_code)]
+    from: NodeId,
+    to: NodeId,
 }
 
 /// The leader group's decision loop and the API around it.
@@ -243,6 +265,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 prepared_merges: Vec::new(),
                 fenced_since: BTreeMap::new(),
                 observing_since,
+                last_rebalance_at: None,
                 was_leader: false,
             })),
         }
@@ -1604,6 +1627,10 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 inner.prepared_splits.clear();
                 inner.prepared_merges.clear();
                 inner.fenced_since.clear();
+                // Timed from a clock this node did not have. Starting the
+                // cooldown fresh makes a new leader wait before its first move
+                // instead of inheriting a deadline it cannot vouch for.
+                inner.last_rebalance_at = Some(now);
                 inner.observing_since = now;
                 inner.was_leader = true;
             }
@@ -1616,7 +1643,158 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.advance_pending_merges().await?;
         self.place_unowned_partitions().await?;
         self.repair_replica_sets().await?;
+        // Last, and deliberately so. Everything above restores a property the
+        // cluster is supposed to have; this one improves a property it merely
+        // prefers. A sweep that has already spent its budget fencing a dead
+        // owner should not then spend more moving a live one for balance.
+        self.rebalance_ownership().await?;
         Ok(())
+    }
+
+    /// Moves one partition's ownership to even out how much owner-side work
+    /// each node carries.
+    ///
+    /// Ownership is not bookkeeping. The owner admits the request, assigns the
+    /// version, updates the index, evaluates conditions, coordinates the
+    /// quorum, and runs flush and compaction; a replica appends to its WAL and
+    /// fsyncs. On the three-node cluster measured for issue #160 a node owning
+    /// every partition of a keyspace carried about 50% more CPU than a node
+    /// that only replicated it, and spreading ownership flattened that to
+    /// within 5%. So an uneven owner count is uneven load, and evening it out
+    /// is real capacity rather than tidiness.
+    ///
+    /// Placement at split time cannot do this job on its own. It only sees the
+    /// moment a partition is created, and the skew that matters arrives later:
+    /// a failover moves every partition of a dead owner onto one survivor and
+    /// nothing moves them back, and a node that joins an already balanced
+    /// cluster is never given anything.
+    ///
+    /// Deliberately slow and deliberately reluctant. One partition per
+    /// cooldown, cluster wide, and only when the imbalance is worth a lease
+    /// drain. A balancer that moves ownership often enough to be noticed is
+    /// worse than the imbalance it is correcting, because every move makes one
+    /// partition briefly unavailable and competes with failover, drains,
+    /// splits, and merges for the same partitions.
+    ///
+    /// Ownership can only move to a node that already holds a copy, so this
+    /// redistributes owner-side work across a partition's existing holders. It
+    /// cannot widen the set of nodes a keyspace lives on; that needs data to
+    /// move and is a different mechanism.
+    async fn rebalance_ownership(&self) -> Result<()> {
+        if !self.config.ownership_rebalancing_enabled {
+            return Ok(());
+        }
+        let now = self.runtime.clock().monotonic_nanos();
+        let cooldown = self.config.ownership_rebalance_cooldown.as_nanos() as u64;
+
+        let plan = {
+            let inner = self.inner.lock().await;
+            if let Some(last) = inner.last_rebalance_at {
+                if now.saturating_sub(last) < cooldown {
+                    return Ok(());
+                }
+            }
+            Self::rebalance_plan(&inner, self.config.ownership_skew_threshold)
+        };
+
+        let Some(Rebalance { partition, to, .. }) = plan else {
+            return Ok(());
+        };
+
+        // Recorded before the move, not after. `transfer_ownership` waits out a
+        // lease drain, so recording afterwards would let a failure partway
+        // through retry immediately and turn one refused move into a loop of
+        // fences.
+        self.inner.lock().await.last_rebalance_at = Some(now);
+
+        match self.transfer_ownership(partition, to).await {
+            // The map moved under the plan: something with a better claim on
+            // this partition got there first. Nothing to repair, and the next
+            // sweep re-derives from whatever it left behind.
+            Ok(()) | Err(Error::StaleEpoch { .. } | Error::InvalidArgument(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Chooses the one ownership move that most reduces owner-count skew, or
+    /// nothing when no move is worth its cost.
+    ///
+    /// Split out from the sweep so it can be tested without a cluster: it is a
+    /// pure decision over a snapshot, and the parts worth protecting are which
+    /// move it picks and when it declines to pick one.
+    fn rebalance_plan(inner: &Inner, threshold: usize) -> Option<Rebalance> {
+        let eligible: Vec<NodeId> = inner
+            .state
+            .nodes()
+            .filter(|node| inner.state.is_eligible_owner(node.id))
+            .map(|node| node.id)
+            .collect();
+        if eligible.len() < 2 {
+            return None;
+        }
+
+        let owned = |node: NodeId| -> usize {
+            inner
+                .state
+                .map()
+                .partitions()
+                .filter(|info| info.owner == Some(node))
+                .count()
+        };
+        // Ties break on node id so the same snapshot always yields the same
+        // move. Two leaders disagreeing here would be harmless — only one
+        // proposes — but a decision that wanders makes a flapping balancer
+        // impossible to tell from a correct one in a log.
+        let mut counts: Vec<(usize, NodeId)> = eligible.iter().map(|n| (owned(*n), *n)).collect();
+        counts.sort_unstable();
+
+        let (fewest, _) = *counts.first()?;
+        let (most, busiest) = *counts.last()?;
+        if most.saturating_sub(fewest) < threshold.max(1) {
+            return None;
+        }
+
+        // Every partition the busiest node owns that could move, cheapest
+        // first by partition id for a stable choice.
+        let mut movable: Vec<&PartitionInfo> = inner
+            .state
+            .map()
+            .partitions()
+            .filter(|info| info.owner == Some(busiest))
+            .filter(|info| inner.state.phase(info.id) == Some(PartitionPhase::Serving))
+            // A transfer aborts a split or merge in flight on the partition,
+            // which throws away work the cluster already paid for to correct
+            // an imbalance that will still be there afterwards.
+            .filter(|info| !inner.state.is_splitting(info.id) && !inner.state.is_merging(info.id))
+            .collect();
+        movable.sort_unstable_by_key(|info| info.id);
+
+        // Take the emptiest node that can actually receive one of them. A node
+        // can only be promoted where it already holds a copy, so the emptiest
+        // node overall is often not a legal target for anything the busiest
+        // node owns.
+        for (count, target) in counts {
+            if target == busiest {
+                break;
+            }
+            // Moving into a node that is already within one of the busiest
+            // does not reduce the spread, it just moves the peak.
+            if most.saturating_sub(count) < threshold.max(1) {
+                break;
+            }
+            if let Some(info) = movable
+                .iter()
+                .find(|info| info.replicas.contains(&target))
+                .copied()
+            {
+                return Some(Rebalance {
+                    partition: info.id,
+                    from: busiest,
+                    to: target,
+                });
+            }
+        }
+        None
     }
 
     async fn repair_voter_set(&self) -> Result<()> {
@@ -2302,6 +2480,285 @@ mod tests {
                 .unwrap();
         });
         (sim, controller)
+    }
+
+    /// Splits the keyspace's single partition into `ids.len() + 1` partitions.
+    async fn split_into(
+        controller: &Controller<orbita_sim::SimRuntime, SingleNodeLog<orbita_sim::SimRuntime>>,
+        boundaries: &[(&'static [u8], u64, u64)],
+    ) {
+        for (at, lower, upper) in boundaries {
+            let parent = {
+                let inner = controller.inner.lock().await;
+                // The partition whose half-open range covers the boundary.
+                let found = inner
+                    .state
+                    .map()
+                    .partitions()
+                    .find(|p| p.range.start() <= *at && p.range.end().is_none_or(|end| *at < end))
+                    .cloned();
+                found
+            };
+            let parent = parent.expect("a partition covering the boundary");
+            controller
+                .submit(ControlCommand::BeginSplit {
+                    parent: parent.id,
+                    at: Bytes::from_static(at),
+                    lower: PartitionId(*lower),
+                    upper: PartitionId(*upper),
+                    expect_epoch: parent.epoch,
+                })
+                .await
+                .unwrap();
+            let mut holders = vec![parent.owner.unwrap()];
+            holders.extend(parent.replicas.iter().copied());
+            for node in holders {
+                controller
+                    .submit(ControlCommand::MarkSplitPrepared {
+                        parent: parent.id,
+                        node,
+                        expect_epoch: parent.epoch,
+                    })
+                    .await
+                    .unwrap();
+            }
+            controller
+                .submit(ControlCommand::CompleteSplit {
+                    parent: parent.id,
+                    expect_epoch: parent.epoch,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Forces every partition onto one owner, which is the shape a failover
+    /// leaves behind and the shape the balancer exists to undo.
+    async fn pile_onto(
+        controller: &Controller<orbita_sim::SimRuntime, SingleNodeLog<orbita_sim::SimRuntime>>,
+        owner: NodeId,
+        replicas: Vec<NodeId>,
+    ) {
+        let ids: Vec<PartitionId> = {
+            let inner = controller.inner.lock().await;
+            let out = inner.state.map().partitions().map(|p| p.id).collect();
+            out
+        };
+        for id in ids {
+            let epoch = controller.epoch_of(id).await.unwrap();
+            controller
+                .submit(ControlCommand::FencePartition {
+                    partition: id,
+                    expect_epoch: epoch,
+                })
+                .await
+                .unwrap();
+            let fenced = controller.epoch_of(id).await.unwrap();
+            controller
+                .submit(ControlCommand::AssignOwner {
+                    partition: id,
+                    owner,
+                    replicas: replicas.clone(),
+                    expect_epoch: fenced,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    type TestController = Controller<orbita_sim::SimRuntime, SingleNodeLog<orbita_sim::SimRuntime>>;
+
+    async fn owner_counts(controller: &TestController) -> BTreeMap<NodeId, usize> {
+        let inner = controller.inner.lock().await;
+        let mut counts = BTreeMap::new();
+        for info in inner.state.map().partitions() {
+            if let Some(owner) = info.owner {
+                *counts.entry(owner).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    #[test]
+    fn every_partition_on_one_owner_plans_a_move_off_it() {
+        // The shape a failover leaves: one survivor holding everything its
+        // dead peer used to own, and nothing that moves them back. The owner
+        // does strictly more work per write than a replica, so this is a real
+        // load imbalance rather than untidy bookkeeping. See issue #160.
+        let (sim, controller) = merged_cluster(300);
+        sim.block_on(async move {
+            split_into(
+                &controller,
+                &[(b"m", 10, 11), (b"f", 12, 13), (b"t", 14, 15)],
+            )
+            .await;
+            pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+            assert_eq!(
+                owner_counts(&controller).await,
+                BTreeMap::from([(NodeId(1), 4)]),
+                "the fixture should have piled all four onto node 1"
+            );
+
+            let inner = controller.inner.lock().await;
+            let plan = TestController::rebalance_plan(&inner, 2).expect("a move");
+            assert_eq!(plan.from, NodeId(1));
+            assert_ne!(plan.to, NodeId(1));
+            assert!(
+                inner
+                    .state
+                    .map()
+                    .partition(plan.partition)
+                    .unwrap()
+                    .replicas
+                    .contains(&plan.to),
+                "ownership can only move where a copy already is"
+            );
+        });
+    }
+
+    #[test]
+    fn an_evenly_owned_cluster_plans_no_move() {
+        // Every move costs one partition a lease drain. A balancer that keeps
+        // moving a cluster that is already as even as it can be spends
+        // availability forever and buys nothing.
+        let (sim, controller) = merged_cluster(301);
+        sim.block_on(async move {
+            split_into(
+                &controller,
+                &[(b"m", 10, 11), (b"f", 12, 13), (b"t", 14, 15)],
+            )
+            .await;
+
+            let counts = owner_counts(&controller).await;
+            assert_eq!(
+                counts.values().sum::<usize>(),
+                4,
+                "the fixture should have four owned partitions, got {counts:?}"
+            );
+            assert_eq!(counts.len(), 3, "spread across every node, got {counts:?}");
+            assert!(
+                counts.values().max().unwrap() - counts.values().min().unwrap() <= 1,
+                "a spread split should already be even, got {counts:?}"
+            );
+
+            let inner = controller.inner.lock().await;
+            assert_eq!(TestController::rebalance_plan(&inner, 2), None);
+        });
+    }
+
+    #[test]
+    fn rebalancing_converges_and_then_stops() {
+        // The property that separates a balancer from a flapper: applying its
+        // own advice repeatedly has to reach a state where it has no advice,
+        // rather than trading the same partition back and forth.
+        let (sim, controller) = merged_cluster(302);
+        sim.block_on(async move {
+            split_into(
+                &controller,
+                &[(b"m", 10, 11), (b"f", 12, 13), (b"t", 14, 15)],
+            )
+            .await;
+            pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+
+            let mut moves = 0;
+            loop {
+                let plan = {
+                    let inner = controller.inner.lock().await;
+                    TestController::rebalance_plan(&inner, 2)
+                };
+                let Some(plan) = plan else { break };
+                moves += 1;
+                assert!(moves <= 8, "did not converge in {moves} moves");
+                controller
+                    .transfer_ownership(plan.partition, plan.to)
+                    .await
+                    .unwrap();
+            }
+
+            let counts = owner_counts(&controller).await;
+            let spread = counts.values().max().unwrap() - counts.values().min().unwrap();
+            assert!(
+                spread < 2,
+                "stopped while still skewed by {spread}: {counts:?}"
+            );
+            assert!(
+                moves > 0,
+                "started skewed, so it should have moved something"
+            );
+        });
+    }
+
+    #[test]
+    fn the_cooldown_allows_only_one_move_per_window() {
+        // Each move makes one partition briefly unavailable, so the rate is
+        // the safety property. A badly skewed cluster must not be corrected by
+        // fencing every partition at once, which would be a self-inflicted
+        // outage in the name of balance.
+        let (sim, controller) = merged_cluster(304);
+        sim.block_on(async move {
+            split_into(
+                &controller,
+                &[(b"m", 10, 11), (b"f", 12, 13), (b"t", 14, 15)],
+            )
+            .await;
+            pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+
+            controller.rebalance_ownership().await.unwrap();
+            let after_one = owner_counts(&controller).await;
+            assert_eq!(
+                after_one.get(&NodeId(1)).copied().unwrap_or(0),
+                3,
+                "exactly one partition should have left node 1, got {after_one:?}"
+            );
+
+            // Still skewed, and it still declines, because the window has not
+            // elapsed.
+            for _ in 0..3 {
+                controller.rebalance_ownership().await.unwrap();
+            }
+            assert_eq!(
+                owner_counts(&controller).await,
+                after_one,
+                "the cooldown did not hold a second move"
+            );
+        });
+    }
+
+    #[test]
+    fn a_partition_mid_split_is_left_alone_by_the_balancer() {
+        // A transfer aborts a split in flight, throwing away preparation the
+        // cluster already paid for, to correct an imbalance that is still
+        // there afterwards.
+        let (sim, controller) = merged_cluster(303);
+        sim.block_on(async move {
+            split_into(&controller, &[(b"m", 10, 11)]).await;
+            pile_onto(&controller, NodeId(1), vec![NodeId(2), NodeId(3)]).await;
+
+            // Open a split on one of them and leave it open.
+            let victim = {
+                let inner = controller.inner.lock().await;
+                let found = inner.state.map().partitions().next().unwrap().clone();
+                found
+            };
+            controller
+                .submit(ControlCommand::BeginSplit {
+                    parent: victim.id,
+                    at: Bytes::from_static(b"c"),
+                    lower: PartitionId(20),
+                    upper: PartitionId(21),
+                    expect_epoch: victim.epoch,
+                })
+                .await
+                .unwrap();
+
+            let inner = controller.inner.lock().await;
+            if let Some(plan) = TestController::rebalance_plan(&inner, 2) {
+                assert_ne!(
+                    plan.partition, victim.id,
+                    "the balancer picked the partition that is mid-split"
+                );
+            }
+        });
     }
 
     #[test]
