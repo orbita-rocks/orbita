@@ -178,6 +178,12 @@ telemetry:
   # entirely; logs still go to stderr, because a node that cannot reach a
   # collector still has to start and still has to be debuggable.
   otlpEndpoint: ""
+  # An existing Secret containing the OTLP headers string under `headers`, for
+  # example `Authorization=Bearer <token>`. The chart injects it through
+  # OTEL_EXPORTER_OTLP_HEADERS, which the exporter applies to traces and metrics.
+  # Keeping this separate from Helm values prevents the token from being stored
+  # in the release. Leave empty when the collector needs no authentication.
+  otlpHeadersSecret: ""
   # The fraction of traces to sample, decided once at the node that starts each
   # trace. 1.0 keeps everything, which is right until the trace volume says
   # otherwise.
