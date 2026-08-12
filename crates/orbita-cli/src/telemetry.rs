@@ -37,6 +37,7 @@ use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{Sampler, TracerProvider};
 use opentelemetry_sdk::{runtime, Resource};
+use tonic::transport::ClientTlsConfig;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -177,11 +178,14 @@ pub fn install_node(config: &Config) -> Result<TelemetryGuard> {
         // Traces. Head-based sampling is decided here because this node is where
         // the trace starts; a forwarded hop inherits the decision rather than
         // re-rolling it.
-        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint.clone())
-            .build()
-            .context("building the OTLP span exporter")?;
+        let span_exporter = configure_otlp_tls(
+            opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint.clone()),
+            &endpoint,
+        )
+        .build()
+        .context("building the OTLP span exporter")?;
         let tracer_provider = TracerProvider::builder()
             .with_batch_exporter(span_exporter, runtime::Tokio)
             .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
@@ -194,11 +198,14 @@ pub fn install_node(config: &Config) -> Result<TelemetryGuard> {
 
         // Metrics. A periodic reader pushes on its own cadence; the node emits
         // into the meter and never blocks a request on an export.
-        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint)
-            .build()
-            .context("building the OTLP metric exporter")?;
+        let metric_exporter = configure_otlp_tls(
+            opentelemetry_otlp::MetricExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint.clone()),
+            &endpoint,
+        )
+        .build()
+        .context("building the OTLP metric exporter")?;
         let reader = PeriodicReader::builder(metric_exporter, runtime::Tokio).build();
         let meter_provider = SdkMeterProvider::builder()
             .with_reader(reader)
@@ -228,6 +235,18 @@ pub fn install_node(config: &Config) -> Result<TelemetryGuard> {
         .try_init();
 
     Ok(guard)
+}
+
+fn configure_otlp_tls<T: opentelemetry_otlp::WithTonicConfig>(builder: T, endpoint: &str) -> T {
+    if otlp_uses_tls(endpoint) {
+        builder.with_tls_config(ClientTlsConfig::new().with_webpki_roots())
+    } else {
+        builder
+    }
+}
+
+fn otlp_uses_tls(endpoint: &str) -> bool {
+    endpoint.starts_with("https://")
 }
 
 /// The OpenTelemetry resource every span and metric is attributed to.
@@ -276,6 +295,12 @@ mod tests {
             ..TelemetryLayer::default()
         }));
         assert!(settings.export_enabled());
+    }
+
+    #[test]
+    fn https_collectors_use_tls_while_local_http_collectors_do_not() {
+        assert!(otlp_uses_tls("https://ingress.example.com:4317"));
+        assert!(!otlp_uses_tls("http://collector:4317"));
     }
 
     #[test]
