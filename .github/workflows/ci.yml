@@ -42,6 +42,9 @@ jobs:
   check:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,7 +60,7 @@ jobs:
       # moon only runs cargo and does not install it.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
 
       - uses: moonrepo/setup-toolchain@v0
         with:
@@ -71,9 +74,31 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Scoped to the Rust crates, because the end-to-end suite also has a
-      # `test` task and it belongs to the job below.
-      - run: moon run :fmt :lint :test --query "language=rust"
+      # A prebuilt, checksum-verified binary avoids compiling the coverage tool
+      # before compiling the workspace it is meant to measure.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.6
+
+      # Keep formatting and clippy uninstrumented. The test tasks below compile
+      # once with LLVM coverage enabled, so coverage does not rerun the suite.
+      - name: Check formatting and lint
+        run: moon run :fmt :lint --query "language=rust"
+
+      - name: Run Rust tests with coverage
+        run: |
+          eval "$(cargo llvm-cov show-env --sh)"
+          cargo llvm-cov clean --workspace
+          moon run :test --query "language=rust" --force
+          cargo llvm-cov report --codecov --output-path codecov.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          files: codecov.json
+          disable_search: true
+          fail_ci_if_error: true
 
       # The live object store tests, which prove that a deposed writer holding
       # a stale ETag loses the manifest swap to the writer that replaced it.
@@ -136,48 +161,6 @@ jobs:
       - name: MinIO logs
         if: failure()
         run: docker logs orbita-minio
-
-  # Coverage gets its own build because LLVM instrumentation changes every Rust
-  # artifact. Sharing a target directory with the ordinary test gate would save
-  # little and make it easier to mix instrumented and uninstrumented objects.
-  # Codecov authenticates the upload with GitHub OIDC, so installing its GitHub
-  # App does not require a long-lived CODECOV_TOKEN in repository secrets.
-  coverage:
-    name: Rust coverage
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-
-      # A prebuilt, checksum-verified binary avoids compiling the coverage tool
-      # before compiling the workspace it is meant to measure.
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov@0.8.6
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Codecov's native format retains region coverage, unlike LCOV, which the
-      # Rust coverage tool can report only as lines once Codecov ingests it.
-      - name: Generate Rust coverage
-        run: cargo llvm-cov --workspace --all-features --codecov --output-path codecov.json
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          use_oidc: true
-          files: codecov.json
-          disable_search: true
-          fail_ci_if_error: true
 
   # A separate job because these fail for different reasons than the Rust
   # tests do: this one is the wire contract as seen by a client that shares no
