@@ -137,6 +137,48 @@ jobs:
         if: failure()
         run: docker logs orbita-minio
 
+  # Coverage gets its own build because LLVM instrumentation changes every Rust
+  # artifact. Sharing a target directory with the ordinary test gate would save
+  # little and make it easier to mix instrumented and uninstrumented objects.
+  # Codecov authenticates the upload with GitHub OIDC, so installing its GitHub
+  # App does not require a long-lived CODECOV_TOKEN in repository secrets.
+  coverage:
+    name: Rust coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      # A prebuilt, checksum-verified binary avoids compiling the coverage tool
+      # before compiling the workspace it is meant to measure.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.6
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Codecov's native format retains region coverage, unlike LCOV, which the
+      # Rust coverage tool can report only as lines once Codecov ingests it.
+      - name: Generate Rust coverage
+        run: cargo llvm-cov --workspace --all-features --codecov --output-path codecov.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          files: codecov.json
+          disable_search: true
+          fail_ci_if_error: true
+
   # A separate job because these fail for different reasons than the Rust
   # tests do: this one is the wire contract as seen by a client that shares no
   # code with the server, so a failure here means the protocol is wrong rather
