@@ -335,6 +335,22 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         self.runtime.transport().local_node()
     }
 
+    /// Whether this node is actually in the leader group's configuration.
+    ///
+    /// Every combined node hosts a Raft state machine, but only the ones in
+    /// the configuration are replicated to. A node outside it holds a dormant
+    /// log that nothing will ever advance, so anything that waits for that log
+    /// to catch up, or reads state out of it, waits forever or reads nothing.
+    /// This is what tells the two apart.
+    ///
+    /// Answered from this node's own membership, which every combined node
+    /// opens from the durable bootstrap certificate, so a node can tell it has
+    /// been left out without having to ask the leader.
+    pub async fn is_active_member(&self) -> bool {
+        let local = self.node();
+        self.log.voters().await.contains(&local) || self.log.learners().await.contains(&local)
+    }
+
     /// Whether this controller may expose leader authority right now.
     ///
     /// This is stricter than the Raft role: it becomes true only after the
@@ -2834,6 +2850,87 @@ mod tests {
                 "the cooldown did not hold a second move"
             );
         });
+    }
+
+    /// A log whose membership can be set, so a node can be placed inside or
+    /// outside the configuration without standing up a Raft group.
+    #[derive(Clone)]
+    struct MembershipLog {
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    }
+
+    impl ConsensusLog for MembershipLog {
+        async fn propose(&self, _command: ControlCommand) -> Result<LogIndex> {
+            Ok(0)
+        }
+        async fn commit_index(&self) -> LogIndex {
+            0
+        }
+        async fn subscribe(&self, _after: LogIndex) -> Result<Vec<crate::LogEntry>> {
+            Ok(Vec::new())
+        }
+        async fn leader_barrier(&self) -> Result<LogIndex> {
+            Ok(0)
+        }
+        async fn is_leader(&self) -> bool {
+            true
+        }
+        async fn leader(&self) -> Option<NodeId> {
+            None
+        }
+        async fn voters(&self) -> Vec<NodeId> {
+            self.voters.clone()
+        }
+        async fn learners(&self) -> Vec<NodeId> {
+            self.learners.clone()
+        }
+    }
+
+    fn membership_controller(
+        sim: &Simulation,
+        local: NodeId,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    ) -> Controller<orbita_sim::SimRuntime, MembershipLog> {
+        let runtime = sim.add_node(local);
+        Controller::new(
+            runtime,
+            Arc::new(MembershipLog { voters, learners }),
+            ControlConfig::default(),
+        )
+    }
+
+    #[test]
+    fn a_node_outside_the_configuration_knows_it_is_not_a_member() {
+        // Every combined node hosts a Raft state machine, but only the ones in
+        // the configuration are replicated to. A node outside it holds a log
+        // nothing will ever advance, so waiting for that log to catch up waits
+        // forever — and waiting is what keeps it out, because the voter set is
+        // filled from nodes eligible to own partitions and eligibility needs
+        // readiness. Telling the two apart is what breaks that cycle. See
+        // issue #167.
+        let sim = Simulation::new(400);
+
+        let voter = membership_controller(&sim, NodeId(1), vec![NodeId(1), NodeId(2)], Vec::new());
+        assert!(
+            sim.block_on(async move { voter.is_active_member().await }),
+            "a voter is replicated to and must still be held to catching up"
+        );
+
+        let learner =
+            membership_controller(&sim, NodeId(3), vec![NodeId(1), NodeId(2)], vec![NodeId(3)]);
+        assert!(
+            sim.block_on(async move { learner.is_active_member().await }),
+            "a learner is replicated to so it can be promoted, so it counts too"
+        );
+
+        let surplus =
+            membership_controller(&sim, NodeId(4), vec![NodeId(1), NodeId(2)], Vec::new());
+        assert!(
+            !sim.block_on(async move { surplus.is_active_member().await }),
+            "a node the configuration leaves out can never catch up and must not be asked to"
+        );
     }
 
     #[test]
