@@ -174,6 +174,14 @@ pub fn install_node(config: &Config) -> Result<TelemetryGuard> {
 
     let (otel_layer, guard) = if let Some(endpoint) = settings.otlp_endpoint.clone() {
         let resource = resource(&settings);
+        let trace_endpoint = effective_otlp_endpoint(
+            opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            &endpoint,
+        );
+        let metrics_endpoint = effective_otlp_endpoint(
+            opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+            &endpoint,
+        );
 
         // Traces. Head-based sampling is decided here because this node is where
         // the trace starts; a forwarded hop inherits the decision rather than
@@ -181,8 +189,8 @@ pub fn install_node(config: &Config) -> Result<TelemetryGuard> {
         let span_exporter = configure_otlp_tls(
             opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
-                .with_endpoint(endpoint.clone()),
-            &endpoint,
+                .with_endpoint(trace_endpoint.clone()),
+            &trace_endpoint,
         )
         .build()
         .context("building the OTLP span exporter")?;
@@ -201,8 +209,8 @@ pub fn install_node(config: &Config) -> Result<TelemetryGuard> {
         let metric_exporter = configure_otlp_tls(
             opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()
-                .with_endpoint(endpoint.clone()),
-            &endpoint,
+                .with_endpoint(metrics_endpoint.clone()),
+            &metrics_endpoint,
         )
         .build()
         .context("building the OTLP metric exporter")?;
@@ -247,6 +255,24 @@ fn configure_otlp_tls<T: opentelemetry_otlp::WithTonicConfig>(builder: T, endpoi
 
 fn otlp_uses_tls(endpoint: &str) -> bool {
     endpoint.starts_with("https://")
+}
+
+fn effective_otlp_endpoint(signal_variable: &str, configured: &str) -> String {
+    select_otlp_endpoint(
+        configured,
+        std::env::var(signal_variable).ok(),
+        std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT).ok(),
+    )
+}
+
+fn select_otlp_endpoint(
+    configured: &str,
+    signal_override: Option<String>,
+    general_override: Option<String>,
+) -> String {
+    signal_override
+        .or(general_override)
+        .unwrap_or_else(|| configured.to_owned())
 }
 
 /// The OpenTelemetry resource every span and metric is attributed to.
@@ -301,6 +327,24 @@ mod tests {
     fn https_collectors_use_tls_while_local_http_collectors_do_not() {
         assert!(otlp_uses_tls("https://ingress.example.com:4317"));
         assert!(!otlp_uses_tls("http://collector:4317"));
+    }
+
+    #[test]
+    fn signal_endpoint_overrides_choose_the_transport_the_exporter_will_use() {
+        let configured = "https://collector:4317";
+        let general = Some("https://general:4317".to_owned());
+
+        let trace_endpoint = select_otlp_endpoint(
+            configured,
+            Some("http://traces:4317".to_owned()),
+            general.clone(),
+        );
+        let metrics_endpoint = select_otlp_endpoint(configured, None, general);
+
+        assert_eq!(trace_endpoint, "http://traces:4317");
+        assert!(!otlp_uses_tls(&trace_endpoint));
+        assert_eq!(metrics_endpoint, "https://general:4317");
+        assert!(otlp_uses_tls(&metrics_endpoint));
     }
 
     #[test]

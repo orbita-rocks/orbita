@@ -81,11 +81,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            {{- with .Values.telemetry.otlpHeadersSecret }}
+            {{- if and .Values.telemetry.otlpEndpoint .Values.telemetry.otlpHeadersSecret }}
             - name: OTEL_EXPORTER_OTLP_HEADERS
               valueFrom:
                 secretKeyRef:
-                  name: {{ . | quote }}
+                  name: {{ .Values.telemetry.otlpHeadersSecret | quote }}
                   key: headers
             {{- end }}
             {{- with (include "orbita.objectStoreEnv" . | trim) }}
