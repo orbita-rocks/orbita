@@ -175,6 +175,19 @@ pub(crate) struct Node<R: Runtime> {
     /// Whether the last attempt to match the open partitions to the map
     /// failed, which is what makes the next refresh try again.
     unreconciled: std::sync::atomic::AtomicBool,
+    /// When a misroute last made this node re-read the map, on its own
+    /// monotonic clock.
+    ///
+    /// A repair costs a fetch from the control plane, and the conditions that
+    /// provoke one are exactly the conditions many requests hit at the same
+    /// instant: a partition mid-failover, or a split that just retired the
+    /// parent every in-flight write is still addressed to. Repairing per
+    /// request would turn one map change into a fetch per request against the
+    /// control leader, which is load added precisely when it is least
+    /// affordable. One fetch serves every caller that arrives inside the
+    /// window, and a caller that finds the map already fresh has learned what
+    /// a fetch of its own would have told it.
+    last_repair_nanos: AtomicU64,
     /// The startup conditions this node reports. The node marks recovery and
     /// catch-up; the control loop above it marks the join.
     readiness: Arc<ReadinessGate>,
@@ -214,6 +227,23 @@ pub(crate) struct Node<R: Runtime> {
 /// fetch per request onto the leader group. At this interval the worst case is
 /// the traffic this node already sends on its own.
 const KEYSPACE_MISS_REPAIR_INTERVAL: Duration = DEFAULT_CONTROL_POLL_INTERVAL;
+
+/// How often a misrouted request may make this node re-read the map.
+///
+/// Bounded for the same reason [`KEYSPACE_MISS_REPAIR_INTERVAL`] is, but much
+/// shorter, because here the wait is the cost being removed rather than the
+/// load being avoided. A split ends by retiring the parent, and until this node
+/// re-reads the map it goes on refusing writes it could serve from the child —
+/// measured at 144ms past the point the split had already completed. Coalescing
+/// at the poll interval would leave that window exactly as it was.
+///
+/// A tenth of the poll interval bounds the worst case at ten fetches per node
+/// per poll, and only while misroutes are actually happening. Against a
+/// failover that leaves a partition unowned for seconds, that is a few hundred
+/// extra fetches spread over the whole event, which is the same order as the
+/// heartbeats those nodes are already sending.
+const MISROUTE_REPAIR_INTERVAL: Duration =
+    Duration::from_nanos(DEFAULT_CONTROL_POLL_INTERVAL.as_nanos() as u64 / 10);
 
 /// Where a request has to go.
 enum Hop<R: Runtime> {
@@ -314,6 +344,7 @@ impl<R: Runtime> Node<R> {
             },
             replica_reads: AtomicU64::new(0),
             unreconciled: std::sync::atomic::AtomicBool::new(false),
+            last_repair_nanos: AtomicU64::new(0),
             readiness,
             accepting_writes: AtomicBool::new(true),
             writes: tokio::sync::RwLock::new(()),
@@ -689,6 +720,21 @@ impl<R: Runtime> Node<R> {
             }
         }
         match info.owner {
+            // The map names this node the owner and this node has no owner
+            // host for it, which is the gap between a map version being
+            // published and the hosts behind it being open. Reconcile reads
+            // the map to decide what to open, so the map has to move first and
+            // the gap is inherent rather than a race to be closed.
+            //
+            // Forwarding here would send the request to this node, which would
+            // answer `NotOwner` naming this node as the owner — a reply that
+            // is both self-contradictory and, because it arrives forwarded,
+            // never retried. Saying what is actually true costs the client one
+            // retry instead of one failure.
+            Some(owner) if owner == self.node_id => Err(Error::Unavailable(format!(
+                "partition {} is opening on this node",
+                info.id
+            ))),
             Some(owner) => Ok(Hop::Forward(owner, info.id)),
             None => Err(Error::Unavailable(format!(
                 "partition {} has no owner",
@@ -1218,14 +1264,54 @@ impl<R: Runtime> Node<R> {
         Ok(())
     }
 
+    /// Whether an error means this node's map may be behind, rather than that
+    /// the request was wrong.
+    ///
+    /// `Unavailable` is here because it is what a partition says while a split
+    /// has its writes quiesced, and a split ends by retiring that partition. A
+    /// node still holding the retired parent goes on refusing writes it could
+    /// serve from the child until its next scheduled poll — measured at 144ms
+    /// past the point the split had already completed. The error is documented
+    /// as retryable and the map is what makes the retry succeed, so the two
+    /// belong together.
+    ///
+    /// A partition that is genuinely unavailable, mid-failover with no owner,
+    /// costs one extra attempt against a map that turns out not to have moved.
+    /// That is bounded: the repair is coalesced, and only the node the client
+    /// reached retries, never a forwarded hop.
     fn should_repair(&self, error: &Error, forwarded: bool) -> bool {
-        !forwarded && matches!(error, Error::NotOwner { .. } | Error::StaleEpoch { .. })
+        !forwarded
+            && matches!(
+                error,
+                Error::NotOwner { .. } | Error::StaleEpoch { .. } | Error::Unavailable(_)
+            )
     }
 
     async fn repair(&self) {
+        if !self.claim_repair() {
+            return;
+        }
         if let Err(error) = self.refresh_map().await {
             tracing::warn!(%error, "could not refresh the partition map after a misroute");
         }
+    }
+
+    /// Takes the right to re-read the map, at most once per
+    /// [`MISROUTE_REPAIR_INTERVAL`].
+    ///
+    /// Compare-and-swap rather than a lock, so a caller that loses the race
+    /// returns immediately instead of queueing behind a fetch it would then
+    /// have to be told the result of. Losing means someone else is already
+    /// asking, and the retry that follows reads whatever they find.
+    fn claim_repair(&self) -> bool {
+        let now = self.runtime.clock().monotonic_nanos();
+        let last = self.last_repair_nanos.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < MISROUTE_REPAIR_INTERVAL.as_nanos() as u64 {
+            return false;
+        }
+        self.last_repair_nanos
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Takes a read lease this node's owner offered for one partition.
@@ -2564,6 +2650,201 @@ mod tests {
         assert!(
             gate.state().is_met(ReadinessCondition::PartitionsCaughtUp),
             "readiness returns once every partition is open again"
+        );
+
+        drop(node);
+    }
+
+    /// A node that has not finished opening a partition the map has already
+    /// given it must say so, rather than forwarding the request to itself.
+    ///
+    /// Reconcile reads the map to decide what to open, so the map moves first
+    /// and there is always an interval where this node is the named owner of a
+    /// partition it cannot yet serve. Routing by the map alone sends the
+    /// request to this node, which answers `NotOwner` naming this node as the
+    /// owner: a reply that contradicts itself, and one that arrives marked as
+    /// forwarded, which is exactly the marking that stops it being retried.
+    #[test]
+    fn a_partition_the_map_has_given_this_node_but_it_cannot_open_reports_opening() {
+        let sim = Simulation::new(13);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(ListingFailureStore::new());
+        let layout = DataLayout {
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            wal_root: "wal".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        };
+
+        let source = StaticMapSource::new(one_partition_map());
+        let gate = Arc::new(ReadinessGate::new());
+        let node = {
+            let layout = layout.clone();
+            let source = BoxedMapSource::new(source.clone());
+            let gate = Arc::clone(&gate);
+            sim.block_on(async move {
+                let authenticator = Arc::new(Authenticator::new(
+                    false,
+                    None,
+                    std::time::Duration::from_secs(86_400),
+                    runtime.clock().clone(),
+                ));
+                Node::start(
+                    runtime,
+                    NodeId(1),
+                    layout,
+                    source,
+                    None,
+                    None,
+                    crate::DEFAULT_LEASE_DURATION,
+                    gate,
+                    authenticator,
+                )
+                .await
+                .expect("the node starts")
+            })
+        };
+
+        // The map hands this node a second partition it cannot open, which is
+        // the state a split leaves behind for as long as the children take to
+        // come up.
+        store.fail_list(true);
+        source.set(two_partition_map());
+        let refreshing = Arc::clone(&node);
+        let _ = sim.block_on(async move { refreshing.refresh_map().await });
+
+        let routing = Arc::clone(&node);
+        let hop = sim.block_on(async move {
+            routing
+                .hop(KeyspaceId(1), b"za-key-above-the-boundary", Purpose::Write)
+                .await
+        });
+
+        match hop {
+            Err(Error::Unavailable(message)) => assert!(
+                message.contains("opening"),
+                "expected an opening refusal, got {message:?}"
+            ),
+            Err(other) => panic!("expected Unavailable, got {other:?}"),
+            Ok(Hop::Forward(to, _)) => {
+                panic!("forwarded to {to:?}, which is this node")
+            }
+            Ok(_) => panic!("served locally from a partition that is not open"),
+        }
+
+        drop(node);
+    }
+
+    /// Repairing the map is a fetch from the control plane, and the conditions
+    /// that provoke one arrive at many requests at once. One fetch has to serve
+    /// all of them, or a single map change becomes a fetch per request against
+    /// the leader group at the moment it is least affordable.
+    #[test]
+    fn a_misroute_re_reads_the_map_at_most_once_per_window() {
+        let sim = Simulation::new(17);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(MemoryStore::new());
+        let layout = DataLayout {
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            wal_root: "wal".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        };
+        let source = StaticMapSource::new(one_partition_map());
+        let gate = Arc::new(ReadinessGate::new());
+        let node = {
+            let source = BoxedMapSource::new(source.clone());
+            sim.block_on(async move {
+                let authenticator = Arc::new(Authenticator::new(
+                    false,
+                    None,
+                    std::time::Duration::from_secs(86_400),
+                    runtime.clock().clone(),
+                ));
+                Node::start(
+                    runtime,
+                    NodeId(1),
+                    layout,
+                    source,
+                    None,
+                    None,
+                    crate::DEFAULT_LEASE_DURATION,
+                    gate,
+                    authenticator,
+                )
+                .await
+                .expect("the node starts")
+            })
+        };
+
+        assert!(node.claim_repair(), "the first misroute may re-read");
+        assert!(
+            !node.claim_repair(),
+            "a second misroute inside the window rides on the first"
+        );
+        assert!(
+            !node.claim_repair(),
+            "and so does every one after it, however many arrive"
+        );
+
+        drop(node);
+    }
+
+    /// Every error that means "this node's view of the map may be behind" has
+    /// to provoke a re-read. `Unavailable` is one of them: it is what a
+    /// partition says while a split holds its writes closed, and a split ends
+    /// by retiring that partition.
+    #[test]
+    fn the_errors_that_mean_a_stale_map_are_the_ones_that_re_read_it() {
+        let sim = Simulation::new(19);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(MemoryStore::new());
+        let layout = DataLayout {
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            wal_root: "wal".to_string(),
+            wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        };
+        let source = StaticMapSource::new(one_partition_map());
+        let gate = Arc::new(ReadinessGate::new());
+        let node = {
+            let source = BoxedMapSource::new(source.clone());
+            sim.block_on(async move {
+                let authenticator = Arc::new(Authenticator::new(
+                    false,
+                    None,
+                    std::time::Duration::from_secs(86_400),
+                    runtime.clock().clone(),
+                ));
+                Node::start(
+                    runtime,
+                    NodeId(1),
+                    layout,
+                    source,
+                    None,
+                    None,
+                    crate::DEFAULT_LEASE_DURATION,
+                    gate,
+                    authenticator,
+                )
+                .await
+                .expect("the node starts")
+            })
+        };
+
+        let quiesced = Error::Unavailable("partition 1 is splitting".into());
+        assert!(node.should_repair(&quiesced, false));
+        assert!(
+            !node.should_repair(&quiesced, true),
+            "a forwarded request has already been routed by the node that owns the decision"
+        );
+        assert!(node.should_repair(
+            &Error::NotOwner {
+                partition: PartitionId(1),
+                owner: None
+            },
+            false
+        ));
+        assert!(
+            !node.should_repair(&Error::NotFound, false),
+            "a missing key says nothing about the map"
         );
 
         drop(node);
