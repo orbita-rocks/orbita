@@ -1274,20 +1274,55 @@ impl ClusterState {
         // moves and none is reissued, which is what ADR 0002 requires.
         let epoch = info.epoch.next();
         let start = info.range.start().to_vec();
+        let prepared = split.prepared.clone();
+        // Sorted so both children derive their replica lists in one canonical
+        // order. `complete_merge` compares the two parents' replica lists with
+        // `Vec` equality, so a pair that differs only in ordering would be
+        // refused a merge it should be allowed.
+        let holders: Vec<NodeId> = {
+            let mut all: Vec<NodeId> = info.replicas.clone();
+            all.extend(info.owner);
+            all.sort_unstable();
+            all.dedup();
+            all
+        };
         self.pending_splits.remove(&parent);
         self.map.remove_partition(info.keyspace, &start);
         for (id, range) in [(lower, low_range), (upper, high_range)] {
+            // Chosen per child rather than inherited from the parent. Both
+            // children were built by every holder — that is what `prepared`
+            // records and why the split protocol requires all of them — so any
+            // of them can own either child with no data to move. Leaving both
+            // on the parent's owner meant splitting a partition added
+            // partitions without adding owners, and since one owner serializes
+            // each partition, throughput did not move: measured flat from one
+            // to eight partitions. See issue #160.
+            //
+            // Recomputed inside the loop so the second child sees the first
+            // one already placed and lands somewhere else when it can.
+            let owner = self.child_owner(&prepared, info.owner);
+            // The holder set is preserved whole; only the role assignment
+            // within it changes. `owner` must not appear in `replicas` — that
+            // is an invariant `assign_owner`, `transfer_ownership`, and
+            // `set_replicas` all refuse to violate — so the node promoted here
+            // is removed from the replica list and the parent's owner takes
+            // the slot it vacated.
+            let replicas: Vec<NodeId> = holders
+                .iter()
+                .copied()
+                .filter(|node| Some(*node) != owner)
+                .collect();
             self.map.insert_partition(PartitionInfo {
                 id,
                 keyspace: info.keyspace,
                 range,
-                owner: info.owner,
+                owner,
                 epoch,
-                replicas: info.replicas.clone(),
+                replicas,
             });
             self.phases.insert(
                 id,
-                if info.owner.is_some() {
+                if owner.is_some() {
                     PartitionPhase::Serving
                 } else {
                     PartitionPhase::Unowned
@@ -1301,6 +1336,51 @@ impl ClusterState {
             .max(upper.get() + 1);
         self.bump_map_version();
         Ok(())
+    }
+
+    /// Which holder should own a child of a split.
+    ///
+    /// Only a node that prepared the child is eligible, because that is the
+    /// set that has its storage built and can serve immediately. Promoting
+    /// anyone else would mean hydrating first, which is the slow path this
+    /// deliberately avoids: ownership here is a lease over state every holder
+    /// already has, not custody of data that has to move.
+    ///
+    /// Ordered by [`ClusterState::placement_candidates`], which is least
+    /// loaded first and documented as deterministic precisely so a decision
+    /// taken during apply cannot diverge between members.
+    ///
+    /// Falls back to the parent's owner when no prepared holder is eligible,
+    /// which keeps a split from silently unowning its children when the
+    /// cluster is degraded. That is the old behaviour, now the exception
+    /// rather than the rule.
+    fn child_owner(
+        &self,
+        prepared: &BTreeSet<NodeId>,
+        parent_owner: Option<NodeId>,
+    ) -> Option<NodeId> {
+        let eligible = self.placement_candidates();
+        let mut ranked: Vec<(usize, NodeId)> = eligible
+            .into_iter()
+            .filter(|node| prepared.contains(node))
+            // Ranked by how many partitions the node already *owns*, not how
+            // many it holds. Every node replicates every partition in a small
+            // cluster, so holdings tie and the tie break on node id sends every
+            // child to the same place — which is the bug this is fixing, in a
+            // more subtle form.
+            .map(|node| {
+                let owned = self
+                    .map
+                    .partitions()
+                    .filter(|p| p.owner == Some(node))
+                    .count();
+                (owned, node)
+            })
+            .collect();
+        // Deterministic: ties break on node id, as they must for a decision
+        // taken during apply on every member.
+        ranked.sort_unstable();
+        ranked.first().map(|(_, node)| *node).or(parent_owner)
     }
 
     /// Abandons a pending split, leaving the parent covering its whole range at
@@ -2090,12 +2170,20 @@ mod tests {
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
 
+        let parent_holders = {
+            let mut all = holders(&parent);
+            all.sort_unstable();
+            all
+        };
         for child in [PartitionId(10), PartitionId(11)] {
-            assert_eq!(
-                state.map().partition(child).unwrap().epoch,
-                parent.epoch.next()
-            );
-            assert_eq!(state.map().partition(child).unwrap().owner, parent.owner);
+            let info = state.map().partition(child).unwrap();
+            assert_eq!(info.epoch, parent.epoch.next());
+            // The children divide the parent's holder set into roles rather
+            // than inheriting its assignment, so the owner moves but the set
+            // does not. Everything the fence has to reach is still here.
+            let mut child_holders = holders(info);
+            child_holders.sort_unstable();
+            assert_eq!(child_holders, parent_holders);
         }
     }
 
@@ -2113,6 +2201,7 @@ mod tests {
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        colocate_for_merge(&mut state, PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
         let upper = state.map().partition(PartitionId(11)).unwrap().clone();
 
@@ -2165,6 +2254,7 @@ mod tests {
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        colocate_for_merge(&mut state, PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
         let upper = state.map().partition(PartitionId(11)).unwrap().clone();
         let generation = merge_generation(&lower, &upper, 12);
@@ -2237,6 +2327,7 @@ mod tests {
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        colocate_for_merge(&mut state, PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
         let upper = state.map().partition(PartitionId(11)).unwrap().clone();
         let stale = merge_generation(&lower, &upper, 12);
@@ -2273,6 +2364,7 @@ mod tests {
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        colocate_for_merge(&mut state, PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
         let upper = state.map().partition(PartitionId(11)).unwrap().clone();
         state
@@ -2298,6 +2390,7 @@ mod tests {
         set_version(&mut state, PROTOCOL_0_1);
         let parent = state.map().partitions().next().unwrap().clone();
         drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        colocate_for_merge(&mut state, PartitionId(10), PartitionId(11));
         let lower = state.map().partition(PartitionId(10)).unwrap().clone();
         let upper = state.map().partition(PartitionId(11)).unwrap().clone();
         state
@@ -2619,6 +2712,139 @@ mod tests {
     /// Runs a split all the way through: open it, prepare every holder, retire
     /// the parent. Used by the tests that care about the result rather than the
     /// ordering that produced it.
+    #[test]
+    fn a_split_gives_its_children_different_owners_when_holders_can_take_them() {
+        // Both children were built by every holder, so ownership can spread
+        // with nothing to move. Leaving both on the parent's owner is what made
+        // splitting add partitions without adding owners, and throughput flat
+        // from one to eight partitions. See issue #160.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        let holders = parent.replicas.len() + usize::from(parent.owner.is_some());
+        assert!(
+            holders >= 2,
+            "the scenario needs more than one holder to spread across"
+        );
+
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+
+        let lower = state.map().partition(PartitionId(10)).unwrap();
+        let upper = state.map().partition(PartitionId(11)).unwrap();
+        assert!(lower.owner.is_some() && upper.owner.is_some());
+        assert_ne!(
+            lower.owner, upper.owner,
+            "both children landed on {:?}, so the split added partitions without adding owners",
+            lower.owner
+        );
+    }
+
+    #[test]
+    fn a_split_child_never_lists_its_own_owner_as_a_replica() {
+        // `assign_owner`, `transfer_ownership`, and `set_replicas` all refuse a
+        // partition whose owner is also a replica, so a split that produced one
+        // would be building a row the rest of the state machine rejects. It
+        // would also double-count that node in the merge's `required` set and
+        // in every quorum derived from the holder list.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+
+        for id in [PartitionId(10), PartitionId(11)] {
+            let child = state.map().partition(id).unwrap();
+            let owner = child.owner.expect("a spread child is still owned");
+            assert!(
+                !child.replicas.contains(&owner),
+                "child {id:?} lists its owner {owner:?} in replicas {:?}",
+                child.replicas
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_leaves_each_child_mergeable_with_its_sibling() {
+        // Spreading the children makes the two halves of one split the common
+        // case of an adjacent pair with different owners, which is exactly the
+        // pair an operator is most likely to want merged back. Relocating one
+        // half onto the other's owner has to be enough to satisfy merge, and it
+        // only is if both children kept the parent's whole holder set.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+        colocate_for_merge(&mut state, PartitionId(10), PartitionId(11));
+
+        let lower = state.map().partition(PartitionId(10)).unwrap().clone();
+        let upper = state.map().partition(PartitionId(11)).unwrap().clone();
+        assert_eq!(lower.owner, upper.owner);
+        assert_eq!(
+            lower.replicas, upper.replicas,
+            "complete_merge compares replica lists with Vec equality, so order counts"
+        );
+        state
+            .apply(&ControlCommand::BeginMerge {
+                generation: merge_generation(&lower, &upper, 12),
+            })
+            .expect("a relocated pair of split children is mergeable");
+    }
+
+    #[test]
+    fn a_childs_owner_is_always_a_holder_that_prepared_it() {
+        // The point of choosing from `prepared` is that the chosen node can
+        // serve immediately. A node that never built the child would have to
+        // hydrate first, which is the slow path this avoids.
+        let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        let mut holders: Vec<NodeId> = parent.replicas.clone();
+        holders.extend(parent.owner);
+
+        drive_split_to_completion(&mut state, &parent, b"m", PartitionId(10), PartitionId(11));
+
+        for id in [PartitionId(10), PartitionId(11)] {
+            let owner = state.map().partition(id).unwrap().owner.unwrap();
+            assert!(
+                holders.contains(&owner),
+                "child {id:?} went to {owner:?}, which never prepared it"
+            );
+        }
+    }
+
+    /// Moves `upper` onto `lower`'s owner so the pair can merge.
+    ///
+    /// A split now spreads its children, so the two halves of one split are
+    /// the common case of an adjacent pair with different owners. Merge still
+    /// requires one holder set, and `Controller::merge_partitions` relocates a
+    /// parent to satisfy that before it opens the merge. These tests drive the
+    /// state machine directly, so they have to do the same thing the
+    /// controller does.
+    fn colocate_for_merge(state: &mut ClusterState, lower: PartitionId, upper: PartitionId) {
+        let target = state.map().partition(lower).unwrap().owner.unwrap();
+        let info = state.map().partition(upper).unwrap().clone();
+        let from = info.owner.unwrap();
+        if from == target {
+            return;
+        }
+        let mut replicas: Vec<NodeId> = info
+            .replicas
+            .iter()
+            .copied()
+            .filter(|node| *node != target)
+            .collect();
+        replicas.push(from);
+        replicas.sort_unstable();
+        state
+            .apply(&ControlCommand::TransferOwnership {
+                partition: upper,
+                from,
+                to: target,
+                replicas,
+                expect_epoch: info.epoch,
+            })
+            .expect("a child's holders always include its sibling's owner");
+    }
+
     fn drive_split_to_completion(
         state: &mut ClusterState,
         parent: &PartitionInfo,
