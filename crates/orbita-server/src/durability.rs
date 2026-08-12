@@ -72,6 +72,7 @@ fn paths(bucket: &Arc<SimBucket>, wal_dir: &str) -> PartitionPaths {
         path: partition_path(),
         wal_dir: wal_dir.to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
     }
 }
 

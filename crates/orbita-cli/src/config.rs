@@ -64,6 +64,10 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
     ("ORBITA_DATA_DIR", "node.data_dir"),
     ("ORBITA_CLUSTER_NAME", "cluster.name"),
     ("ORBITA_VOTER_TARGET", "cluster.voter_target, either 3 or 5"),
+    (
+        "ORBITA_READ_REPLICA_TARGET",
+        "cluster.read_replica_target, replicas kept per partition for serving reads",
+    ),
     ("ORBITA_VOTER_ELIGIBLE", "cluster.voter_eligible"),
     ("ORBITA_FAILURE_DOMAIN", "cluster.failure_domain"),
     (
@@ -261,6 +265,13 @@ pub struct ClusterConfig {
     /// See [`crate::node`] for why.
     pub leader_peers: Vec<String>,
     pub voter_target: usize,
+    /// How many replicas a partition keeps so they can serve reads.
+    ///
+    /// Distinct from the durability contract, which is sized by the control
+    /// plane's replication factor. Raising this adds nodes that hold a copy and
+    /// answer reads; it does not add acknowledgements a write must wait for.
+    /// See ADR 0013.
+    pub read_replica_target: Option<usize>,
     pub voter_eligible: bool,
     pub failure_domain: String,
     pub allow_version_skew: bool,
@@ -501,6 +512,7 @@ pub struct ClusterLayer {
     pub name: Option<String>,
     pub leader_peers: Option<Vec<String>>,
     pub voter_target: Option<usize>,
+    pub read_replica_target: Option<usize>,
     pub voter_eligible: Option<bool>,
     pub failure_domain: Option<String>,
     pub allow_version_skew: Option<bool>,
@@ -592,6 +604,7 @@ impl Layer {
             name,
             leader_peers,
             voter_target,
+            read_replica_target,
             voter_eligible,
             failure_domain,
             allow_version_skew,
@@ -735,6 +748,8 @@ impl Layer {
                 name: get("ORBITA_CLUSTER_NAME").map(str::to_owned),
                 leader_peers: get("ORBITA_LEADER_PEERS").map(parse_list),
                 voter_target: parse("ORBITA_VOTER_TARGET")?.map(|value| value as usize),
+                read_replica_target: parse("ORBITA_READ_REPLICA_TARGET")?
+                    .map(|value| value as usize),
                 voter_eligible: flag("ORBITA_VOTER_ELIGIBLE")?,
                 failure_domain: get("ORBITA_FAILURE_DOMAIN").map(str::to_owned),
                 allow_version_skew: flag("ORBITA_ALLOW_VERSION_SKEW")?,
@@ -942,6 +957,9 @@ impl Layer {
                 name: self.cluster.name.unwrap_or_else(|| "orbita".to_owned()),
                 leader_peers: self.cluster.leader_peers.unwrap_or_default(),
                 voter_target,
+                // Unset means the control plane's own default, which is the
+                // durability floor. See ADR 0013.
+                read_replica_target: self.cluster.read_replica_target,
                 voter_eligible: self.cluster.voter_eligible.unwrap_or(true),
                 failure_domain: self.cluster.failure_domain.unwrap_or_default(),
                 allow_version_skew: self.cluster.allow_version_skew.unwrap_or(false),

@@ -138,6 +138,11 @@ pub(crate) struct DataLayout {
     /// checkpoint removes and therefore how far a replica may fall behind and
     /// still be caught up from the owner's log.
     pub wal_segment_bytes: u64,
+    /// How many peer acknowledgements make a write durable, independent of how
+    /// many peers hold the partition. One, with the owner, is the two-of-three
+    /// the WAL has always required; peers beyond it follow for freshness and
+    /// cannot hold a write up. See ADR 0013.
+    pub durability_acks: usize,
 }
 
 impl DataLayout {
@@ -147,6 +152,7 @@ impl DataLayout {
             path: PartitionPath::new("", keyspace, partition),
             wal_dir: format!("{}/p{}", self.wal_root, partition.get()),
             wal_segment_bytes: self.wal_segment_bytes,
+            durability_acks: self.durability_acks,
         }
     }
 }
@@ -2700,6 +2706,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
 
         let source = StaticMapSource::new(one_partition_map());
@@ -2776,6 +2783,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
 
         let source = StaticMapSource::new(one_partition_map());
@@ -2851,6 +2859,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
         let source = StaticMapSource::new(one_partition_map());
         let gate = Arc::new(ReadinessGate::new());
@@ -2914,6 +2923,7 @@ mod tests {
                 store: Arc::clone(&store) as Arc<dyn ObjectStore>,
                 wal_root: "wal".to_string(),
                 wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+                durability_acks: 1,
             };
             let source = BoxedMapSource::new(StaticMapSource::new(one_partition_map()));
             sim.block_on(async move {
@@ -2966,6 +2976,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
         let source = StaticMapSource::new(one_partition_map());
         let gate = Arc::new(ReadinessGate::new());
@@ -3050,6 +3061,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
         let source = StaticMapSource::new(one_partition_map());
         let gate = Arc::new(ReadinessGate::new());
@@ -3131,6 +3143,7 @@ mod tests {
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
         let source = BoxedMapSource::new(StaticMapSource::new(two_partition_map()));
         let gate = Arc::new(ReadinessGate::new());

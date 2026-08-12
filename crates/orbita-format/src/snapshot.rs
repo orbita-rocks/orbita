@@ -12,6 +12,8 @@
 //! are durable in the write-ahead log but not yet flushed are not here, which
 //! is the difference between the two durability levels a client can ask about.
 
+use futures_util::{StreamExt as _, TryStreamExt as _};
+
 use crate::error::{FormatError, Result};
 use crate::manifest::Manifest;
 use crate::paths::PartitionPath;
@@ -56,6 +58,16 @@ impl Location {
 }
 
 /// A partition as of one manifest.
+/// How many segments' footers and key indexes are fetched at once when building
+/// an index.
+///
+/// Bounded rather than unbounded because a partition can hold a great many
+/// segments, and every one of them is two ranged reads against the same prefix.
+/// Sixteen is chosen to keep a cold open latency-bound on the object store's
+/// concurrency rather than on this loop, without turning one open into a burst
+/// an object store would rate limit.
+const SEGMENT_FETCH_CONCURRENCY: usize = 16;
+
 pub struct Snapshot<S: ObjectStore + ?Sized> {
     store: Arc<S>,
     path: PartitionPath,
@@ -105,32 +117,89 @@ impl<S: ObjectStore + ?Sized> Snapshot<S> {
     }
 
     async fn build(&mut self) -> Result<()> {
-        for (position, entry) in self.manifest.segments.iter().enumerate() {
-            // A shared segment (a split's cross-partition reference) lives under
-            // the source partition's directory, not this one's. See ADR 0009.
-            let key = self.path.resolve_segment(entry);
+        // Fetched concurrently, merged in order. The two are separated because
+        // they are bound by different things: reading a segment's footer and
+        // key index is two round trips to the object store and nothing else,
+        // while merging has to see segments in manifest order for
+        // [`Snapshot::winner`] to break ties the same way every time.
+        //
+        // Doing both in one sequential pass made a cold open cost
+        // `2 × segments` round trips in series — 2.36s for a 309 MiB partition
+        // against real S3, which is why the cost scaled with segment count
+        // rather than with bytes.
+        // Scoped so the shared borrows the fetches hold end before the merge
+        // below needs the index mutably.
+        let indexes: Vec<(usize, SegmentIndex)> = {
+            let store = &self.store;
 
-            let tail = self
-                .store
-                .get_range(&key, entry.footer_range())
-                .await
-                .map_err(FormatError::Store)?;
-            let footer = SegmentFooter::decode(&tail)?;
-            if footer.record_count != entry.record_count {
-                return Err(FormatError::Corrupt(format!(
-                    "{} holds {} records where the manifest claims {}",
-                    entry.name, footer.record_count, entry.record_count
-                )));
+            // Everything a fetch needs, read out of the manifest first so the
+            // futures own it. Mapping straight off a borrowing iterator gives
+            // the closure a signature that is not generic over the borrow's
+            // lifetime, which the compiler rejects as soon as anything above
+            // this tries to spawn a task holding the result.
+            struct Fetch {
+                position: usize,
+                key: String,
+                footer_range: std::ops::Range<u64>,
+                bytes: u64,
+                record_count: u64,
+                name: String,
             }
 
-            let index_range = footer.index_range(entry.bytes)?;
-            let raw = self
-                .store
-                .get_range(&key, index_range)
-                .await
-                .map_err(FormatError::Store)?;
-            let index = SegmentIndex::decode(&raw, &footer)?;
+            let inputs: Vec<Fetch> = self
+                .manifest
+                .segments
+                .iter()
+                .enumerate()
+                .map(|(position, entry)| Fetch {
+                    position,
+                    // A shared segment (a split's cross-partition reference)
+                    // lives under the source partition's directory, not this
+                    // one's. See ADR 0009.
+                    key: self.path.resolve_segment(entry),
+                    footer_range: entry.footer_range(),
+                    bytes: entry.bytes,
+                    record_count: entry.record_count,
+                    name: entry.name.clone(),
+                })
+                .collect();
 
+            let fetches = inputs.into_iter().map(|fetch| async move {
+                let tail = store
+                    .get_range(&fetch.key, fetch.footer_range)
+                    .await
+                    .map_err(FormatError::Store)?;
+                let footer = SegmentFooter::decode(&tail)?;
+                if footer.record_count != fetch.record_count {
+                    return Err(FormatError::Corrupt(format!(
+                        "{} holds {} records where the manifest claims {}",
+                        fetch.name, footer.record_count, fetch.record_count
+                    )));
+                }
+
+                let index_range = footer.index_range(fetch.bytes)?;
+                let raw = store
+                    .get_range(&fetch.key, index_range)
+                    .await
+                    .map_err(FormatError::Store)?;
+                let index = SegmentIndex::decode(&raw, &footer)?;
+                Ok::<_, FormatError>((fetch.position, index))
+            });
+
+            // Bounded, because a partition can hold a great many segments and
+            // an unbounded fan-out would trade one bottleneck for a thundering
+            // herd against one prefix.
+            let mut collected: Vec<(usize, SegmentIndex)> = futures_util::stream::iter(fetches)
+                .buffer_unordered(SEGMENT_FETCH_CONCURRENCY)
+                .try_collect()
+                .await?;
+            // Restores manifest order, which the merge depends on and
+            // `buffer_unordered` does not preserve.
+            collected.sort_unstable_by_key(|(position, _)| *position);
+            collected
+        };
+
+        for (position, index) in indexes {
             for candidate in index.entries() {
                 // A shared segment physically holds keys on both sides of the
                 // split boundary; a child indexes only the keys in its own
@@ -397,6 +466,121 @@ mod tests {
             expires_at_millis: None,
             value: RecordValue::Inline(key(value)),
         }
+    }
+
+    /// A store that records how many reads were in flight at once.
+    ///
+    /// The property under test is not a latency figure, which would be a
+    /// benchmark rather than a test. It is that the reads overlap at all: a
+    /// cold open is two ranged reads per segment, and doing them in sequence is
+    /// what made the cost scale with segment count rather than with bytes.
+    struct ConcurrencyProbe {
+        inner: Arc<MemoryStore>,
+        in_flight: std::sync::Mutex<(usize, usize)>,
+    }
+
+    impl ConcurrencyProbe {
+        fn new(inner: Arc<MemoryStore>) -> Self {
+            Self {
+                inner,
+                in_flight: std::sync::Mutex::new((0, 0)),
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.in_flight.lock().expect("probe poisoned").1
+        }
+
+        fn enter(&self) {
+            let mut held = self.in_flight.lock().expect("probe poisoned");
+            held.0 += 1;
+            held.1 = held.1.max(held.0);
+        }
+
+        fn leave(&self) {
+            self.in_flight.lock().expect("probe poisoned").0 -= 1;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl orbita_objectstore::ObjectStore for ConcurrencyProbe {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> orbita_objectstore::ObjectResult<(Bytes, orbita_objectstore::ETag)> {
+            self.inner.get(key).await
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            body: Bytes,
+        ) -> orbita_objectstore::ObjectResult<orbita_objectstore::ETag> {
+            self.inner.put(key, body).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> orbita_objectstore::ObjectResult<Bytes> {
+            self.enter();
+            // Yields so a sequential caller cannot accidentally look concurrent:
+            // with an await point here, overlapping reads are the only way the
+            // count can exceed one.
+            tokio::task::yield_now().await;
+            let out = self.inner.get_range(key, range).await;
+            self.leave();
+            out
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> orbita_objectstore::ObjectResult<orbita_objectstore::ObjectMeta> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> orbita_objectstore::ObjectResult<Vec<orbita_objectstore::ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> orbita_objectstore::ObjectResult<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn put_if(
+            &self,
+            key: &str,
+            body: Bytes,
+            precondition: orbita_objectstore::Precondition,
+        ) -> orbita_objectstore::ObjectResult<orbita_objectstore::ETag> {
+            self.inner.put_if(key, body, precondition).await
+        }
+    }
+
+    #[tokio::test]
+    async fn building_an_index_reads_segments_concurrently() {
+        // Eight segments, so there is something to overlap.
+        let flushes: Vec<Vec<SegmentRecord>> = (0..8)
+            .map(|i| vec![put(&format!("k{i:02}"), i + 1, "v")])
+            .collect();
+        let store = partition(&flushes).await;
+        let probe = Arc::new(ConcurrencyProbe::new(store));
+
+        let snapshot = Snapshot::open(Arc::clone(&probe), path())
+            .await
+            .expect("opens")
+            .expect("a manifest exists");
+        assert_eq!(snapshot.index.len(), 8, "every key is indexed");
+
+        assert!(
+            probe.peak() > 1,
+            "segment reads ran one at a time, so a cold open still costs a round trip per segment"
+        );
     }
 
     fn build(records: &[SegmentRecord]) -> BuiltSegment {

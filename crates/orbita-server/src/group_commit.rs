@@ -44,6 +44,7 @@ fn partition_paths() -> PartitionPaths {
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
         wal_dir: "wal/p1".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
     }
 }
 
@@ -53,6 +54,7 @@ fn paths_in(store: Arc<MemoryStore>, wal_dir: &str) -> PartitionPaths {
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
         wal_dir: wal_dir.to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
     }
 }
 

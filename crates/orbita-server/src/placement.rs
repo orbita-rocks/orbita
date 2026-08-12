@@ -115,6 +115,7 @@ fn start_node_on_store(
         store,
         wal_root: "wal".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
     };
     let source = BoxedMapSource::new(source.clone());
     let gate = Arc::new(crate::ReadinessGate::new());
@@ -161,6 +162,7 @@ fn start_node_reporting(
         // about what a catch-up may carry, and the retention cliff is
         // `retention.rs`'s subject.
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
     };
     let source = BoxedMapSource::new(source.clone());
     let gate = Arc::clone(gate);

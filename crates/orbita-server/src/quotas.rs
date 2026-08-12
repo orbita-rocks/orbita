@@ -87,6 +87,7 @@ fn start_with_auth(
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
     };
     let source = BoxedMapSource::new(StaticMapSource::new(map(specs)));
     sim.block_on(async move {
@@ -175,6 +176,7 @@ fn start_with_map(sim: &Simulation, map: PartitionMap) -> Arc<Node<SimRuntime>> 
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
     };
     let source = BoxedMapSource::new(StaticMapSource::new(map));
     let authenticator = Arc::new(Authenticator::new(

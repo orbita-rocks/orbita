@@ -256,6 +256,7 @@ fn start_node_with_snapshots(
         store,
         wal_root: format!("wal-{}", node.get()),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
     };
     let source = BoxedMapSource::new(source.clone());
     let gate = Arc::new(crate::ReadinessGate::new());

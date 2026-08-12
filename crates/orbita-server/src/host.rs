@@ -192,6 +192,10 @@ pub(crate) struct PartitionPaths {
     /// a checkpoint drops whole segments, so this is what decides how much
     /// history an owner keeps after one.
     pub wal_segment_bytes: u64,
+    /// How many peer acknowledgements a write requires, independent of how
+    /// many peers this partition ships appends to. See
+    /// [`orbita_wal::WalConfig::durability_acks`].
+    pub durability_acks: usize,
 }
 
 pub(crate) struct PartitionHost<R: Runtime> {
@@ -310,6 +314,7 @@ impl<R: Runtime> PartitionHost<R> {
             .with_replicas(replicas.clone())
             .with_hydration(hydrated);
         config.segment_target_bytes = paths.wal_segment_bytes;
+        config.durability_acks = paths.durability_acks;
         let wal = Wal::open(runtime.clone(), config).await?;
 
         // A restart finds entries that were durable and never applied, because
@@ -2217,6 +2222,7 @@ mod tests {
             path: partition_path(),
             wal_dir: "wal/p1".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
         sim.block_on(async move {
             PartitionHost::open_owner(
@@ -2245,6 +2251,7 @@ mod tests {
             path: partition_path(),
             wal_dir: "wal/replica-p1".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
         sim.block_on(async move {
             PartitionHost::open_replica(

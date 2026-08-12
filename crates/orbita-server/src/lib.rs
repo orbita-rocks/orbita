@@ -333,6 +333,9 @@ impl Server {
             };
             let mut control_config =
                 ControlConfig::default().with_voter_target(config.voter_target)?;
+            if let Some(target) = config.read_replica_target {
+                control_config = control_config.with_read_replica_target(target)?;
+            }
             if config.automatic_cluster {
                 control_config = control_config.with_voter_management();
             }
@@ -381,6 +384,9 @@ impl Server {
             store,
             wal_root: "wal".to_string(),
             wal_segment_bytes: config.wal_segment_bytes,
+            // ADR 0013: the durability contract is one peer plus this node,
+            // whatever the partition's peer list has grown to for read serving.
+            durability_acks: config.durability_acks,
         };
 
         // A node in a real cluster takes its map from the leader group, and

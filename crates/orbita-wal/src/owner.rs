@@ -29,8 +29,23 @@ pub struct WalConfig {
     /// older epoch than a replica has seen is rejected, which is what stops a
     /// deposed owner.
     pub epoch: Epoch,
-    /// The peers holding the other two copies. This node is the third.
+    /// The peers this owner ships every append to. Some of them hold a durable
+    /// copy the cluster counts on; the rest follow for freshness only. Both
+    /// receive the same stream, because a follower that is not sent the writes
+    /// cannot stay current, and telling them apart here would put a policy
+    /// decision in the replication path.
     pub replicas: Vec<NodeId>,
+    /// How many of those peers must acknowledge before a write is durable.
+    ///
+    /// Separate from the length of the peer list, and that separation is the
+    /// point. A quorum sized from the list means every peer added to serve
+    /// reads also has to be waited on, so read capacity could only be bought
+    /// with write latency and with a larger set of nodes any one of which can
+    /// stall a write. Sized independently, a peer beyond the quorum receives
+    /// every append, can be promoted, and can be lost without a write noticing.
+    ///
+    /// One, with this node, is the two-of-three the WAL has always required.
+    pub durability_acks: usize,
     pub segment_target_bytes: u64,
     /// What the manifest this node's storage was built from says, if there was
     /// one.
@@ -53,9 +68,20 @@ impl WalConfig {
             dir: dir.into(),
             epoch,
             replicas: Vec::new(),
+            // One peer plus this node is the two-of-three the WAL has always
+            // required, so the default changes nothing for a cluster that adds
+            // no followers.
+            durability_acks: 1,
             segment_target_bytes: DEFAULT_SEGMENT_TARGET_BYTES,
             hydrated: Hydration::default(),
         }
+    }
+
+    /// Sets how many peer acknowledgements a write requires.
+    #[must_use]
+    pub fn with_durability_acks(mut self, acks: usize) -> Self {
+        self.durability_acks = acks;
+        self
     }
 
     #[must_use]
@@ -325,6 +351,10 @@ pub struct Wal<R: Runtime> {
     /// a replication pass takes one cheap snapshot and never holds the lock
     /// across an await.
     replicas: Mutex<Arc<[NodeId]>>,
+    /// How many peer acknowledgements make a write durable. Fixed for the life
+    /// of the owner: it is a property of the durability contract, not of who
+    /// happens to be listening.
+    durability_acks: usize,
     state: Mutex<OwnerState>,
     progress: tokio::sync::Notify,
     /// How many fsyncs this owner has issued, and how many entries they
@@ -386,6 +416,7 @@ impl<R: Runtime> Wal<R> {
             log,
             partition: config.partition,
             replicas: Mutex::new(config.replicas.into()),
+            durability_acks: config.durability_acks,
             state: Mutex::new(OwnerState {
                 epoch: config.epoch,
                 next_lamport: durable,
@@ -1393,7 +1424,12 @@ impl<R: Runtime> Wal<R> {
     /// wins every race.
     async fn replicate(self: &Arc<Self>, request: AppendRequest) -> Result<()> {
         let replicas = self.replicas();
-        let required = replicas.len().div_ceil(2);
+        // Sized from the durability requirement, not from how many peers happen
+        // to be listening. Peers beyond the quorum are followers: they get the
+        // append so their view stays current, and they cannot hold a write up
+        // by being slow or gone. Capped by the list because a quorum larger
+        // than the peers that exist could never be met.
+        let required = self.durability_acks.min(replicas.len());
         if required == 0 {
             return Ok(());
         }

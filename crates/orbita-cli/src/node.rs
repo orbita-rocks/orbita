@@ -247,6 +247,7 @@ fn server_config(
 
     let peers = parse_leader_peers(&config.cluster.leader_peers)?;
     if config.node.role == Role::Node && !options.dev {
+        server_config = server_config.with_read_replica_target(config.cluster.read_replica_target);
         server_config = server_config.with_automatic_cluster(
             config.cluster.name.clone(),
             config.cluster.voter_target,

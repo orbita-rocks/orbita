@@ -106,6 +106,7 @@ fn start_replica(
         path: path(),
         wal_dir: "wal/replica".to_string(),
         wal_segment_bytes: orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES,
+        durability_acks: 1,
     };
     sim.block_on(async move {
         let (bridge, applies) = ReplicaBridge::start(&runtime);
@@ -417,6 +418,7 @@ fn a_hydrated_node_leaves_a_log_the_previous_binary_still_recovers() {
                 path: path(),
                 wal_dir: "wal/worker".to_string(),
                 wal_segment_bytes: orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES,
+                durability_acks: 1,
             };
             let host = sim.block_on({
                 let runtime = runtime.clone();

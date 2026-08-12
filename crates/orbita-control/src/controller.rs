@@ -2280,7 +2280,14 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     }
 
     async fn repair_replica_sets(&self) -> Result<()> {
-        let want = self.config.replication_factor.saturating_sub(1);
+        // The read-serving set, not the durability quorum. Peers past the
+        // quorum receive every append and serve reads without being counted by
+        // a write, so this can grow without making writes slower or more
+        // fragile. See ADR 0013.
+        let want = self
+            .config
+            .read_replica_target
+            .max(self.config.replication_factor.saturating_sub(1));
         let commands: Vec<ControlCommand> = {
             let inner = self.inner.lock().await;
             let candidates = inner.state.placement_candidates();
@@ -2899,6 +2906,28 @@ mod tests {
             Arc::new(MembershipLog { voters, learners }),
             ControlConfig::default(),
         )
+    }
+
+    #[test]
+    fn the_read_replica_target_widens_the_holder_set_without_touching_durability() {
+        // The control-plane half of ADR 0013. Raising the read target adds
+        // holders, and holders are what may serve a read; it must not change
+        // the replication factor, which is what sizes the durability contract.
+        // If the two moved together, read capacity could only be bought with
+        // write latency.
+        let config = ControlConfig::default()
+            .with_read_replica_target(4)
+            .expect("above the durability floor");
+        assert_eq!(config.replication_factor, 3, "durability is untouched");
+        assert_eq!(config.read_replica_target, 4);
+
+        // And it refuses to take copies away, which is the direction that
+        // would quietly weaken durability rather than widen reach.
+        let refused = ControlConfig::default().with_read_replica_target(1);
+        assert!(
+            refused.is_err(),
+            "a target below the durability floor must be refused, got {refused:?}"
+        );
     }
 
     #[test]
