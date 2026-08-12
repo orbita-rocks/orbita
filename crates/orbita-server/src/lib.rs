@@ -841,11 +841,20 @@ impl Server {
             let Some(authenticator) = authenticator.upgrade() else {
                 return;
             };
-            match &leader_controller {
-                Some(controller) => {
+            // Same distinction as the readiness loop. A node outside the
+            // configuration has an empty committed state, so reading
+            // credentials out of it would leave the cache empty and refuse
+            // every authenticated request. It pulls them over the wire like
+            // any other worker until it is promoted.
+            let participating = match &leader_controller {
+                Some(controller) => controller.is_active_member().await,
+                None => false,
+            };
+            match (&leader_controller, participating) {
+                (Some(controller), true) => {
                     authenticator.refresh(controller.credential_snapshot().await);
                 }
-                None => match client.fetch_credentials().await {
+                _ => match client.fetch_credentials().await {
                     Ok(credentials) => {
                         authenticator.refresh(orbita_control::CredentialSnapshot::new(credentials));
                     }
@@ -942,8 +951,20 @@ impl Server {
                     false
                 }
             };
-            match &leader_controller {
-                Some(controller) => {
+            // Only a node the leader group actually replicates to can be
+            // waited on to catch up. Every combined node hosts a Raft state
+            // machine, but one outside the configuration holds a dormant log
+            // that nothing advances, so gating its readiness on catching up
+            // would keep it unready for as long as it stayed outside — and
+            // being unready is what keeps it out, because the voter set is
+            // filled from nodes eligible to own partitions. It reports as a
+            // worker instead, which is what it is until it is promoted.
+            let participating = match &leader_controller {
+                Some(controller) => controller.is_active_member().await,
+                None => false,
+            };
+            match (&leader_controller, participating) {
+                (Some(controller), true) => {
                     let caught_up = match client.fetch_commit_index().await {
                         Ok(authority) => controller
                             .catch_up_through(authority)
@@ -953,7 +974,7 @@ impl Server {
                     };
                     update_control_readiness(&readiness, reported, Some(caught_up));
                 }
-                None => update_control_readiness(&readiness, reported, None),
+                _ => update_control_readiness(&readiness, reported, None),
             }
             directory.refresh().await;
             if let Err(error) = live.refresh_map().await {
