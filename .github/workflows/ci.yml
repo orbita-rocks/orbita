@@ -42,6 +42,9 @@ jobs:
   check:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,7 +60,7 @@ jobs:
       # moon only runs cargo and does not install it.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
 
       - uses: moonrepo/setup-toolchain@v0
         with:
@@ -71,9 +74,31 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Scoped to the Rust crates, because the end-to-end suite also has a
-      # `test` task and it belongs to the job below.
-      - run: moon run :fmt :lint :test --query "language=rust"
+      # A prebuilt, checksum-verified binary avoids compiling the coverage tool
+      # before compiling the workspace it is meant to measure.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.6
+
+      # Keep formatting and clippy uninstrumented. The test tasks below compile
+      # once with LLVM coverage enabled, so coverage does not rerun the suite.
+      - name: Check formatting and lint
+        run: moon run :fmt :lint --query "language=rust"
+
+      - name: Run Rust tests with coverage
+        run: |
+          eval "$(cargo llvm-cov show-env --sh)"
+          cargo llvm-cov clean --workspace
+          moon run :test --query "language=rust" --force
+          cargo llvm-cov report --codecov --output-path codecov.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          files: codecov.json
+          disable_search: true
+          fail_ci_if_error: true
 
       # The live object store tests, which prove that a deposed writer holding
       # a stale ETag loses the manifest swap to the writer that replaced it.

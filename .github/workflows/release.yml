@@ -85,6 +85,9 @@ jobs:
   test:
     name: full test suite
     needs: verify
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/ci.yml
     with:
       long_sim: true
