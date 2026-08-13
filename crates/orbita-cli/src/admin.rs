@@ -10,12 +10,13 @@
 
 use anyhow::{bail, Result};
 use orbita_proto::v1::admin_client::AdminClient;
+use orbita_proto::v1::health_client::HealthClient;
 use orbita_proto::v1::{
-    CreateCredentialRequest, CreateKeyspaceRequest, DeleteKeyspaceRequest, DescribeClusterRequest,
-    DescribeClusterResponse, Keyspace, KeyspaceConfig, ListKeyspacesRequest,
-    MergePartitionsRequest, Node, NodeHealth, NodeRole, Partition, Permission,
-    RevokeCredentialRequest, SplitPartitionRequest, TransferOwnershipRequest,
-    UpdateKeyspaceRequest,
+    CheckReadinessRequest, ClusterVersion, CreateCredentialRequest, CreateKeyspaceRequest,
+    DeleteKeyspaceRequest, DescribeClusterRequest, DescribeClusterResponse, FinalizeUpgradeRequest,
+    Keyspace, KeyspaceConfig, ListKeyspacesRequest, MergePartitionsRequest, Node, NodeHealth,
+    NodeRole, Partition, Permission, RevokeCredentialRequest, SplitPartitionRequest,
+    TransferOwnershipRequest, UpdateKeyspaceRequest,
 };
 use tonic::transport::Channel;
 
@@ -23,21 +24,43 @@ use crate::cli::{
     ClusterCommand, CredentialCommand, KeyspaceCommand, KeyspaceConfigArgs, PartitionCommand,
     PermissionArg,
 };
-use crate::client::{authed, channel};
-use crate::config::Config;
+use crate::client::authed;
 use crate::output::{
-    render, Ack, Blob, ClusterView, CredentialView, Format, KeyspaceConfigView, KeyspaceListView,
-    KeyspaceView, NodeView, PartitionResultView, PartitionView, PingView, ReplicaView, SplitView,
+    render, Ack, Blob, ClusterView, CredentialView, FinalizeUpgradeView, Format,
+    KeyspaceConfigView, KeyspaceListView, KeyspaceUsageView, KeyspaceView, NodeView,
+    PartitionResultView, PartitionView, PingView, ReadyConditionView, ReadyView, ReplicaView,
+    SplitView,
 };
+use crate::session::Session;
 
-/// Opens an admin client against the configured endpoint.
-pub fn connect(config: &Config) -> Result<AdminClient<Channel>> {
-    Ok(AdminClient::new(channel(config)?))
+/// Opens an admin client over the session's channel.
+///
+/// The channel is cloned from the session rather than dialed anew, so a REPL
+/// keeps one connection across every admin command. Sized to the Admin ceiling,
+/// not the KV one: a describe-cluster response grows with the number of
+/// partitions rather than with any value or list limit, so the smaller KV
+/// ceiling would refuse a valid description of a large cluster inside this
+/// client's own gRPC stack. See [`orbita_server::max_admin_message_bytes`].
+pub fn connect(channel: Channel) -> AdminClient<Channel> {
+    let limit = orbita_server::max_admin_message_bytes();
+    AdminClient::new(channel)
+        .max_decoding_message_size(limit)
+        .max_encoding_message_size(limit)
+}
+
+/// Opens a health client over the session's channel.
+fn connect_health(channel: Channel) -> HealthClient<Channel> {
+    HealthClient::new(channel)
 }
 
 /// Runs a `keyspace` subcommand and returns what should be printed.
-pub async fn keyspace(config: &Config, format: Format, command: KeyspaceCommand) -> Result<String> {
-    let mut client = connect(config)?;
+pub async fn keyspace(
+    session: &Session,
+    format: Format,
+    command: KeyspaceCommand,
+) -> Result<String> {
+    let config = &session.config;
+    let mut client = connect(session.channel.clone());
     match command {
         KeyspaceCommand::Create { name, config: args } => {
             let request = authed(
@@ -91,11 +114,12 @@ pub async fn keyspace(config: &Config, format: Format, command: KeyspaceCommand)
 
 /// Runs a `credential` subcommand.
 pub async fn credential(
-    config: &Config,
+    session: &Session,
     format: Format,
     command: CredentialCommand,
 ) -> Result<String> {
-    let mut client = connect(config)?;
+    let config = &session.config;
+    let mut client = connect(session.channel.clone());
     match command {
         CredentialCommand::Create {
             keyspace,
@@ -141,8 +165,9 @@ pub async fn credential(
 }
 
 /// Runs a `cluster` subcommand.
-pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -> Result<String> {
-    let mut client = connect(config)?;
+pub async fn cluster(session: &Session, format: Format, command: ClusterCommand) -> Result<String> {
+    let config = &session.config;
+    let mut client = connect(session.channel.clone());
     match command {
         ClusterCommand::Describe { keyspace } => {
             let request = authed(
@@ -181,6 +206,78 @@ pub async fn cluster(config: &Config, format: Format, command: ClusterCommand) -
                 },
             )
         }
+        ClusterCommand::FinalizeUpgrade => {
+            let request = authed(config, FinalizeUpgradeRequest {})?;
+            let response = client.finalize_upgrade(request).await?.into_inner();
+            render(
+                format,
+                &FinalizeUpgradeView {
+                    previous: version_text(response.previous.as_ref()),
+                    active: version_text(response.active.as_ref()),
+                },
+            )
+        }
+        ClusterCommand::Ready => {
+            let mut health = connect_health(session.channel.clone());
+            let request = authed(config, CheckReadinessRequest {})?;
+            // Unlike `ping`, an error here is a failure. A readiness probe
+            // asks whether this node may take traffic, and a node that cannot
+            // answer that question may not. This includes `Unimplemented` from
+            // a build older than the readiness API, which is a node nobody
+            // should be routing to on the strength of this command's exit
+            // code.
+            let response = health.check_readiness(request).await?.into_inner();
+            if !response.ready {
+                let waiting: Vec<&str> = response
+                    .conditions
+                    .iter()
+                    .filter(|condition| !condition.met)
+                    .map(|condition| condition.name.as_str())
+                    .collect();
+                // A server that says "not ready" without naming a condition is
+                // violating the response contract, but the probe log should
+                // still read as a sentence rather than trail off.
+                if waiting.is_empty() {
+                    bail!("the node is not ready, and named no unmet condition");
+                }
+                bail!("the node is not ready, waiting on: {}", waiting.join(", "));
+            }
+            render(
+                format,
+                &ReadyView {
+                    endpoint: config.client.endpoint.clone(),
+                    ready: true,
+                    conditions: response
+                        .conditions
+                        .iter()
+                        .map(|condition| ReadyConditionView {
+                            name: condition.name.clone(),
+                            met: condition.met,
+                        })
+                        .collect(),
+                },
+            )
+        }
+    }
+}
+
+/// Renders a wire version as "major.minor", or "unknown" when the server did
+/// not send one, which a script can still branch on.
+fn version_text(version: Option<&ClusterVersion>) -> String {
+    version.map_or_else(
+        || "unknown".to_owned(),
+        |v| format!("{}.{}", v.major, v.minor),
+    )
+}
+
+/// Renders a node's speakable window the way the docs write one.
+fn speaks_text(min: Option<&ClusterVersion>, max: Option<&ClusterVersion>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) if min != max => {
+            format!("{}..{}", version_text(Some(min)), version_text(Some(max)))
+        }
+        (_, Some(max)) => version_text(Some(max)),
+        _ => "unknown".to_owned(),
     }
 }
 
@@ -203,11 +300,12 @@ fn answered<T>(result: &Result<T, tonic::Status>) -> bool {
 
 /// Runs a `partition` subcommand.
 pub async fn partition(
-    config: &Config,
+    session: &Session,
     format: Format,
     command: PartitionCommand,
 ) -> Result<String> {
-    let mut client = connect(config)?;
+    let config = &session.config;
+    let mut client = connect(session.channel.clone());
     match command {
         PartitionCommand::Split { partition_id, at } => {
             let request = authed(
@@ -323,12 +421,14 @@ pub fn partition_view(partition: &Partition) -> PartitionView {
         epoch: partition.epoch,
         committed_lamport: partition.committed_lamport,
         size_bytes: partition.size_bytes,
+        index_bytes: partition.index_bytes,
         replicas: partition
             .replicas
             .iter()
             .map(|r| ReplicaView {
                 node_id: r.node_id,
                 applied_lamport: r.applied_lamport,
+                durable_lamport: r.durable_lamport,
             })
             .collect(),
     }
@@ -358,6 +458,8 @@ pub fn node_view(node: &Node) -> NodeView {
         role: role.to_owned(),
         health: health.to_owned(),
         raft_leader: node.is_raft_leader,
+        speaks: speaks_text(node.speaks_min.as_ref(), node.speaks_max.as_ref()),
+        index_memory_bytes: node.index_memory_bytes,
     }
 }
 
@@ -368,6 +470,29 @@ pub fn cluster_view(response: &DescribeClusterResponse) -> ClusterView {
         response.nodes.iter().map(node_view).collect(),
         response.partitions.iter().map(partition_view).collect(),
     )
+    .with_cluster_version(
+        response
+            .cluster_version
+            .as_ref()
+            .map(|v| version_text(Some(v))),
+    )
+    .with_keyspaces(response.keyspaces.iter().map(keyspace_usage_view).collect())
+}
+
+/// Turns a `Keyspace` into the usage row `cluster describe` prints.
+///
+/// The quota is read out of the config rather than recomputed, because the
+/// server is the only thing that knows what it will actually enforce.
+#[must_use]
+pub fn keyspace_usage_view(keyspace: &Keyspace) -> KeyspaceUsageView {
+    KeyspaceUsageView {
+        id: keyspace.id,
+        name: keyspace.name.clone(),
+        partition_count: keyspace.partition_count,
+        stored_bytes: keyspace.stored_bytes,
+        partitions_without_size: keyspace.partitions_without_size,
+        max_storage_bytes: keyspace.config.and_then(|c| c.max_storage_bytes),
+    }
 }
 
 /// The wall clock, used only to turn a relative expiry into an absolute one.
@@ -396,12 +521,14 @@ mod tests {
             end_key: Vec::new(),
             owner_node_id: 3,
             epoch: 4,
-            committed_lamport: 5,
+            committed_lamport: Some(5),
             replicas: vec![Replica {
                 node_id: 6,
-                applied_lamport: 5,
+                applied_lamport: Some(5),
+                durable_lamport: Some(5),
             }],
-            size_bytes: 7,
+            size_bytes: Some(7),
+            index_bytes: Some(8),
         });
         assert!(view.end_key.is_none());
         assert_eq!(view.start_key, Blob::new(b"a"));
@@ -416,9 +543,24 @@ mod tests {
             role: 99,
             health: 99,
             is_raft_leader: false,
+            speaks_min: None,
+            speaks_max: None,
+            index_memory_bytes: None,
         });
         assert_eq!(view.role, "unknown");
         assert_eq!(view.health, "unknown");
+        assert_eq!(
+            view.speaks, "unknown",
+            "a server that predates version reporting still renders"
+        );
+    }
+
+    #[test]
+    fn a_speakable_window_renders_the_way_the_docs_write_one() {
+        let v = |major, minor| Some(ClusterVersion { major, minor });
+        assert_eq!(speaks_text(v(0, 1).as_ref(), v(0, 2).as_ref()), "0.1..0.2");
+        assert_eq!(speaks_text(v(0, 0).as_ref(), v(0, 0).as_ref()), "0.0");
+        assert_eq!(speaks_text(None, v(0, 2).as_ref()), "0.2");
     }
 
     #[test]
@@ -477,6 +619,7 @@ mod tests {
             created_at_millis: 0,
             partition_count: 1,
             stored_bytes: 0,
+            partitions_without_size: 0,
         });
         assert_eq!(view.name, "demo");
         assert_eq!(view.config.default_ttl_millis, None);

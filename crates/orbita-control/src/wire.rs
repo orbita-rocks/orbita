@@ -1,15 +1,22 @@
 //! The worker-to-leader-group protocol.
 //!
-//! Two methods: fetch the partition map, and report a node's own status. That
-//! is the whole data plane facing surface of the control plane, and keeping it
-//! that small is deliberate. Everything an operator does goes through the
-//! `Admin` gRPC service instead, so the path a worker depends on stays
-//! something you can hold in your head.
+//! Two methods carry the data plane: fetch the partition map, and report a
+//! node's own status. That is the whole surface a worker depends on, and
+//! keeping it that small is deliberate — it is the path that must keep working
+//! while everything else is on fire, so it should be something you can hold in
+//! your head.
+//!
+//! Everything an operator does goes through the `Admin` gRPC service instead.
+//! One method here carries such a call from the node that received it to the
+//! member that can decide it, in the operator's own encoding, without this
+//! protocol learning what any of them mean. See [`METHOD_ADMIN_CALL`].
 //!
 //! Everything is little endian, framed by [`crate::codec`].
 
 use crate::codec::{CodecError, CodecResult, Reader, Writer};
 use crate::membership::NodeStatus;
+use crate::model::Credential;
+use crate::version::{ClusterVersion, CompatibilityRefusal, VersionRange};
 
 use bytes::Bytes;
 use orbita_core::{
@@ -18,14 +25,105 @@ use orbita_core::{
 };
 
 pub const METHOD_FETCH_MAP: u16 = 1;
+/// The v0.0.1 status report: no speakable range in the request, no cluster
+/// version in the reply. Served for one release window so that a rolling
+/// update between 0.0 and the first version-aware release does not black out
+/// heartbeats across the boundary; delete when the window moves past 0.0.
 pub const METHOD_REPORT_STATUS: u16 = 2;
 pub const METHOD_FETCH_NODES: u16 = 3;
+/// The status report carrying the speakable range, answered with the active
+/// cluster version. A client that gets "unknown control method" back falls
+/// back to [`METHOD_REPORT_STATUS`], which is how a new worker heartbeats an
+/// old leader mid-rollout.
+pub const METHOD_REPORT_STATUS_V2: u16 = 4;
+/// Reads the leader's committed control-command index. A restarting voter uses
+/// this as catch-up authority before it reports Ready.
+pub const METHOD_FETCH_COMMIT_INDEX: u16 = 5;
+/// Status reporting with readiness and draining state.
+pub const METHOD_REPORT_STATUS_V3: u16 = 6;
+/// A worker asks the control leader to hand off every partition it owns.
+pub const METHOD_DRAIN_NODE: u16 = 7;
+/// Status reporting that carries what each partition's index costs in memory.
+/// A separate method rather than a wider V3 payload because the progress list
+/// is fixed-width per entry: a leader decoding the old shape would read the
+/// new field as the next partition id.
+pub const METHOD_REPORT_STATUS_V4: u16 = 8;
+/// Status reporting that carries the owner's committed prefix beside its
+/// durable position.
+///
+/// A separate method for the same reason V4 was: the progress list decodes a
+/// fixed sequence of fields per entry, so a V4 leader reading a sixth field
+/// would take it for the next partition's id. That is the rule for anything
+/// added per partition, and it is why a new rung is cheaper than it looks —
+/// the fallback below already knows how to lose a field and keep the
+/// heartbeat.
+pub const METHOD_REPORT_STATUS_V5: u16 = 9;
+/// One `Admin` gRPC call, forwarded by a node that is not the control leader.
+///
+/// The payload is the operator's own protobuf message, re-encoded rather than
+/// translated, for the reason `orbita_server::proxy` gives about client
+/// requests: translating means a second description of every field, and the
+/// copy nobody reads is the one that rots. It rides on the control protocol
+/// because that is the only path with leader discovery and redirect already
+/// built into it, which is precisely what a misdirected admin call needs.
+pub const METHOD_ADMIN_CALL: u16 = 10;
+/// Fetches every live credential, secret hashes and all, so a worker can
+/// enforce authentication against a cached copy rather than a control-plane
+/// round trip per request. A worker polls this on the same timer as its map.
+pub const METHOD_FETCH_CREDENTIALS: u16 = 11;
+/// Asks the leader group whether the cluster requires authentication.
+///
+/// This is what lets a node gate its readiness on agreeing with the cluster's
+/// auth policy rather than on its own config alone: without it, a rolling
+/// change to `require_auth` leaves a window where an auth-disabled node behind
+/// the load balancer accepts unauthenticated requests while its peers reject
+/// them. A leader too old to serve this returns an error, which the caller
+/// reads as "cannot determine" and does not gate on — the documented residual.
+pub const METHOD_FETCH_AUTH_POLICY: u16 = 12;
+/// Asks the leader group which splits this node must prepare child storage for.
+///
+/// A worker polls this beside the map. The split intent cannot ride the map,
+/// which is a frozen contract that carries only live partitions; a pending
+/// split's children are not live until the parent retires, so the intent needs
+/// its own channel. See [ADR 0009](../../../docs/adr/0009-a-split-shares-the-parents-segments.md).
+pub const METHOD_FETCH_SPLIT_INTENTS: u16 = 13;
+/// Reports that this node has durably prepared its child storage for a split.
+///
+/// This is the real acknowledgement the completion waits on: a worker calls it
+/// only after both child manifests are on the object store, so the leader's
+/// `MarkSplitPrepared` reflects storage that exists rather than a map version a
+/// node happened to observe.
+pub const METHOD_REPORT_SPLIT_PREPARED: u16 = 14;
+/// Fetches split intents with the map version observed beside them.
+pub const METHOD_FETCH_SPLIT_INTENTS_V2: u16 = 15;
+/// Reports preparation for one exact pair of child ids.
+pub const METHOD_REPORT_SPLIT_PREPARED_V2: u16 = 16;
+/// Status reporting with combined-node voter eligibility and placement data.
+pub const METHOD_REPORT_STATUS_V6: u16 = 17;
+/// Fetches coherent dual-parent merge intents. Unsupported means no merge can
+/// be active on that older leader, so new workers degrade to an empty snapshot.
+pub const METHOD_FETCH_MERGE_INTENTS: u16 = 18;
+/// Reports durable preparation for one complete merge generation.
+pub const METHOD_REPORT_MERGE_PREPARED: u16 = 19;
 
 const STATUS_MAP: u8 = 0;
 const STATUS_ACCEPTED: u8 = 1;
 const STATUS_NOT_LEADER: u8 = 2;
 const STATUS_ERROR: u8 = 3;
 const STATUS_NODES: u8 = 4;
+const STATUS_COMMIT_INDEX: u8 = 5;
+const STATUS_UNAVAILABLE: u8 = 6;
+const STATUS_INCOMPATIBLE: u8 = 7;
+const STATUS_DRAIN_PROGRESS: u8 = 8;
+const STATUS_ADMIN_OK: u8 = 9;
+const STATUS_ADMIN_FAILED: u8 = 10;
+const STATUS_CREDENTIALS: u8 = 11;
+const STATUS_AUTH_POLICY: u8 = 12;
+const STATUS_SPLIT_INTENTS: u8 = 13;
+const STATUS_SPLIT_PREPARED: u8 = 14;
+const STATUS_SPLIT_INTENTS_V2: u8 = 15;
+const STATUS_MERGE_INTENTS: u8 = 16;
+const STATUS_MERGE_PREPARED: u8 = 17;
 
 /// Asks for the map, saying what the caller already has.
 ///
@@ -71,6 +169,290 @@ impl ReportStatusRequest {
         r.done()?;
         Ok(Self { node, status })
     }
+
+    pub(crate) fn encode_v5(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v5(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v5(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v5(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
+    pub(crate) fn encode_v4(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v4(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v4(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v4(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
+    pub(crate) fn encode_v3(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v3(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v3(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v3(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
+    pub(crate) fn encode_v2(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_v2(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_v2(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_v2(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+
+    /// The v0.0.1 payload shape, for [`super::wire::METHOD_REPORT_STATUS`].
+    pub(crate) fn encode_legacy(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u64(self.node.get());
+        self.status.encode_legacy(&mut w);
+        w.finish()
+    }
+
+    pub(crate) fn decode_legacy(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let node = NodeId(r.u64()?);
+        let status = NodeStatus::decode_legacy(&mut r)?;
+        r.done()?;
+        Ok(Self { node, status })
+    }
+}
+
+/// One forwarded admin call: which RPC, a stable operation id, and the encoded
+/// request behind it.
+///
+/// The method is a discriminant of this crate's own rather than the gRPC
+/// method name, so a forwarded call costs a fixed four bytes and a receiver
+/// that does not recognise it says so instead of guessing.
+///
+/// `op_id` is the forwarding node's name for *this* logical invocation,
+/// minted once before the first send and reused on every retry the transport
+/// or the leader sweep makes underneath. It is what lets the leader tell a
+/// resent call apart from a fresh one: the peer transport resends after an
+/// ambiguous connection loss even though the leader may already have applied
+/// the first copy, and a non-idempotent mutation replayed that way would
+/// commit twice. The token is opaque to this protocol; only the mutation that
+/// needs it reads it. See `AdminService::forwarded`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdminCallRequest {
+    pub method: u32,
+    pub op_id: u128,
+    pub payload: Bytes,
+}
+
+impl AdminCallRequest {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut w = Writer::new();
+        w.u32(self.method)
+            .u64((self.op_id >> 64) as u64)
+            .u64(self.op_id as u64)
+            .bytes(&self.payload);
+        w.finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let method = r.u32()?;
+        let op_hi = r.u64()?;
+        let op_lo = r.u64()?;
+        let request = Self {
+            method,
+            op_id: (u128::from(op_hi) << 64) | u128::from(op_lo),
+            payload: r.bytes()?,
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrainNodeRequest {
+    pub node: NodeId,
+}
+
+impl DrainNodeRequest {
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new().u64(self.node.get()).finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
+/// Which node is asking for the splits it must prepare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FetchSplitIntentsRequest {
+    pub node: NodeId,
+}
+
+/// Which worker is asking for merges it must prepare.
+pub(crate) type FetchMergeIntentsRequest = FetchSplitIntentsRequest;
+
+impl FetchSplitIntentsRequest {
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new().u64(self.node.get()).finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
+/// A node's report that it has durably prepared one exact generation of child
+/// storage for a split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportSplitPreparedRequest {
+    pub node: NodeId,
+    pub parent: PartitionId,
+}
+
+impl ReportSplitPreparedRequest {
+    #[cfg(test)]
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new()
+            .u64(self.node.get())
+            .u64(self.parent.get())
+            .finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+            parent: PartitionId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
+/// The generation-scoped preparation report introduced after the legacy
+/// parent-only shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportSplitPreparedV2Request {
+    pub node: NodeId,
+    pub parent: PartitionId,
+    pub lower: PartitionId,
+    pub upper: PartitionId,
+}
+
+impl ReportSplitPreparedV2Request {
+    pub(crate) fn encode(self) -> Bytes {
+        Writer::new()
+            .u64(self.node.get())
+            .u64(self.parent.get())
+            .u64(self.lower.get())
+            .u64(self.upper.get())
+            .finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut r = Reader::new(buf);
+        let request = Self {
+            node: NodeId(r.u64()?),
+            parent: PartitionId(r.u64()?),
+            lower: PartitionId(r.u64()?),
+            upper: PartitionId(r.u64()?),
+        };
+        r.done()?;
+        Ok(request)
+    }
+}
+
+/// One active split a worker holds: which parent, at what boundary, into which
+/// two child ids, and whether this node still owes preparation work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireSplitIntent {
+    pub parent: PartitionId,
+    pub at: Bytes,
+    pub lower: PartitionId,
+    pub upper: PartitionId,
+    pub prepared_by_this_node: bool,
+}
+
+/// Split intents observed from the same committed control state as this map
+/// version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitIntentSnapshot {
+    pub map_version: MapVersion,
+    pub intents: Vec<WireSplitIntent>,
+}
+
+/// One exact merge generation a worker must keep frozen or prepare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireMergeIntent {
+    pub generation: crate::MergeGeneration,
+    pub prepared_by_this_node: bool,
+}
+
+/// Merge lifecycle state captured with its routing map version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeIntentSnapshot {
+    pub map_version: MapVersion,
+    pub intents: Vec<WireMergeIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportMergePreparedRequest {
+    pub node: NodeId,
+    pub generation: crate::MergeGeneration,
+}
+
+impl ReportMergePreparedRequest {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut writer = Writer::new();
+        writer.u64(self.node.get());
+        self.generation.encode(&mut writer);
+        writer.finish()
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> CodecResult<Self> {
+        let mut reader = Reader::new(buf);
+        let node = NodeId(reader.u64()?);
+        let generation = crate::MergeGeneration::decode(&mut reader)?;
+        reader.done()?;
+        Ok(Self { node, generation })
+    }
 }
 
 /// The one response shape both methods share.
@@ -80,6 +462,15 @@ pub(crate) enum ControlResponse {
     Map(Option<PartitionMap>),
     Accepted {
         map_version: MapVersion,
+        /// The active cluster version, carried on every heartbeat reply so a
+        /// node learns which version to speak in the same round trip that
+        /// keeps it out of the failure detector.
+        ///
+        /// Optional because it rides at the end of the message: a v0.0.1
+        /// leader's reply simply ends after the map version, and a reply to a
+        /// v0.0.1 worker must end there too or the worker rejects it as
+        /// trailing bytes. `None` means "the other side predates versions".
+        cluster_version: Option<ClusterVersion>,
     },
     /// Carries the leader so the caller retries in one hop rather than
     /// sweeping the whole group.
@@ -94,7 +485,48 @@ pub(crate) enum ControlResponse {
     /// answer, and handing it back is what lets an operator configure the
     /// leader group and nothing else.
     Nodes(Vec<(NodeId, String)>),
+    /// A drain request was accepted. `complete` becomes true only after every
+    /// receiver in this node's handoff set has reported its transfer version.
+    DrainProgress {
+        complete: bool,
+        map_version: MapVersion,
+    },
+    /// Every live credential, secret hashes and all.
+    ///
+    /// This is the one control-plane answer that carries secret material, and
+    /// it carries only the hashes the replicated log already holds, never a
+    /// secret. A worker caches it to enforce authentication locally.
+    Credentials(Vec<Credential>),
+    /// Whether the leader group requires authentication, for a node checking
+    /// its own `require_auth` against the cluster's before it reports ready.
+    AuthPolicy(bool),
+    /// The leader ran a forwarded admin call and it succeeded. The bytes are
+    /// the encoded protobuf response, which the forwarding node hands back to
+    /// its client untouched.
+    AdminOk(Bytes),
+    /// The leader ran a forwarded admin call and it failed. `code` is a
+    /// `tonic::Code` discriminant, carried so the operator sees the leader's
+    /// own refusal rather than a forwarding error wrapped around it — the
+    /// difference between "no such keyspace" and "something went wrong".
+    AdminFailed {
+        code: u32,
+        message: String,
+    },
+    /// The leader's committed control-command index.
+    CommitIndex(crate::LogIndex),
+    /// This member cannot establish leader authority right now. Unlike a
+    /// command refusal, callers may try another member or retry later.
+    Unavailable(String),
+    Incompatible(CompatibilityRefusal),
     Error(String),
+    /// The splits a node must prepare child storage for.
+    SplitIntents(Vec<WireSplitIntent>),
+    /// Generation-safe intents observed with their routing map version.
+    SplitIntentsV2(SplitIntentSnapshot),
+    /// A split-preparation report was accepted.
+    SplitPrepared,
+    MergeIntents(MergeIntentSnapshot),
+    MergePrepared,
 }
 
 impl ControlResponse {
@@ -113,8 +545,14 @@ impl ControlResponse {
                     }
                 }
             }
-            ControlResponse::Accepted { map_version } => {
+            ControlResponse::Accepted {
+                map_version,
+                cluster_version,
+            } => {
                 w.u8(STATUS_ACCEPTED).u64(map_version.get());
+                if let Some(cluster_version) = cluster_version {
+                    cluster_version.encode(&mut w);
+                }
             }
             ControlResponse::NotLeader { leader } => {
                 w.u8(STATUS_NOT_LEADER)
@@ -126,8 +564,62 @@ impl ControlResponse {
                     w.u64(node.get()).str(address);
                 });
             }
+            ControlResponse::DrainProgress {
+                complete,
+                map_version,
+            } => {
+                w.u8(STATUS_DRAIN_PROGRESS)
+                    .u8(u8::from(*complete))
+                    .u64(map_version.get());
+            }
+            ControlResponse::Incompatible(refusal) => {
+                w.u8(STATUS_INCOMPATIBLE);
+                refusal.speaks.encode(&mut w);
+                refusal.active.encode(&mut w);
+            }
+            ControlResponse::Credentials(credentials) => {
+                w.u8(STATUS_CREDENTIALS);
+                w.seq(credentials, |w, credential| credential.encode(w));
+            }
+            ControlResponse::AuthPolicy(require_auth) => {
+                w.u8(STATUS_AUTH_POLICY).u8(u8::from(*require_auth));
+            }
+            ControlResponse::AdminOk(payload) => {
+                w.u8(STATUS_ADMIN_OK).bytes(payload);
+            }
+            ControlResponse::AdminFailed { code, message } => {
+                w.u8(STATUS_ADMIN_FAILED).u32(*code).str(message);
+            }
+            ControlResponse::CommitIndex(index) => {
+                w.u8(STATUS_COMMIT_INDEX).u64(*index);
+            }
             ControlResponse::Error(message) => {
                 w.u8(STATUS_ERROR).str(message);
+            }
+            ControlResponse::Unavailable(message) => {
+                w.u8(STATUS_UNAVAILABLE).str(message);
+            }
+            ControlResponse::SplitIntents(intents) => {
+                w.u8(STATUS_SPLIT_INTENTS);
+                w.seq(intents, encode_split_intent);
+            }
+            ControlResponse::SplitIntentsV2(snapshot) => {
+                w.u8(STATUS_SPLIT_INTENTS_V2);
+                w.u64(snapshot.map_version.get());
+                w.seq(&snapshot.intents, encode_split_intent);
+            }
+            ControlResponse::SplitPrepared => {
+                w.u8(STATUS_SPLIT_PREPARED);
+            }
+            ControlResponse::MergeIntents(snapshot) => {
+                w.u8(STATUS_MERGE_INTENTS).u64(snapshot.map_version.get());
+                w.seq(&snapshot.intents, |w, intent| {
+                    intent.generation.encode(w);
+                    w.u8(u8::from(intent.prepared_by_this_node));
+                });
+            }
+            ControlResponse::MergePrepared => {
+                w.u8(STATUS_MERGE_PREPARED);
             }
         }
         w.finish()
@@ -145,12 +637,53 @@ impl ControlResponse {
             }
             STATUS_ACCEPTED => ControlResponse::Accepted {
                 map_version: MapVersion(r.u64()?),
+                // The version is the last field, so a reply from a v0.0.1
+                // leader is one that ends here. Absent is an answer, not an
+                // error; the caller treats it as "no version learned".
+                cluster_version: if r.has_more() {
+                    Some(ClusterVersion::decode(&mut r)?)
+                } else {
+                    None
+                },
             },
             STATUS_NOT_LEADER => ControlResponse::NotLeader {
                 leader: r.opt_u64()?.map(NodeId),
             },
             STATUS_NODES => ControlResponse::Nodes(r.seq(|r| Ok((NodeId(r.u64()?), r.string()?)))?),
+            STATUS_DRAIN_PROGRESS => ControlResponse::DrainProgress {
+                complete: r.u8()? != 0,
+                map_version: MapVersion(r.u64()?),
+            },
+            STATUS_INCOMPATIBLE => ControlResponse::Incompatible(CompatibilityRefusal {
+                speaks: VersionRange::decode(&mut r)?,
+                active: ClusterVersion::decode(&mut r)?,
+            }),
+            STATUS_CREDENTIALS => ControlResponse::Credentials(r.seq(|r| Credential::decode(r))?),
+            STATUS_AUTH_POLICY => ControlResponse::AuthPolicy(r.u8()? != 0),
+            STATUS_ADMIN_OK => ControlResponse::AdminOk(r.bytes()?),
+            STATUS_ADMIN_FAILED => ControlResponse::AdminFailed {
+                code: r.u32()?,
+                message: r.string()?,
+            },
+            STATUS_COMMIT_INDEX => ControlResponse::CommitIndex(r.u64()?),
             STATUS_ERROR => ControlResponse::Error(r.string()?),
+            STATUS_UNAVAILABLE => ControlResponse::Unavailable(r.string()?),
+            STATUS_SPLIT_INTENTS => ControlResponse::SplitIntents(r.seq(decode_split_intent)?),
+            STATUS_SPLIT_INTENTS_V2 => ControlResponse::SplitIntentsV2(SplitIntentSnapshot {
+                map_version: MapVersion(r.u64()?),
+                intents: r.seq(decode_split_intent)?,
+            }),
+            STATUS_SPLIT_PREPARED => ControlResponse::SplitPrepared,
+            STATUS_MERGE_INTENTS => ControlResponse::MergeIntents(MergeIntentSnapshot {
+                map_version: MapVersion(r.u64()?),
+                intents: r.seq(|r| {
+                    Ok(WireMergeIntent {
+                        generation: crate::MergeGeneration::decode(r)?,
+                        prepared_by_this_node: r.u8()? != 0,
+                    })
+                })?,
+            }),
+            STATUS_MERGE_PREPARED => ControlResponse::MergePrepared,
             tag => {
                 return Err(CodecError::UnknownTag {
                     what: "control response",
@@ -161,6 +694,24 @@ impl ControlResponse {
         r.done()?;
         Ok(response)
     }
+}
+
+fn encode_split_intent(w: &mut Writer, intent: &WireSplitIntent) {
+    w.u64(intent.parent.get())
+        .bytes(&intent.at)
+        .u64(intent.lower.get())
+        .u64(intent.upper.get())
+        .u8(u8::from(intent.prepared_by_this_node));
+}
+
+fn decode_split_intent(r: &mut Reader<'_>) -> CodecResult<WireSplitIntent> {
+    Ok(WireSplitIntent {
+        parent: PartitionId(r.u64()?),
+        at: r.bytes()?,
+        lower: PartitionId(r.u64()?),
+        upper: PartitionId(r.u64()?),
+        prepared_by_this_node: r.u8()? != 0,
+    })
 }
 
 /// Encodes a map for the wire.
@@ -308,18 +859,158 @@ mod tests {
             ControlResponse::Map(None),
             ControlResponse::Accepted {
                 map_version: MapVersion(9),
+                cluster_version: Some(ClusterVersion::new(0, 2)),
+            },
+            // What a v0.0.1 leader sends, and what a leader answering a
+            // v0.0.1 worker must send.
+            ControlResponse::Accepted {
+                map_version: MapVersion(9),
+                cluster_version: None,
             },
             ControlResponse::NotLeader {
                 leader: Some(NodeId(2)),
             },
             ControlResponse::NotLeader { leader: None },
+            ControlResponse::DrainProgress {
+                complete: false,
+                map_version: MapVersion(10),
+            },
+            ControlResponse::Incompatible(CompatibilityRefusal {
+                speaks: VersionRange::new(ClusterVersion::new(0, 3), ClusterVersion::new(0, 4)),
+                active: ClusterVersion::new(0, 2),
+            }),
+            ControlResponse::Unavailable("catching up".into()),
             ControlResponse::Error("no".into()),
+            ControlResponse::CommitIndex(42),
+            ControlResponse::Credentials(vec![Credential {
+                id: "cred-1".into(),
+                secret_hash: crate::model::hash_secret("s3cret"),
+                keyspaces: vec!["catalog".into()],
+                permissions: vec![crate::model::Permission::Read],
+                description: "a worker's cached copy".into(),
+                created_at_millis: 7,
+                expires_at_millis: Some(99),
+            }]),
+            ControlResponse::AdminOk(Bytes::from_static(b"encoded response")),
+            ControlResponse::AdminFailed {
+                code: 5,
+                message: "no such keyspace".into(),
+            },
+            ControlResponse::AuthPolicy(true),
+            ControlResponse::AuthPolicy(false),
+            ControlResponse::SplitIntents(vec![WireSplitIntent {
+                parent: PartitionId(6),
+                at: Bytes::from_static(b"g"),
+                lower: PartitionId(18),
+                upper: PartitionId(19),
+                prepared_by_this_node: false,
+            }]),
+            ControlResponse::SplitIntentsV2(SplitIntentSnapshot {
+                map_version: MapVersion(14),
+                intents: vec![
+                    WireSplitIntent {
+                        parent: PartitionId(7),
+                        at: Bytes::from_static(b"m"),
+                        lower: PartitionId(20),
+                        upper: PartitionId(21),
+                        prepared_by_this_node: true,
+                    },
+                    WireSplitIntent {
+                        parent: PartitionId(8),
+                        at: Bytes::new(),
+                        lower: PartitionId(22),
+                        upper: PartitionId(23),
+                        prepared_by_this_node: false,
+                    },
+                ],
+            }),
+            ControlResponse::SplitIntents(Vec::new()),
+            ControlResponse::SplitIntentsV2(SplitIntentSnapshot {
+                map_version: MapVersion(15),
+                intents: Vec::new(),
+            }),
+            ControlResponse::SplitPrepared,
+            ControlResponse::MergeIntents(MergeIntentSnapshot {
+                map_version: MapVersion(16),
+                intents: vec![WireMergeIntent {
+                    generation: merge_generation(),
+                    prepared_by_this_node: true,
+                }],
+            }),
+            ControlResponse::MergePrepared,
         ] {
             assert_eq!(
                 ControlResponse::decode(&response.encode()),
                 Ok(response.clone())
             );
         }
+    }
+
+    #[test]
+    fn the_split_wire_requests_round_trip() {
+        let fetch = FetchSplitIntentsRequest { node: NodeId(4) };
+        assert_eq!(FetchSplitIntentsRequest::decode(&fetch.encode()), Ok(fetch));
+        let report = ReportSplitPreparedRequest {
+            node: NodeId(4),
+            parent: PartitionId(7),
+        };
+        assert_eq!(
+            ReportSplitPreparedRequest::decode(&report.encode()),
+            Ok(report)
+        );
+        let report = ReportSplitPreparedV2Request {
+            node: NodeId(4),
+            parent: PartitionId(7),
+            lower: PartitionId(20),
+            upper: PartitionId(21),
+        };
+        assert_eq!(
+            ReportSplitPreparedV2Request::decode(&report.encode()),
+            Ok(report)
+        );
+    }
+
+    #[test]
+    fn the_merge_preparation_request_carries_the_exact_generation() {
+        let report = ReportMergePreparedRequest {
+            node: NodeId(4),
+            generation: merge_generation(),
+        };
+        assert_eq!(
+            ReportMergePreparedRequest::decode(&report.encode()),
+            Ok(report)
+        );
+    }
+
+    fn merge_generation() -> crate::MergeGeneration {
+        crate::MergeGeneration {
+            lower: PartitionId(2),
+            upper: PartitionId(3),
+            lower_epoch: Epoch(4),
+            upper_epoch: Epoch(5),
+            merged: PartitionId(6),
+            boundary: Bytes::from_static(b"m"),
+            range: KeyRange::unbounded(),
+        }
+    }
+
+    #[test]
+    fn drain_progress_round_trips_distinct_from_a_refusal() {
+        for complete in [false, true] {
+            let progress = ControlResponse::DrainProgress {
+                complete,
+                map_version: MapVersion(12),
+            };
+            assert_eq!(ControlResponse::decode(&progress.encode()), Ok(progress));
+        }
+
+        let progress = ControlResponse::DrainProgress {
+            complete: false,
+            map_version: MapVersion(12),
+        };
+        let refusal = ControlResponse::Error("node is not draining".into());
+        assert_ne!(progress.encode()[0], refusal.encode()[0]);
+        assert_eq!(ControlResponse::decode(&refusal.encode()), Ok(refusal));
     }
 
     #[test]
@@ -330,11 +1021,19 @@ mod tests {
                 role: NodeRole::Worker,
                 address: "10.0.0.7:7000".into(),
                 map_version: MapVersion(3),
+                speaks: crate::version::binary_speaks(),
+                ready: true,
+                draining: false,
+                voter_eligible: true,
+                failure_domain: "zone-a".into(),
+                node_identity: "node-7".into(),
                 partitions: vec![PartitionProgress {
                     partition: PartitionId(1),
                     durable_lamport: Lamport(10),
                     applied_lamport: Lamport(9),
                     size_bytes: 1024,
+                    index_bytes: Some(256),
+                    committed_lamport: Some(Lamport(9)),
                 }],
             },
         };
@@ -342,6 +1041,101 @@ mod tests {
             ReportStatusRequest::decode(&request.encode()),
             Ok(request.clone())
         );
+    }
+
+    #[test]
+    fn a_status_report_carries_index_memory_only_on_the_newest_method() {
+        // The progress list is fixed width per entry, so a leader decoding
+        // the older shape would read index memory as the next partition id.
+        // The two methods exist to keep that from being possible.
+        let request = ReportStatusRequest {
+            node: NodeId(7),
+            status: NodeStatus {
+                role: NodeRole::Worker,
+                address: "10.0.0.7:7000".into(),
+                map_version: MapVersion(3),
+                speaks: crate::version::binary_speaks(),
+                ready: true,
+                draining: false,
+                voter_eligible: false,
+                failure_domain: String::new(),
+                node_identity: String::new(),
+                partitions: vec![PartitionProgress {
+                    partition: PartitionId(1),
+                    durable_lamport: Lamport(10),
+                    applied_lamport: Lamport(9),
+                    size_bytes: 1024,
+                    index_bytes: Some(256),
+                    committed_lamport: Some(Lamport(9)),
+                }],
+            },
+        };
+
+        assert_ne!(request.encode(), request.encode_v3());
+        let through_v3 = ReportStatusRequest::decode_v3(&request.encode_v3()).unwrap();
+        assert_eq!(
+            through_v3.status.partitions[0].index_bytes, None,
+            "a report that could not carry the measurement did not carry a zero either"
+        );
+        assert_eq!(through_v3.status.partitions[0].size_bytes, 1024);
+        assert_eq!(
+            ReportStatusRequest::decode(&request.encode())
+                .unwrap()
+                .status
+                .partitions[0]
+                .index_bytes,
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn a_v0_0_1_status_report_still_decodes_through_the_legacy_method() {
+        // The legacy encoding is byte for byte what v0.0.1 sends on
+        // METHOD_REPORT_STATUS. If this breaks, an old worker heartbeating a
+        // new leader mid-rollout drops out of the failure detector.
+        let request = ReportStatusRequest {
+            node: NodeId(7),
+            status: NodeStatus {
+                role: NodeRole::Worker,
+                address: "10.0.0.7:7000".into(),
+                map_version: MapVersion(3),
+                speaks: crate::version::VersionRange::exactly(crate::version::ClusterVersion::ZERO),
+                ready: false,
+                draining: false,
+                voter_eligible: false,
+                failure_domain: String::new(),
+                node_identity: String::new(),
+                partitions: vec![PartitionProgress {
+                    partition: PartitionId(1),
+                    durable_lamport: Lamport(10),
+                    applied_lamport: Lamport(9),
+                    size_bytes: 1024,
+                    // A v0.0.1 report cannot carry either of these, so the
+                    // only value that round trips through the legacy shape is
+                    // the one meaning nobody said.
+                    index_bytes: None,
+                    committed_lamport: None,
+                }],
+            },
+        };
+        assert_eq!(
+            ReportStatusRequest::decode_legacy(&request.encode_legacy()),
+            Ok(request)
+        );
+    }
+
+    #[test]
+    fn a_forwarded_admin_call_carries_its_request_bytes_unchanged() {
+        // The whole design rests on the leader seeing exactly the bytes the
+        // operator's client sent. Anything that reshapes them here would be a
+        // second description of the admin API, which is what forwarding an
+        // opaque payload exists to avoid.
+        let request = AdminCallRequest {
+            method: 3,
+            op_id: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+            payload: Bytes::from_static(&[0x0a, 0x04, b'd', b'e', b'm', b'o']),
+        };
+        assert_eq!(AdminCallRequest::decode(&request.encode()), Ok(request));
     }
 
     #[test]

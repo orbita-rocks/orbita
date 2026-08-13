@@ -91,13 +91,20 @@ struct Inner {
     local: NodeId,
     clock: TokioClock,
     call_timeout: Duration,
-    handlers: Mutex<HashMap<ServiceId, Arc<dyn ErasedHandler>>>,
+    handlers: Mutex<HashMap<ServiceId, RegisteredHandler>>,
+    service_executors: Mutex<HashMap<ServiceId, tokio::runtime::Handle>>,
     /// Where each peer is reached. Configuration rather than discovery,
     /// because discovering a peer's address requires asking something, and the
     /// thing to ask is reached over this transport.
     directory: Mutex<HashMap<NodeId, String>>,
     peers: Mutex<HashMap<NodeId, Arc<PeerSlot>>>,
     next_request_id: AtomicU64,
+}
+
+#[derive(Clone)]
+struct RegisteredHandler {
+    handler: Arc<dyn ErasedHandler>,
+    executor: tokio::runtime::Handle,
 }
 
 /// One peer's connection, behind its own lock so that dialling a slow peer
@@ -121,6 +128,7 @@ impl PeerTransport {
                 clock: TokioClock::new(),
                 call_timeout,
                 handlers: Mutex::new(HashMap::new()),
+                service_executors: Mutex::new(HashMap::new()),
                 directory: Mutex::new(HashMap::new()),
                 peers: Mutex::new(HashMap::new()),
                 next_request_id: AtomicU64::new(1),
@@ -157,24 +165,53 @@ impl PeerTransport {
     /// Returns once the socket is bound, so a caller that holds one of these
     /// can tell its peers where to find it.
     pub async fn listen(&self, addr: SocketAddr) -> std::io::Result<PeerListener> {
-        let listener = TcpListener::bind(addr).await?;
-        let local_addr = listener.local_addr()?;
-        let (shutdown, stop) = oneshot::channel();
-        let transport = self.clone();
+        self.listen_on(addr, tokio::runtime::Handle::current())
+            .await
+    }
 
-        let task = tokio::spawn(async move {
-            let mut stop = stop;
+    /// Binds and serves the shared peer socket on `executor`.
+    ///
+    /// The listener and frame reader live there so worker saturation cannot
+    /// stop Raft heartbeats at the socket. Individual services are dispatched
+    /// to the handle captured at registration, keeping WAL and proxy handlers
+    /// on the worker runtime.
+    pub async fn listen_on(
+        &self,
+        addr: SocketAddr,
+        executor: tokio::runtime::Handle,
+    ) -> std::io::Result<PeerListener> {
+        let (bound, listening) = oneshot::channel();
+        let transport = self.clone();
+        let task = executor.spawn(async move {
+            let listener = match TcpListener::bind(addr).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let _ = bound.send(Err(error));
+                    return;
+                }
+            };
+            let local_addr = match listener.local_addr() {
+                Ok(local_addr) => local_addr,
+                Err(error) => {
+                    let _ = bound.send(Err(error));
+                    return;
+                }
+            };
+            let (shutdown, mut stop) = oneshot::channel();
+            let (connections, _) = tokio::sync::watch::channel(false);
+            let connection_shutdown = connections.clone();
+            if bound.send(Ok((local_addr, shutdown, connections))).is_err() {
+                return;
+            }
             loop {
                 tokio::select! {
                     _ = &mut stop => break,
                     accepted = listener.accept() => match accepted {
                         Ok((stream, from)) => {
                             let transport = transport.clone();
-                            tokio::spawn(async move { serve(transport, stream, from).await });
+                            let stop = connection_shutdown.subscribe();
+                            tokio::spawn(async move { serve(transport, stream, from, stop).await });
                         }
-                        // An accept failure is usually a file descriptor
-                        // limit, which is transient and node-wide rather than
-                        // a reason to stop listening.
                         Err(error) => {
                             tracing::warn!(%error, "accepting a peer connection failed");
                         }
@@ -182,16 +219,27 @@ impl PeerTransport {
                 }
             }
         });
-
+        let (local_addr, shutdown, connections) = listening.await.map_err(|_| {
+            std::io::Error::other("peer listener executor stopped before binding")
+        })??;
         tracing::info!(node = self.inner.local.get(), %local_addr, "serving peer traffic");
         Ok(PeerListener {
             local_addr,
             shutdown,
+            connections,
             task,
         })
     }
 
-    fn handler(&self, service: ServiceId) -> Option<Arc<dyn ErasedHandler>> {
+    pub(crate) fn route_service(&self, service: ServiceId, executor: tokio::runtime::Handle) {
+        self.inner
+            .service_executors
+            .lock()
+            .expect("peer service executors poisoned")
+            .insert(service, executor);
+    }
+
+    fn handler(&self, service: ServiceId) -> Option<RegisteredHandler> {
         self.inner
             .handlers
             .lock()
@@ -267,7 +315,15 @@ impl PeerTransport {
         let Some(handler) = self.handler(call.service) else {
             return Err(TransportError::NoHandler(call.service));
         };
-        handler.handle_boxed(self.inner.local, call).await
+        let local = self.inner.local;
+        let erased = Arc::clone(&handler.handler);
+        let (reply, result) = oneshot::channel();
+        handler.executor.spawn(async move {
+            let _ = reply.send(erased.handle_boxed(local, call).await);
+        });
+        result
+            .await
+            .unwrap_or(Err(TransportError::Unreachable(local)))
     }
 
     async fn call_remote(&self, to: NodeId, call: PeerCall) -> TransportResult<Bytes> {
@@ -327,11 +383,25 @@ impl Transport for PeerTransport {
     }
 
     fn register(&self, service: ServiceId, handler: impl PeerHandler) {
+        let executor = self
+            .inner
+            .service_executors
+            .lock()
+            .expect("peer service executors poisoned")
+            .get(&service)
+            .cloned()
+            .unwrap_or_else(tokio::runtime::Handle::current);
         self.inner
             .handlers
             .lock()
             .expect("peer handler registry poisoned")
-            .insert(service, Arc::new(Erased(handler)));
+            .insert(
+                service,
+                RegisteredHandler {
+                    handler: Arc::new(Erased(handler)),
+                    executor,
+                },
+            );
     }
 
     fn local_node(&self) -> NodeId {
@@ -347,6 +417,7 @@ impl Transport for PeerTransport {
 pub struct PeerListener {
     local_addr: SocketAddr,
     shutdown: oneshot::Sender<()>,
+    connections: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -358,6 +429,7 @@ impl PeerListener {
     }
 
     pub async fn shutdown(self) {
+        let _ = self.connections.send(true);
         let _ = self.shutdown.send(());
         let _ = self.task.await;
     }
@@ -502,7 +574,12 @@ fn status_of(to: NodeId, service: ServiceId, response: Response) -> TransportRes
 /// single writer, so a slow handler holds up neither the reader nor the
 /// replies to calls that finished behind it. The request id is what makes that
 /// safe: the caller matches replies by id and never by order.
-async fn serve(transport: PeerTransport, stream: TcpStream, from: SocketAddr) {
+async fn serve(
+    transport: PeerTransport,
+    stream: TcpStream,
+    from: SocketAddr,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%from, %error, "could not disable Nagle on an inbound connection");
     }
@@ -519,7 +596,11 @@ async fn serve(transport: PeerTransport, stream: TcpStream, from: SocketAddr) {
     });
 
     loop {
-        let body = match read_frame(&mut reader).await {
+        let frame = tokio::select! {
+            _ = stop.changed() => break,
+            frame = read_frame(&mut reader) => frame,
+        };
+        let body = match frame {
             Ok(Some(body)) => body,
             Ok(None) => break,
             Err(error) => {
@@ -540,33 +621,36 @@ async fn serve(transport: PeerTransport, stream: TcpStream, from: SocketAddr) {
 
         let transport = transport.clone();
         let replies = replies.clone();
-        tokio::spawn(async move {
-            let request_id = request.request_id;
-            let response = match transport.handler(request.service) {
-                None => Response {
-                    request_id,
+        let handler = transport.handler(request.service);
+        let Some(handler) = handler else {
+            let _ = replies.send(
+                Response {
+                    request_id: request.request_id,
                     status: STATUS_NO_HANDLER,
                     payload: Bytes::new(),
-                },
-                Some(handler) => {
-                    let call = PeerCall {
-                        service: request.service,
-                        method: request.method,
-                        payload: request.payload,
-                    };
-                    match handler.handle_boxed(UNIDENTIFIED_PEER, call).await {
-                        Ok(payload) => Response {
-                            request_id,
-                            status: STATUS_OK,
-                            payload,
-                        },
-                        Err(error) => Response {
-                            request_id,
-                            status: STATUS_ERROR,
-                            payload: Bytes::from(error.to_string()),
-                        },
-                    }
                 }
+                .encode(),
+            );
+            continue;
+        };
+        handler.executor.spawn(async move {
+            let request_id = request.request_id;
+            let call = PeerCall {
+                service: request.service,
+                method: request.method,
+                payload: request.payload,
+            };
+            let response = match handler.handler.handle_boxed(UNIDENTIFIED_PEER, call).await {
+                Ok(payload) => Response {
+                    request_id,
+                    status: STATUS_OK,
+                    payload,
+                },
+                Err(error) => Response {
+                    request_id,
+                    status: STATUS_ERROR,
+                    payload: Bytes::from(error.to_string()),
+                },
             };
             let _ = replies.send(response.encode());
         });
@@ -666,6 +750,19 @@ mod tests {
         }
     }
 
+    struct ExecutionThread;
+
+    impl PeerHandler for ExecutionThread {
+        async fn handle(&self, _from: NodeId, _call: PeerCall) -> TransportResult<Bytes> {
+            Ok(Bytes::from(
+                std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_owned(),
+            ))
+        }
+    }
+
     fn call(payload: &'static [u8]) -> PeerCall {
         PeerCall {
             service: ServiceId::Proxy,
@@ -719,6 +816,35 @@ mod tests {
             one.call(NodeId(2), call(b"over the wire")).await,
             Ok(Bytes::from_static(b"over the wire"))
         );
+        listener.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn control_ingress_and_handlers_run_on_the_reserved_executor() {
+        let one = PeerTransport::new(NodeId(1));
+        let two = PeerTransport::new(NodeId(2));
+        let executor = crate::runtime::ControlExecutor::start().unwrap();
+        two.route_service(ServiceId::Control, executor.handle());
+        two.register(ServiceId::Control, ExecutionThread);
+        let listener = two
+            .listen_on("127.0.0.1:0".parse().unwrap(), executor.handle())
+            .await
+            .unwrap();
+        one.set_peer(NodeId(2), listener.local_addr().to_string());
+
+        let handled = one
+            .call(
+                NodeId(2),
+                PeerCall {
+                    service: ServiceId::Control,
+                    method: 1,
+                    payload: Bytes::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(handled, Bytes::from_static(b"orbita-control"));
+
         listener.shutdown().await;
     }
 

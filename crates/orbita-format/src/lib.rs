@@ -61,4 +61,5 @@ pub use segment::{
     BuiltSegment, Segment, SegmentBuilder, SegmentFooter, SegmentHeader, SegmentIndex, FOOTER_LEN,
     FORMAT_VERSION, HEADER_LEN,
 };
-pub use snapshot::Snapshot;
+pub use snapshot::{KeyLocation, Snapshot};
+pub use sweep::{sweep_partition, sweep_partition_protecting, Referenced, SweepReport};

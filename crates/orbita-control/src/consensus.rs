@@ -1,39 +1,21 @@
-//! The seam where Raft goes.
-//!
-//! # This is staging, not an oversight
-//!
-//! `docs/plan/03-control.md` says the leader group runs Raft, and it will.
-//! What ships here is the replicated state machine, the failover protocol, the
-//! partition map, and the admin surface, with consensus behind
-//! [`ConsensusLog`] and a single-node implementation underneath it. That order
-//! is deliberate. Everything above the trait is where the correctness argument
-//! lives, and none of it gets easier to write or to test with a real Raft
-//! underneath. A single-node log is a correct implementation of the trait for
-//! a cluster of one, which is what `orbita dev` runs and what most of the
-//! simulator scenarios need, so the staging buys a working system now without
-//! costing anything later.
-//!
-//! What it does not do is survive the loss of the leader group node, and
-//! nothing in this crate pretends otherwise. A single-node control plane is
-//! not a production configuration.
-//!
-//! # How Raft slots in
+//! The seam consensus lives behind.
 //!
 //! [`ConsensusLog`] is three operations: propose a command and learn when it
 //! is committed, read the commit index, and read committed entries after a
-//! given index. That is deliberately the intersection of what `openraft` and
-//! `raft-rs` both offer.
+//! given index. Everything above the trait, meaning [`crate::state`],
+//! [`crate::controller`], and [`crate::client`], is where the correctness
+//! argument lives, and none of it knows how a command became committed.
 //!
-//! With `openraft`, `propose` becomes `Raft::client_write`, whose response
-//! already carries the log index, and `subscribe` is served from the state
-//! machine store's committed entries. `openraft`'s `RaftLogStorage` and
-//! `RaftNetwork` are implemented against `orbita_runtime::Disk` and
-//! `orbita_runtime::Transport`, which is the seam the brief calls out as the
-//! reason to adopt rather than build. Nothing in [`crate::state`],
-//! [`crate::controller`], or [`crate::client`] changes, because none of them
-//! knows how a command became committed.
+//! Two implementations sit underneath it. [`SingleNodeLog`], here, is the
+//! durable log for a cluster of one: it is what `orbita dev` runs and what
+//! most simulator scenarios need, and it is a correct implementation of the
+//! trait for that cluster size. [`crate::RaftLog`] is the replicated one, a
+//! Raft group run by `raft-rs` with its clock, network, storage, and
+//! randomness all routed through `orbita_runtime`, which is what lets the
+//! deterministic simulator drive its elections; the `raft` module documents
+//! that mapping.
 //!
-//! The one thing that does change is that `propose` starts failing with
+//! The one observable difference between them is that `propose` fails with
 //! "not the leader" on a follower. [`crate::controller::Controller`] already
 //! surfaces that, and [`crate::client::ControlClient`] already follows the
 //! redirect, because a single-node log is the degenerate case of a leader and
@@ -59,6 +41,28 @@ pub type LogIndex = u64;
 pub struct LogEntry {
     pub index: LogIndex,
     pub command: ControlCommand,
+}
+
+/// One safe Raft membership operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// Add a non-voting member so it can catch up before promotion.
+    AddLearner(NodeId),
+    /// Adds a learner and durably binds the address and node identity every
+    /// voter needs to rediscover it after a full restart.
+    AddLearnerMember(RaftMember),
+    /// Promote a caught-up learner into the voting set.
+    Promote(NodeId),
+    /// Remove a voter or learner through the replicated Raft configuration.
+    Remove(NodeId),
+}
+
+/// One Raft participant and the durable discovery identity bound to its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftMember {
+    pub node: NodeId,
+    pub address: String,
+    pub node_identity: String,
 }
 
 /// An ordered, durable, agreed-upon sequence of commands.
@@ -87,11 +91,52 @@ pub trait ConsensusLog: Send + Sync + 'static {
     /// catches up on a timer.
     fn subscribe(&self, after: LogIndex) -> impl Future<Output = Result<Vec<LogEntry>>> + Send;
 
+    /// Confirms this node is still leader after processing its current
+    /// consensus work, and returns the command index visible at that point.
+    ///
+    /// Leader-facing reads apply through this index and confirm a second
+    /// barrier before answering. A plain `is_leader` check is insufficient:
+    /// election can become visible before the state machine has applied the
+    /// committed prefix inherited from the previous leader.
+    fn leader_barrier(&self) -> impl Future<Output = Result<LogIndex>> + Send;
+
     /// Whether this node may propose. Always true for a single-node log.
     fn is_leader(&self) -> impl Future<Output = bool> + Send;
 
     /// Who to redirect a proposal to, when this node is not the leader.
     fn leader(&self) -> impl Future<Output = Option<NodeId>> + Send;
+
+    /// The applied Raft voters, which are authoritative over node roles.
+    fn voters(&self) -> impl Future<Output = Vec<NodeId>> + Send {
+        async { Vec::new() }
+    }
+
+    /// The applied non-voting members available for safe promotion.
+    fn learners(&self) -> impl Future<Output = Vec<NodeId>> + Send {
+        async { Vec::new() }
+    }
+
+    /// Whether a learner has replicated the leader's current log.
+    fn learner_caught_up(&self, _node: NodeId) -> impl Future<Output = bool> + Send {
+        async { false }
+    }
+
+    /// Applies one configuration change and resolves after it is committed.
+    fn change_membership(
+        &self,
+        change: MembershipChange,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            Err(Error::InvalidArgument(format!(
+                "this consensus log cannot apply membership change {change:?}"
+            )))
+        }
+    }
+
+    /// Whether this implementation hosts a mutable Raft configuration.
+    fn manages_membership(&self) -> bool {
+        false
+    }
 }
 
 const FRAME_HEADER_BYTES: usize = 8;
@@ -152,7 +197,11 @@ impl<R: Runtime> SingleNodeLog<R> {
             }
         };
 
-        let (entries, good_bytes) = decode_log(&raw);
+        let recovered = decode_log(&raw);
+        if let Some(error) = &recovered.unreadable {
+            return Err(unreadable_entry(recovered.good_bytes, raw.len(), error));
+        }
+        let good_bytes = recovered.good_bytes;
         if good_bytes < raw.len() {
             tracing::warn!(
                 node = %runtime.transport().local_node(),
@@ -162,6 +211,7 @@ impl<R: Runtime> SingleNodeLog<R> {
             file.truncate(good_bytes as u64).await.map_err(disk_error)?;
             file.sync().await.map_err(disk_error)?;
         }
+        let entries = recovered.entries;
 
         Ok(Arc::new(Self {
             node: runtime.transport().local_node(),
@@ -221,12 +271,34 @@ impl<R: Runtime> ConsensusLog for SingleNodeLog<R> {
             .collect())
     }
 
+    async fn leader_barrier(&self) -> Result<LogIndex> {
+        Ok(self.commit_index().await)
+    }
+
     async fn is_leader(&self) -> bool {
         true
     }
 
     async fn leader(&self) -> Option<NodeId> {
         Some(self.node)
+    }
+
+    async fn voters(&self) -> Vec<NodeId> {
+        vec![self.node]
+    }
+
+    async fn learners(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    async fn learner_caught_up(&self, _node: NodeId) -> bool {
+        false
+    }
+
+    async fn change_membership(&self, change: MembershipChange) -> Result<()> {
+        Err(Error::InvalidArgument(format!(
+            "a single-node development log cannot apply membership change {change:?}"
+        )))
     }
 }
 
@@ -243,10 +315,29 @@ fn encode_frame(payload: &[u8]) -> Bytes {
     buf.freeze()
 }
 
-/// Decodes as far as the bytes are trustworthy, returning the entries and how
-/// many bytes they came from.
-fn decode_log(raw: &[u8]) -> (Vec<ControlCommand>, usize) {
+/// What replaying the durable log produced, and why it stopped.
+struct RecoveredLog {
+    entries: Vec<ControlCommand>,
+    /// How many bytes the entries came from. Anything past this is a tail the
+    /// caller may truncate.
+    good_bytes: usize,
+    /// Set when reading stopped at a frame that was *whole* and passed its
+    /// checksum, and whose payload this binary still could not decode.
+    ///
+    /// This is the case that must never be confused with a torn tail. A torn
+    /// frame is a process that died mid-append and it was never acknowledged
+    /// to anybody, so dropping it costs nothing. A whole, checksummed frame is
+    /// bytes some binary deliberately wrote and fsynced, and truncating there
+    /// throws away that decision *and every decision after it* — which is how
+    /// a partition disappears from the routing map and the id counter walks
+    /// backwards at the same time. See issue #171.
+    unreadable: Option<CodecError>,
+}
+
+/// Decodes as far as the bytes are trustworthy.
+fn decode_log(raw: &[u8]) -> RecoveredLog {
     let mut entries = Vec::new();
+    let mut unreadable = None;
     let mut offset = 0;
 
     while offset + FRAME_HEADER_BYTES <= raw.len() {
@@ -276,12 +367,39 @@ fn decode_log(raw: &[u8]) -> (Vec<ControlCommand>, usize) {
             // means a binary that understood this entry wrote it and this one
             // does not. Stopping here is the only safe answer: applying the
             // entries after it would skip a decision every other member made.
-            Err(_) => break,
+            // Reported rather than silently truncated, because the frame is
+            // whole and so is everything behind it.
+            Err(error) => {
+                unreadable = Some(error);
+                break;
+            }
         }
         offset = body_end;
     }
 
-    (entries, offset)
+    RecoveredLog {
+        entries,
+        good_bytes: offset,
+        unreadable,
+    }
+}
+
+/// The refusal recovery gives rather than destroying a whole, checksummed
+/// entry to carry on.
+///
+/// Loud and fatal on purpose. The alternative that used to be here — truncate
+/// and start anyway — produces a node that looks healthy while serving a
+/// routing map rolled back to some earlier prefix, which is indistinguishable
+/// from working until an acknowledged write turns out to be unreachable. A
+/// process that will not start is a page; a process that quietly forgot is a
+/// data-loss incident nobody notices for a day.
+fn unreadable_entry(at: usize, total: usize, error: &CodecError) -> Error {
+    Error::Internal(format!(
+        "control log: the entry at byte {at} is whole, passes its checksum, and this binary \
+         cannot decode it ({error}). Refusing to start: truncating there would destroy {} bytes \
+         of committed decisions. A binary that understands this entry wrote it — run one.",
+        total - at
+    ))
 }
 
 fn disk_error(e: DiskError) -> Error {
@@ -305,6 +423,9 @@ mod tests {
             node: NodeId(id),
             role: NodeRole::Worker,
             address: format!("10.0.0.{id}:7000"),
+            speaks: crate::version::binary_speaks(),
+            ready: true,
+            draining: false,
         }
     }
 
@@ -354,11 +475,16 @@ mod tests {
         let whole = entries.freeze();
 
         for cut in 1..whole.len() {
-            let (decoded, good) = decode_log(&whole[..cut]);
+            let recovered = decode_log(&whole[..cut]);
+            let (decoded, good) = (recovered.entries, recovered.good_bytes);
             assert!(good <= cut);
             assert!(
                 decoded.len() <= 2,
                 "a truncated log must never yield more entries than were written"
+            );
+            assert!(
+                recovered.unreadable.is_none(),
+                "a frame cut short is a torn tail, not an entry this binary cannot read"
             );
             if cut >= good && good > 0 {
                 assert_eq!(decoded[0], register(1), "the intact prefix survives");
@@ -375,7 +501,56 @@ mod tests {
         let last = raw.len() - 1;
         raw[last] ^= 0xFF;
 
-        let (decoded, _) = decode_log(&raw);
-        assert_eq!(decoded, vec![register(1)]);
+        assert_eq!(decode_log(&raw).entries, vec![register(1)]);
+    }
+
+    #[test]
+    fn recovery_refuses_to_start_rather_than_truncate_an_entry_it_cannot_decode() {
+        // The upgrade shape from issue #171: a whole, checksummed entry a
+        // newer binary wrote, sitting in front of decisions this one already
+        // committed. Truncating there would have taken the tail with it and
+        // brought the node up serving a rolled-back map.
+        let sim = Simulation::new(4);
+        let runtime = sim.add_node(NodeId(1));
+        let first = runtime.clone();
+        sim.block_on(async move {
+            let log = SingleNodeLog::open(&first).await.unwrap();
+            for id in 1..=3 {
+                log.propose(register(id)).await.unwrap();
+            }
+        });
+
+        let wedging = sim.runtime(NodeId(1));
+        let before = sim.block_on(async move {
+            let file = wedging
+                .disk()
+                .open(LOG_PATH, OpenOptions::create())
+                .await
+                .unwrap();
+            file.append(encode_frame(&[200, 1, 2, 3])).await.unwrap();
+            file.sync().await.unwrap();
+            file.size().await.unwrap()
+        });
+
+        let reopening = sim.runtime(NodeId(1));
+        let error = sim
+            .block_on(async move { SingleNodeLog::open(&reopening).await })
+            .err()
+            .expect("an undecodable committed entry is fatal, not a torn tail");
+        assert!(error.to_string().contains("Refusing to start"), "{error}");
+
+        let checking = sim.runtime(NodeId(1));
+        let after = sim.block_on(async move {
+            let file = checking
+                .disk()
+                .open(LOG_PATH, OpenOptions::create())
+                .await
+                .unwrap();
+            file.size().await.unwrap()
+        });
+        assert_eq!(
+            after, before,
+            "a refusal must leave the bytes alone so a binary that can read them still can"
+        );
     }
 }

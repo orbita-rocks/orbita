@@ -63,10 +63,52 @@
 //! was ever told it was written.
 //!
 //! So the peer's extra entries are discarded rather than merged. That happens
-//! in two places: the fence message sent on promotion, and, for a peer that
-//! was unreachable at the time, the first append it receives at the new epoch,
-//! which truncates above the point the new owner says its history ends. There
-//! is no path where a divergent entry survives and is later replayed.
+//! in two places: the fence message, sent whenever an owner takes the
+//! partition above the epoch its own log records — `Wal::open` and
+//! `Wal::promote` both send it — and, for a peer that was unreachable at the
+//! time, the first append it receives at the new epoch, which truncates above
+//! the point the new owner says its history ends. There is no path where a
+//! divergent entry survives and is later replayed.
+//!
+//! Both legs rest on the epoch having moved: a replica only gives up its tail
+//! for a strictly higher epoch, because that rule is also what stops a deposed
+//! owner truncating a live one. So an owner that has handed Lamports back —
+//! `Wal::quiesce` is the only thing that can — may not reopen at the epoch it
+//! surrendered under. It would resume assigning from the committed prefix,
+//! reissuing versions a replica still holds different bytes for, and a replica
+//! skips an entry at or below its durable position without comparing bytes, so
+//! it would acknowledge the replacement and keep the original.
+//! `Wal::surrendered_lamport` is what a reopening caller asks.
+//!
+//! ## A catch-up carries the committed prefix, and not one entry more
+//!
+//! Replication is driven by appends, so a replica placed onto a partition that
+//! then goes quiet, or one belonging to an owner that has closed write
+//! admission to drain, has nothing coming to move it forward. `Wal` can push
+//! to those replicas without a write behind it, and the question that decision
+//! turns on is how far.
+//!
+//! It is the committed prefix, meaning `Wal::committed_lamport`, and never the
+//! local durable position. The two differ by exactly the entries that reached
+//! this node's disk and no other, whose `commit` returned `Unavailable`. Those
+//! entries are allowed to stay in the log, because a later batch's
+//! acknowledgement can still rescue them, but rescuing them is the job of a
+//! write with a client waiting on the answer. A push that carried them would
+//! put a reported failure onto a second node with nobody to report to, and the
+//! section above is then the trap: whatever a promoted owner has on its disk
+//! becomes history and gets replayed into storage, so the write the client was
+//! told had failed comes back as a value. The same reasoning bounds a draining
+//! owner, which gives that tail up entirely rather than advertise a position
+//! no replica may be carried to.
+//!
+//! The committed prefix is the ceiling; retention is the floor. A replica
+//! below the oldest entry the log still holds cannot be carried at all, and
+//! the two limits meet in one per-replica record, [`ReplicaCatchUp`]. Reading
+//! that record two ways is what keeps the owner's answers consistent:
+//! `Wal::replicas_behind` is the work a catch-up can still do and something
+//! retries it, `Wal::beyond_retention` is the work it cannot and something
+//! reports it. A replica belongs to exactly one of them, so an owner can never
+//! be simultaneously retrying a node and declaring it unreachable.
 //!
 //! # Failure stance
 //!
@@ -96,12 +138,16 @@ mod wire;
 mod testkit;
 
 #[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
 mod tests;
 
 pub use format::{WalEntry, WalOp};
 pub use log::{
-    PartitionLog, RecoveryState, Truncation, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES,
+    CatchUp, PartitionLog, RecoveryState, Truncation, TruncationReason,
+    DEFAULT_SEGMENT_TARGET_BYTES,
 };
-pub use owner::{Wal, WalConfig};
-pub use replica::{ReplicaObserver, WalService};
+pub use owner::{BeyondRetention, CatchUpPass, ReplicaCatchUp, ReplicationLag, Wal, WalConfig};
+pub use replica::{Hydration, PartitionHydrator, ReplicaObserver, WalService};
 pub use wire::{METHOD_APPEND, METHOD_FENCE, METHOD_STATUS};

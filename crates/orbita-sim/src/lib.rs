@@ -70,34 +70,56 @@
 //! because the cluster spends the whole run recovering and never reaches the
 //! states worth checking.
 //!
-//! # The limit, stated honestly
+//! # Liveness, alongside safety
 //!
-//! RocksDB does its own file I/O beneath `orbita_runtime::Disk`, so this crate
-//! cannot inject faults inside it. Simulation covers the distributed protocol
-//! layer, meaning WAL replication, consensus, ownership, routing, and the read
-//! path, and treats a local RocksDB as a trusted component with faults
-//! injected at its API boundary instead. The claim this supports is "the
-//! distributed layer is verified under deterministic simulation," not "the
-//! whole system is."
+//! Every check above answers "did the cluster do something wrong". A cluster
+//! that is safe and permanently stuck answers no to all of them, and the two
+//! defects of that shape found in Orbita so far were both caught by a person
+//! reading a diff rather than by this crate. [`converge_within`] closes that
+//! gap: a scenario stops breaking the world and then has to show the cluster
+//! finished reacting within a bound of virtual time. Scenarios apply it at the
+//! end of the fault schedules they already run, so a liveness check comes for
+//! free with every seed that was already being explored.
+//!
+//! # What is covered, stated honestly
+//!
+//! Every seam the system does I/O through is simulated and has faults
+//! injected into it: the clock, the network, the disk the log writes through,
+//! and, since the storage engine moved onto `orbita_objectstore::ObjectStore`
+//! per ADR 0006, the store its segments and manifests persist through.
+//!
+//! That last one is [`SimBucket`], and it is deliberately not an
+//! `ObjectStore`. It implements `orbita_objectstore::s3::HttpTransport`, so a
+//! simulated partition persists through the same `S3Store` production runs,
+//! signing and status mapping and paginated listings included. Injecting at
+//! the `ObjectStore` trait would have been less code and would have verified
+//! a store the product does not ship.
+//!
+//! What is still trusted: the process, the allocator, and the wire below
+//! HTTP. Nothing between a client call and a durable byte is.
 //!
 //! Work brief: `docs/plan/05-sim.md`.
 
 #![forbid(unsafe_code)]
 
 mod config;
+pub mod converge;
 mod disk;
 pub mod harness;
 pub mod lin;
 mod net;
+mod objectstore;
 mod runtime;
 mod sim;
 mod trace;
 mod world;
 
-pub use config::{DiskFaults, NetworkFaults, SimConfig};
+pub use config::{DiskFaults, NetworkFaults, SimConfig, StoreFaults};
+pub use converge::{converge_within, Unmet};
 pub use disk::{SimDisk, SimFile};
-pub use harness::{check_seeds, seeds, Failure};
+pub use harness::{check_seeds, expect_converged, seeds, Failure};
 pub use net::SimTransport;
+pub use objectstore::{SimBucket, StoreFault};
 pub use runtime::{SimClock, SimRng, SimRuntime};
 pub use sim::{DiskPolicy, Simulation};
 pub use trace::Trace;

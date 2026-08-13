@@ -15,7 +15,7 @@
 //! versions handed out only ever increase. Those hold across the whole run
 //! rather than at any one step, so no single operation could catch a break.
 
-use crate::partition::{WriteOutcome, TOMBSTONE_RETENTION_MILLIS};
+use crate::partition::{ScanBudget, WriteOutcome, TOMBSTONE_RETENTION_MILLIS};
 use crate::testing::{partition_with_clock, ManualClock, TempPartition};
 
 use bytes::Bytes;
@@ -204,7 +204,7 @@ async fn page_through(
     let mut cursor: Option<Bytes> = None;
     loop {
         let page = partition
-            .scan(prefix, cursor.as_deref(), limit)
+            .scan(prefix, cursor.as_deref(), ScanBudget::of_entries(limit))
             .await
             .expect("scanning a valid prefix");
         seen.extend(page.entries.into_iter().map(|e| (e.key, e.record)));

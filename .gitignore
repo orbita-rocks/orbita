@@ -4,6 +4,12 @@
 *.sw[onp]
 /.claude
 .DS_Store
+/.agents/worktrees/
+
+# Local operator credentials for infrastructure maintenance. Server
+# configuration remains explicit ORBITA_* environment variables; this file is
+# only a local source for provider credentials and must never be committed.
+/.env
 
 #
 # Rust build output
@@ -17,6 +23,16 @@
 #
 /.moon/cache
 /.moon/docker
+
+#
+# Coverage output. `cargo llvm-cov` writes a raw profile per test process,
+# named from the profile-file pattern rather than from the target directory,
+# so these land in whichever crate directory the process ran in and escape
+# the /target rule above. Unanchored for the same reason.
+#
+*.profraw
+*.profdata
+/codecov.json
 
 #
 # Local cluster scratch data

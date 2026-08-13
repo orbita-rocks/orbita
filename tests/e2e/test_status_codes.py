@@ -97,6 +97,14 @@ def test_a_failed_condition_is_a_successful_call_that_did_not_apply(kv):
     # program, not an error, so it must not be a status. A client library that
     # raised on FAILED_PRECONDITION here would make every lock acquisition a
     # try/except.
+    #
+    # `applied=False` is a verdict, and only a verdict. A conditional write the
+    # owner could not decide — one that collided with a write still in flight
+    # to the same key and outlasted the settle budget — is UNAVAILABLE, so a
+    # client that reads this field is never reading a guess. That case needs
+    # two genuinely concurrent writers and a log that stops answering, which is
+    # a simulator scenario rather than something to race for over a socket:
+    # `linearizability::a_conditional_write_that_cannot_settle_in_time_is_undecided_rather_than_lost`.
     written = kv.Set(kv_pb2.SetRequest(keyspace=KS, key=b"k", value=b"v"))
     response = kv.Set(
         kv_pb2.SetRequest(

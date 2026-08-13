@@ -85,6 +85,9 @@ jobs:
   test:
     name: full test suite
     needs: verify
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/ci.yml
     with:
       long_sim: true
@@ -97,13 +100,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native runners for every target. Cross-compiling would mean
-          # cross-compiling RocksDB and its C++ toolchain, which is a much
-          # larger problem than renting four machines.
+          # A native runner per architecture, still. The storage engine is pure
+          # Rust now, but ring is not: it compiles C for whatever target it is
+          # built against, so every cross-build needs a C toolchain for that
+          # target, and the Apple targets additionally need an SDK that only a
+          # Mac has. Building where the code will run avoids maintaining four
+          # cross toolchains to save two machines.
+          #
+          # gnu and musl for the same architecture share a runner, so the two
+          # static targets below cost build minutes rather than machines.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+
+          # The static builds, for anybody who does not know or does not
+          # control the libc on the far end. These link no interpreter and have
+          # no dynamic section, so there is no glibc version to match, which is
+          # most of the point of shipping one binary.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+
           - target: aarch64-apple-darwin
             runner: macos-14
           # The last Intel macOS image GitHub offers; it retires in August
@@ -123,10 +142,36 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Rust first: moon runs cargo, it does not install it.
+      # ring is the one dependency left that compiles C, and for a musl target
+      # it wants a musl C compiler. cc-rs looks for <arch>-linux-musl-gcc and
+      # falls back to musl-gcc, which is what this package provides. Without it
+      # the build dies in ring's build script, well before the link step, so
+      # the failure does not look like a linking problem at all.
+      - name: musl C toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+
+      # Rust first: moon runs cargo, it does not install it. The `targets`
+      # input here adds the target to the *stable* toolchain this action
+      # installs, which is not the toolchain the build runs under: see below.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # rust-toolchain.toml pins the toolchain to a specific version, and cargo
+      # honours that override, so the build runs under the pinned toolchain and
+      # not the stable one dtolnay just set up. The musl std component the
+      # action added therefore lands on the wrong toolchain, and the pinned one
+      # has no musl std at all, so the build dies with "target may not be
+      # installed" before it compiles a line. Adding the target from the repo
+      # root runs under the override and attaches it to the toolchain cargo
+      # will actually use. Only the musl legs need this: every other target is
+      # the runner's host target, which the pinned toolchain already ships.
+      - name: Add the target to the pinned toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: rustup target add ${{ matrix.target }}
 
       - uses: moonrepo/setup-toolchain@v0
         with:

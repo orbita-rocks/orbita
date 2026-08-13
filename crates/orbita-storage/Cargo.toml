@@ -1,6 +1,6 @@
 [package]
 name = "orbita-storage"
-description = "Single-partition storage engine over RocksDB: versioned values, conditional writes, and TTL."
+description = "Single-partition storage engine over the Orbita partition format: versioned values, conditional writes, and TTL."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,10 +16,21 @@ publish = false
 [dependencies]
 orbita-core.workspace = true
 orbita-runtime.workspace = true
+orbita-format.workspace = true
+orbita-objectstore.workspace = true
 bytes.workspace = true
+crc32c.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-rocksdb = "0.24.0"
+# Only the lock. The engine owns no background tasks and does no I/O of its
+# own; the async runtime stays the server's decision.
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+# The in-memory object store, so a test's "restart" is reopening over the
+# same objects rather than pointing at a directory.
+orbita-format = { workspace = true, features = ["testing"] }
+# `ObjectStore` is an async trait, so wrapping it to count what a test read
+# needs the same macro the trait is declared with.
+async-trait.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

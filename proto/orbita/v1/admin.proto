@@ -23,6 +23,19 @@ service Admin {
   rpc SplitPartition(SplitPartitionRequest) returns (SplitPartitionResponse);
   rpc MergePartitions(MergePartitionsRequest) returns (MergePartitionsResponse);
   rpc TransferOwnership(TransferOwnershipRequest) returns (TransferOwnershipResponse);
+
+  // Advances the active cluster version once every live node can speak the
+  // new one. This is the one-way door at the end of a rolling upgrade; see
+  // docs/UPGRADES.md.
+  rpc FinalizeUpgrade(FinalizeUpgradeRequest) returns (FinalizeUpgradeResponse);
+}
+
+// The protocol and format version a cluster has agreed to speak. Not a binary
+// version: before 1.0 the minor is the compatibility unit, so the patch
+// component of a binary version has no business here.
+message ClusterVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
 }
 
 message KeyspaceConfig {
@@ -45,7 +58,20 @@ message Keyspace {
   uint64 created_at_millis = 4;
   // Current partition count, which grows as the keyspace splits.
   uint32 partition_count = 5;
+  // Bytes stored across this keyspace's partitions. Exact when
+  // partitions_without_size is zero, and a lower bound otherwise.
   uint64 stored_bytes = 6;
+  // How many of this keyspace's partitions had no owner reporting a size when
+  // this was measured, which is what a fenced partition looks like while the
+  // control plane waits for its replicas to report past the fence.
+  //
+  // Nonzero means stored_bytes is a floor, not a total. Reported rather than
+  // folded in, because a sum that quietly omits a contributor reads as a
+  // small number rather than an incomplete one, and quota saturation is
+  // exactly the place that reading costs something. A floor is still enough
+  // to prove a keyspace is over its quota; it is not enough to prove it is
+  // under.
+  uint32 partitions_without_size = 7;
 }
 
 message CreateKeyspaceRequest {
@@ -126,6 +152,21 @@ message Node {
   NodeHealth health = 4;
   // True for the current Raft leader of the control plane.
   bool is_raft_leader = 5;
+  // The cluster versions this node's binary can speak, inclusive at both
+  // ends. This is what finalize-upgrade checks before it advances.
+  ClusterVersion speaks_min = 6;
+  ClusterVersion speaks_max = 7;
+  // The memory this node's partition indexes hold, summed over every
+  // partition it reported. Since ADR 0006 made the index memory-resident,
+  // this is the resource a worker runs out of first.
+  //
+  // Explicitly optional because unset and zero are different answers and the
+  // difference matters most exactly when it is easiest to get wrong: a node
+  // running a binary from before this field existed reports nothing, and
+  // rendering that as an empty index tells an operator they have room they do
+  // not have. Unset means nobody measured it. Zero means nobody is holding
+  // one. A node the leader has never heard from is unset too.
+  optional uint64 index_memory_bytes = 8;
 }
 
 message Replica {
@@ -133,7 +174,20 @@ message Replica {
   // How far this replica has applied, for comparison against the owner's
   // lamport. The gap is what decides whether it can serve a read locally and
   // how far behind it would be if promoted.
-  uint64 applied_lamport = 2;
+  //
+  // Unset when the leader group has not heard this replica's position at
+  // all, which is the state #79 named Unestablished on the owner's side.
+  // Lamport zero is a real position, so it cannot also mean "nobody said":
+  // rendering silence as zero invents a maximally-behind replica out of a
+  // node that may be perfectly current.
+  optional uint64 applied_lamport = 2;
+  // How far this replica has made durable in its write-ahead log. Two
+  // different lags fall out of this and they mean different things: the gap
+  // to the owner's committed lamport is replication lag, and the gap down to
+  // applied_lamport is log this replica holds but has not applied yet.
+  //
+  // Unset for the same reason applied_lamport is.
+  optional uint64 durable_lamport = 3;
 }
 
 message Partition {
@@ -146,14 +200,37 @@ message Partition {
   // Bumped on every ownership change; a write carrying a stale epoch is
   // rejected, which is what fences a deposed owner.
   uint64 epoch = 6;
-  uint64 committed_lamport = 7;
+  // The owner's durable position, which is this partition's committed one.
+  // Unset when no owner has reported it: an unowned partition, or one held
+  // fenced while its replicas report past the fence. Lamport zero is a real
+  // position a partition can be at, so it cannot also mean "nobody said".
+  optional uint64 committed_lamport = 7;
   repeated Replica replicas = 8;
-  uint64 size_bytes = 9;
+  // What the owner reported this partition holds. Unset for the same reason
+  // committed_lamport is. A fenced partition holding a gigabyte has an
+  // unknown size, not a size of zero, and an operator deciding what it can
+  // afford to lose needs to be able to tell those apart.
+  optional uint64 size_bytes = 9;
+  // What the owner's memory-resident index costs for this partition. Per
+  // ADR 0006 the index is resident whether or not the values are, and a
+  // single partition's index has to fit on its owner, so this is a number an
+  // operator sizes machines against rather than an implementation detail.
+  //
+  // Optional for the same reason index_memory_bytes is: an unowned partition,
+  // and one whose owner runs a binary that does not measure this, have no
+  // answer rather than an answer of zero.
+  optional uint64 index_bytes = 10;
 }
 
 message DescribeClusterResponse {
   repeated Node nodes = 1;
   repeated Partition partitions = 2;
+  // The active cluster version every node has agreed to speak.
+  ClusterVersion cluster_version = 3;
+  // Every keyspace the description covers, carried so that stored_bytes can
+  // be read against the storage quota in its config. A partition list says
+  // nothing about how close a tenant is to being refused writes.
+  repeated Keyspace keyspaces = 4;
 }
 
 message SplitPartitionRequest {
@@ -186,4 +263,13 @@ message TransferOwnershipRequest {
 
 message TransferOwnershipResponse {
   Partition partition = 1;
+}
+
+message FinalizeUpgradeRequest {}
+
+// What the finalize committed. After this lands, rolling back is not
+// supported; the only path backwards is a restore.
+message FinalizeUpgradeResponse {
+  ClusterVersion previous = 1;
+  ClusterVersion active = 2;
 }

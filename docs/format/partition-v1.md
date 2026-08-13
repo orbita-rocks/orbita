@@ -1,6 +1,7 @@
 # Orbita partition format, version 1
 
-Status: Draft. The bytes may still change until the first release.
+Status: Draft. The bytes may still change until v0.1.0 ships; earlier
+pre-releases do not close the window.
 
 This specifies everything Orbita writes to object storage for one partition. It
 is written to be implementable by someone who has never read the Orbita source,
@@ -36,11 +37,57 @@ integers written as 16 lowercase hexadecimal digits, zero padded. Padding is
 what makes a listing sort in the same order as the numbers, which matters
 because a writer recovering its place walks a listing.
 
+### A segment object may be named by more than one partition
+
+Almost everything a partition names sits under that partition's own directory,
+and the manifest holds names relative to it. There is one exception, and a
+reader that has not implemented it will fail on any partition that came from a
+split.
+
+When a partition splits, each child references the parent's segment objects
+where they already sit rather than copying them. A partition splits because it
+is large, so copying would rewrite the whole thing at the moment the system can
+least afford it, and would double the stored bytes until compaction caught up.
+The objects are immutable and already sorted and versioned, so a child needs a
+new index over them rather than new bytes. See
+[ADR 0009](../adr/0009-a-split-shares-the-parents-segments.md).
+
+A child records this by putting the parent's partition id on the segment entry,
+in `source_partition_id`, which the manifest section below defines. The object
+is not moved, copied, or renamed. It stays at the key it has always had, under
+the parent's directory, and the parent's manifest may still name it too.
+
+Sharing stays inside one keyspace. A shared object's key differs from one under
+the referencing partition's own directory only in the `<partition_id>`
+component of the path, so a reader resolves it by substituting that component
+and nothing else.
+
+Sharing is temporary. When a child compacts, it merges the shared segments into
+a segment under its own directory and drops the references, and the object
+becomes collectable once no partition names it. The compaction and deletion
+section below says what that costs and what it forbids.
+
+A child's first manifest is published by whoever performs the split, before the
+child has an owner of its own, and is stamped with the epoch the child was
+allocated rather than the publisher's. Everything after that is the ordinary
+commit protocol.
+
 ### Object names are never reused
 
 A name identifies one object for the life of the partition. Writing different
 bytes to a name that was used before is the one unrecoverable failure this
 format has, because a manifest that references it may already have been read.
+
+A name is only unique within one partition's directory, which is the most a
+writer can enforce, so an object is fully identified by the partition whose
+directory it lives under together with its relative name. A manifest may not
+list that pair twice. Two entries carrying the same relative name and different
+source partitions name two different objects and are both legal.
+
+A writer lists and names objects only under its own directory, and it never
+writes a segment or a value object into another partition's. So a shared
+reference cannot collide with anything the referencing partition writes, and a
+writer recovering its next sequence still only has to walk its own listing.
 
 Two rules make that hold.
 
@@ -60,6 +107,13 @@ that fact leaves the object on the store and the memory gone.
 Nothing outside the manifest is authoritative. An object that exists and is not
 named by the manifest is not part of the partition, whether it is a leftover
 from an interrupted commit or from a compaction whose cleanup has not run.
+
+That says which partition an object belongs to. It does not say the object is
+garbage, and reading it that way is now a way to delete live data. An object
+under one partition's directory may be named by another partition's manifest, so
+what makes it collectable is that no manifest in the keyspace names it. The
+compaction and deletion section below states that rule, and it is the one a
+sweep has to implement.
 
 ## The manifest
 
@@ -124,11 +178,126 @@ Each segment entry:
 
 | Field | Meaning |
 |---|---|
-| `name` | The object's name, relative to the partition directory. |
-| `bytes` | The object's exact size. A reader without suffix range requests uses this to compute the footer's absolute offset. |
-| `record_count` | How many records the segment holds. |
-| `min_key`, `max_key` | The smallest and largest keys actually present, both inclusive. Not the range the segment was written for. |
-| `min_lamport`, `max_lamport` | The smallest and largest `lamport` of any record present, both inclusive. |
+| `name` | The object's name, relative to the directory it lives under, which is `source_partition_id`'s when that is present and this partition's otherwise. |
+| `source_partition_id` | Optional. The partition whose directory holds the object. Absent means this partition's own. Defined below. |
+| `bytes` | The object's exact size. A reader without suffix range requests uses this to compute the footer's absolute offset. Always the whole object's size, including for a shared entry. |
+| `record_count` | How many records the object holds. Always the whole object's count, including for a shared entry, because a reader checks it against the object's own footer before filtering anything. |
+| `min_key`, `max_key` | The smallest and largest keys this entry contributes to this partition, both inclusive. Not the range the segment was written for. For a shared entry these are clamped to this partition's range, so they describe the part of the object this partition serves rather than the whole object. |
+| `min_lamport`, `max_lamport` | The smallest and largest `lamport` of any record in the object, both inclusive. These are not clamped for a shared entry, so an entry's Lamport span may reach outside what this partition serves. |
+
+Every other rule about an entry holds whether or not it is shared. The name must
+still be one this format produces, `min_key` and `max_key` must still sit inside
+the partition's range, and `max_lamport` must still be at or below
+`committed_lamport`. A reader must reject a manifest that breaks any of them.
+
+### source_partition_id names a shared segment
+
+`source_partition_id` is an unsigned 64-bit integer and it is optional. A writer
+omits it entirely for a segment the partition wrote itself, rather than writing
+`null` or the partition's own id, and a reader must treat its absence as the
+whole meaning it has: the object is under this partition's directory and is
+resolved exactly as it was before this field existed.
+
+When it is present, the object is under that partition's directory instead. Both
+partitions are in the same keyspace, so a reader builds the key by taking its own
+partition directory and replacing the `<partition_id>` component.
+
+Two values are illegal and a reader must reject the manifest rather than
+interpret them. A `source_partition_id` equal to the manifest's own
+`partition_id` is refused, because a segment under a partition's own directory
+is already named relatively and a source pointing back at that partition would
+be a second, ambiguous way to say the same thing. And the same
+`source_partition_id` and `name` pair must not appear twice, since that names one
+object twice.
+
+References do not chain. A `source_partition_id` names the partition whose
+directory actually holds the bytes, not an intermediate partition that also
+referenced it. When a child of a split is itself split, its children carry the
+original owner's id, so a reader resolves an object in one step and never has to
+follow a manifest it has not been asked to read.
+
+Here is a child of the partition above, holding the lower half of its range and
+serving it out of the parent's two segments without a byte having been copied.
+
+```json
+{
+  "format_version": 1,
+  "keyspace_id": 1,
+  "partition_id": 20,
+  "epoch": 9,
+  "committed_lamport": 4000,
+  "range": { "start": "", "end": "Zg==" },
+  "segments": [
+    {
+      "name": "segments/0000000000000005-0000000000000011.oseg",
+      "source_partition_id": 7,
+      "bytes": 1048576,
+      "record_count": 1200,
+      "min_key": "YQ==",
+      "max_key": "ZQ==",
+      "min_lamport": 1,
+      "max_lamport": 2500
+    },
+    {
+      "name": "segments/0000000000000006-0000000000000000.oseg",
+      "source_partition_id": 7,
+      "bytes": 262144,
+      "record_count": 300,
+      "min_key": "Yw==",
+      "max_key": "ZA==",
+      "min_lamport": 2501,
+      "max_lamport": 4000
+    }
+  ]
+}
+```
+
+The first entry resolves to
+`<root>/keyspaces/0000000000000001/partitions/0000000000000007/segments/0000000000000005-0000000000000011.oseg`,
+which is the same object the parent's own manifest names. Under partition 20's
+own directory there is no `segments/` at all until it flushes or compacts, and a
+reader that resolved the name there would get a missing object rather than a
+wrong answer.
+
+The asymmetry in that entry is deliberate and a writer has to get it right.
+`bytes` and `record_count` describe the whole object, so the footer sits where
+the entry says it does and a reader's check of the entry against the footer
+still means something. The key bounds describe the child, so pruning and the
+manifest's own range validation see only what the child serves. The Lamport
+bounds describe the whole object, which is the conservative direction: a span
+wider than the truth only makes a reader read the actual Lamports out of two
+candidate records more often, and reading them is what decides the winner
+anyway.
+
+`committed_lamport` is inherited from the parent, because a child continues the
+parent's Lamport sequence and allocates above it. No key's version moves.
+
+### An old reader cannot read a manifest with shared segments
+
+This field arrived after version 1 was first written and the version number did
+not move, so it is worth being exact about who can read what.
+
+A manifest that names no shared segment does not carry the field at all, so it
+is byte for byte what a writer would have produced before the field existed.
+Any partition whose manifest names no shared segment is therefore readable by
+any implementation of version 1, old or new, and every manifest written before
+this change is readable now. That covers a split's parent as well, since a
+parent's own manifest never carries the field, and it covers a child again once
+it has compacted its way out of sharing.
+
+A manifest that does name a shared segment is a different matter. This format
+has no extension mechanism and unknown fields are refused rather than skipped,
+which is the rule that stops a reader silently returning something other than
+what was stored. So an implementation of version 1 that predates this field will
+reject a child's manifest outright. That is the correct outcome and it is also a
+real limitation: such a reader cannot read a partition produced by a split, and
+it will say so rather than guess.
+
+Version 1 is a draft, and this is the window a draft exists for. Amending it
+here is the cheaper answer than a version 2, because a new version number would
+make every manifest unreadable to older implementations rather than only the
+ones that use the new field. Once the first release ships, that door closes and
+a change of this shape becomes a new version number.
 
 ### committed_lamport is the flush horizon
 
@@ -158,6 +327,12 @@ A writer stamps its own ownership epoch and no other value. It never copies the
 epoch it read, and never raises its own to match.
 
 A manifest is never replaced by one carrying a lower epoch.
+
+A split's first manifest for a child is the one case where the writer is not the
+partition's owner, because the child has no owner yet. It stamps the epoch the
+child was allocated, which is the epoch the child's first real owner will hold,
+and the rule above then governs everything after it. It is still one epoch, held
+by one partition, and it is still never the publisher's own.
 
 ## Segments
 
@@ -227,10 +402,24 @@ Each record in the data section is:
 |---|---|
 | 1 | `flags` |
 | 8 | `lamport`, which is also the record's version |
+| 8 | `commit_timestamp`, reserved; must be written as zero |
 | 4 | `key_length` |
 | `key_length` | `key` |
 | 8 | `expires_at_millis`, present only if `flags` bit 1 is set |
 | varies | value, described below |
+
+`commit_timestamp` is reserved for the transaction work described in the
+Transactions section of [REQUIREMENTS.md](../REQUIREMENTS.md), which needs its
+bytes to exist before v0.1.0 freezes them. In partition-v1 a writer must write
+it as zero and a reader must reject a non-zero value rather than interpret it,
+the same rule the reserved flag bits follow. Readers must not assign it any
+meaning; a future version will.
+
+That rejection has a consequence the transaction work inherits: a v1 reader
+refuses a non-zero value as a malformed record, not as a version it does not
+implement. Whatever eventually writes this field for real must gate the change
+on every reader understanding it, by cluster version or capability, rather
+than relying on the format version to sort readers from writers.
 
 `expires_at_millis` is milliseconds since the Unix epoch, UTC. A record is
 expired when that value is less than or equal to the reader's current time on
@@ -243,7 +432,13 @@ the same scale.
 | 0 | tombstone; the key is deleted and there is no value |
 | 1 | the record carries `expires_at_millis` |
 | 2 | the value is stored in its own object |
-| 3-7 | reserved, must be zero |
+| 3 | intent; reserved for the transaction work, must be zero |
+| 4-7 | reserved, must be zero |
+
+Bit 3 is named rather than generic for the same reason `commit_timestamp`
+exists: the Transactions direction claims it before v0.1.0 freezes
+this version's bytes. In partition-v1 it must be zero like every other reserved
+bit, and a reader treats it exactly as it treats them.
 
 Legal combinations:
 
@@ -275,9 +470,15 @@ An external value, when bit 2 is set, is:
 | Size | Field |
 |---|---|
 | 4 | `name_length` |
-| `name_length` | object name, relative to the partition directory |
+| `name_length` | object name, relative to the directory of the segment that holds this record |
 | 8 | `value_length`, the size of that object |
 | 4 | `crc32c` of the object's contents |
+
+The name is relative rather than absolute for the same reason a segment's is,
+and it is resolved the same way. For a record in a segment the partition wrote
+itself that is the partition's own directory. For a record in a shared segment
+it is the source partition's, because the value object was written beside the
+segment by whoever wrote both.
 
 Value objects hold the value bytes and nothing else. No header, no framing. A
 reader that wants one can fetch it and use it directly, and the integrity data
@@ -371,6 +572,11 @@ Steps 1 and 2 are safe to repeat and safe to abandon. An object written by a
 commit that never reached step 6 is unreferenced, and unreferenced objects are
 not part of the partition.
 
+Steps 1 and 2 cover the objects this commit produces. A manifest may also name
+shared segments, which are already on the store under another partition's
+directory and which this writer neither writes nor may write. It names them and
+nothing else changes about the protocol.
+
 The conditional write is the only ordering primitive this format needs, and it
 is why `ObjectStore` requires compare-and-swap. A backend without it cannot
 host this format safely, and should not pretend to.
@@ -381,22 +587,43 @@ An implementation that only reads, which is the case this format exists to
 support, does the following.
 
 1. Fetch `manifest.json`. Reject any `format_version` it does not implement.
-2. For each segment, fetch the footer, verify its own checksum, and reject a
+2. For each segment entry, work out the object's key. When the entry carries a
+   `source_partition_id`, the object is under that partition's directory in the
+   same keyspace. When it does not, the object is under this partition's own
+   directory. Every request for that segment, now and later, goes to the key
+   this step produced.
+3. For each segment, fetch the footer, verify its own checksum, and reject a
    `format_version` or magic it does not recognise. Fetch the key index and
    verify it against the footer's index checksum.
-3. Build a map from key to the record holding it. Segments may overlap, so more
+4. Discard index entries whose key falls outside the manifest's `range`. A
+   shared segment physically holds keys on both sides of the boundary the split
+   drew, and only the ones inside this partition's range are this partition's to
+   serve. For a segment the partition wrote itself this discards nothing, since
+   both its bounds are inside the range and so is everything between them.
+5. Build a map from key to the record holding it. Segments may overlap, so more
    than one may hold a key; the record with the higher `lamport` wins. Two
    records for one key with the same `lamport` is a corrupt partition, not a
    tie to break.
-4. Drop tombstones. Drop records whose `expires_at_millis` is at or before the
+6. Drop tombstones. Drop records whose `expires_at_millis` is at or before the
    current time. Both are absent keys, not present ones with special values.
-5. To read a value, range-request the record at its offset and length, verify
-   its checksum, and decode it. If the value is external, fetch that object and
-   check it against the length and checksum in the record.
+7. To read a value, range-request the record at its offset and length, verify
+   its checksum, and decode it. If the value is external, resolve its name under
+   the same directory as the segment that holds the record, which for a shared
+   entry means the source partition's rather than this one's. Fetch that object
+   and check it against the length and checksum in the record.
 
 A reader pruning candidates without building a full index uses each segment
 entry's `min_key` and `max_key` to skip segments that cannot hold the key, then
-applies step 3 to whatever remains.
+applies step 5 to whatever remains. A shared entry's bounds are already clamped
+to this partition's range, so such a reader gets step 4 without doing anything.
+
+Step 7 is the one worth stating separately, because a value object's name is
+relative like a segment's and there is nothing in the name to say where it
+lives. A record inside a shared segment was written by the source partition and
+names a value object beside it, under the source partition's directory. A reader
+that resolved it under its own would request an object that is not there. The
+rule is that a value is resolved wherever the segment that referenced it was
+resolved.
 
 The section checksums in the footer cover the whole data and index sections.
 Verifying the data section means reading all of it, so a point read verifies
@@ -419,6 +646,33 @@ Compaction merges segments and reclaims space. Correctness rules:
 - An expired record may be dropped at any time.
 - The result is published by the ordinary commit above.
 
+### Compacting a shared segment
+
+A compaction may take a shared segment as input, and doing so is how a child
+stops sharing. Three extra rules apply, and each one is a way to lose or corrupt
+data if it is skipped.
+
+The output holds only keys inside this partition's range. A shared segment holds
+keys on both sides of the split boundary, and writing the far side into a
+segment under this partition's directory would produce a manifest naming keys
+outside its own range, which a reader must reject.
+
+Any external value the merged records reference is copied into this partition's
+`values/` directory and the record is rewritten to name the copy. The output
+segment is written under this partition's directory and carries no
+`source_partition_id`, so from that moment its records resolve relative to this
+partition, and a name still pointing at the source partition's value object
+would resolve to nothing. This copy is the only one a split ever pays for, and
+it is bounded by the values the child actually keeps rather than by the
+partition's size. A writer that reads a value to copy it checks it against the
+length and checksum in the referencing record first, so a corrupt value is
+caught before it is duplicated.
+
+The compaction drops the shared entries from this manifest and deletes nothing.
+The objects are under another partition's directory and may still be named by
+the partition that wrote them or by a sibling child. Reclaiming them is the
+sweep's job, under the rule below.
+
 ### Dropping a tombstone erases a distinction
 
 A tombstone exists so that a conditional write can tell a key that never
@@ -435,9 +689,60 @@ bounds the duration is an operational question, and it is
 [ADR 0002](../adr/0002-key-versions-are-partition-lamports.md) territory
 rather than the format's.
 
+### An object is live while any partition names it
+
+Before shared segments existed, an object under a partition's directory was
+garbage exactly when that partition's own manifest stopped naming it. That is no
+longer sufficient grounds to delete anything, and a sweep that still works that
+way will delete a segment a child is reading from. This is the most dangerous
+consequence of sharing, because it destroys data through the path that is
+supposed to be housekeeping, and it does it quietly.
+
+An object under partition P's directory is referenced when any of the following
+holds. It is a candidate for deletion only when none of them does.
+
+- **P's own manifest names it** as a segment entry carrying no
+  `source_partition_id`.
+- **Another partition in the same keyspace names it**, as a segment entry whose
+  `source_partition_id` is P and whose `name` is this object's.
+- **A record inside a segment either of those rules protects** points at it as
+  an external value.
+
+The third rule is the one that is easy to miss, because a value object appears
+in no manifest at all. It is reached only through a record inside a segment, so
+establishing that a value is unreferenced means reading the live segments that
+resolve to P's directory, including the ones another partition shares from it. A
+sweeper that judged values from manifests alone would delete every large value
+in the partition.
+
+The union is over the keyspace, not over one directory, so a sweeper has to know
+every live partition in the keyspace before it can delete anything under any of
+them. That is a harder thing to be sure of than reading one manifest, and the
+rule that makes it safe is that uncertainty means retention. A sweeper that
+cannot enumerate the keyspace's live partitions, cannot load one of their
+manifests, or is looking at a partition that has no manifest at all must delete
+nothing. Retaining an object that turned out to be garbage costs storage until
+the next pass. Deleting one that turned out to be live cannot be undone.
+
+Two situations follow from that and are worth naming, because an implementation
+that has not thought about them will get them wrong in the unsafe direction.
+
+A partition that is being split must not sweep. Its children's references are
+decided before their manifests exist, so for the length of the split there is a
+window in which an object is spoken for and nothing on the store says so.
+
+A partition retired by a split has no manifest, so there is no set of live
+references to subtract against and nothing sweeps its directory. Its segments
+stay alive on the children's references, which is the point. Its manifest object
+and anything the children have since compacted past are left behind until some
+keyspace-wide pass reclaims them, and no such pass is specified here. Leaking a
+manifest object is cheap. Getting the liveness union wrong is not, and building
+the reclamation before the union is trustworthy would be building the dangerous
+half first.
+
 ### The deletion grace period
 
-Objects that the current manifest does not name may eventually be deleted, but
+Objects that nothing names, by the rule above, may eventually be deleted, but
 not immediately, and the clock that governs the wait starts in different places
 for the two ways an object becomes unreferenced.
 
@@ -445,7 +750,9 @@ for the two ways an object becomes unreferenced.
 becomes unreferenced when the manifest that stopped naming it was written. The
 clock starts there, not at the object's creation. A segment may be live for
 months before a compaction drops it, and deleting it on an age threshold would
-remove objects that are still referenced.
+remove objects that are still referenced. For a shared object, more than one
+manifest can be the one that drops it, and the clock starts at the last of them.
+A reader is still draining on whichever partition let go of it most recently.
 
 **An object that was never referenced,** left by a commit that failed or was
 abandoned, can only be judged by its own age, since nothing records when it was

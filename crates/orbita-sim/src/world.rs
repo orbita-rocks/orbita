@@ -22,7 +22,7 @@ use orbita_runtime::{PeerCall, Rng, SeededRng, TransportError};
 pub(crate) type TransportResult<T> = Result<T, TransportError>;
 
 use bytes::Bytes;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -69,6 +69,43 @@ pub(crate) struct NodeState {
     pub files: BTreeMap<String, FileState>,
 }
 
+/// One object as the simulated store holds it.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredObject {
+    pub bytes: Bytes,
+    pub etag: String,
+}
+
+/// One bucket.
+///
+/// Buckets live in the world rather than in the handles that address them,
+/// for the same reason files do: a bucket is shared by every node that names
+/// it, and a replacement worker hydrating from what its predecessor wrote is
+/// the case the whole design turns on. A per-handle bucket would quietly make
+/// that case untestable.
+#[derive(Debug, Default)]
+pub(crate) struct BucketState {
+    pub objects: BTreeMap<String, StoredObject>,
+    /// Entity tags are never reused, including for an object that was deleted
+    /// and written again, so a compare-and-swap cannot succeed against a
+    /// version that no longer means what its holder thinks.
+    pub next_tag: u64,
+    /// Faults a scenario asked for by name, each fired at most once and
+    /// matched in the order they were queued.
+    pub injected: VecDeque<crate::objectstore::PendingFault>,
+    pub requests: u64,
+}
+
+impl BucketState {
+    pub fn tag(&mut self) -> String {
+        self.next_tag += 1;
+        // Quoted, because a real entity tag is a quoted string and the store
+        // passes it back into `If-Match` verbatim. An unquoted tag here would
+        // let a bug in that round trip pass.
+        format!("\"sim-{}\"", self.next_tag)
+    }
+}
+
 pub(crate) struct TaskSlot {
     /// The node the task belongs to, if any. Crashing a node drops its tasks,
     /// which is what makes a crash abrupt rather than graceful.
@@ -87,6 +124,7 @@ pub(crate) struct SimState {
     /// the same nanosecond still fire in a fixed order.
     pub timers: BTreeMap<(u64, u64), Waker>,
     pub nodes: BTreeMap<NodeId, NodeState>,
+    pub buckets: BTreeMap<String, BucketState>,
     /// Directed links that are down. `(a, b)` present means a message from `a`
     /// to `b` is discarded, while `b` to `a` may still flow. Asymmetric
     /// reachability is the case that finds bugs symmetric partitions do not,
@@ -95,6 +133,14 @@ pub(crate) struct SimState {
     pub handlers: BTreeMap<(NodeId, u16), Arc<dyn DynHandler>>,
     pub trace: Trace,
     pub faults_used: u64,
+    /// The virtual instant the last fault was injected, if any. What a
+    /// convergence check measures its bound from, since "recovered" is only
+    /// meaningful relative to the last thing that broke.
+    pub last_fault_nanos: Option<u64>,
+    /// Set once a scenario has stopped breaking the world on purpose. Distinct
+    /// from an exhausted budget, which is a run that ran out of faults rather
+    /// than one that decided it was done.
+    pub faults_frozen: bool,
 }
 
 impl SimState {
@@ -108,10 +154,13 @@ impl SimState {
             ready: BTreeSet::new(),
             timers: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             blocked: BTreeSet::new(),
             handlers: BTreeMap::new(),
             trace: Trace::new(config.seed, config.trace_limit),
             faults_used: 0,
+            last_fault_nanos: None,
+            faults_frozen: false,
         }
     }
 
@@ -186,7 +235,7 @@ impl SimCore {
     /// Every fault site goes through here so that the budget and the warm-up
     /// are enforced in one place rather than remembered at each call site.
     pub fn roll_fault(&self, state: &mut SimState, permille: u64) -> bool {
-        if permille == 0 {
+        if permille == 0 || state.faults_frozen {
             return false;
         }
         if state.now < self.config.fault_warmup.as_nanos() as u64 {
@@ -197,6 +246,7 @@ impl SimCore {
         }
         if self.fault_rng.chance(permille, 1000) {
             state.faults_used += 1;
+            state.last_fault_nanos = Some(state.now);
             true
         } else {
             false
@@ -335,6 +385,61 @@ impl SimCore {
         Some(wakers)
     }
 
+    /// Kills a node where it stands.
+    ///
+    /// This lives here rather than only on `Simulation` because a crash is not
+    /// always something a test schedules from the outside. The object store
+    /// can be asked to kill the node that issued a request, which is the only
+    /// way to place a crash exactly between a segment upload and the manifest
+    /// swap that would publish it, and that window is the one ADR 0006's
+    /// durability claim rests on.
+    pub fn crash_node(&self, node: NodeId) {
+        self.kill_node_tasks(node);
+        let mut state = self.state();
+        state.last_fault_nanos = Some(state.now);
+        let torn = self.config.disk.torn_tail_on_crash;
+        let mut torn_bytes = Vec::new();
+        if let Some(entry) = state.nodes.get_mut(&node) {
+            entry.up = false;
+            for (path, file) in entry.files.iter_mut() {
+                let unsynced = file.visible.len().saturating_sub(file.durable.len());
+                let keep = if torn && unsynced > 1 {
+                    // A prefix of the unsynced tail reached the platter. How
+                    // much is arbitrary, which is the point.
+                    self.fault_below(unsynced as u64) as usize
+                } else {
+                    0
+                };
+                if keep > 0 {
+                    torn_bytes.push((path.clone(), keep));
+                }
+                let end = file.durable.len() + keep;
+                file.visible.truncate(end);
+                file.durable.clear();
+                file.durable.extend_from_slice(&file.visible);
+            }
+        }
+        // Removed handlers are collected and dropped after the lock is
+        // released, the same rule task futures and re-registered handlers
+        // follow: a handler's destructor can reach back into the world, for
+        // example by waking the task that owned the other end of a channel.
+        let mut doomed = Vec::new();
+        state.handlers.retain(|(owner, _), handler| {
+            if *owner == node {
+                doomed.push(handler.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for (path, keep) in torn_bytes {
+            state.record(format!("torn tail node={node} path={path} bytes={keep}"));
+        }
+        state.record(format!("node {node} crashed"));
+        drop(state);
+        drop(doomed);
+    }
+
     /// Drops every task belonging to a node. Used by crash, where the point is
     /// that in-flight work simply stops rather than unwinding.
     pub fn kill_node_tasks(&self, node: NodeId) {
@@ -361,6 +466,7 @@ impl SimCore {
     /// state does not leak. Called when the driving `Simulation` is dropped.
     pub fn clear(&self) {
         let mut orphans = Vec::new();
+        let handlers;
         {
             let mut state = self.state();
             let ids: Vec<TaskId> = state.tasks.keys().copied().collect();
@@ -371,9 +477,14 @@ impl SimCore {
             }
             state.ready.clear();
             state.timers.clear();
-            state.handlers.clear();
+            // Taken rather than cleared: a handler's destructor can reach
+            // back into the world too, for example by dropping the last
+            // sender of a channel whose receiver's waker is a task waker, so
+            // it must run outside the lock like the futures do.
+            handlers = std::mem::take(&mut state.handlers);
         }
         drop(orphans);
+        drop(handlers);
     }
 }
 
@@ -438,12 +549,23 @@ impl Future for SimSleep {
             }
             return std::task::Poll::Ready(());
         }
-        if me.key.is_none() {
-            let seq = state.seq();
-            let key = (me.deadline, seq);
-            state.timers.insert(key, cx.waker().clone());
-            me.key = Some(key);
-        }
+        // The waker is refreshed on every poll, not only on the first. A
+        // future can be polled by one task, left pending, and then moved into
+        // another: `orbita_wal` does exactly that when a batch reaches its
+        // quorum before every replica has answered and the remaining calls are
+        // handed to background tasks. Keeping the first waker meant the timer
+        // fired against a task that had already finished, the wake was
+        // discarded, and the moved future was never polled again, which the
+        // driver reported as the world going idle with work outstanding.
+        let key = match me.key {
+            Some(key) => key,
+            None => {
+                let seq = state.seq();
+                (me.deadline, seq)
+            }
+        };
+        state.timers.insert(key, cx.waker().clone());
+        me.key = Some(key);
         std::task::Poll::Pending
     }
 }

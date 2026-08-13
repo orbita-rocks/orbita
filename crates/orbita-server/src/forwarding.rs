@@ -14,43 +14,16 @@ use orbita_core::{
     Epoch, Error, KeyRange, KeyspaceId, KeyspaceInfo, KeyspaceName, MapVersion, NodeId,
     PartitionId, PartitionInfo, PartitionMap,
 };
+use orbita_format::testing::MemoryStore;
 use orbita_proto::v1::{GetRequest, ListRequest, SetRequest};
+use orbita_runtime::Runtime;
 use orbita_sim::{SimRuntime, Simulation};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use orbita_storage::ValueCache;
 use std::sync::Arc;
 
 const KEYSPACE: &str = "default";
 const BOUNDARY: &[u8] = b"m";
-
-/// Storage directories for one run, removed when the test ends.
-struct Roots(std::path::PathBuf);
-
-impl Roots {
-    fn new(label: &str) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "orbita-forwarding-{}-{label}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::remove_dir_all(&path).ok();
-        Self(path)
-    }
-
-    fn layout(&self, node: NodeId) -> DataLayout {
-        DataLayout {
-            storage_root: self.0.join(format!("n{}", node.get())),
-            wal_root: "wal".to_string(),
-        }
-    }
-}
-
-impl Drop for Roots {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).ok();
-    }
-}
 
 /// One keyspace split in two at `m`, with a different owner on each side.
 fn split_map() -> PartitionMap {
@@ -93,15 +66,43 @@ fn split_map() -> PartitionMap {
     map
 }
 
-fn start(sim: &Simulation, roots: &Roots, node: NodeId) -> Arc<Node<SimRuntime>> {
+fn start(sim: &Simulation, node: NodeId) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
-    let layout = roots.layout(node);
-    std::fs::create_dir_all(&layout.storage_root).expect("a storage directory");
+    // Each node persists into its own in-memory store, so a run touches no
+    // real filesystem and stays deterministic.
+    let layout = DataLayout {
+        read_ahead_bytes: 256 * 1024,
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
+        store: Arc::new(MemoryStore::new()),
+        wal_root: "wal".to_string(),
+        wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+        durability_acks: 1,
+    };
     let source = BoxedMapSource::new(StaticMapSource::new(split_map()));
     sim.block_on(async move {
-        Node::start(runtime, node, layout, source, crate::DEFAULT_LEASE_DURATION)
-            .await
-            .expect("the node starts")
+        // Authentication off: this suite exercises forwarding, not the
+        // credential gate, so admission lets every request straight through to
+        // the routing it is testing.
+        let authenticator = Arc::new(crate::auth::Authenticator::new(
+            false,
+            None,
+            std::time::Duration::from_secs(86_400),
+            runtime.clock().clone(),
+        ));
+        Node::start(
+            runtime,
+            node,
+            layout,
+            source,
+            None,
+            None,
+            crate::DEFAULT_LEASE_DURATION,
+            crate::DEFAULT_CONTROL_POLL_INTERVAL,
+            Arc::new(crate::ReadinessGate::new()),
+            authenticator,
+        )
+        .await
+        .expect("the node starts")
     })
 }
 
@@ -124,23 +125,22 @@ fn get(key: &str) -> GetRequest {
 
 #[test]
 fn a_request_for_a_key_this_node_does_not_own_is_served_by_the_one_that_does() {
-    let roots = Roots::new("forward");
     let sim = Simulation::new(1);
-    let first = start(&sim, &roots, NodeId(1));
-    let second = start(&sim, &roots, NodeId(2));
+    let first = start(&sim, NodeId(1));
+    let second = start(&sim, NodeId(2));
 
     // "zebra" is past the boundary, so node one owns none of it and has to
     // forward. The client is talking to node one throughout.
     let written = {
         let node = Arc::clone(&first);
-        sim.block_on(async move { node.set(set("zebra", "striped"), false).await })
+        sim.block_on(async move { node.set(set("zebra", "striped"), false, None).await })
     }
     .expect("a forwarded write succeeds");
     assert!(written.applied);
 
     let read = {
         let node = Arc::clone(&first);
-        sim.block_on(async move { node.get(get("zebra"), false).await })
+        sim.block_on(async move { node.get(get("zebra"), false, None).await })
     }
     .expect("a forwarded read succeeds");
     assert!(read.found);
@@ -151,7 +151,7 @@ fn a_request_for_a_key_this_node_does_not_own_is_served_by_the_one_that_does() {
     // right place rather than being served from the wrong one.
     let direct = {
         let node = Arc::clone(&second);
-        sim.block_on(async move { node.get(get("zebra"), false).await })
+        sim.block_on(async move { node.get(get("zebra"), false, None).await })
     }
     .expect("the owner has the key");
     assert_eq!(direct.value, b"striped");
@@ -162,16 +162,15 @@ fn a_request_for_a_key_this_node_does_not_own_is_served_by_the_one_that_does() {
 
 #[test]
 fn each_node_serves_the_half_of_the_keyspace_it_owns() {
-    let roots = Roots::new("both-halves");
     let sim = Simulation::new(2);
-    let first = start(&sim, &roots, NodeId(1));
-    let _second = start(&sim, &roots, NodeId(2));
+    let first = start(&sim, NodeId(1));
+    let _second = start(&sim, NodeId(2));
 
     for key in ["apple", "zebra"] {
         let node = Arc::clone(&first);
         let key = key.to_string();
         let written = sim
-            .block_on(async move { node.set(set(&key, "v"), false).await })
+            .block_on(async move { node.set(set(&key, "v"), false, None).await })
             .expect("a client can write anywhere in the keyspace through any node");
         assert!(written.applied);
     }
@@ -190,7 +189,7 @@ fn each_node_serves_the_half_of_the_keyspace_it_owns() {
             include_values: false,
         };
         let page = sim
-            .block_on(async move { node.list(request, false).await })
+            .block_on(async move { node.list(request, false, None).await })
             .expect("a page");
         seen.extend(page.entries.iter().map(|e| e.key.clone()));
         cursor = page.next_cursor;
@@ -210,13 +209,12 @@ fn each_node_serves_the_half_of_the_keyspace_it_owns() {
 fn a_forwarded_request_is_never_forwarded_again() {
     // A stale map anywhere in the cluster would otherwise turn one request
     // into a loop between two nodes that each think the other owns the key.
-    let roots = Roots::new("one-hop");
     let sim = Simulation::new(3);
-    let first = start(&sim, &roots, NodeId(1));
+    let first = start(&sim, NodeId(1));
 
     let node = Arc::clone(&first);
     let refused = sim
-        .block_on(async move { node.get(get("zebra"), true).await })
+        .block_on(async move { node.get(get("zebra"), true, None).await })
         .expect_err("a node that was forwarded a key it does not own must refuse");
 
     assert!(

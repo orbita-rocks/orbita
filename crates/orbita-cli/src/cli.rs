@@ -63,8 +63,8 @@ const ABOUT: &str = "A strongly consistent, multitenant key-value store.";
 const LONG_ABOUT: &str = "\
 A strongly consistent, multitenant key-value store.
 
-One binary does everything. `orbita serve` runs a node, as a leader group
-member or as a worker depending on configuration. Every other command is a
+One binary does everything. `orbita serve` runs a combined node. Every node
+serves worker traffic and an automatically managed subset votes in Raft. Every other command is a
 client that talks to a running cluster over the same gRPC API a program would
 use, so anything you can do here you can script.
 
@@ -81,7 +81,9 @@ show` to see what was resolved and `orbita config env` for the variables that
 are read.
 
 Exit codes: 0 success, 1 error, 2 the key was not found, 3 a conditional write
-was not applied.";
+was not applied. Code 3 means the cluster decided against you. A conditional
+write the cluster could not decide at all is an error, exits 1, and is safe to
+retry.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -147,6 +149,10 @@ impl GlobalArgs {
             client: ClientLayer {
                 endpoint: self.endpoint.clone(),
                 credential: self.credential.clone(),
+                // The default keyspace is not a global flag: it comes from
+                // ORBITA_KEYSPACE, the config file, or the REPL's `:use`, so a
+                // one-shot command still names its keyspace on the line.
+                keyspace: None,
             },
             telemetry: TelemetryLayer {
                 log_level: self.log_level.clone(),
@@ -166,22 +172,19 @@ impl GlobalArgs {
 pub enum Command {
     /// Run a node.
     #[command(long_about = "\
-Run a node, in whichever role the configuration says.
+Run a combined clustered node.
 
-A leader group member runs Raft and owns the partition map, keyspace metadata,
-and failover. A worker owns partitions and serves reads and writes. Both are
-this binary; nothing else is installed.
+Every node owns or replicates partitions and serves reads and writes. Three or
+five eligible nodes additionally vote in Raft, and one voter is elected leader.
 
 A node binds two listeners. --listen carries client and admin gRPC, and is the
 one to expose. --peer-listen carries traffic from other nodes in a private
 framing, and belongs on a private network: it is compatible only within a
 cluster version window, and a peer port reachable from the internet is a hole.
 
-cluster.leader_peers is the leader group as peer advertise addresses, identical
-on every node. A fresh leader forms the initial Raft configuration from it and
-ignores it once the data directory holds a Raft log, so it is safe to leave in
-a template forever. A worker uses the same list to find a leader to register
-with, and retries until one answers or --join-timeout runs out.")]
+Fresh nodes agree on a durable identity and initial three-voter certificate
+through the shared object store. --leader-peers remains only for migration from
+the old fixed-role topology.")]
     Serve(ServeArgs),
 
     /// Run a single node cluster with no configuration at all.
@@ -245,7 +248,44 @@ ahead of a load test or draining a node before maintenance.")]
         #[command(subcommand)]
         command: ConfigCommand,
     },
+
+    /// Open an interactive session against a cluster.
+    #[command(long_about = "\
+Open one session and type commands into it, instead of paying a fresh process,
+runtime, and connection for every line.
+
+This is a loop, not a second tool. Each line is parsed by the same argument
+parser and printed by the same renderer as the one-shot `orbita` command, so
+anything you can type here you can script, and the reverse. `orbita get demo k`
+on the command line and `get demo k` at the prompt do the same thing.
+
+The session remembers a current keyspace and output format so a data command
+can leave its keyspace off. Set them with the session commands, which start
+with a colon so they can never be confused with a cluster command:
+
+  :use <keyspace>      set the current keyspace (`:use` with no name clears it)
+  :format <human|json> switch output format for the rest of the session
+  :keyspace            show the current keyspace
+  :help                list the session commands
+  :quit                leave (Ctrl-D does the same)
+
+A missed `get` and a lost compare-and-swap have no exit code to land in here,
+so they print their normal output and then a `[not found]` or `[condition not
+met]` note, which is the same answer a script reads from exit code 2 or 3.
+
+serve and dev run a node and block forever, so they are refused here. So is
+reading a `set` value from standard input, because the line editor owns stdin;
+pass the value as an argument instead.")]
+    Repl(ReplArgs),
 }
+
+/// Options for the interactive session.
+///
+/// It is its own args struct, empty today, so that a later flag such as a
+/// startup script or a one-shot `--command` has somewhere to land without
+/// reshaping the command enum.
+#[derive(Debug, Args, Default)]
+pub struct ReplArgs {}
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -254,7 +294,7 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ID")]
     pub node_id: Option<u64>,
 
-    /// Whether this node joins the leader group or serves partitions.
+    /// The node role. Use node; leader and worker are migration spellings.
     #[arg(long, value_name = "ROLE")]
     pub role: Option<Role>,
 
@@ -282,17 +322,39 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ADDR")]
     pub peer_advertise: Option<String>,
 
-    /// Where the WAL, the local RocksDB, and the Raft log live.
+    /// Where the WAL, the local partition objects, and the Raft log live.
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// The leader group, as peer advertise addresses.
+    /// Bytes of segment records to hold in memory, across every partition this
+    /// node hosts. Zero turns the cache off.
+    #[arg(long, value_name = "BYTES")]
+    pub value_cache_bytes: Option<u64>,
+
+    /// Bytes one cache miss fetches beyond the record that missed. Zero fetches
+    /// exactly the record asked for.
+    #[arg(long, value_name = "BYTES")]
+    pub read_ahead_bytes: Option<u64>,
+
+    /// The leader group, as NODE_ID=ADDR entries.
     ///
-    /// Identical on every node. A leader uses it as the initial Raft
-    /// membership and ignores it once it has a Raft log. A worker uses it as
-    /// the list of leaders to contact.
-    #[arg(long, value_name = "ADDR", value_delimiter = ',')]
+    /// Identical on every node. A leader uses the ids as fixed Raft voters and
+    /// checks them against durable state on restart. A worker uses the same
+    /// entries to contact the group.
+    #[arg(long, value_name = "NODE_ID=ADDR", value_delimiter = ',')]
     pub leader_peers: Option<Vec<String>>,
+
+    /// Desired Raft voters, independent from worker count. Must be 3 or 5.
+    #[arg(long, value_name = "3|5")]
+    pub voter_target: Option<usize>,
+
+    /// Failure domain used to spread voters, such as an availability zone.
+    #[arg(long, value_name = "NAME")]
+    pub failure_domain: Option<String>,
+
+    /// Keep this node out of automatic voter placement.
+    #[arg(long)]
+    pub voter_ineligible: bool,
 
     /// How long to keep trying to reach the leader group before giving up,
     /// such as 5m. Use 0 to retry forever.
@@ -328,9 +390,14 @@ impl ServeArgs {
                 peer_listen: self.peer_listen.clone(),
                 peer_advertise: self.peer_advertise.clone(),
                 data_dir: self.data_dir.clone(),
+                value_cache_bytes: self.value_cache_bytes,
+                read_ahead_bytes: self.read_ahead_bytes,
             },
             cluster: ClusterLayer {
                 leader_peers: self.leader_peers.clone(),
+                voter_target: self.voter_target,
+                voter_eligible: self.voter_ineligible.then_some(false),
+                failure_domain: self.failure_domain.clone(),
                 allow_version_skew: self.allow_version_skew.then_some(true),
                 join_timeout: self.join_timeout.clone(),
                 ..ClusterLayer::default()
@@ -484,19 +551,51 @@ thing to look at during a failover.")]
         keyspace: Option<String>,
     },
 
-    /// Check that a node is answering, for a container health check.
+    /// Check that a node is answering, for a container liveness check.
     #[command(long_about = "\
 Ask a node whether it is up, and exit 0 if it answered.
 
-This is what a Docker health check or a Kubernetes probe should run. It is
-deliberately weaker than `cluster describe`: any answer at all counts, even an
-error, because the question is whether the process is serving rather than
-whether the cluster is well. Only a connection that could not be made or a
-request that timed out counts as down.
+This is what a liveness probe should run. It is deliberately weaker than
+`cluster describe`: any answer at all counts, even an error, because the
+question is whether the process is serving rather than whether the cluster is
+well. Only a connection that could not be made or a request that timed out
+counts as down.
 
-Use `cluster describe` to find out whether the cluster is healthy. Use this to
-find out whether one node is.")]
+Use `cluster ready` for a readiness probe, `cluster describe` to find out
+whether the cluster is healthy, and this to find out whether one process is
+alive.")]
     Ping,
+
+    /// Check that a node is ready to serve, for a readiness probe.
+    #[command(long_about = "\
+Ask a node whether it is ready to serve, and exit 0 only if it is.
+
+Ready is stronger than answering. A node is ready once it has registered with
+the leader group, recovered its write-ahead log, and opened and caught up
+every partition the map says it holds. Until then this exits non-zero and
+names the conditions still outstanding, which is what makes a rolling upgrade
+wait for the node instead of outrunning it.
+
+This is what a Kubernetes readiness or startup probe should run. Liveness
+should keep running `cluster ping`: readiness depends on the leader group, and
+a liveness probe that does would restart healthy pods during a control plane
+outage.")]
+    Ready,
+
+    /// Advance the cluster version after a rolling upgrade.
+    #[command(long_about = "\
+Advance the cluster's active version to the newest one every live node can
+speak. Run it once every node is upgraded and you are happy with the result.
+
+Until this runs, upgraded nodes keep speaking the old version and a rollback
+is the ordinary Kubernetes one, because nothing new has been written. After it
+runs, nodes start writing new formats and rolling back is not supported: the
+only path backwards is restoring from a backup taken before the upgrade. That
+is why finalization is a command and not automatic.
+
+If any live node cannot speak the new version, nothing is committed and the
+error names the nodes holding it back.")]
+    FinalizeUpgrade,
 }
 
 #[derive(Debug, Subcommand)]
@@ -535,11 +634,30 @@ not a transfer.")]
 }
 
 #[derive(Debug, Args)]
+#[command(long_about = "\
+Read a key.
+
+The keyspace comes first: `get demo greeting`. It may be left off when a
+default keyspace is in effect, from ORBITA_KEYSPACE, `client.keyspace` in the
+configuration, or `:use` in the REPL, so that `get greeting` reads from the
+current keyspace. Passing both a keyspace and a key always names the keyspace
+first, so a two-argument `get demo greeting` means the same thing no matter
+what the environment holds.
+
+A miss is not an error. The command prints the key as not found and exits 2, so
+a script checking a lock can branch on the code without parsing anything.")]
 pub struct GetArgs {
-    /// The keyspace to read from.
-    pub keyspace: String,
+    /// The keyspace to read from, or the key when a default keyspace is set.
+    pub keyspace: Option<String>,
     /// The key to read.
-    pub key: String,
+    pub key: Option<String>,
+
+    /// Name the keyspace explicitly, ahead of any positional or default.
+    ///
+    /// The unambiguous form: with it, the positionals are only the key, so
+    /// there is never a question of which argument is the keyspace.
+    #[arg(short = 'k', long = "keyspace", value_name = "NAME")]
+    pub keyspace_flag: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -549,20 +667,46 @@ Write a key.
 The value can be an argument, a file, or standard input, because a value is
 bytes and not every byte survives a shell.
 
+The keyspace comes first: `set demo key value`. It may be left off when a
+default keyspace is in effect (ORBITA_KEYSPACE, `client.keyspace`, or the
+REPL's `:use`), in which case `set key value` writes to the current keyspace.
+Because the value is optional, a two-argument `set a b` is read as keyspace and
+key when no default is set, and as key and value when one is.
+
+When the value comes from a file or standard input there is no third argument
+to break the tie, so name the keyspace with --keyspace to be unambiguous:
+`printf secret | orbita set --keyspace prod locks/leader` writes the piped bytes
+to `locks/leader` in `prod`, no matter what default is set. With --keyspace the
+positionals are only the key and an optional value.
+
 Conditions are what make this usable for locks and catalog pointers.
 --if-not-present takes a lock; --if-version swings a pointer only if nobody
 else moved it first. A condition that is not met is not an error: the command
-exits 3 and reports the version it found instead.")]
+exits 3 and reports the version it found instead.
+
+Exit 3 is a verdict, so it is the one answer a script may act on without
+retrying. A conditional write that collides with another write the cluster has
+not finished landing is refused as UNAVAILABLE and exits 1 instead, because
+nobody yet knows who won; retry it.")]
 pub struct SetArgs {
-    /// The keyspace to write to.
-    pub keyspace: String,
-    /// The key to write.
-    pub key: String,
+    /// The keyspace to write to, or the key when a default keyspace is set.
+    pub keyspace: Option<String>,
+    /// The key to write, or the value when a default keyspace is set.
+    pub key: Option<String>,
     /// The value. Omit it to read the value from standard input.
     pub value: Option<String>,
 
+    /// Name the keyspace explicitly, ahead of any positional or default.
+    ///
+    /// The unambiguous form, and the one to use when the value comes from a
+    /// file or standard input: with it the positionals are only the key and an
+    /// optional value, so `set <keyspace> <key>` can never be misread as
+    /// `set <key> <value>`.
+    #[arg(short = 'k', long = "keyspace", value_name = "NAME")]
+    pub keyspace_flag: Option<String>,
+
     /// Read the value from this file instead.
-    #[arg(long, value_name = "PATH", conflicts_with = "value")]
+    #[arg(long, value_name = "PATH")]
     pub value_file: Option<PathBuf>,
 
     /// Expire the key this long after the write commits, such as 30s or 1h.
@@ -580,10 +724,14 @@ pub struct SetArgs {
 
 #[derive(Debug, Args)]
 pub struct DeleteArgs {
-    /// The keyspace to delete from.
-    pub keyspace: String,
+    /// The keyspace to delete from, or the key when a default keyspace is set.
+    pub keyspace: Option<String>,
     /// The key to delete.
-    pub key: String,
+    pub key: Option<String>,
+
+    /// Name the keyspace explicitly, ahead of any positional or default.
+    #[arg(short = 'k', long = "keyspace", value_name = "NAME")]
+    pub keyspace_flag: Option<String>,
 
     /// Delete only if the key is at exactly this version.
     #[arg(long, value_name = "VERSION")]
@@ -599,11 +747,16 @@ spans several pages is not a point-in-time snapshot of the keyspace, and a
 caller that needs one has to build it. The cursor is printed rather than
 followed automatically so that this stays true and visible.")]
 pub struct ListArgs {
-    /// The keyspace to scan.
-    pub keyspace: String,
+    /// The keyspace to scan, or the prefix when a default keyspace is set.
+    pub keyspace: Option<String>,
     /// The prefix to match. Empty scans the whole keyspace.
-    #[arg(default_value = "")]
-    pub prefix: String,
+    pub prefix: Option<String>,
+
+    /// Name the keyspace explicitly, ahead of any positional or default.
+    ///
+    /// With it, the single positional is unambiguously the prefix.
+    #[arg(short = 'k', long = "keyspace", value_name = "NAME")]
+    pub keyspace_flag: Option<String>,
 
     /// Continue from the cursor a previous page returned.
     #[arg(long, value_name = "CURSOR")]
@@ -670,7 +823,7 @@ mod tests {
             "--node-id",
             "3",
             "--leader-peers",
-            "a:7100,b:7100",
+            "1=a:7101,2=b:7101",
         ])
         .unwrap();
         let Command::Serve(args) = cli.command else {
@@ -681,7 +834,7 @@ mod tests {
         assert_eq!(layer.node.id, Some(3));
         assert_eq!(
             layer.cluster.leader_peers.as_deref(),
-            Some(["a:7100".to_owned(), "b:7100".to_owned()].as_slice())
+            Some(["1=a:7101".to_owned(), "2=b:7101".to_owned()].as_slice())
         );
     }
 

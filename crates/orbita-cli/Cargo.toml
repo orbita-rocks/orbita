@@ -29,8 +29,36 @@ anyhow = "1.0.104"
 base64 = "0.22"
 bytes.workspace = true
 clap = { version = "4.6.5", features = ["derive", "wrap_help"] }
+# The node process is the one place that installs an exporter, so the heavy
+# OpenTelemetry pieces live here rather than in the libraries that emit signals.
+# rt-tokio because the OTLP batch and periodic exporters run their background
+# work on the same runtime the node already has, which is also what a
+# deterministic build would swap out. grpc-tonic so the exporter speaks OTLP
+# over the tonic stack the rest of the binary links anyway. tls-webpki-roots so
+# an `https://` collector endpoint gets a TLS connector backed by bundled trust
+# roots: without it grpc-tonic has no way to establish TLS, and a production
+# collector would be reachable only over plaintext OTLP. Webpki roots rather
+# than the system trust store so the image needs no CA bundle baked in.
+opentelemetry.workspace = true
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = [
+    "grpc-tonic",
+    "tls-webpki-roots",
+    "trace",
+    "metrics",
+] }
+tracing-opentelemetry = "0.28"
 orbita-core.workspace = true
+orbita-objectstore = { workspace = true, features = ["s3"] }
 orbita-proto.workspace = true
+# The line editor for `orbita repl`, and the first line-editing dependency in
+# the workspace. rustyline over reedline on purpose: it is smaller and older,
+# pulls fewer transitive crates, and is synchronous, which is the exact shape of
+# the REPL loop (read a line, then block the session's runtime on dispatching
+# it). reedline is built for nushell's async, multi-line, styled prompt and
+# would be weight spent on features a thin operator console does not use. See
+# src/repl.rs for the same reasoning at the call site.
+rustyline = "15"
 # The only thing that uses this is src/node.rs, which is the one place in the
 # crate that starts a server rather than dialing one. It goes through the
 # workspace like every other sibling, because a literal version here is a copy

@@ -1,0 +1,46 @@
+# https://moonrepo.dev/docs/config/project
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+# No `dependsOn`. This crate deliberately depends on no other crate in the
+# workspace: it is the seam everything else reaches storage through, so an edge
+# out of here would become an edge into everything that stores an object.
+
+tasks:
+  # The live S3 suite. `crates/orbita-objectstore/tests/minio.rs` is `#[ignore]`d
+  # because most machines have no bucket to talk to, so it needs its own target
+  # rather than riding in the inherited `test` task, which every crate runs on
+  # every change.
+  #
+  # What it proves is the manifest compare-and-swap: a deposed writer holding a
+  # stale ETag must lose to the writer that replaced it. That is the whole of
+  # the fencing story for the object store, and since the live write path
+  # started swapping manifests it is load-bearing in production. It cannot be
+  # proved against a mock, because the failure being guarded against is a real
+  # server accepting `If-None-Match: *` and quietly ignoring it.
+  #
+  # The endpoint comes from ORBITA_S3_TEST_* in the environment; see the module
+  # docs in tests/minio.rs for a one-liner that stands one up locally.
+  #
+  # There is one task rather than one per backend, because the tests name no
+  # backend. Pull requests point it at MinIO in a container; the weekly job in
+  # .github/workflows/live-object-store.yml points the same task at a real AWS
+  # bucket and a real R2 bucket. Splitting it would let the thing that runs on
+  # every pull request drift away from the thing that checks the backends we
+  # actually tell people to use.
+  test-live-s3:
+    # Two commands, because a test binary containing no tests exits 0 and reads
+    # as coverage. `--list` is the cheap assertion that the binary still holds
+    # the tests we think it does: drop `--all-features` and the whole file cfgs
+    # out to nothing behind `hyper-client`, and without this guard the run would
+    # go green having talked to no server at all.
+    script: >
+      cargo test -p orbita-objectstore --all-features --test minio -- --ignored --list
+      | grep -q 'conditional_writes_enforce_the_manifest_swap_rules: test'
+      && cargo test -p orbita-objectstore --all-features --test minio -- --ignored
+    options:
+      # Never cached, for the same reason `sim-long` is not. The inputs to this
+      # task are not only the source: they are also whichever server the
+      # environment points at, and moon cannot hash that. A cache hit here would
+      # report a durability guarantee as verified without opening a socket,
+      # which is the one wrong answer that matters for a test like this.
+      cache: false

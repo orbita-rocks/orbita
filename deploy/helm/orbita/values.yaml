@@ -16,56 +16,29 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# The leader group runs Raft and owns the partition map. Three is the smallest
-# number that survives losing one node, which is the point of having a group.
-# Use an odd number: a group of four tolerates the same single failure as three
-# and needs one more vote to agree.
-leader:
+# Every process serves the worker data path. The voter target below selects an
+# automatically managed subset for Raft, so adding replicas adds capacity
+# without enlarging quorum.
+node:
   replicas: 3
-  # Long enough for a Raft leader to step down and hand off before it goes
-  # away, so that a rolling restart does not spend an election per pod. The
-  # server does not perform that handoff yet, and until it does this is only
-  # headroom. See docs/adr/0005-upgrades-follow-kubernetes-rollouts.md.
-  terminationGracePeriodSeconds: 120
-  persistence:
-    enabled: true
-    size: 10Gi
-    # Empty uses the cluster's default StorageClass.
-    storageClass: ""
-  resources:
-    requests:
-      cpu: 500m
-      memory: 1Gi
-    limits:
-      memory: 2Gi
-  nodeSelector: {}
-  tolerations: []
-  # Spread the group across nodes, because three Raft members on one machine is
-  # a single point of failure wearing a quorum as a disguise.
-  topologySpreadEnabled: true
-
-# Workers own partitions and serve reads and writes. This is the number to
-# raise when the cluster needs more capacity.
-worker:
-  replicas: 3
-  # A planned shutdown should hand each partition to a caught-up replica rather
-  # than going through failure detection and promotion, because a rolling
-  # restart of three workers is an ordinary weekly event and should not cost
-  # three failover windows. Three hundred seconds is room for a handoff of a
-  # large partition set. The server does not do the handoff yet.
   terminationGracePeriodSeconds: 300
   persistence:
     enabled: true
     size: 100Gi
+    # Empty uses the cluster's default StorageClass.
     storageClass: ""
   resources:
     requests:
-      cpu: "1"
+      # One CPU remains available for the dedicated control executor even when
+      # the worker data path is busy.
+      cpu: "2"
       memory: 4Gi
     limits:
       memory: 8Gi
   nodeSelector: {}
   tolerations: []
+  # Spread the group across nodes, because three Raft members on one machine is
+  # a single point of failure wearing a quorum as a disguise.
   topologySpreadEnabled: true
 
 # The client-facing Service, in front of the workers. Any worker can answer any
@@ -97,6 +70,8 @@ networkPolicy:
 
 cluster:
   name: orbita
+  # Independent from node.replicas. Supported values are 3 and 5.
+  voterTarget: 3
   # Inert, and kept only so that a values file carrying it does not break.
   # Refusing to start on a version mismatch was replaced by a cluster version
   # window: a node outside the window starts, reports itself not ready, and
@@ -111,6 +86,9 @@ cluster:
   joinBackoffInitial: 250ms
   joinBackoffMax: 10s
   joinTimeout: 5m
+  # Ten seconds shorter than the worker pod's grace period, so a failed drain
+  # is logged and exits non-zero before Kubernetes has to send SIGKILL.
+  drainTimeout: 290s
 
 objectStore:
   endpoint: ""
@@ -119,18 +97,96 @@ objectStore:
   # AWS S3 wants this false. MinIO, R2, and most other S3-compatible stores
   # want it true.
   forcePathStyle: true
-  # Credentials come from a Secret. Set existingSecret to bring your own, with
-  # keys access_key_id and secret_access_key. Otherwise the chart creates one
-  # from the values below, which is fine for a test cluster and not for a real
-  # one.
+
+  # Where the node's S3 credentials come from.
+  #
+  #   default           Resolve at startup, in the order the AWS SDKs use:
+  #                     AWS_ACCESS_KEY_ID from the environment, then EKS IRSA,
+  #                     then the ECS/Pod Identity container endpoint, then the
+  #                     EC2 instance profile. Whichever it picks is logged once
+  #                     at startup. A shared ~/.aws profile is a startup error
+  #                     rather than a silently skipped step.
+  #   static            An access key pair, from the Secret below. This is what
+  #                     MinIO and R2 need, because they offer nothing else.
+  #   environment       AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and
+  #                     optionally AWS_SESSION_TOKEN, injected by something
+  #                     else in your pod spec.
+  #   web-identity      EKS IRSA. The pod identity webhook injects
+  #                     AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN when the
+  #                     service account carries an eks.amazonaws.com/role-arn
+  #                     annotation. This is the *workload* role.
+  #   container         An ECS or Fargate task role, or the EKS Pod Identity
+  #                     agent.
+  #   instance-profile  Read from the EC2 instance metadata service over
+  #                     IMDSv2. No Secret is created and none is mounted. The
+  #                     nodes must run on instances with an instance profile
+  #                     attached, and IMDSv2 must be enabled (`HttpTokens` may
+  #                     be `required`; this chart never falls back to IMDSv1).
+  #                     Note that on EKS this is the *node* role, which is not
+  #                     the same principal as IRSA gives you.
+  #
+  # Empty picks one for you: static when accessKeyId or existingSecret is set,
+  # and default otherwise. Naming it explicitly is better in production,
+  # because then a source that is not there is a startup error rather than a
+  # node quietly authenticating as something nobody expected.
+  credentialSource: ""
+
+  # A role to assume on top of whatever credentialSource produced. This is the
+  # preferred AWS shape: the instance profile is permitted only to assume this
+  # role, and the role carries the bucket policy, so storage access can be
+  # re-scoped without touching a single instance. Leave roleArn empty to use
+  # the base credentials against S3 directly.
+  #
+  # externalId is only for cross-account access, where the role's trust policy
+  # demands it. It is delivered through the same Secret as the access keys,
+  # because it is a shared secret whatever AWS calls it.
+  roleArn: ""
+  externalId: ""
+  # What the assumed session is called in CloudTrail. Empty derives it from the
+  # cluster name and the node id, which is what makes an audit log able to tell
+  # two nodes apart.
+  sessionName: ""
+
+  # Overrides the STS endpoint used for role assumption and for the IRSA token
+  # exchange. Empty derives a regional one from the region's partition, which
+  # is correct in the commercial partition, in GovCloud, and in China. Set this
+  # for a PrivateLink endpoint, for an isolated partition, or for a partition
+  # newer than this chart.
+  stsEndpoint: ""
+
+  # Static credentials. Set existingSecret to bring your own, with keys
+  # access_key_id and secret_access_key, and optionally external_id. Otherwise
+  # the chart creates one from the values below, which is fine for a test
+  # cluster and not for a real one: inline values end up in the Helm release,
+  # readable by anyone who can read releases.
+  #
+  # existingSecret is read for access keys only when credentialSource resolves
+  # to static. With a keyless source it is read only for external_id, and so it
+  # requires roleArn; setting it without one is rejected at template time
+  # rather than mounting a Secret nothing reads.
+  #
+  # Leave all three empty to deploy with no Secret at all.
   existingSecret: ""
   accessKeyId: ""
   secretAccessKey: ""
 
 telemetry:
-  # Empty disables trace and metric export. Logs still go to stdout, because a
-  # node that cannot reach a collector still has to be debuggable.
+  # The OTLP collector to push traces and metrics to. Orbita exports rather than
+  # being scraped, so this is the whole switch: set it and the node ships spans
+  # and per-keyspace, per-partition metrics to the collector on this endpoint,
+  # which fans them out to Prometheus, Tempo, or wherever. Empty disables export
+  # entirely; logs still go to stderr, because a node that cannot reach a
+  # collector still has to start and still has to be debuggable.
   otlpEndpoint: ""
+  # An existing Secret containing the OTLP headers string under `headers`, for
+  # example `Authorization=Bearer <token>`. The chart injects it through
+  # OTEL_EXPORTER_OTLP_HEADERS, which the exporter applies to traces and metrics.
+  # Keeping this separate from Helm values prevents the token from being stored
+  # in the release. Leave empty when the collector needs no authentication.
+  otlpHeadersSecret: ""
+  # The fraction of traces to sample, decided once at the node that starts each
+  # trace. 1.0 keeps everything, which is right until the trace volume says
+  # otherwise.
   traceSampleRatio: 1.0
   serviceName: orbita
   logLevel: info
@@ -172,27 +228,26 @@ podDisruptionBudget:
 #
 # A StatefulSet replaces pods one at a time and will not move to the next one
 # until the current one reports Ready, so readiness is the entire safety
-# mechanism of an upgrade. Readiness is supposed to mean that this node has
-# registered with the leader group, recovered its write-ahead log, opened every
-# partition the map says it holds, and caught up enough to serve them.
+# mechanism of an upgrade. Readiness means that this node has recovered its
+# write-ahead log, opened every partition the map says it holds, caught up
+# enough to serve them, and registered with the leader group where it has one.
 #
-# It does not mean that yet. The server exposes no such signal, so readiness
-# here runs `orbita cluster ping`, which answers as soon as the process is
-# serving on the client port. That is weaker than the rule above, and it is
-# written down rather than papered over: until the server reports registration
-# and catch-up, a rolling upgrade of this chart can advance to the next pod
-# before the previous one has caught up. Stage upgrades with the StatefulSet
-# partition field and watch the cluster rather than trusting the rollout, and
-# read docs/UPGRADES.md before doing it on anything that matters.
+# Readiness and startup run `orbita cluster ready`, which exits non-zero and
+# names the unmet conditions until the node's readiness gate reports all of
+# them met. Leaders wait for their durable Raft state and an elected quorum;
+# workers wait until the control plane accepts their registration. Recovery
+# and partition catch-up are asserted before either role reports Ready.
 #
 # Liveness is the opposite and stays conservative, because failing it kills the
-# pod. It asks only whether the process responds, never anything about the
-# cluster or about reaching peers. A liveness probe that depended on peers
-# would turn a network partition into every pod being killed at once.
+# pod. It runs `orbita cluster ping`, which asks only whether the process
+# responds, never anything about the cluster or about reaching peers. A
+# liveness probe that depended on the leader group would turn a control plane
+# outage or a network partition into every pod being killed at once.
 #
 # Slow starts belong to the startup probe. Recovering a large write-ahead log
-# legitimately takes time, and that is not the same as being wedged, so the
-# startup budget is generous where the liveness threshold is not.
+# or waiting for the leader group legitimately takes time, and that is not the
+# same as being wedged, so the startup budget is generous where the liveness
+# threshold is not.
 probes:
   readiness:
     enabled: true
@@ -208,5 +263,4 @@ probes:
     # Five minutes for a leader, ten for a worker. A worker that starts before
     # the leader group retries until it can join, and killing it for that would
     # turn an ordinary rollout into a crash loop.
-    leaderFailureThreshold: 60
-    workerFailureThreshold: 120
+    nodeFailureThreshold: 120

@@ -84,11 +84,16 @@ version bump as a revert.
 
 ## Prereleases
 
-There is nothing to do. Every push to `develop` publishes
-`ghcr.io/orbita-rocks/orbita:develop` and a `sha-` tag, and uploads a Linux
-binary as a workflow artifact for 30 days. When pointing somebody at a
-prerelease build, quote the `sha-` tag rather than `develop`, because `develop`
-will have moved by the time they read it.
+The nightly workflow publishes `ghcr.io/orbita-rocks/orbita:0.2.0-dev`, at
+whatever the current `-dev` version is, and a `sha-` tag. It uploads a Linux
+binary as a workflow artifact for seven days. Dispatch the Prerelease workflow
+when a build is needed sooner. There is no branch-named tag; every tag carries a
+version. When pointing somebody at a prerelease build, quote the `sha-` tag
+rather than the `-dev` one, because the `-dev` tag will have moved by the time
+they read it. SHA-only images expire after 30 days.
+
+Dispatching it against `main` fails, because the version there has no `-dev`
+suffix and publishing it would replace a real release.
 
 ## When something fails
 

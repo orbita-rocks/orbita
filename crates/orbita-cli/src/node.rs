@@ -13,21 +13,17 @@
 //! wrong at exactly the moment somebody is deciding whether to keep going.
 //! Orbita does neither.
 //!
-//! - A leader node reads `cluster.leader_peers`, which is the complete initial
+//! - A leader node reads `cluster.leader_peers`, which is the complete fixed
 //!   membership and is identical on every leader. It is a static list because
 //!   it has to be knowable before anything is running, and every orchestrator
 //!   can already produce a stable list of names for a StatefulSet.
-//! - If the data directory already holds a Raft log, the list is ignored
-//!   entirely and membership comes from the log. This matters more than it
-//!   looks: it means the list can stay in a Helm template forever, and that
-//!   adding a fourth leader later does not conflict with what the template
-//!   says.
-//! - On a genuinely fresh start, the node with the lowest address in the list
-//!   creates the initial Raft configuration containing all of the peers, and
-//!   the others wait to hear from it. Choosing by a total order over the list
-//!   rather than by a race is what prevents two nodes from each forming a
-//!   single-node cluster and both believing they are the leader group. Every
-//!   node computes the same answer from the same list with no coordination.
+//! - The voter IDs are persisted beside the Raft log and checked on every
+//!   restart. A changed template cannot silently redefine an existing cluster;
+//!   dynamic membership is deliberately outside this fixed-voter boundary.
+//! - On a genuinely fresh start, the configured voters elect one leader and
+//!   only that leader creates the initial control state. A lone member of a
+//!   three-voter set cannot bootstrap, so it cannot accidentally form a second
+//!   cluster while its peers are unavailable.
 //! - Workers do not bootstrap. A worker dials any leader address, registers,
 //!   and is told the partition map. A worker that starts before the leader
 //!   group exists retries rather than failing, because in a container
@@ -39,14 +35,22 @@
 //!   with a single partition covering the whole range, so `keyspace create` is
 //!   the only step and there is no "now create a partition" to forget.
 //!
-//! `orbita dev` shortcuts all of it. One node with an empty peer list is its
-//! own leader group, which means a Raft configuration of one member that is
-//! committed the moment it is written, and the same node also serves
-//! partitions. There is no quorum to wait for and no second process. It also
-//! creates a keyspace on startup so the first write does not need a second
-//! command. This path exists because the first ten minutes decide whether
-//! there is an eleventh, and a bootstrap that needs a paragraph of explanation
-//! has already lost.
+//! `orbita dev` shortcuts all of it. There is no peer list to write down, so
+//! this module writes the only one that could be true: a leader group whose
+//! single member is this node. That is a Raft configuration of one, which
+//! elects itself after one election timeout and commits everything it writes,
+//! and the same node is also admitted as the worker that owns the partitions.
+//! There is no quorum to wait for and no second process. It also creates a
+//! keyspace on startup so the first write does not need a second command.
+//! This path exists because the first ten minutes decide whether there is an
+//! eleventh, and a bootstrap that needs a paragraph of explanation has already
+//! lost.
+//!
+//! The membership is written out rather than left implied, because leaving it
+//! implied is what issue #88 was: an empty list meant the node skipped the
+//! configuration that carries its role, came up as a worker with no control
+//! plane, and answered `Unimplemented` to the `keyspace create` printed in its
+//! own help text.
 //!
 //! # Version skew
 //!
@@ -82,15 +86,17 @@
 //! 0004: peer framing is compatible within a cluster version window rather
 //! than not at all, which is what makes a rolling upgrade possible.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use orbita_core::{KeyspaceName, NodeId};
-use orbita_server::{Server, ServerConfig};
+use orbita_objectstore::s3::Credentials;
+use orbita_server::{AssumeRoleConfig, S3CredentialSource, S3StorageConfig, Server, ServerConfig};
 
-use crate::config::{ClusterConfig, Config, Role};
+use crate::config::{ClusterConfig, Config, CredentialSource, Role};
 
 /// What a node run needs beyond the configuration.
 #[derive(Debug, Clone)]
@@ -109,32 +115,17 @@ pub struct NodeOptions {
 /// Every other command is a network client, so a change to the server's API is
 /// a change to this one function rather than to twenty.
 ///
-/// The client listener, the data directory, the node id, and the startup
-/// keyspace are wired up. The peer listener and the leader peer list are
-/// resolved and validated here but not yet handed to the server, because the
-/// server does not accept them yet. The `TODO(peer-listener)` below is the
-/// single place that changes when it does.
 pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
+    // Installed here, inside the runtime, rather than in `main`: the OTLP
+    // exporters spawn background tasks, so they need a runtime to build on. The
+    // guard is held for the whole run so its final `Drop` flushes whatever the
+    // exporters were still holding when the node stops.
+    let _telemetry = crate::telemetry::install_node(config)?;
     preflight(config, options)?;
     prepare_data_dir(&config.node.data_dir, false)?;
 
     let listen = resolve("node.listen", &config.node.listen)?;
     let peer_listen = resolve("node.peer_listen", &config.node.peer_listen)?;
-
-    // TODO(leader-peers): the leader peer list does not reach the server yet.
-    // `ServerConfig::with_peers` wants pairs of node id and address, and
-    // `cluster.leader_peers` is addresses alone, because an operator writing a
-    // peer list should not also have to keep a node id table in sync with it.
-    // Closing that gap is a question for the server's registration path, not
-    // for this crate to guess at, so the list is carried and logged here and
-    // wired up when there is somewhere to put it.
-    if !config.cluster.leader_peers.is_empty() {
-        tracing::info!(
-            leader_peers = %config.cluster.leader_peers.join(","),
-            peer_advertise = %config.node.peer_advertise,
-            "the leader group is configured but this build does not yet register with it"
-        );
-    }
 
     // A worker whose leader group is not up yet retries instead of failing.
     // Nobody chooses start order in an orchestrator, and a worker that exits
@@ -143,21 +134,31 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
     let joining =
         config.node.role == Role::Worker && !options.dev && !config.cluster.leader_peers.is_empty();
     let mut backoff = JoinBackoff::new(&config.cluster);
+    let mut join_attempts = 0u64;
 
-    let server = loop {
+    let mut server = loop {
         match Server::start(server_config(config, options, listen, peer_listen)?).await {
             Ok(server) => break server,
             Err(error) if joining => {
+                join_attempts += 1;
                 let Some(delay) = backoff.next_delay() else {
                     return Err(anyhow::anyhow!("{error}"))
                         .context(join_give_up_message(&config.cluster));
                 };
-                tracing::warn!(
-                    error = %error,
-                    leader_peers = %config.cluster.leader_peers.join(","),
-                    retry_in_millis = delay.as_millis() as u64,
-                    "cannot join the leader group yet, retrying"
-                );
+                if join_attempts == 1 {
+                    tracing::info!(
+                        leader_peers = %config.cluster.leader_peers.join(","),
+                        retry_in_millis = delay.as_millis() as u64,
+                        "waiting for the leader group to become available"
+                    );
+                } else {
+                    tracing::debug!(
+                        %error,
+                        join_attempts,
+                        retry_in_millis = delay.as_millis() as u64,
+                        "leader group is not available yet"
+                    );
+                }
                 tokio::time::sleep(delay).await;
             }
             Err(error) => {
@@ -168,7 +169,7 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
 
     // Startup notes go to stderr so that anything a later command pipes stays
     // clean.
-    eprintln!("orbita: serving on {}", server.local_addr());
+    eprintln!("orbita: listening on {}", server.local_addr());
 
     // Ctrl-C is the ordinary way a foreground node stops, and a container stop
     // sends the same signal. Draining rather than dropping means in-flight
@@ -177,15 +178,51 @@ pub async fn run_node(config: &Config, options: &NodeOptions) -> Result<()> {
         result = server.wait() => {
             result.map_err(|e| anyhow::anyhow!("{e}")).context("while serving")?;
         }
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("waiting for a shutdown signal")?;
+        signal = shutdown_signal() => {
+            signal?;
+            // A development cluster is one node, so there is nobody to hand a
+            // partition to and a drain would spend its whole budget waiting
+            // for a receiver that cannot exist before shutting down anyway.
+            // Ctrl-C on a laptop should be immediate.
+            if options.dev {
+                server
+                    .shutdown()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .context("stopping the node")?;
+                return Ok(());
+            }
             eprintln!("orbita: draining");
-            // `wait` consumed the server in the other branch, so this branch
-            // owns it here.
+            server
+                .drain(Duration::from_millis(config.cluster.drain_timeout_millis))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .context("draining partitions before shutdown")?;
+            eprintln!("orbita: drain complete");
             return Ok(());
         }
     }
 
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("installing the SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("waiting for Ctrl-C")?;
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
     Ok(())
 }
 
@@ -203,7 +240,91 @@ fn server_config(
     let mut server_config = ServerConfig::single_node(&config.node.data_dir)
         .with_node_id(NodeId(config.node.id))
         .with_listen_addr(listen)
-        .with_peer_listen_addr(peer_listen);
+        .with_peer_listen_addr(peer_listen)
+        .with_peer_advertise_addr(config.node.peer_advertise.clone())
+        .with_require_auth(config.cluster.require_auth)
+        .with_root_credential(config.cluster.root_credential.clone())
+        .with_value_cache_bytes(config.node.value_cache_bytes)
+        .with_read_ahead_bytes(config.node.read_ahead_bytes);
+
+    let peers = parse_leader_peers(&config.cluster.leader_peers)?;
+    if config.node.role == Role::Node && !options.dev {
+        server_config = server_config.with_read_replica_target(config.cluster.read_replica_target);
+        server_config = server_config.with_automatic_cluster(
+            config.cluster.name.clone(),
+            config.cluster.voter_target,
+            config.cluster.voter_eligible,
+            config.cluster.failure_domain.clone(),
+        );
+    } else if !peers.is_empty() {
+        let voters = peers.iter().map(|(node, _)| *node).collect();
+        server_config = server_config
+            .with_peers(peers)
+            .with_leader_group(voters)
+            .with_leader_member(config.node.role == Role::Leader);
+    } else if options.dev {
+        // A development node has nobody to list, and an empty list used to
+        // mean this whole block was skipped, so the node came up as a worker
+        // with no control plane and every admin call answered Unimplemented.
+        // The membership of a leader group of one is this node, written out
+        // rather than inferred from the empty list, so that the shape the dev
+        // path runs is the shape production runs.
+        let local = NodeId(config.node.id);
+        server_config = server_config
+            .with_peers(vec![(local, config.node.peer_advertise.clone())])
+            .with_leader_group(vec![local])
+            .with_leader_member(true)
+            // And its own worker, or the one node in the cluster would be
+            // barred from owning the partition it is the only candidate for.
+            .with_leader_owns_partitions(true);
+    }
+
+    if let Some(endpoint) = &config.object_store.endpoint {
+        let credentials = match config.object_store.credential_source {
+            CredentialSource::Static => match (
+                config.object_store.access_key_id.clone(),
+                config.object_store.secret_access_key.clone(),
+            ) {
+                (Some(access_key_id), Some(secret_access_key)) => {
+                    S3CredentialSource::Static(Credentials {
+                        access_key_id,
+                        secret_access_key,
+                        session_token: None,
+                    })
+                }
+                _ => bail!(
+                    "object_store.access_key_id and object_store.secret_access_key must be set \
+                     together"
+                ),
+            },
+            CredentialSource::Default => S3CredentialSource::Default,
+            CredentialSource::Environment => S3CredentialSource::Environment,
+            CredentialSource::WebIdentity => S3CredentialSource::WebIdentity,
+            CredentialSource::Container => S3CredentialSource::ContainerCredentials,
+            CredentialSource::InstanceProfile => S3CredentialSource::InstanceProfile,
+        };
+        server_config = server_config.with_object_store(S3StorageConfig {
+            endpoint: endpoint.clone(),
+            bucket: config.object_store.bucket.clone(),
+            region: config.object_store.region.clone(),
+            credentials,
+            assume_role: assume_role_config(config)?,
+            imds_endpoint: None,
+            sts_endpoint: config.object_store.sts_endpoint.clone(),
+            session_name: Some(session_name(config)),
+            force_path_style: config.object_store.force_path_style,
+        });
+    }
+
+    // The orphan sweep. Off unless the operator turned it on, and every bound
+    // is a deployment decision resolved from configuration rather than a
+    // constant in the binary, because the grace period has to exceed this
+    // deployment's longest read and commit.
+    server_config = server_config
+        .with_sweep_enabled(config.sweep.enabled)
+        .with_sweep_dry_run(config.sweep.dry_run)
+        .with_sweep_bounds(config.sweep.grace_millis, config.sweep.skew_millis)
+        .with_sweep_interval(Duration::from_millis(config.sweep.interval_millis));
 
     // The keyspace has to exist before the node serves, because the map a
     // worker opens its partitions from is built at start. Creating it after
@@ -216,6 +337,39 @@ fn server_config(
         server_config = server_config.with_keyspaces(&[keyspace]);
     }
     Ok(server_config)
+}
+
+/// What this node's assumed sessions are called in CloudTrail.
+///
+/// The cluster name and node id rather than something fixed, because the
+/// session name is what tells two nodes apart in an audit log, and a log where
+/// every entry says `orbita` answers no question anybody asks it. It is used
+/// for `AssumeRole` and for the IRSA token exchange alike, so a node has one
+/// identity in CloudTrail no matter which way it authenticated.
+fn session_name(config: &Config) -> String {
+    config
+        .object_store
+        .role_session_name
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", config.cluster.name, config.node.id))
+}
+
+/// The role to assume on top of the base credentials, if one was configured.
+fn assume_role_config(config: &Config) -> Result<Option<AssumeRoleConfig>> {
+    let Some(role_arn) = &config.object_store.role_arn else {
+        if config.object_store.role_external_id.is_some() {
+            bail!(
+                "object_store.role_external_id is set but object_store.role_arn is not; an \
+                 external id only means anything to a role being assumed"
+            );
+        }
+        return Ok(None);
+    };
+    Ok(Some(AssumeRoleConfig {
+        external_id: config.object_store.role_external_id.clone(),
+        endpoint: config.object_store.sts_endpoint.clone(),
+        ..AssumeRoleConfig::new(role_arn.clone(), session_name(config))
+    }))
 }
 
 /// Turns a configured address into a socket address.
@@ -300,6 +454,46 @@ pub fn preflight(config: &Config, options: &NodeOptions) -> Result<()> {
         );
     }
     if !options.dev {
+        let peers = parse_leader_peers(&config.cluster.leader_peers)?;
+        if config.node.role == Role::Worker
+            && peers.iter().any(|(node, _)| node.get() == config.node.id)
+        {
+            bail!(
+                "worker node id {} is also a fixed leader voter id in cluster.leader_peers; \
+                 assign the worker an id outside the voter set",
+                config.node.id
+            );
+        }
+        if config.node.role == Role::Leader {
+            let local = NodeId(config.node.id);
+            let configured = peers
+                .iter()
+                .find_map(|(node, address)| (*node == local).then_some(address));
+            let Some(configured) = configured else {
+                bail!(
+                    "leader node {} is missing from cluster.leader_peers; add {}={}",
+                    config.node.id,
+                    config.node.id,
+                    config.node.peer_advertise
+                );
+            };
+            if configured != &config.node.peer_advertise {
+                bail!(
+                    "leader node {} advertises {}, but cluster.leader_peers maps it to {}; make \
+                     the complete peer set identical on every node",
+                    config.node.id,
+                    config.node.peer_advertise,
+                    configured
+                );
+            }
+        }
+        if !peers.is_empty() && peers.len() < 3 {
+            bail!(
+                "cluster.leader_peers has {} voters, but a production leader group needs at \
+                 least 3. Use `orbita dev` for a supported single-node cluster",
+                peers.len()
+            );
+        }
         if let Some(option) = unroutable("node.advertise", &config.node.advertise) {
             bail!(
                 "{option} is {}, which nothing can dial. Set it to an address clients can reach",
@@ -323,6 +517,58 @@ pub fn preflight(config: &Config, options: &NodeOptions) -> Result<()> {
                 config.node.advertise
             );
         }
+    }
+    Ok(())
+}
+
+/// Parses the fixed leader voter set while preserving its configured addresses.
+pub fn parse_leader_peers(entries: &[String]) -> Result<Vec<(NodeId, String)>> {
+    let mut by_id = BTreeMap::new();
+    let mut addresses = BTreeSet::new();
+    for entry in entries {
+        let Some((id, address)) = entry.split_once('=') else {
+            bail!(
+                "cluster.leader_peers entry {entry:?} is malformed; expected NODE_ID=HOST:PORT, \
+                 for example 1=leader-0:7101"
+            );
+        };
+        let id: u64 = id.parse().with_context(|| {
+            format!("cluster.leader_peers entry {entry:?} has an invalid node id")
+        })?;
+        if id == 0 {
+            bail!("cluster.leader_peers node ids must be greater than zero, got {entry:?}");
+        }
+        validate_host_port(entry, address)?;
+        if by_id.insert(NodeId(id), address.to_owned()).is_some() {
+            bail!("cluster.leader_peers contains node id {id} more than once");
+        }
+        if !addresses.insert(address) {
+            bail!("cluster.leader_peers contains address {address:?} more than once");
+        }
+    }
+    Ok(by_id.into_iter().collect())
+}
+
+fn validate_host_port(entry: &str, address: &str) -> Result<()> {
+    let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            bail!("cluster.leader_peers entry {entry:?} needs an IPv6 address in [HOST]:PORT form");
+        };
+        (host, port)
+    } else {
+        let Some((host, port)) = address.rsplit_once(':') else {
+            bail!("cluster.leader_peers entry {entry:?} is missing its port");
+        };
+        (host, port)
+    };
+    if host.is_empty() {
+        bail!("cluster.leader_peers entry {entry:?} is missing its host");
+    }
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("cluster.leader_peers entry {entry:?} has an invalid port"))?;
+    if port == 0 {
+        bail!("cluster.leader_peers entry {entry:?} cannot advertise port zero");
     }
     Ok(())
 }
@@ -401,7 +647,7 @@ pub fn version_skew_message(ours: &str, theirs: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClusterLayer, Layer, NodeLayer};
+    use crate::config::{ClusterLayer, Layer, NodeLayer, ObjectStoreLayer};
 
     fn options() -> NodeOptions {
         NodeOptions {
@@ -482,6 +728,204 @@ mod tests {
         assert_eq!(config.node.peer_advertise, "worker-1:7101");
     }
 
+    #[test]
+    fn configured_object_storage_reaches_the_server_startup_config() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store = ObjectStoreLayer {
+            endpoint: Some("http://minio:9000".to_string()),
+            bucket: Some("orbita".to_string()),
+            region: Some("us-east-1".to_string()),
+            access_key_id: Some("orbita".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            force_path_style: Some(true),
+            ..ObjectStoreLayer::default()
+        };
+        let config = layer.resolve().unwrap();
+
+        let server = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+
+        let object_store = server.object_store.expect("S3 was selected");
+        assert_eq!(object_store.endpoint, "http://minio:9000");
+        assert_eq!(object_store.bucket, "orbita");
+        assert!(matches!(
+            object_store.credentials,
+            S3CredentialSource::Static(_)
+        ));
+        assert!(object_store.assume_role.is_none());
+        assert!(object_store.force_path_style);
+    }
+
+    #[test]
+    fn an_object_store_endpoint_without_static_keys_resolves_its_source_at_startup() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+        layer.object_store.force_path_style = Some(false);
+        let config = layer.resolve().unwrap();
+
+        let server = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                server.object_store.expect("S3 was selected").credentials,
+                S3CredentialSource::Default
+            ),
+            "keyless must not be pinned to IMDS here: an EKS pod configured this way would \
+             authenticate as its node rather than as its workload"
+        );
+    }
+
+    #[test]
+    fn each_named_credential_source_reaches_the_server_unchanged() {
+        for (named, expected) in [
+            (CredentialSource::Default, "default"),
+            (CredentialSource::Environment, "environment"),
+            (CredentialSource::WebIdentity, "web-identity"),
+            (CredentialSource::Container, "container"),
+            (CredentialSource::InstanceProfile, "instance-profile"),
+        ] {
+            let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+            layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+            layer.object_store.credential_source = Some(named);
+            let config = layer.resolve().unwrap();
+
+            let server = server_config(
+                &config,
+                &options(),
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+
+            let actual = match server.object_store.expect("S3 was selected").credentials {
+                S3CredentialSource::Default => "default",
+                S3CredentialSource::Static(_) => "static",
+                S3CredentialSource::Environment => "environment",
+                S3CredentialSource::WebIdentity => "web-identity",
+                S3CredentialSource::ContainerCredentials => "container",
+                S3CredentialSource::InstanceProfile => "instance-profile",
+            };
+            assert_eq!(actual, expected, "{named} was mapped to {actual}");
+        }
+    }
+
+    #[test]
+    fn a_configured_role_is_assumed_over_the_resolved_base() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+        layer.object_store.role_arn = Some("arn:aws:iam::123456789012:role/orbita".to_string());
+        layer.object_store.role_external_id = Some("shared-secret".to_string());
+        let config = layer.resolve().unwrap();
+
+        let server = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+
+        let object_store = server.object_store.expect("S3 was selected");
+        assert!(matches!(
+            object_store.credentials,
+            S3CredentialSource::Default
+        ));
+        let assume = object_store.assume_role.expect("a role was configured");
+        assert_eq!(assume.role_arn, "arn:aws:iam::123456789012:role/orbita");
+        assert_eq!(assume.external_id.as_deref(), Some("shared-secret"));
+    }
+
+    #[test]
+    fn a_configured_sts_endpoint_reaches_both_the_server_and_the_role() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.cn-north-1.amazonaws.com.cn".to_string());
+        layer.object_store.region = Some("cn-north-1".to_string());
+        layer.object_store.role_arn = Some("arn:aws-cn:iam::123456789012:role/orbita".to_string());
+        layer.object_store.sts_endpoint = Some("https://sts.internal.example.com".to_string());
+        let config = layer.resolve().unwrap();
+
+        let server = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+
+        let object_store = server.object_store.expect("S3 was selected");
+        assert_eq!(
+            object_store.sts_endpoint.as_deref(),
+            Some("https://sts.internal.example.com")
+        );
+        assert_eq!(
+            object_store
+                .assume_role
+                .expect("a role was configured")
+                .endpoint
+                .as_deref(),
+            Some("https://sts.internal.example.com")
+        );
+    }
+
+    #[test]
+    fn the_assumed_session_name_identifies_the_node_by_default() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+        layer.object_store.role_arn = Some("arn:aws:iam::123456789012:role/orbita".to_string());
+        layer.cluster.name = Some("prod".to_string());
+        layer.node.id = Some(107);
+        let config = layer.resolve().unwrap();
+
+        let assume = assume_role_config(&config)
+            .unwrap()
+            .expect("a role was configured");
+        assert_eq!(
+            assume.session_name, "prod-107",
+            "two nodes sharing a session name make an audit log useless"
+        );
+    }
+
+    #[test]
+    fn an_external_id_without_a_role_is_refused() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
+        layer.object_store.role_external_id = Some("shared-secret".to_string());
+        let config = layer.resolve().unwrap();
+
+        let error = assume_role_config(&config).unwrap_err();
+        assert!(format!("{error:#}").contains("role_arn"));
+    }
+
+    #[test]
+    fn partial_static_object_store_credentials_fail_before_startup() {
+        let mut layer = layer(Role::Worker, &[], "10.0.0.1:7100");
+        layer.object_store.endpoint = Some("http://minio:9000".to_string());
+        layer.object_store.credential_source = Some(CredentialSource::Static);
+        layer.object_store.access_key_id = Some("orbita".to_string());
+        let config = layer.resolve().unwrap();
+
+        let error = server_config(
+            &config,
+            &options(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("must be set together"));
+    }
+
     fn backoff(initial: u64, max: u64, timeout: u64) -> JoinBackoff {
         let mut cluster = config(Role::Worker, &[], "10.0.0.1:7100").cluster;
         cluster.join_backoff_initial_millis = initial;
@@ -519,7 +963,12 @@ mod tests {
 
     #[test]
     fn giving_up_names_the_addresses_that_were_tried_and_how_to_wait_longer() {
-        let cluster = config(Role::Worker, &["leader-1:7101", "leader-2:7101"], "w:7100").cluster;
+        let cluster = config(
+            Role::Worker,
+            &["1=leader-1:7101", "2=leader-2:7101"],
+            "w:7100",
+        )
+        .cluster;
         let message = join_give_up_message(&cluster);
         assert!(message.contains("leader-1:7101"), "{message}");
         assert!(message.contains("leader-2:7101"), "{message}");
@@ -533,6 +982,134 @@ mod tests {
             dev: true,
         };
         assert!(preflight(&config(Role::Leader, &[], "0.0.0.0:7100"), &dev).is_ok());
+    }
+
+    #[test]
+    fn a_peer_entry_without_a_stable_node_id_is_rejected_actionably() {
+        let error = parse_leader_peers(&["leader-1:7101".to_owned()]).unwrap_err();
+        assert!(format!("{error:#}").contains("NODE_ID=HOST:PORT"));
+    }
+
+    #[test]
+    fn duplicate_peer_ids_are_rejected() {
+        let error =
+            parse_leader_peers(&["1=leader-1:7101".to_owned(), "1=leader-2:7101".to_owned()])
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("node id 1 more than once"));
+    }
+
+    #[test]
+    fn duplicate_peer_addresses_are_rejected() {
+        let error =
+            parse_leader_peers(&["1=leader-1:7101".to_owned(), "2=leader-1:7101".to_owned()])
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("address \"leader-1:7101\" more than once"));
+    }
+
+    #[test]
+    fn a_leader_missing_itself_from_the_complete_set_is_rejected() {
+        let mut layer = layer(Role::Leader, &["2=leader-2:7101"], "leader-1:7100");
+        layer.node.id = Some(1);
+        layer.node.peer_advertise = Some("leader-1:7101".to_owned());
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("leader node 1 is missing"));
+    }
+
+    #[test]
+    fn a_leaders_advertised_address_must_match_the_complete_set() {
+        let mut layer = layer(Role::Leader, &["1=old-leader:7101"], "leader-1:7100");
+        layer.node.id = Some(1);
+        layer.node.peer_advertise = Some("leader-1:7101".to_owned());
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("maps it to old-leader:7101"));
+    }
+
+    #[test]
+    fn a_worker_cannot_reuse_a_fixed_voter_id() {
+        let mut layer = layer(
+            Role::Worker,
+            &["1=leader-1:7101", "2=leader-2:7101", "3=leader-3:7101"],
+            "worker-1:7100",
+        );
+        layer.node.id = Some(2);
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("also a fixed leader voter id"));
+    }
+
+    #[test]
+    fn a_production_leader_group_needs_at_least_three_voters() {
+        let mut layer = layer(
+            Role::Leader,
+            &["1=leader-1:7101", "2=leader-2:7101"],
+            "leader-1:7100",
+        );
+        layer.node.id = Some(1);
+        layer.node.peer_advertise = Some("leader-1:7101".to_owned());
+        let error = preflight(&layer.resolve().unwrap(), &options()).unwrap_err();
+        assert!(format!("{error:#}").contains("needs at least 3"));
+    }
+
+    #[test]
+    fn dev_forms_a_leader_group_of_one_so_there_is_a_control_plane_to_serve_admin_from() {
+        // The bug this protects against was invisible from the configuration:
+        // the role resolved to Leader correctly and was then dropped, because
+        // an empty peer list skipped the block that carries it through. Every
+        // admin RPC answered Unimplemented as a result, so the second line of
+        // the quickstart failed on a node that reported itself healthy.
+        let dev = NodeOptions {
+            create_keyspace: Some("default".to_owned()),
+            dev: true,
+        };
+        let config = config(Role::Leader, &[], "127.0.0.1:7100");
+
+        let server = server_config(
+            &config,
+            &dev,
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:7101".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            server.leader_member,
+            "no leader membership means no controller, and no controller means no Admin service"
+        );
+        assert_eq!(server.leader_group, vec![NodeId(config.node.id)]);
+        assert!(
+            server.leader_owns_partitions,
+            "the only node has to be an eligible owner, or the cluster serves no partition at all"
+        );
+        assert_eq!(
+            server.peers,
+            vec![(NodeId(config.node.id), config.node.peer_advertise.clone())],
+            "the group's own membership has to name an address, or the bootstrap registers nobody"
+        );
+    }
+
+    #[test]
+    fn a_worker_with_no_peer_list_still_hosts_no_control_plane() {
+        // The dev exemption above is exactly that. A node that is not `orbita
+        // dev` and has nothing to join stays a worker with a static map, which
+        // is what the tests and the ephemeral single-node path rely on.
+        let server = server_config(
+            &config(Role::Worker, &[], "127.0.0.1:7100"),
+            &options(),
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:7101".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert!(!server.leader_member);
+        assert!(server.leader_group.is_empty());
+    }
+
+    #[test]
+    fn dev_remains_the_explicit_single_node_exemption() {
+        let dev = NodeOptions {
+            create_keyspace: Some("default".to_owned()),
+            dev: true,
+        };
+        assert!(preflight(&config(Role::Leader, &[], "127.0.0.1:7100"), &dev).is_ok());
     }
 
     #[test]
@@ -597,6 +1174,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Layer {
             node: NodeLayer {
+                role: Some(Role::Worker),
                 advertise: Some("127.0.0.1:0".to_owned()),
                 listen: Some("127.0.0.1:0".to_owned()),
                 // Port 0 for the peer listener too, or two runs of this test

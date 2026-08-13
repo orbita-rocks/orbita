@@ -3,6 +3,13 @@ Everything that is not a secret and not per-pod goes in the file. Node id and
 advertise address are per-pod and come from the environment instead, which is
 exactly the split the configuration precedence was designed for.
 */}}
+{{- include "orbita.validateObjectStore" . -}}
+{{- if lt (int .Values.node.replicas) 3 -}}
+{{- fail "node.replicas must be at least 3; use `orbita dev` for a supported single-node cluster" -}}
+{{- end }}
+{{- if not (has (int .Values.cluster.voterTarget) (list 3 5)) -}}
+{{- fail "cluster.voterTarget must be 3 or 5" -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -21,11 +28,12 @@ data:
 
     [cluster]
     name = {{ .Values.cluster.name | quote }}
-    leader_peers = [{{ range $i, $peer := splitList "," (include "orbita.leaderPeers" .) }}{{ if $i }}, {{ end }}{{ $peer | quote }}{{ end }}]
+    voter_target = {{ .Values.cluster.voterTarget }}
     allow_version_skew = {{ .Values.cluster.allowVersionSkew }}
     join_backoff_initial = {{ .Values.cluster.joinBackoffInitial | quote }}
     join_backoff_max = {{ .Values.cluster.joinBackoffMax | quote }}
     join_timeout = {{ .Values.cluster.joinTimeout | quote }}
+    drain_timeout = {{ .Values.cluster.drainTimeout | quote }}
 
     [object_store]
     {{- if .Values.objectStore.endpoint }}
@@ -33,6 +41,19 @@ data:
     {{- end }}
     bucket = {{ .Values.objectStore.bucket | quote }}
     region = {{ .Values.objectStore.region | quote }}
+    # Written out even when it was defaulted, so that a rendered ConfigMap says
+    # which identity this release authenticates as rather than leaving an
+    # operator to reconstruct the rule.
+    credential_source = {{ include "orbita.credentialSource" . | quote }}
+    {{- with .Values.objectStore.roleArn }}
+    role_arn = {{ . | quote }}
+    {{- end }}
+    {{- with .Values.objectStore.sessionName }}
+    role_session_name = {{ . | quote }}
+    {{- end }}
+    {{- with .Values.objectStore.stsEndpoint }}
+    sts_endpoint = {{ . | quote }}
+    {{- end }}
     force_path_style = {{ .Values.objectStore.forcePathStyle }}
 
     [telemetry]

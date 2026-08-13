@@ -17,18 +17,20 @@ use orbita_cli::cli::{
     ClusterCommand, GetArgs, KeyspaceCommand, KeyspaceConfigArgs, SetArgs, EXIT_CONDITION_NOT_MET,
     EXIT_NOT_FOUND,
 };
-use orbita_cli::config::{Config, Layer};
+use orbita_cli::config::Layer;
 use orbita_cli::output::Format;
+use orbita_cli::session::Session;
 use orbita_cli::{admin, data};
 use orbita_proto::v1::admin_server::{Admin, AdminServer};
 use orbita_proto::v1::kv_server::{Kv, KvServer};
 use orbita_proto::v1::{
-    CreateCredentialRequest, CreateCredentialResponse, CreateKeyspaceRequest,
+    ClusterVersion, CreateCredentialRequest, CreateCredentialResponse, CreateKeyspaceRequest,
     DeleteKeyspaceRequest, DeleteKeyspaceResponse, DeleteRequest, DeleteResponse,
-    DescribeClusterRequest, DescribeClusterResponse, GetRequest, GetResponse, Keyspace,
-    KeyspaceConfig, ListKeyspacesRequest, ListKeyspacesResponse, ListRequest, ListResponse,
-    MergePartitionsRequest, MergePartitionsResponse, Node, NodeHealth, NodeRole, Partition,
-    Replica, RevokeCredentialRequest, RevokeCredentialResponse, SetRequest, SetResponse,
+    DescribeClusterRequest, DescribeClusterResponse, FinalizeUpgradeRequest,
+    FinalizeUpgradeResponse, GetRequest, GetResponse, Keyspace, KeyspaceConfig,
+    ListKeyspacesRequest, ListKeyspacesResponse, ListRequest, ListResponse, MergePartitionsRequest,
+    MergePartitionsResponse, Node, NodeHealth, NodeRole, Partition, Replica,
+    RevokeCredentialRequest, RevokeCredentialResponse, SetRequest, SetResponse,
     SplitPartitionRequest, SplitPartitionResponse, TransferOwnershipRequest,
     TransferOwnershipResponse, UpdateKeyspaceRequest,
 };
@@ -44,6 +46,12 @@ struct Seen {
     keyspace_name: Option<String>,
     set_key: Option<Vec<u8>>,
     set_condition: bool,
+    /// The keyspace a `set` named, so a test can prove an explicit keyspace is
+    /// honoured rather than shadowed by a default.
+    set_keyspace: Option<String>,
+    /// The value bytes a `set` carried, so a test can prove a file- or
+    /// stdin-backed value is not dropped for a positional.
+    set_value: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -53,6 +61,13 @@ struct Fake {
     key_exists: bool,
     /// Whether Set should report the condition as met.
     condition_holds: bool,
+    /// Whether DescribeCluster reports index memory at all. False is what a
+    /// leader group running a binary from before the measurement looks like
+    /// on the wire: the field is simply absent.
+    reports_index_memory: bool,
+    /// The storage quota DescribeCluster reports for its keyspace. `Some(0)`
+    /// is a real cap that allows nothing, not the absence of a cap.
+    quota_bytes: Option<u64>,
 }
 
 impl Fake {
@@ -80,6 +95,7 @@ fn keyspace(name: &str) -> Keyspace {
         created_at_millis: 1_700_000_000_000,
         partition_count: 1,
         stored_bytes: 4096,
+        partitions_without_size: 0,
     }
 }
 
@@ -156,6 +172,9 @@ impl Admin for Fake {
                 role: NodeRole::Leader as i32,
                 health: NodeHealth::Healthy as i32,
                 is_raft_leader: true,
+                speaks_min: Some(ClusterVersion { major: 0, minor: 1 }),
+                speaks_max: Some(ClusterVersion { major: 0, minor: 2 }),
+                index_memory_bytes: self.reports_index_memory.then_some(2 * 1024 * 1024),
             }],
             partitions: vec![Partition {
                 id: 10,
@@ -164,12 +183,22 @@ impl Admin for Fake {
                 end_key: Vec::new(),
                 owner_node_id: 2,
                 epoch: 3,
-                committed_lamport: 500,
+                committed_lamport: Some(500),
                 replicas: vec![Replica {
                     node_id: 3,
-                    applied_lamport: 490,
+                    applied_lamport: Some(490),
+                    durable_lamport: Some(495),
                 }],
-                size_bytes: 1_048_576,
+                size_bytes: Some(1_048_576),
+                index_bytes: self.reports_index_memory.then_some(65_536),
+            }],
+            cluster_version: Some(ClusterVersion { major: 0, minor: 2 }),
+            keyspaces: vec![Keyspace {
+                config: Some(KeyspaceConfig {
+                    max_storage_bytes: self.quota_bytes,
+                    ..keyspace("orders").config.expect("the helper sets one")
+                }),
+                ..keyspace("orders")
             }],
         }))
     }
@@ -193,6 +222,17 @@ impl Admin for Fake {
         _: Request<TransferOwnershipRequest>,
     ) -> Result<Response<TransferOwnershipResponse>, Status> {
         Err(Status::unimplemented("not needed by these tests"))
+    }
+
+    async fn finalize_upgrade(
+        &self,
+        request: Request<FinalizeUpgradeRequest>,
+    ) -> Result<Response<FinalizeUpgradeResponse>, Status> {
+        self.record_auth(&request);
+        Ok(Response::new(FinalizeUpgradeResponse {
+            previous: Some(ClusterVersion { major: 0, minor: 1 }),
+            active: Some(ClusterVersion { major: 0, minor: 2 }),
+        }))
     }
 }
 
@@ -233,6 +273,8 @@ impl Kv for Fake {
             let mut seen = self.seen.lock().unwrap();
             seen.set_key = Some(request.key.clone());
             seen.set_condition = request.condition.is_some();
+            seen.set_keyspace = Some(request.keyspace.clone());
+            seen.set_value = Some(request.value.clone());
         }
         Ok(Response::new(SetResponse {
             applied: self.condition_holds,
@@ -262,11 +304,14 @@ impl Kv for Fake {
     }
 }
 
-/// Starts the stand-in on a loopback port and returns a config pointing at it.
+/// Starts the stand-in on a loopback port and returns a session pointing at it.
 ///
 /// The port comes from the listener rather than from a guess, so parallel test
-/// binaries cannot collide.
-async fn start(fake: Fake) -> (Config, Arc<Mutex<Seen>>) {
+/// binaries cannot collide. A non-interactive session is what the one-shot
+/// binary builds, and it is what these tests exercise the command functions
+/// through, so the channel is dialed once and shared exactly as it is in
+/// production.
+async fn start(fake: Fake) -> (Session, Arc<Mutex<Seen>>) {
     let seen = Arc::clone(&fake.seen);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -283,7 +328,9 @@ async fn start(fake: Fake) -> (Config, Arc<Mutex<Seen>>) {
     let mut layer = Layer::default();
     layer.client.endpoint = Some(format!("http://{address}"));
     layer.client.credential = Some("token-abc".to_owned());
-    (layer.resolve().unwrap(), seen)
+    let config = layer.resolve().unwrap();
+    let session = Session::new(config, Format::Human, false).unwrap();
+    (session, seen)
 }
 
 fn fake() -> Fake {
@@ -291,13 +338,15 @@ fn fake() -> Fake {
         seen: Arc::new(Mutex::new(Seen::default())),
         key_exists: true,
         condition_holds: true,
+        reports_index_memory: true,
+        quota_bytes: None,
     }
 }
 
 #[tokio::test]
 async fn listing_keyspaces_returns_every_keyspace_the_server_reported() {
-    let (config, _) = start(fake()).await;
-    let text = admin::keyspace(&config, Format::Human, KeyspaceCommand::List)
+    let (session, _) = start(fake()).await;
+    let text = admin::keyspace(&session, Format::Human, KeyspaceCommand::List)
         .await
         .unwrap();
     assert!(text.contains("orders"), "{text}");
@@ -306,8 +355,8 @@ async fn listing_keyspaces_returns_every_keyspace_the_server_reported() {
 
 #[tokio::test]
 async fn a_credential_reaches_the_server_as_a_bearer_token() {
-    let (config, seen) = start(fake()).await;
-    admin::keyspace(&config, Format::Json, KeyspaceCommand::List)
+    let (session, seen) = start(fake()).await;
+    admin::keyspace(&session, Format::Json, KeyspaceCommand::List)
         .await
         .unwrap();
     assert_eq!(
@@ -318,9 +367,9 @@ async fn a_credential_reaches_the_server_as_a_bearer_token() {
 
 #[tokio::test]
 async fn creating_a_keyspace_sends_the_name_and_renders_what_came_back() {
-    let (config, seen) = start(fake()).await;
+    let (session, seen) = start(fake()).await;
     let text = admin::keyspace(
-        &config,
+        &session,
         Format::Json,
         KeyspaceCommand::Create {
             name: "orders".to_owned(),
@@ -343,9 +392,9 @@ async fn creating_a_keyspace_sends_the_name_and_renders_what_came_back() {
 
 #[tokio::test]
 async fn a_mismatched_confirmation_stops_before_the_request_is_sent() {
-    let (config, seen) = start(fake()).await;
+    let (session, seen) = start(fake()).await;
     let err = admin::keyspace(
-        &config,
+        &session,
         Format::Human,
         KeyspaceCommand::Delete {
             name: "orders".to_owned(),
@@ -363,9 +412,9 @@ async fn a_mismatched_confirmation_stops_before_the_request_is_sent() {
 
 #[tokio::test]
 async fn describing_the_cluster_shows_nodes_and_replica_lag() {
-    let (config, _) = start(fake()).await;
+    let (session, _) = start(fake()).await;
     let text = admin::cluster(
-        &config,
+        &session,
         Format::Human,
         ClusterCommand::Describe { keyspace: None },
     )
@@ -381,9 +430,9 @@ async fn describing_the_cluster_shows_nodes_and_replica_lag() {
 /// any table and it has to be right without reading one.
 #[tokio::test]
 async fn describing_the_cluster_leads_with_a_summary_of_what_is_wrong() {
-    let (config, _) = start(fake()).await;
+    let (session, _) = start(fake()).await;
     let text = admin::cluster(
-        &config,
+        &session,
         Format::Human,
         ClusterCommand::Describe { keyspace: None },
     )
@@ -400,9 +449,9 @@ async fn describing_the_cluster_leads_with_a_summary_of_what_is_wrong() {
 
 #[tokio::test]
 async fn the_describe_json_carries_the_summary_a_script_would_alert_on() {
-    let (config, _) = start(fake()).await;
+    let (session, _) = start(fake()).await;
     let text = admin::cluster(
-        &config,
+        &session,
         Format::Json,
         ClusterCommand::Describe { keyspace: None },
     )
@@ -416,14 +465,204 @@ async fn the_describe_json_carries_the_summary_a_script_would_alert_on() {
 }
 
 #[tokio::test]
+async fn describing_the_cluster_shows_what_it_is_consuming_end_to_end() {
+    // The whole point of the change: an operator can see the cluster is
+    // correct and still not know whether it is about to run out of room.
+    let (session, _) = start(fake()).await;
+    let text = admin::cluster(
+        &session,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    assert!(text.contains("index memory"), "{text}");
+    assert!(text.contains("2.0 MiB"), "the node's index memory: {text}");
+    assert!(text.contains("64.0 KiB"), "the partition's index: {text}");
+    assert!(
+        text.contains("WAL LAG"),
+        "the partition table has a column: {text}"
+    );
+    assert!(
+        text.contains("5 wal"),
+        "and the summary has the worst one: {text}"
+    );
+    assert!(text.contains("KEYSPACES"), "{text}");
+}
+
+#[tokio::test]
+async fn the_describe_json_carries_every_consumption_signal_for_a_script() {
+    let (session, _) = start(fake()).await;
+    let text = admin::cluster(
+        &session,
+        Format::Json,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["nodes"][0]["index_memory_bytes"], 2 * 1024 * 1024);
+    assert_eq!(json["partitions"][0]["index_bytes"], 65_536);
+    assert_eq!(json["partitions"][0]["size_bytes"], 1_048_576);
+    assert_eq!(json["partitions"][0]["replicas"][0]["durable_lamport"], 495);
+    assert_eq!(json["summary"]["max_wal_lag"], 5);
+    assert_eq!(json["keyspaces"][0]["stored_bytes"], 4096);
+    assert_eq!(
+        json["keyspaces"][0]["max_storage_bytes"],
+        serde_json::Value::Null,
+        "a keyspace with no quota reports none rather than a number"
+    );
+}
+
+#[tokio::test]
+async fn a_cluster_that_does_not_report_index_memory_describes_it_as_unknown() {
+    // The mixed-version case, end to end: an older leader group leaves the
+    // field unset, and every hop from decode to render has to keep saying
+    // "nobody measured this" rather than "this index is empty". Zero would
+    // tell an operator they have memory headroom during exactly the window
+    // where they are most likely to be checking.
+    let (session, _) = start(Fake {
+        reports_index_memory: false,
+        ..fake()
+    })
+    .await;
+
+    let text = admin::cluster(
+        &session,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    assert!(text.contains("unknown"), "{text}");
+    assert!(
+        text.contains("index memory unknown"),
+        "the total says it is missing rather than summing to nothing: {text}"
+    );
+    assert!(
+        text.contains("not reporting"),
+        "and says how much of it is missing: {text}"
+    );
+    assert!(
+        !text.contains("0 B"),
+        "no unmeasured index may be rendered as an empty one: {text}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(
+        &admin::cluster(
+            &session,
+            Format::Json,
+            ClusterCommand::Describe { keyspace: None },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        json["nodes"][0]["index_memory_bytes"],
+        serde_json::Value::Null,
+        "a script reading this must not see a number that is not there"
+    );
+    assert_eq!(
+        json["partitions"][0]["index_bytes"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["summary"]["index_memory_bytes"],
+        serde_json::Value::Null,
+        "and the total is absent rather than a partial sum wearing its name"
+    );
+    assert_eq!(json["summary"]["nodes_without_index_memory"], 1);
+}
+
+#[tokio::test]
+async fn a_keyspace_at_a_zero_byte_quota_describes_as_over_and_not_as_unlimited() {
+    // Some(0) is a cap that allows nothing. Treated as no measurement it
+    // printed the same dash an unlimited keyspace gets, hiding a tenant that
+    // is entirely over its limit behind the rendering of one that has none.
+    let (session, _) = start(Fake {
+        quota_bytes: Some(0),
+        ..fake()
+    })
+    .await;
+
+    let text = admin::cluster(
+        &session,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    assert!(
+        text.contains("at or over their storage quota"),
+        "the summary names it: {text}"
+    );
+    assert!(text.contains("over"), "and the row does too: {text}");
+
+    let json: serde_json::Value = serde_json::from_str(
+        &admin::cluster(
+            &session,
+            Format::Json,
+            ClusterCommand::Describe { keyspace: None },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["keyspaces"][0]["max_storage_bytes"], 0);
+    assert_eq!(json["summary"]["keyspaces_over_quota"], 1);
+}
+
+#[tokio::test]
+async fn describing_the_cluster_shows_the_active_version_and_what_each_node_speaks() {
+    let (session, _) = start(fake()).await;
+    let text = admin::cluster(
+        &session,
+        Format::Human,
+        ClusterCommand::Describe { keyspace: None },
+    )
+    .await
+    .unwrap();
+    assert!(text.contains("version      0.2"), "{text}");
+    assert!(text.contains("0.1..0.2"), "{text}");
+}
+
+#[tokio::test]
+async fn finalizing_an_upgrade_reports_the_advance_and_warns_that_rollback_is_gone() {
+    let (session, seen) = start(fake()).await;
+    let text = admin::cluster(&session, Format::Human, ClusterCommand::FinalizeUpgrade)
+        .await
+        .unwrap();
+    assert!(text.contains("from 0.1 to 0.2"), "{text}");
+    assert!(text.contains("not"), "{text}");
+    assert!(text.contains("supported"), "{text}");
+    assert_eq!(
+        seen.lock().unwrap().authorization.as_deref(),
+        Some("Bearer token-abc")
+    );
+}
+
+#[tokio::test]
+async fn the_finalize_json_carries_both_versions_for_a_script() {
+    let (session, _) = start(fake()).await;
+    let text = admin::cluster(&session, Format::Json, ClusterCommand::FinalizeUpgrade)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["previous"], "0.1");
+    assert_eq!(json["active"], "0.2");
+}
+
+#[tokio::test]
 async fn a_get_that_found_the_key_exits_zero_and_prints_the_value_first() {
-    let (config, _) = start(fake()).await;
+    let (session, _) = start(fake()).await;
     let outcome = data::get(
-        &config,
+        &session,
         Format::Human,
         GetArgs {
-            keyspace: "demo".to_owned(),
-            key: "greeting".to_owned(),
+            keyspace: Some("demo".to_owned()),
+            key: Some("greeting".to_owned()),
+            keyspace_flag: None,
         },
     )
     .await
@@ -434,17 +673,18 @@ async fn a_get_that_found_the_key_exits_zero_and_prints_the_value_first() {
 
 #[tokio::test]
 async fn a_get_that_missed_exits_with_the_not_found_code_rather_than_failing() {
-    let (config, _) = start(Fake {
+    let (session, _) = start(Fake {
         key_exists: false,
         ..fake()
     })
     .await;
     let outcome = data::get(
-        &config,
+        &session,
         Format::Json,
         GetArgs {
-            keyspace: "demo".to_owned(),
-            key: "greeting".to_owned(),
+            keyspace: Some("demo".to_owned()),
+            key: Some("greeting".to_owned()),
+            keyspace_flag: None,
         },
     )
     .await
@@ -457,9 +697,10 @@ async fn a_get_that_missed_exits_with_the_not_found_code_rather_than_failing() {
 
 fn set_args() -> SetArgs {
     SetArgs {
-        keyspace: "demo".to_owned(),
-        key: "locks/leader".to_owned(),
+        keyspace: Some("demo".to_owned()),
+        key: Some("locks/leader".to_owned()),
         value: Some("node-1".to_owned()),
+        keyspace_flag: None,
         value_file: None,
         ttl: None,
         if_not_present: true,
@@ -469,8 +710,10 @@ fn set_args() -> SetArgs {
 
 #[tokio::test]
 async fn a_conditional_write_that_applied_exits_zero() {
-    let (config, seen) = start(fake()).await;
-    let outcome = data::set(&config, Format::Human, set_args()).await.unwrap();
+    let (session, seen) = start(fake()).await;
+    let outcome = data::set(&session, Format::Human, set_args())
+        .await
+        .unwrap();
     assert_eq!(outcome.code, 0);
     assert_eq!(outcome.text, "ok, version 43\n");
     let seen = seen.lock().unwrap();
@@ -478,14 +721,66 @@ async fn a_conditional_write_that_applied_exits_zero() {
     assert!(seen.set_condition, "the condition did not reach the server");
 }
 
+/// The P1 the review caught, end to end: with a default keyspace in effect, an
+/// explicit `--keyspace` on a file-backed set must write the file's bytes to the
+/// named key in the named keyspace, not misparse the arguments into a literal
+/// value in the default keyspace.
+#[tokio::test]
+async fn a_file_backed_set_with_an_explicit_keyspace_writes_where_it_is_told() {
+    let (mut session, seen) = start(fake()).await;
+    // The dangerous default: without the explicit flag, the positional
+    // shorthand would treat `set other key` as key `other`, value `key`.
+    session.keyspace = Some("current".to_owned());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("value");
+    std::fs::write(&path, b"piped-or-filed-secret").unwrap();
+
+    // The shape clap produces for `set --keyspace other key --value-file <path>`:
+    // the keyspace is the flag, the sole positional is the key, and the value is
+    // absent so it comes from the file.
+    let outcome = data::set(
+        &session,
+        Format::Human,
+        SetArgs {
+            keyspace: Some("key".to_owned()),
+            key: None,
+            value: None,
+            keyspace_flag: Some("other".to_owned()),
+            value_file: Some(path),
+            ttl: None,
+            if_not_present: false,
+            if_version: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.code, 0);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.set_keyspace.as_deref(),
+        Some("other"),
+        "the explicit keyspace must win over the session default"
+    );
+    assert_eq!(seen.set_key.as_deref(), Some(b"key".as_slice()));
+    assert_eq!(
+        seen.set_value.as_deref(),
+        Some(b"piped-or-filed-secret".as_slice()),
+        "the file's bytes must be the value, not a misparsed positional"
+    );
+}
+
 #[tokio::test]
 async fn a_conditional_write_that_lost_the_race_exits_with_its_own_code() {
-    let (config, _) = start(Fake {
+    let (session, _) = start(Fake {
         condition_holds: false,
         ..fake()
     })
     .await;
-    let outcome = data::set(&config, Format::Human, set_args()).await.unwrap();
+    let outcome = data::set(&session, Format::Human, set_args())
+        .await
+        .unwrap();
     assert_eq!(outcome.code, EXIT_CONDITION_NOT_MET);
     assert!(outcome.text.contains("version 41"), "{}", outcome.text);
 }
@@ -496,7 +791,8 @@ async fn an_unreachable_endpoint_reports_an_error_rather_than_hanging() {
     // Port 1 on loopback is never listening, and connecting fails fast.
     layer.client.endpoint = Some("http://127.0.0.1:1".to_owned());
     let config = layer.resolve().unwrap();
-    let result = admin::keyspace(&config, Format::Human, KeyspaceCommand::List).await;
+    let session = Session::new(config, Format::Human, false).unwrap();
+    let result = admin::keyspace(&session, Format::Human, KeyspaceCommand::List).await;
     assert!(result.is_err());
 }
 
@@ -504,18 +800,19 @@ async fn an_unreachable_endpoint_reports_an_error_rather_than_hanging() {
 /// which is what lets the CLI and an application share a single address.
 #[tokio::test]
 async fn the_admin_and_data_services_share_one_endpoint() {
-    let (config, _) = start(fake()).await;
+    let (session, _) = start(fake()).await;
     assert!(
-        admin::keyspace(&config, Format::Json, KeyspaceCommand::List)
+        admin::keyspace(&session, Format::Json, KeyspaceCommand::List)
             .await
             .is_ok()
     );
     assert!(data::get(
-        &config,
+        &session,
         Format::Json,
         GetArgs {
-            keyspace: "demo".to_owned(),
-            key: "k".to_owned(),
+            keyspace: Some("demo".to_owned()),
+            key: Some("k".to_owned()),
+            keyspace_flag: None,
         }
     )
     .await

@@ -16,11 +16,12 @@ use std::io::Write as _;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use orbita_cli::cli::{Cli, Command, ConfigCommand, DevArgs, Outcome, ServeArgs, EXIT_ERROR};
+use orbita_cli::cli::{Cli, Command, DevArgs, Outcome, ServeArgs, EXIT_ERROR};
 use orbita_cli::config::{self, Config};
 use orbita_cli::node::{self, NodeOptions};
-use orbita_cli::output::{render, EnvVariable, EnvView, Format};
-use orbita_cli::{admin, data, telemetry};
+use orbita_cli::output::Format;
+use orbita_cli::session::{self, Session};
+use orbita_cli::{repl, telemetry};
 
 fn main() {
     let cli = Cli::parse();
@@ -80,54 +81,40 @@ fn run(cli: Cli) -> Result<Outcome> {
         _ => config::load(config_path.as_deref(), &env, global)?,
     };
 
-    telemetry::install_logging(&config)?;
+    // A node installs its telemetry inside its own runtime, because the OTLP
+    // exporters need one to spawn on; see `node::run_node`. Every other command
+    // is a short-lived client, so stderr logging is installed here and now.
+    if !matches!(cli.command, Command::Serve(_) | Command::Dev(_)) {
+        telemetry::install_logging(&config)?;
+    }
 
     match cli.command {
+        // Serve and dev run a node and block forever, so they build their own
+        // runtime and never touch the shared dispatch.
         Command::Serve(args) => serve(&config, &args),
         Command::Dev(args) => dev(&config, &args),
-        Command::Config { command } => match command {
-            ConfigCommand::Show => Ok(Outcome::ok(render(format, &config)?)),
-            ConfigCommand::Env => {
-                let view = EnvView {
-                    variables: config::ENVIRONMENT
-                        .iter()
-                        .map(|(name, sets)| EnvVariable {
-                            name: (*name).to_owned(),
-                            sets: (*sets).to_owned(),
-                        })
-                        .collect(),
-                };
-                Ok(Outcome::ok(render(format, &view)?))
-            }
-        },
-        // Every remaining command is a network call, so the endpoint is named
-        // on the failure path. "connection refused" without an address is the
-        // least useful error a CLI can produce.
-        other => {
+        // The config commands read no cluster, so they render here without a
+        // runtime. That is the reason `orbita config show` does not start a
+        // thread pool it will never use.
+        Command::Config { command } => session::config_outcome(&config, format, command),
+        // The interactive session owns its own runtime and channel for the life
+        // of the loop, so it is entered directly rather than through block_on.
+        Command::Repl(_) => repl::run(config, format),
+        // Every remaining command is a network call. It goes through the exact
+        // dispatch the REPL uses, so there is one command surface and not two.
+        // A one-shot session is built, used once, and dropped. The endpoint is
+        // named on the failure path, because "connection refused" without an
+        // address is the least useful error a CLI can produce.
+        //
+        // The session is built *inside* `block_on`, not before it. Dialing a
+        // channel — even a lazy one — needs a Tokio reactor in scope, and
+        // constructing it out here panicked every network command with "there
+        // is no reactor running" before it could report a real error.
+        command => {
             let endpoint = config.client.endpoint.clone();
             block_on(async move {
-                let text = match other {
-                    Command::Keyspace { command } => {
-                        admin::keyspace(&config, format, command).await?
-                    }
-                    Command::Credential { command } => {
-                        admin::credential(&config, format, command).await?
-                    }
-                    Command::Cluster { command } => {
-                        admin::cluster(&config, format, command).await?
-                    }
-                    Command::Partition { command } => {
-                        admin::partition(&config, format, command).await?
-                    }
-                    Command::Get(args) => return data::get(&config, format, args).await,
-                    Command::Set(args) => return data::set(&config, format, args).await,
-                    Command::Delete(args) => return data::delete(&config, format, args).await,
-                    Command::List(args) => return data::list(&config, format, args).await,
-                    Command::Serve(_) | Command::Dev(_) | Command::Config { .. } => {
-                        unreachable!("handled above")
-                    }
-                };
-                Ok(Outcome::ok(text))
+                let session = Session::new(config, format, false)?;
+                session::dispatch(&session, format, command).await
             })
             .with_context(|| format!("while talking to {endpoint}"))
         }
@@ -140,9 +127,11 @@ fn serve(config: &Config, args: &ServeArgs) -> Result<Outcome> {
         dev: false,
     };
     if args.allow_version_skew {
-        tracing::warn!(
-            "--allow-version-skew does nothing. Compatibility is a cluster version window now, \
-             and no node checks a version yet"
+        // Written to stderr rather than through `tracing`, because the node's
+        // subscriber is not installed until `run_node` is inside its runtime.
+        eprintln!(
+            "orbita: --allow-version-skew does nothing. Compatibility is a cluster version window \
+             now, and no node checks a version yet"
         );
     }
     node::preflight(config, &options)?;

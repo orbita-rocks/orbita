@@ -80,3 +80,84 @@ def test_a_value_one_byte_over_the_reported_limit_is_refused(kv):
         kv.Set(pb.SetRequest(keyspace=KS, key=b"over-the-limit", value=value))
 
     assert caught.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_a_list_page_stays_under_the_reported_message_size_and_pages_the_rest(kv):
+    # A LIST the store assembles has to fit the channel the store advertises.
+    # A caller can ask for a thousand entries; with maximum values that is a
+    # multi-gigabyte response, and even a handful of them overruns the ceiling.
+    # The page has to be bounded by the bytes it will occupy, not just the count
+    # asked for, and carry a cursor for the remainder. Without that bound the
+    # transport refuses the oversized page and the caller cannot read its data.
+    limits = kv.GetLimits(pb.GetLimitsRequest(keyspace=KS))
+    ceiling = limits.max_message_bytes
+    value = b"v" * limits.max_value_bytes
+
+    # Enough maximum values that returning them all at once would overrun the
+    # ceiling several times over, and a caller who asks for far more than that.
+    count = 40
+    for i in range(count):
+        written = kv.Set(
+            pb.SetRequest(keyspace=KS, key=f"big/{i:04}".encode(), value=value)
+        )
+        assert written.applied
+
+    seen = []
+    cursor = b""
+    pages = 0
+    while True:
+        page = kv.List(
+            pb.ListRequest(
+                keyspace=KS,
+                prefix=b"big/",
+                limit=limits.max_list_entries,
+                cursor=cursor,
+                include_values=True,
+            )
+        )
+        pages += 1
+        assert pages < 100, "pagination is not terminating"
+        assert page.ByteSize() <= ceiling, (
+            f"a page ({page.ByteSize()} bytes) must fit under the advertised "
+            f"ceiling ({ceiling} bytes)"
+        )
+        seen.extend(entry.key for entry in page.entries)
+        cursor = page.next_cursor
+        if not cursor:
+            break
+
+    assert pages > 1, "the byte bound must have forced more than one page"
+    assert seen == [f"big/{i:04}".encode() for i in range(count)], (
+        "every key comes back once, in order, across the pages"
+    )
+
+
+def test_a_request_at_the_reported_message_size_reaches_the_handler(kv):
+    # The published max_message_bytes is a promise the transport has to keep: a
+    # client that sizes its channel to it (the harness does) and sends exactly
+    # that many bytes must reach the handler rather than be cut off first. The
+    # conftest channel is built to this very number, so this is the assertion
+    # that fails when the server advertises a ceiling above what its own
+    # transport will accept -- the request never arrives and gRPC reports a
+    # message-size error instead of the handler's own answer.
+    #
+    # The value runs far past the value limit on purpose. That makes the
+    # handler refuse the request for size, and that INVALID_ARGUMENT -- rather
+    # than a transport error -- is what proves the whole message crossed.
+    limits = kv.GetLimits(pb.GetLimitsRequest(keyspace=KS))
+    target = limits.max_message_bytes
+    key = b"at-the-message-limit"
+
+    # Grow the value until the whole request encodes to exactly the ceiling.
+    # One step is not always enough because the value's length varint can widen
+    # as it grows, so close the remaining gap until it lands.
+    request = pb.SetRequest(keyspace=KS, key=key, value=b"x" * target)
+    while request.ByteSize() != target:
+        value_len = len(request.value) + (target - request.ByteSize())
+        request = pb.SetRequest(keyspace=KS, key=key, value=b"x" * value_len)
+    assert request.ByteSize() == target
+
+    with pytest.raises(grpc.RpcError) as caught:
+        kv.Set(request)
+
+    assert caught.value.code() == grpc.StatusCode.INVALID_ARGUMENT

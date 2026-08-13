@@ -29,6 +29,10 @@ pub fn to_status(error: &Error) -> Status {
         Error::QuotaExceeded(_) => Code::ResourceExhausted,
         Error::Unauthenticated => Code::Unauthenticated,
         Error::PermissionDenied => Code::PermissionDenied,
+        // Unknown rather than Unavailable, and the difference is the point.
+        // Most client stacks retry UNAVAILABLE by default, and this is the one
+        // failure a client must not replay without looking first.
+        Error::Indeterminate(_) => Code::Unknown,
         Error::Internal(_) => Code::Internal,
     };
     Status::new(code, error.to_string())

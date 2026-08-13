@@ -3,7 +3,11 @@
 //! The nodes that hold the cluster's authoritative metadata: the partition
 //! map, worker membership, keyspace definitions and quotas, and ownership
 //! epochs. It detects dead workers, fences and replaces partition owners, and
-//! decides when to split.
+//! drives worker-prepared partition splits and merges end to end. The state
+//! machine refuses to retire source partitions until every holder has durably
+//! prepared child storage and reported it. Workers quiesce the source WALs and
+//! publish child manifests over shared immutable segments before the atomic map
+//! replacement.
 //!
 //! Nothing here is on the data path. Workers cache what they need and keep
 //! serving reads while the leader group is unavailable, which is deliberate: a
@@ -19,25 +23,21 @@
 //! sequence of [`ControlCommand`]s to the cluster's metadata. [`Controller`]
 //! proposes commands, applies them, and runs the sweep that turns missed
 //! heartbeats into failovers. [`ConsensusLog`] is the seam consensus lives
-//! behind, [`SingleNodeLog`] is the implementation that ships today, and
+//! behind, [`SingleNodeLog`] and [`RaftLog`] are the implementations, and
 //! [`ControlClient`] is how everything outside this crate reaches it.
 //!
 //! # What is here and what is not
 //!
-//! Consensus is behind a trait with a single-node implementation underneath
-//! it. That is staging, and [`consensus`] documents it as such along with
-//! exactly how `openraft` slots in without changing anything above the trait.
-//! A single-node control plane is not a production configuration and this
-//! crate does not pretend it is.
+//! Consensus is behind a trait with two implementations underneath it:
+//! [`SingleNodeLog`], the durable log for a cluster of one that `orbita dev`
+//! runs, and [`RaftLog`], a Raft group driven by `raft-rs` with every piece
+//! of its IO routed through `orbita_runtime`. [`consensus`] documents the
+//! seam and the `raft` module documents how the pieces map onto it.
 //!
-//! Partition merge is not implemented. It is the highest-risk requirement in
-//! the project, `docs/plan/README.md` flags it as the first thing to cut, and
-//! a half-built merge would be worse than none. The constraint it has to meet
-//! is written down in
-//! [ADR 0002](../../../docs/adr/0002-key-versions-are-partition-lamports.md):
-//! a merged partition's Lamport sequence has to exceed everything either side
-//! ever issued, or a client's held version stops matching through no write of
-//! its own.
+//! Merge follows
+//! [ADR 0010](../../../docs/adr/0010-a-merge-shares-both-parents-segments.md):
+//! both parents quiesce, the child keeps existing record versions, and its
+//! Lamport sequence resumes above both source horizons.
 //!
 //! # The failover ordering
 //!
@@ -51,11 +51,12 @@
 //! 3. The new owner waits out the deposed owner's read leases.
 //! 4. One entry names the most caught-up replica as owner.
 //!
-//! Steps two and four cannot be reordered or fused, and that is enforced in
-//! [`ClusterState`] rather than in the code that drives a failover:
-//! `AssignOwner` is rejected for a partition that still has an owner, and the
-//! only thing that removes an owner is `FencePartition`, which bumps the epoch
-//! in the same entry. A caller cannot get the order wrong even by trying.
+//! Steps two and four cannot be reordered or fused during failover, and that
+//! is enforced in [`ClusterState`] rather than in the code that drives it:
+//! `AssignOwner` is rejected for a partition that still has an owner. Planned
+//! shutdown is different because the old owner is present to quiesce writes
+//! and drain leases first. Its `TransferOwnership` entry moves the owner and
+//! bumps the epoch atomically, avoiding the ownerless interval failover needs.
 //!
 //! Step three is why [`ControlConfig`] keeps the lease duration next to the
 //! failure detection thresholds. Per
@@ -92,6 +93,7 @@
 #![forbid(unsafe_code)]
 
 mod admin;
+mod auth;
 mod client;
 mod codec;
 mod command;
@@ -99,20 +101,40 @@ mod config;
 pub mod consensus;
 mod controller;
 mod membership;
+mod metrics;
 mod model;
+mod raft;
 mod service;
 mod state;
+mod version;
 mod wire;
 
 pub use admin::AdminService;
-pub use client::{ControlClient, LocalControlClient};
+pub use auth::{bearer_secret, root_secret_hash, CredentialSnapshot};
+pub use client::{AdminOutcome, ControlClient, LocalControlClient, StatusReportResponse};
 pub use codec::CodecError;
-pub use command::ControlCommand;
+pub use command::{ControlCommand, MergeGeneration};
 pub use config::ControlConfig;
-pub use consensus::{ConsensusLog, LogEntry, LogIndex, SingleNodeLog};
-pub use controller::{BootstrapSpec, ClusterView, Controller, NodeView, PartitionView};
+pub use consensus::{
+    ConsensusLog, LogEntry, LogIndex, MembershipChange, RaftMember, SingleNodeLog,
+};
+pub use controller::{
+    BootstrapSpec, ClusterView, Controller, FinalizedUpgrade, NodeView, PartitionView,
+    RegistrationOutcome, ReplicaProgressView,
+};
 pub use membership::{NodeHealth, NodeRole, NodeStatus, PartitionProgress};
 pub use model::{hash_secret, Credential, Keyspace, KeyspaceConfig, Permission};
+pub use raft::{RaftLog, RaftMembership};
 pub use service::ControlService;
-pub use state::{ClusterState, NodeRecord, PartitionPhase};
-pub use wire::{METHOD_FETCH_MAP, METHOD_FETCH_NODES, METHOD_REPORT_STATUS};
+pub use state::{ClusterState, MergeIntent, NodeRecord, PartitionPhase, SplitIntent};
+pub use version::{
+    binary_speaks, binary_version, lifecycle_protocol_active, speaks_for, ClusterVersion,
+    CompatibilityRefusal, VersionRange, PROTOCOL_0_1, PROTOCOL_0_2,
+};
+pub use wire::{
+    MergeIntentSnapshot, SplitIntentSnapshot, WireMergeIntent, WireSplitIntent, METHOD_DRAIN_NODE,
+    METHOD_FETCH_COMMIT_INDEX, METHOD_FETCH_MAP, METHOD_FETCH_MERGE_INTENTS, METHOD_FETCH_NODES,
+    METHOD_FETCH_SPLIT_INTENTS, METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS,
+    METHOD_REPORT_STATUS_V2, METHOD_REPORT_STATUS_V3, METHOD_REPORT_STATUS_V4,
+    METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
+};

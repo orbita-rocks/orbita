@@ -21,17 +21,34 @@ publish = false
 [dependencies]
 orbita-core.workspace = true
 orbita-control.workspace = true
+orbita-format.workspace = true
+orbita-objectstore = { workspace = true, features = ["hyper-client"] }
 orbita-runtime.workspace = true
 orbita-proto.workspace = true
 orbita-storage.workspace = true
 orbita-wal.workspace = true
+async-trait.workspace = true
+
 bytes.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+crc32c.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+getrandom = "0.2"
+# The API crate only. Instruments come from the global meter, which is a no-op
+# until orbita-cli installs an exporter, so this adds no collector connection to
+# a test or a single-node run that never configures one.
+opentelemetry.workspace = true
 prost = "0.13"
 tonic = "0.12"
 
 [dev-dependencies]
 orbita-sim = { path = "../orbita-sim" }
+# The in-memory object store, so simulated partitions touch no filesystem.
+orbita-format = { workspace = true, features = ["testing"] }
 orbita-proto.workspace = true
+# So an over-the-wire test can size a request to the exact byte the server
+# advertises, by measuring a request's encoded length rather than guessing it.
+prost = "0.13"

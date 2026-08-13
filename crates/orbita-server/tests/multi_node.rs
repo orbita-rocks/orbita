@@ -29,14 +29,17 @@
 //! part that would gain fidelity is the part already covered by packaging.
 
 use orbita_control::{
-    BootstrapSpec, ControlConfig, ControlService, Controller, KeyspaceConfig, SingleNodeLog,
+    binary_speaks, BootstrapSpec, ClusterVersion, ControlCommand, ControlConfig, ControlService,
+    Controller, KeyspaceConfig, SingleNodeLog, METHOD_FETCH_SPLIT_INTENTS,
+    METHOD_FETCH_SPLIT_INTENTS_V2, METHOD_REPORT_STATUS_V5, METHOD_REPORT_STATUS_V6,
 };
 use orbita_core::{NodeId, PartitionMap};
 use orbita_proto::v1::kv_client::KvClient;
 use orbita_proto::v1::{GetRequest, SetRequest};
-use orbita_runtime::{Runtime, ServiceId, Transport};
+use orbita_runtime::{PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportResult};
 use orbita_server::{Server, ServerConfig, ServerRuntime, DEFAULT_KEYSPACE};
 
+use bytes::{BufMut, Bytes, BytesMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -83,6 +86,73 @@ struct LeaderGroup {
     _dir: DataDir,
 }
 
+/// A leader group whose split vocabulary is missing, wrapped around a real
+/// controller so every other method behaves normally. This is the shape of a
+/// rolling upgrade in progress: the worker is new, the leader is not, and the
+/// worker still has to boot.
+struct PreSplitControl {
+    inner: ControlService<ServerRuntime, SingleNodeLog<ServerRuntime>>,
+    split_fetch: SplitFetchResponse,
+    refuse_version: bool,
+    split_calls: Arc<AtomicU64>,
+    status_calls: Arc<AtomicU64>,
+}
+
+enum SplitFetchResponse {
+    UnknownMethod,
+    Refuse(String),
+}
+
+impl PeerHandler for PreSplitControl {
+    async fn handle(&self, from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
+        match call.method {
+            METHOD_FETCH_SPLIT_INTENTS | METHOD_FETCH_SPLIT_INTENTS_V2 => {
+                // Startup fetches split state before its first status report.
+                // Count that exchange only, not later control-loop polls.
+                if self.status_calls.load(Ordering::Relaxed) == 0 {
+                    self.split_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                let message = match &self.split_fetch {
+                    SplitFetchResponse::UnknownMethod => {
+                        format!("unknown control method {}", call.method)
+                    }
+                    SplitFetchResponse::Refuse(message) => message.clone(),
+                };
+                Ok(legacy_control_error(&message))
+            }
+            METHOD_REPORT_STATUS_V6 if self.refuse_version => Ok(legacy_control_error(&format!(
+                "unknown control method {METHOD_REPORT_STATUS_V6}"
+            ))),
+            METHOD_REPORT_STATUS_V5 if self.refuse_version => {
+                self.status_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(incompatible_response())
+            }
+            _ => self.inner.handle(from, call).await,
+        }
+    }
+}
+
+/// The exact response shape an old control service emits for an unknown method.
+fn legacy_control_error(message: &str) -> Bytes {
+    let mut encoded = BytesMut::new();
+    encoded.put_u8(3);
+    encoded.put_u32_le(message.len() as u32);
+    encoded.put_slice(message.as_bytes());
+    encoded.freeze()
+}
+
+fn incompatible_response() -> Bytes {
+    let speaks = binary_speaks();
+    let active = ClusterVersion::new(speaks.max.major + 1, 0);
+    let mut encoded = BytesMut::new();
+    encoded.put_u8(7);
+    for version in [speaks.min, speaks.max, active] {
+        encoded.put_u32_le(version.major);
+        encoded.put_u32_le(version.minor);
+    }
+    encoded.freeze()
+}
+
 async fn start_leader_group(config: ControlConfig) -> LeaderGroup {
     let dir = DataDir::new("leader");
     let runtime = ServerRuntime::new(LEADER, &dir.0, Some(1));
@@ -127,6 +197,57 @@ async fn start_leader_group(config: ControlConfig) -> LeaderGroup {
     }
 }
 
+async fn start_pre_split_leader_group(
+    split_fetch: SplitFetchResponse,
+    refuse_version: bool,
+) -> (LeaderGroup, Arc<AtomicU64>, Arc<AtomicU64>) {
+    let dir = DataDir::new("pre-split-leader");
+    let runtime = ServerRuntime::new(LEADER, &dir.0, Some(1));
+    let log = SingleNodeLog::open(&runtime)
+        .await
+        .expect("the consensus log opens");
+    let controller = Controller::new(runtime.clone(), log, ControlConfig::default());
+    let split_calls = Arc::new(AtomicU64::new(0));
+    let status_calls = Arc::new(AtomicU64::new(0));
+    runtime.transport().register(
+        ServiceId::Control,
+        PreSplitControl {
+            inner: ControlService::new(controller.clone()),
+            split_fetch,
+            refuse_version,
+            split_calls: Arc::clone(&split_calls),
+            status_calls: Arc::clone(&status_calls),
+        },
+    );
+    let listener = runtime
+        .transport()
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("the leader group binds a peer port");
+    let address = listener.local_addr().to_string();
+    std::mem::forget(listener);
+    controller
+        .bootstrap(&BootstrapSpec {
+            keyspace: DEFAULT_KEYSPACE.to_string(),
+            config: KeyspaceConfig::default(),
+            leaders: vec![(LEADER, address.clone())],
+            workers: vec![(WORKERS[0], String::new())],
+        })
+        .await
+        .expect("the cluster bootstraps");
+    let sweeping = controller.clone();
+    tokio::spawn(async move { sweeping.run().await });
+    (
+        LeaderGroup {
+            controller,
+            address,
+            _dir: dir,
+        },
+        split_calls,
+        status_calls,
+    )
+}
+
 /// One worker, with the directory it writes to.
 struct Worker {
     id: NodeId,
@@ -167,6 +288,74 @@ impl Worker {
         let server = self.server.take().expect("this worker is still running");
         server.shutdown().await.expect("the listener stops");
     }
+
+    async fn drain(&mut self, timeout: Duration) -> orbita_core::Result<()> {
+        let server = self.server.take().expect("this worker is still running");
+        server.drain(timeout).await
+    }
+}
+
+/// The worker-first rolling upgrade in UPGRADES.md: a new binary meets a leader
+/// that has never heard of split intents. Startup fetches those intents before
+/// hosts enter routing, so if the unknown-method refusal were fatal every new
+/// worker would crash-loop instead of coming up not-ready.
+#[tokio::test]
+async fn a_worker_boots_against_a_leader_that_does_not_know_the_split_intent_method() {
+    let (group, split_calls, status_calls) =
+        start_pre_split_leader_group(SplitFetchResponse::UnknownMethod, true).await;
+    let mut worker = start_worker(WORKERS[0], &group.address, BUDGET).await;
+
+    let deadline = Instant::now() + BUDGET;
+    while status_calls.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        split_calls.load(Ordering::Relaxed),
+        2,
+        "startup falls back from the unknown V2 method to the unknown V1 method"
+    );
+    assert!(
+        status_calls.load(Ordering::Relaxed) > 0,
+        "the running worker reached the version-aware heartbeat"
+    );
+    let readiness = worker.server().readiness().state();
+    assert!(!readiness.is_ready());
+    assert!(
+        !readiness.is_met(orbita_server::ReadinessCondition::ClusterVersionCompatible),
+        "an authoritative version refusal stops the rollout without stopping the process"
+    );
+    worker.kill().await;
+}
+
+/// The compatibility path is scoped to one refusal, not to the method. A leader
+/// that knows the method and cannot answer it leaves the worker unable to rule
+/// out an in-flight split, which is exactly what the restart gates need.
+#[tokio::test]
+async fn a_non_compatibility_split_fetch_refusal_still_fails_worker_startup() {
+    let (group, split_calls, _) = start_pre_split_leader_group(
+        SplitFetchResponse::Refuse("split state is unavailable".into()),
+        false,
+    )
+    .await;
+    let dir = DataDir::new("refused-split-fetch-worker");
+    let config = ServerConfig::single_node(&dir.0)
+        .with_node_id(WORKERS[0])
+        .on_ephemeral_port()
+        .with_peers(vec![(LEADER, group.address.clone())])
+        .with_leader_group(vec![LEADER]);
+
+    let error = match Server::start(config).await {
+        Ok(server) => {
+            server.shutdown().await.unwrap();
+            panic!("a real split-state refusal must not be treated as an empty active set")
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        orbita_core::Error::Internal(message) if message == "split state is unavailable"
+    ));
+    assert_eq!(split_calls.load(Ordering::Relaxed), 1);
 }
 
 fn set(key: &str, value: &str) -> SetRequest {
@@ -302,6 +491,14 @@ async fn a_cluster_survives_losing_the_owner_without_losing_an_acknowledged_writ
             .into_inner();
         assert!(found.found, "{key} was missing from the replica");
         assert_eq!(String::from_utf8_lossy(&found.value), *value);
+    }
+    let deadline = Instant::now() + BUDGET * 3;
+    while workers[replica_index].server().replica_reads() == 0 && Instant::now() < deadline {
+        let _ = workers[replica_index]
+            .client
+            .get(get(&acknowledged[0].0))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
         workers[replica_index].server().replica_reads() > 0,
@@ -451,4 +648,317 @@ async fn a_cluster_survives_losing_the_owner_without_losing_an_acknowledged_writ
             worker.kill().await;
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_worker_reports_ready_once_the_leader_group_has_heard_from_it() {
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+
+    let mut worker = start_worker(WORKERS[0], &group.address, lease).await;
+
+    // Recovery and partition open complete inside `Server::start`, but the
+    // join lands only when the control loop's first heartbeat is accepted, so
+    // readiness is awaited rather than asserted. The subscription is the same
+    // handle the SIGTERM handoff will consume, which is why this waits on the
+    // gate instead of polling the RPC.
+    let gate = worker.server().readiness();
+    let mut watched = gate.subscribe();
+    tokio::time::timeout(
+        BUDGET * 4,
+        watched.wait_for(orbita_server::ReadinessState::is_ready),
+    )
+    .await
+    .expect("the worker becomes ready within the budget")
+    .expect("the gate outlives the wait");
+
+    // The wire agrees with the gate.
+    let mut health = orbita_proto::v1::health_client::HealthClient::connect(format!(
+        "http://{}",
+        worker.server().local_addr()
+    ))
+    .await
+    .expect("a health client connects");
+    let response = health
+        .check_readiness(orbita_proto::v1::CheckReadinessRequest {})
+        .await
+        .expect("readiness is answered")
+        .into_inner();
+    assert!(response.ready, "unmet: {:?}", response.conditions);
+
+    worker.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_planned_shutdown_hands_off_acknowledged_writes_and_retires_the_old_owner() {
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+    let mut workers = Vec::new();
+    for id in WORKERS {
+        workers.push(start_worker(id, &group.address, lease).await);
+    }
+
+    let seen = group.controller.clone();
+    let placed = Arc::new(std::sync::Mutex::new((None, Vec::new())));
+    let watch = Arc::clone(&placed);
+    tokio::spawn(async move {
+        loop {
+            *watch.lock().unwrap() = placement(&seen.partition_map().await);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    until("the partition to be replicated", BUDGET * 4, || {
+        placed.lock().unwrap().1.len() == 2
+    })
+    .await;
+    let old_owner = placed.lock().unwrap().0.unwrap();
+    let old_index = workers
+        .iter()
+        .position(|worker| worker.id == old_owner)
+        .unwrap();
+
+    let deadline = Instant::now() + BUDGET * 4;
+    loop {
+        let outcome = workers[old_index]
+            .client
+            .set(set("drain-warmup", "ready"))
+            .await;
+        if matches!(&outcome, Ok(response) if response.get_ref().applied) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cluster never became writable"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut writer = workers[old_index].client.clone();
+    let writes = tokio::spawn(async move {
+        let mut acknowledged = Vec::new();
+        for i in 0..50u64 {
+            let key = format!("drain-{i}");
+            match writer.set(set(&key, &i.to_string())).await {
+                Ok(response) if response.get_ref().applied => acknowledged.push((key, i)),
+                Ok(_) | Err(_) => break,
+            }
+        }
+        acknowledged
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    workers[old_index]
+        .drain(BUDGET * 6)
+        .await
+        .expect("the planned handoff completes");
+    let acknowledged = writes.await.expect("the writer task finishes");
+    assert!(
+        !acknowledged.is_empty(),
+        "the concurrent writer proved nothing"
+    );
+
+    let map = group.controller.partition_map().await;
+    let (new_owner, _) = placement(&map);
+    let new_owner = new_owner.expect("the partition remains owned");
+    assert_ne!(new_owner, old_owner);
+    let new_index = workers
+        .iter()
+        .position(|worker| worker.id == new_owner)
+        .unwrap();
+    for (key, value) in acknowledged {
+        let response = workers[new_index]
+            .client
+            .get(get(&key))
+            .await
+            .expect("an acknowledged write is readable from the new owner")
+            .into_inner();
+        assert_eq!(String::from_utf8_lossy(&response.value), value.to_string());
+    }
+
+    assert!(
+        workers[old_index].client.get(get("drain-0")).await.is_err(),
+        "the stale owner endpoint must stop serving after transfer"
+    );
+    for worker in &mut workers {
+        if worker.server.is_some() {
+            worker.kill().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_planned_shutdown_completes_when_the_replicas_were_placed_after_the_last_write() {
+    // The load-sensitive version of this is
+    // `a_planned_shutdown_hands_off_acknowledged_writes_and_retires_the_old_owner`,
+    // which only reaches this state when the scheduler is busy enough that the
+    // owner's map poll loses a race with the drain. Here the ordering is built
+    // rather than waited for: one worker starts alone, so the partition is born
+    // owned and unreplicated, every write lands while that is still true, and
+    // the replicas are placed afterwards with nothing left to write.
+    //
+    // That is the shape a SIGTERM arriving shortly after a scale-up has, and it
+    // is the one where a handoff has to be made possible rather than merely
+    // permitted: the control plane will not give a partition to a replica that
+    // has not caught up, write admission is already closed, and an append is
+    // the only thing that ever moves a replica forward.
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+
+    let mut workers = vec![start_worker(WORKERS[0], &group.address, lease).await];
+    let seen = group.controller.clone();
+    let placed = Arc::new(std::sync::Mutex::new((None, Vec::new())));
+    let watch = Arc::clone(&placed);
+    tokio::spawn(async move {
+        loop {
+            *watch.lock().unwrap() = placement(&seen.partition_map().await);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    // Twice the budget the other tests give this, because they start from a
+    // cluster that is already at its final shape and this one is waiting out a
+    // cold bootstrap. The number that matters to what is under test is the
+    // drain budget below, which is the same as everywhere else.
+    const SETUP: Duration = Duration::from_secs(16);
+    until("the only worker to be given the partition", SETUP, || {
+        let held = placed.lock().unwrap();
+        held.0 == Some(WORKERS[0]) && held.1.is_empty()
+    })
+    .await;
+
+    // Acknowledged while the map honestly promises a single copy.
+    let mut acknowledged = Vec::new();
+    let deadline = Instant::now() + SETUP;
+    while acknowledged.len() < 10 {
+        let key = format!("early-{}", acknowledged.len());
+        let value = acknowledged.len().to_string();
+        match workers[0].client.set(set(&key, &value)).await {
+            Ok(response) if response.get_ref().applied => acknowledged.push((key, value)),
+            _ => assert!(
+                Instant::now() < deadline,
+                "the single-node cluster never became writable"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The scale-up. Nothing writes from here on, so the only thing that can
+    // put these entries on a second node is the owner deciding to send them.
+    for id in &WORKERS[1..] {
+        workers.push(start_worker(*id, &group.address, lease).await);
+    }
+    until("the scaled-up partition to be replicated", SETUP, || {
+        placed.lock().unwrap().1.len() == 2
+    })
+    .await;
+
+    workers[0]
+        .drain(BUDGET * 6)
+        .await
+        .expect("the planned handoff completes");
+
+    let (new_owner, _) = placement(&group.controller.partition_map().await);
+    let new_owner = new_owner.expect("the partition remains owned");
+    assert_ne!(new_owner, WORKERS[0], "the drained node is still the owner");
+    let new_index = workers
+        .iter()
+        .position(|worker| worker.id == new_owner)
+        .unwrap();
+    for (key, value) in acknowledged {
+        let response = workers[new_index]
+            .client
+            .get(get(&key))
+            .await
+            .expect("an acknowledged write is readable from the new owner")
+            .into_inner();
+        assert!(response.found, "{key} did not survive the handoff");
+        assert_eq!(String::from_utf8_lossy(&response.value), value);
+    }
+
+    for worker in &mut workers {
+        if worker.server.is_some() {
+            worker.kill().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_timeout_is_reported_as_failure() {
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+    let mut worker = start_worker(WORKERS[0], &group.address, lease).await;
+
+    let deadline = Instant::now() + BUDGET * 3;
+    while !worker.server().readiness().is_ready() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        worker.server().readiness().is_ready(),
+        "worker never became ready"
+    );
+
+    let error = worker
+        .drain(Duration::from_millis(10))
+        .await
+        .expect_err("a ten millisecond budget cannot drain a live lease");
+    assert!(error.to_string().contains("drain timed out"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incompatible_rejoin_stays_running_and_reports_version_readiness() {
+    let control = ControlConfig::for_failover_budget(BUDGET);
+    let lease = control.lease_duration;
+    let group = start_leader_group(control).await;
+    let previous = binary_speaks().max;
+    let active = ClusterVersion::new(previous.major, previous.minor + 1);
+    group
+        .controller
+        .submit(ControlCommand::SetClusterVersion {
+            version: active,
+            expect: previous,
+        })
+        .await
+        .expect("the test advances beyond this binary's range");
+
+    let mut worker = start_worker(WORKERS[0], &group.address, lease).await;
+    tokio::time::timeout(BUDGET, async {
+        loop {
+            if worker.server().active_cluster_version() == Some(active) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the worker receives the structured refusal");
+
+    let readiness = worker.server().readiness().state();
+    assert!(
+        !readiness.is_ready(),
+        "an incompatible node must not be Ready"
+    );
+    assert!(!readiness.is_met(orbita_server::ReadinessCondition::ClusterVersionCompatible));
+    assert!(!readiness.is_met(orbita_server::ReadinessCondition::ControlPlaneJoined));
+
+    // The health endpoint is still reachable, which is what keeps diagnostics
+    // available while Kubernetes holds the rollout at this pod.
+    let mut health = orbita_proto::v1::health_client::HealthClient::connect(format!(
+        "http://{}",
+        worker.server().local_addr()
+    ))
+    .await
+    .expect("the incompatible worker stays alive");
+    let response = health
+        .check_readiness(orbita_proto::v1::CheckReadinessRequest {})
+        .await
+        .expect("the running worker answers readiness")
+        .into_inner();
+    assert!(response
+        .conditions
+        .iter()
+        .any(|condition| condition.name == "cluster-version-compatible" && !condition.met));
+
+    worker.kill().await;
 }

@@ -17,14 +17,14 @@ There are two branches. `develop` is where work lands and where prerelease
 artifacts come from. `main` only ever contains released code, and a tag on
 `main` is what publishes.
 
-|                | `develop`                | `main`                       |
-| -------------- | ------------------------ | ---------------------------- |
-| Version        | `0.2.0-dev`              | `0.1.0`                      |
-| Built on       | every push               | a pushed tag                 |
-| Image tags     | `develop`, `sha-abc1234` | `0.1.0`, `0.1`, `latest`     |
-| Binaries       | workflow artifacts, 30d  | attached to the release      |
-| Chart          | not published            | pushed to GHCR as OCI        |
-| GitHub release | none                     | yes                          |
+|                | `develop`                  | `main`                   |
+| -------------- | -------------------------- | ------------------------ |
+| Version        | `0.2.0-dev`                | `0.1.0`                  |
+| Built on       | nightly or by hand         | a pushed tag             |
+| Image tags     | `0.2.0-dev`, `sha-abc1234` | `0.1.0`, `0.1`, `latest` |
+| Binaries       | workflow artifacts, 7d     | attached to the release  |
+| Chart          | not published              | pushed to GHCR as OCI    |
+| GitHub release | none                       | yes                      |
 
 The `-dev` suffix is a real semver prerelease, so `0.2.0-dev` sorts before
 `0.2.0` and Cargo is happy with it. It does not change per commit. A commit is
@@ -32,6 +32,32 @@ identified by the sha in the image tag and by the sha baked into the binary,
 which is why `orbita --version` prints `0.2.0-dev (abc1234)`. Bumping the
 version on every merge would produce a version number nobody could reason
 about and a lockfile churning on every commit.
+
+The nightly cadence is deliberate. A multi-architecture image compiles ARM
+under emulation and costs far more than the merge gate, while prerelease users
+need a recent build rather than one artifact per commit. The workflow can be
+dispatched when a particular commit is needed sooner. SHA-only image versions
+expire after 30 days; release tags and the moving `-dev` tag are never selected
+by that cleanup, because it only deletes an image whose tags are all `sha-`
+prefixed.
+
+Every published tag carries a version. There is no branch-named `develop` tag,
+because the name would say nothing about what is inside it: two pulls a release
+cycle apart would hand you incompatible binaries with no way to tell them apart
+before running one. `0.2.0-dev` still floats, since it names a cycle rather than
+a build, but it at least tells you which cycle, and it sorts against the
+releases either side of it.
+
+That tag is also what `develop`'s own install paths pin. `bump-version.sh`
+writes the workspace version into the image tags in
+`deploy/manifests/orbita.yaml` and into the chart's `appVersion`, which
+`values.yaml` defaults the image tag to. If nothing published `0.2.0-dev`,
+applying the manifests off `develop` would fail to pull. Because it floats, a
+bug report should still quote the `sha-` tag.
+
+Dispatching the Prerelease workflow against a ref whose version has no `-dev`
+suffix fails on purpose. `main` carries a released version, and publishing it
+from this workflow would put a develop build at the name of a real release.
 
 ## Cutting a release
 
@@ -66,10 +92,18 @@ the tag does not help anybody.
 
 Pushing the tag starts the **Release** workflow, which verifies the tag against
 the tree, reruns the full test suite with the nightly simulation batch,
-builds binaries for four targets, builds and signs a multi-architecture image,
+builds binaries for six targets, builds and signs a multi-architecture image,
 publishes the chart if its version moved, and creates the GitHub release. The
 publishing jobs sit behind the `release` environment, so there is a second
 approval between a pushed tag and a public artifact.
+
+Four of those six targets are Linux, because both architectures are built
+against glibc and against musl. The musl artifacts are fully static, meaning no
+interpreter and no dynamic section, so they run on a host whose libc nobody
+checked first. That is the whole single-binary pitch, and it is worth two extra
+matrix legs to keep it honest. They share runners with their glibc
+counterparts, so the cost is build minutes rather than machines. The only thing
+the musl legs need beyond the usual is `musl-tools`, for ring's C.
 
 Afterwards the **Post-release** workflow opens a pull request merging `main`
 back into `develop` and setting the version to `0.2.0-dev`. It looks like
@@ -102,7 +136,8 @@ direction; cut a minor release rather than arguing with it.
 - `scripts/tag-release.sh` checks that a commit is releasable, then tags it.
 - `.github/workflows/release-pr.yml` opens the release pull request.
 - `.github/workflows/release.yml` is everything a tag does.
-- `.github/workflows/prerelease.yml` is everything a push to `develop` does.
+- `.github/workflows/prerelease.yml` publishes the nightly or manually requested
+  build of `develop`.
 - `.github/workflows/post-release.yml` back-merges and opens the next cycle.
 - `cliff.toml` decides which commit types reach the changelog. It follows the
   visible and hidden split in the conventional commit skill, with anything
@@ -149,7 +184,7 @@ are internal libraries, and publishing them would be a semver promise about
 `orbita-core`'s types that is not worth making before 1.0. The product is the
 binary and the image.
 
-There are no musl builds. The image builds RocksDB from source with a C++
-toolchain, and static linking against musl is a project of its own. It becomes
-much cheaper if the storage engine stops needing C++, and is worth revisiting
-then.
+The image is not built on musl. The static binaries exist, so a `scratch` or
+distroless base is now possible, but that is a separate decision about the
+image's attack surface and debuggability rather than a free consequence of this
+one.

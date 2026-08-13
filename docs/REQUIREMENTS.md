@@ -1,8 +1,9 @@
 # Orbita
 
 > Orbita is a strongly consistent, multitenant distributed key-value store. It
-> uses RocksDB for storage, keeps compacted data on object storage, and is
-> built under deterministic simulation from day one.
+> stores partitions as immutable objects behind a memory-resident index, keeps
+> the objects on object storage, and is built under deterministic simulation
+> from day one.
 
 This document is the product requirements for Orbita v1. It fixes the scope,
 the guarantees, and the acceptance criteria. Sequencing and detailed design
@@ -41,9 +42,12 @@ past where etcd stops.
   adopting, and they feel etcd's limits directly.
 - **Positioned against etcd.** Same role, without the 8GB ceiling, the single
   Raft group, or the single-tenant assumption.
-- **Positioned respectfully against FoundationDB.** FDB is more capable if you
-  need multi-key transactions, and heavier if you don't. We concede the
-  transaction gap openly rather than pretending it away.
+- **Positioned respectfully against FoundationDB.** FDB is more capable today
+  if you need multi-key transactions, and v1 concedes that openly. The
+  concession is now dated rather than permanent: strict-serializability
+  transactions are a committed post-v1 direction (see Transactions below), and
+  the long-term contrast with FDB becomes published correctness evidence
+  rather than scope.
 - **Not a cache.** Redis and Valkey trade durability and consistency for
   latency. Orbita makes the opposite trade. We do not compete on raw latency
   and should not invite that comparison.
@@ -98,7 +102,10 @@ Each page of a LIST is a consistent snapshot of a single partition's range. A
 multi-page scan across partitions is not a point-in-time snapshot. I
 considered snapshot-consistent full scans, but that pulls MVCC machinery into
 v1 for a guarantee the target use cases rarely need, so we ship the honest,
-cheap version and document it clearly.
+cheap version and document it clearly. The eventual fix is already designed:
+once snapshot timestamps land as the first stage of the transaction work (see
+Transactions), a scan can carry one and a multi-page scan becomes
+point-in-time. v1 ships without it.
 
 ### TTL
 
@@ -138,6 +145,42 @@ partitioned key namespace with:
   store learns eventually; we build it in from the start.
 - **Config.** Per-keyspace defaults such as default TTL and max value size.
 
+### Security
+
+The first version of this document specified credentials and quotas and said
+nothing about transport security or granular authorization, which had the
+priorities inverted for a system asking to hold control-plane state. This
+section fixes the requirements; ROADMAP.md schedules them, currently at
+v0.5.0.
+
+- **Encryption in transit, everywhere.** TLS on the client surface, and
+  mutually authenticated connections between peers, completing what
+  [ADR 0004](adr/0004-peer-traffic-uses-private-framing.md) starts.
+  Certificate rotation must not require a restart, because coordination
+  infrastructure is exactly the thing you cannot bounce casually.
+- **Authorization finer than the keyspace.** Credentials grantable per key
+  prefix within a keyspace, read or write. A substrate shared by teams needs
+  the range-scoped permissions etcd users already expect, and arguably needs
+  them more, since multitenancy is the pitch.
+- **Audit logging.** Administrative and credential operations produce an
+  audit record. The target buyer's security review asks for this by name.
+
+- **Encryption at rest.** Envelope encryption of the write-ahead log and the
+  object segments under a single KMS-backed cluster key, with key rotation
+  re-wrapping data keys rather than rewriting data.
+
+An earlier version of this document fenced encryption at rest out, on the
+argument that object storage backends provide it and the deployment docs
+should say how to turn it on. That reversal is deliberate. The argument was
+never complete: server-side encryption covers segments and manifests, but the
+2-of-3 replicated WAL lives on local worker disks and holds every
+acknowledged write that has not yet flushed, so the data with the strongest
+durability promise had the weakest at-rest story. Per-keyspace keys and
+customer-supplied keys are noted as a possible multitenancy differentiator
+and deliberately not required here; one cluster key closes the gap without
+pulling key-per-tenant plumbing through the format, compaction, and the admin
+surface.
+
 ## Architecture requirements
 
 This section fixes the architectural commitments the product depends on. The
@@ -146,10 +189,12 @@ to the design doc.
 
 ### Topology
 
-A cluster is a leader group plus workers, all running the same binary in
-different roles.
+A cluster is three or more combined nodes. Every node serves the worker data
+path, while an automatically managed subset of three or five nodes votes in
+Raft. See [ADR 0011](adr/0011-combined-nodes-form-one-automatically-managed-voter-set.md).
 
-- **The leader group** is 3 or more nodes running Raft. It owns the partition
+- **The voters** are three nodes by default, or five when configured. One voter
+  is the elected Raft leader. The group owns the partition
   map, worker membership, keyspace metadata, split and merge decisions, and
   failover. I considered object-store CAS election and an external
   coordinator, but a Raft group is the battle-tested pattern here and gives
@@ -157,7 +202,7 @@ different roles.
   raft-rs) rather than building our own; Orbita owns the storage and network
   traits underneath it, which is exactly the seam deterministic simulation
   needs anyway.
-- **Workers** own partitions. Each partition has one owning worker that
+- **Workers** are the data-path capability every node has. Each partition has one owning worker that
   serializes all writes, plus two full replicas.
 
 ### Partitioning
@@ -206,6 +251,17 @@ Object storage access goes through a pluggable storage trait. v1 ships and
 supports the S3-compatible API only (AWS S3, MinIO, R2); other backends are
 the community's to add through the trait.
 
+Credentials for the S3 backend cannot be limited to static keys. On AWS the
+node must be able to assume an IAM role, and it must be able to source
+credentials from the instance profile via the instance metadata service, with
+role assumption as the preferred deployment and instance profiles required.
+Both hand out short-lived session credentials, so the node has to refresh them
+before expiry without interrupting in-flight work. This matters because
+long-lived access keys in a Secret are exactly what security-conscious AWS
+shops prohibit; without keyless credential sourcing, a real AWS deployment of
+Orbita fails their review before it starts. Static keys stay supported,
+because MinIO and R2 offer nothing else.
+
 ### Failure handling
 
 When a partition owner dies, the leader group detects it via missed
@@ -223,11 +279,88 @@ connects to any worker, typically through one load-balanced endpoint. Every
 worker caches the partition map and forwards misdirected requests to the right
 owner internally, costing at most one intra-cluster hop.
 
-I considered smart clients that route directly to partition owners, which is
-the higher-performance pattern, but it means maintaining a real client library
-per language forever. A protocol simple enough to use from generated gRPC
-stubs is worth the hop, especially for an open-source project that lives or
-dies on ease of adoption.
+The dumb path stays fully supported: generated stubs against the load-balanced
+endpoint remain a complete way to use every non-transactional operation,
+because ease of adoption is still what an open-source project lives or dies
+on. The original position stopped there, since a real client library per
+language is a forever cost. Transactions changed the math. An interactive
+transaction cannot pay a forwarding hop per read, and conflict retries belong
+in a library rather than in every caller, so we now also ship an official
+smart client:
+
+- **A Rust core library**, generic over `orbita_runtime` like every other
+  crate, so the deterministic simulator can drive the client too and
+  map-staleness races and mid-commit failovers become seeded, replayable
+  tests.
+- **A partition map cache** discovered through the API the same way limits
+  are, and repaired by the standard loop: a misrouted request is answered with
+  the right owner, the client patches its cache and retries. Misrouting is
+  never a correctness problem because epoch fencing means a deposed owner can
+  only refuse, so the cache is purely a latency optimization.
+- **A retry-closure transaction API** in the FoundationDB style, so the
+  conflict-retry state machine lives in the library once.
+- **Python bindings next**, with the end-to-end suite doubling as the
+  conformance suite for every binding after it.
+
+Third parties will write clients we do not, so `docs/CLIENTS.md` specifies
+what a client must implement: the routing and repair loop, the error taxonomy
+and which outcomes rerun a transaction, and the read-your-own-writes overlay
+semantics, including how buffered writes merge into a scan. It is written
+alongside the official client rather than after it, because a spec nobody has
+implemented against is prose, not a contract.
+
+## Transactions
+
+The first version of this document treated multi-key transactions as
+permanently out of scope. That position is reversed: ACID transactions are a
+committed direction, currently scheduled at v0.3.0 in ROADMAP.md, after the
+first release and after the testing investment that makes checking them
+possible. This section records the decisions so everything built earlier has
+them in mind, not to schedule the work; sequencing lives in ROADMAP.md.
+
+The guarantee is strict serializability or nothing. I considered causal
+transactions over vector clocks, which avoid central timestamping and handle
+splits and merges gracefully, but they deliver parallel snapshot isolation,
+and its anomalies, meaning two observers seeing commits in different orders,
+are exactly what the coordination use cases exist to prevent. A transaction
+guarantee weaker than the KV store's linearizability would undercut the one
+claim the product makes.
+
+The design that fits the architecture:
+
+- **Timestamps come from an oracle in the leader group**, allocated in blocks
+  committed through Raft so that Raft stays off the per-transaction hot path,
+  with the new leader skipping to the end of the last reserved block on
+  failover. I rejected clock-based schemes (HLCs with uncertainty windows)
+  because their correctness rests on a skew bound holding in production, which
+  the simulator can exercise but never discharge, and an assumption-dependent
+  guarantee lands on the headline claim.
+- **MVCC rides the immutable-object format.** Old segments already contain old
+  versions and a manifest is already a snapshot; what MVCC adds is retention
+  governed by a cluster-wide low-watermark, the minimum active snapshot
+  timestamp, with a configurable window so a forgotten reader cannot stall
+  reclamation forever. Snapshot reads older than the window fail cleanly.
+- **Validation happens at partition owners.** Optimistic concurrency: reads at
+  a snapshot timestamp, writes buffered in the client, and a commit validated
+  by the owners involved, with intents logged through the existing 2-of-3 WAL
+  so they survive failover, and epoch fencing preventing a deposed owner from
+  validating anything. The coordinator is an owner, never the client, so a
+  client that dies mid-transaction leaves nothing to clean up.
+- **Single-key writes never touch the oracle.** They keep today's latency and
+  availability. The partition Lamport advances past any commit timestamp it
+  observes, Lamport's own rule, so versions stay totally ordered within a
+  partition and the CAS contract is unchanged.
+
+The staging, each stage independently shippable and independently useful:
+snapshot timestamps on reads first, which fixes the LIST limitation; then
+single-partition multi-key batches, which need no oracle at all because the
+owner already serializes; then cross-partition snapshot isolation; then
+read-set validation, which upgrades it to strict serializability.
+
+What v1 owes this direction is one thing, and it has a deadline: the
+partition-v1 record encoding reserves a commit timestamp field and an intent
+flag before the format freezes at the first release. Everything else defers;
+frozen bytes do not.
 
 ## Scale envelope
 
@@ -242,8 +375,8 @@ someone runs a bigger experiment. Only the first is a ceiling.
 | Partitions | Leader group metadata throughput, which is the real ceiling on cluster size | not characterized yet |
 | Hot data | The sum of memory across the workers | grows by adding workers |
 | Total data | Object storage, meaning effectively nothing | unbounded in practice, and independent of worker count |
-| Read throughput | Replica count, since replicas serve reads | ~100k reads/sec |
-| Write throughput | Partition count, since one owner serializes each partition | ~10k writes/sec |
+| Read throughput | Replica count, since replicas serve reads — and a keyspace has exactly `replication_factor` of them | ~100k reads/sec |
+| Write throughput | Owner count, bounded by `replication_factor`; see the note below | ~10k writes/sec |
 | Max key size | Fixed | 10KB |
 | Max value size | Per-keyspace configuration | 10MB, default far lower |
 
@@ -265,10 +398,30 @@ rather than a rewrite.
 The throughput numbers are targets rather than measurements, and they are
 cluster-wide figures for a cluster of the size we currently test. Neither is a
 ceiling. Read capacity grows with replicas per
-[ADR 0001](adr/0001-linearizable-reads-from-replicas.md), and write capacity
-grows with partitions, which split as they grow. Publishing a measured curve
-of both against worker count is a release deliverable, and it replaces these
-rows when it exists.
+[ADR 0001](adr/0001-linearizable-reads-from-replicas.md). Write capacity was
+claimed here to grow with partitions, which split as they grow. That is not what
+it grows with, and the correction is worth stating precisely because it is a
+smaller claim than it looks.
+
+One owner serialises a partition, and the owner does more work per write than a
+replica, so capacity grows with the number of *owners* a keyspace has. Splitting
+distributes owners as of #163, so it does buy throughput. But a split gives each
+child the parent's holder set, ownership can only move to a node that already
+holds a copy, and nothing widens a holder set for load — so a keyspace has
+exactly `replication_factor` holders, forever, and therefore at most that many
+owners. Measured: a six-node cluster running one keyspace split eight ways puts
+every partition on three nodes and leaves three holding nothing.
+
+So a single keyspace does not scale past `replication_factor` nodes however
+large the cluster is, for reads or for writes. A cluster spreads *keyspaces*
+across its machines, and it heals onto new capacity when a holder is lost, but
+it does not expand onto capacity that is added. Issue #170 tracks it, and the
+cost of the mechanism that would fix it has been measured: adopting a 309 MiB
+partition on a node that never held it took about three seconds, and cost the
+existing owner about three CPU-seconds.
+
+Publishing a measured curve of both against worker count is a release
+deliverable, and it replaces these rows when it exists.
 
 The partition ceiling is genuinely unknown, which is worth saying rather than
 guessing at. The simulator has no partition-count knob today, so nothing has
@@ -304,22 +457,37 @@ them by exceeding one.
 
 ## Operations
 
-- **One static binary.** The same `orbita` binary runs as leader or worker by
-  configuration. A laptop cluster is one command. This is a deliberate
+- **One static binary.** The same `orbita` process serves worker traffic and may
+  also be a Raft voter. A laptop cluster is one command. This is a deliberate
   adoption lever, not a convenience.
 - **Distribution.** A Docker image built and published on every release,
   Kubernetes manifests and a Helm chart, and a Docker Compose quickstart that
-  stands up a leader group, workers, and MinIO for local evaluation.
+  stands up three combined nodes and MinIO for local evaluation.
 - **Admin surface.** An admin gRPC API with a CLI wrapping it: keyspace CRUD,
   credential management, partition map inspection, and manual split, merge,
   and rebalance triggers.
 - **Observability.** OpenTelemetry traces, logs, and metrics throughout,
   including per-keyspace and per-partition latency, WAL replication lag, split
   and merge activity, and quota consumption.
+- **Backup and point-in-time restore.** The storage design in
+  [ADR 0006](adr/0006-partitions-are-an-index-over-immutable-objects.md) makes
+  this cheap on purpose: immutable segments and manifests mean a backup is a
+  manifest retention policy and a restore is pointing at an old manifest. The
+  requirement is that an operator can restore a keyspace to a named point in
+  time, and that the retention window is theirs to configure. Backup is the
+  first checkbox on any production-adoption review, and a design that gets it
+  nearly free should say so out loud.
+- **An offline format reader.** A standalone tool that reads a partition from
+  a bucket with no cluster running. The format is specified so that data at
+  rest is reachable without Orbita, and this tool is what makes that promise
+  checkable rather than aspirational; it is also the recovery path of last
+  resort.
 
 ## Engineering posture
 
-- **Language.** Rust, using the mature `rocksdb` crate.
+- **Language.** Rust. Storage originally sat on the `rocksdb` crate; ADR 0006
+  replaced that with a partition format this project owns, so the engine has
+  no storage dependency to trust beyond the object store.
 - **Deterministic simulation testing from day one.** All network, disk, and
   clock access sits behind swappable interfaces so the whole system runs
   single-threaded in a seeded, fault-injecting simulation. This is expensive
@@ -354,9 +522,10 @@ v1 does not ship until these are measured, not estimated:
 These are out of scope on purpose, and each is a fence we draw now so scope
 cannot creep past it:
 
-- **Multi-key transactions.** Single-key atomicity and version CAS only.
-  Cross-key transactions mean MVCC and a transaction protocol, which is a
-  different product tier.
+- **Multi-key transactions, in v1.** Single-key atomicity and version CAS
+  only. This is no longer a permanent fence; the direction and its constraints
+  are fixed in Transactions above, and v1's only obligation to it is the
+  format reservation recorded there.
 - **Watch/subscribe streams.** No change notifications. This is the known gap
   for the coordination use case and the first roadmap item.
 - **Secondary indexes and queries.** Key lookup and prefix scan only. Orbita
@@ -364,12 +533,20 @@ cannot creep past it:
 - **Geo-replication.** Single-region clusters only. This keeps the
   clock-sync and uncertainty-interval design space out of v1 entirely.
 
-## Roadmap (post-v1, in rough priority order)
+## Roadmap
 
-1. Watch/subscribe streams.
-2. Third-party Jepsen analysis.
-3. Additional object storage backends via the storage trait (GCS, Azure).
-4. Multi-region story.
-Multi-key transactions are deliberately absent from this list. FoundationDB is
-the better tool if you need them, and conceding that flatly is a more
-persuasive position than leaving a door open we do not intend to walk through.
+Sequencing lives in ROADMAP.md, which maps this work to releases. The
+priority order, for when the two disagree: watch/subscribe streams first,
+then the transaction ladder from Transactions above with the official client
+library and `docs/CLIENTS.md` alongside, then a third-party Jepsen analysis,
+then additional object storage backends via the storage trait (GCS, Azure),
+then a multi-region story.
+
+Earlier versions of this document kept multi-key transactions off this list
+and conceded them to FoundationDB flatly. That concession is withdrawn
+deliberately, not drifted into. The deciding argument was that the pieces
+Orbita already has, meaning owner serialization, epoch fencing, a replicated
+WAL that can carry intents, and a simulator that can drive the whole protocol,
+are most of a verifiable transaction system, and published correctness
+evidence for transactions is scarcer in the market than transactions
+themselves.

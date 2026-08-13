@@ -69,6 +69,68 @@ Do not argue that this is safe. Have the simulator's linearizability checker
 demonstrate it under partitions and failovers, which is the entire reason that
 crate exists.
 
+### WAL retention and hydration
+
+Live flushes checkpoint an owner's local WAL only after the partition manifest
+is published, which bounds owner disk use. What that used to cost was recovery:
+a replica behind the retained WAL asked for entries the owner had already
+removed, got no catch-up range, and stayed unavailable rather than inventing
+state.
+
+Hydration is the answer, and it is what makes the retention bound safe rather
+than merely cheap. A node builds the partition from the current manifest and
+takes that horizon as where its own log starts, so it resumes replication above
+the horizon instead of at the start. It happens when a partition is opened,
+which is the replacement-worker case, and in place when an inbound batch turns
+out to leave a hole, which is the fell-behind case and does not need a restart.
+
+The horizon is derived at every open rather than written into the log, and that
+is a compatibility decision rather than an implementation detail. The log's
+framing cannot skip a record it does not understand: an older reader stops at
+the first unknown kind and truncates the rest, so a marker record would make
+the pre-finalization rollback `docs/UPGRADES.md` promises lose acknowledged
+writes. Nothing is lost by deriving it, because the manifest is read before the
+log is opened on both the owner and replica paths.
+
+Hydration also carries the manifest's epoch, not only its horizon. A manifest
+reaches the bucket through the owner's fenced compare-and-swap, so it is proof
+about who owns the partition. A replica that hydrates on behalf of a sender the
+manifest outranks refuses the append instead of acknowledging it, and a worker
+whose ownership grant the manifest outranks refuses to open as owner at all.
+
+Two limits remain, and neither is a fallback to an incomplete WAL. A partition
+that has never been flushed has nothing to hydrate from, and a manifest that is
+itself behind the gap closes only part of it. Both are reported as the gap they
+are.
+
+The cliff is a state rather than a log line. The owner records the replica, the
+Lamport it stopped at, and the oldest Lamport the owner still retains, and
+reports all three through `Server::replicas_beyond_retention`. That drives the
+`replicas-recoverable` readiness condition, so the answer leaves the process
+through `Health.CheckReadiness` and a rolling update stops at a node that owns
+a partition permanently short a copy.
+
+The evidence comes from two places, and the second is what makes the first
+trustworthy. An append refused with `Gap` proves it, and the lease heartbeat
+carries every replica's log position back on a cadence that does not depend on
+there being any writes. Without the second, an owner that restarts or is
+promoted starts with an empty view, and an empty view read as a healthy one is
+how a partition sits stranded and silent. So the owner's view names every
+replica, including the ones it has established nothing about; see
+`orbita_wal::ReplicaCatchUp`.
+
+`crates/orbita-server/src/retention.rs` drives the whole thing under the
+simulator and pins what it looks like from outside: the owner names it and
+fails readiness, the replica leaves the read set rather than serving from its
+own state, its log stops where it stopped instead of resuming above the hole,
+and an owner that restarts and writes nothing reaches the same verdict. That
+scenario is also the tracking test for #17: it asserts one of two named
+outcomes, and hydration has to move which one.
+
+How far a replica may lag before it falls off is the write-ahead log's segment
+size, since a checkpoint drops whole segments. That is `wal_segment_bytes` on
+`ServerConfig`, defaulting to 64 MiB.
+
 ## Decisions to make and write down
 
 - **Proxy hop cost.** Does a forwarded request open a new stream per call, or

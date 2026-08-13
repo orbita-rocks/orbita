@@ -53,18 +53,38 @@ use serde::{Deserialize, Serialize};
 pub const ENVIRONMENT: &[(&str, &str)] = &[
     ("ORBITA_CONFIG", "path to the configuration file"),
     ("ORBITA_NODE_ID", "node.id"),
-    ("ORBITA_NODE_ROLE", "node.role, one of leader or worker"),
+    (
+        "ORBITA_NODE_ROLE",
+        "node.role; node is the combined clustered role",
+    ),
     ("ORBITA_LISTEN", "node.listen"),
     ("ORBITA_ADVERTISE", "node.advertise"),
     ("ORBITA_PEER_LISTEN", "node.peer_listen"),
     ("ORBITA_PEER_ADVERTISE", "node.peer_advertise"),
     ("ORBITA_DATA_DIR", "node.data_dir"),
+    (
+        "ORBITA_VALUE_CACHE_BYTES",
+        "node.value_cache_bytes, memory held for values read out of segments",
+    ),
+    (
+        "ORBITA_READ_AHEAD_BYTES",
+        "node.read_ahead_bytes, bytes one cache miss fetches beyond its record",
+    ),
     ("ORBITA_CLUSTER_NAME", "cluster.name"),
+    ("ORBITA_VOTER_TARGET", "cluster.voter_target, either 3 or 5"),
+    (
+        "ORBITA_READ_REPLICA_TARGET",
+        "cluster.read_replica_target, replicas kept per partition for serving reads",
+    ),
+    ("ORBITA_VOTER_ELIGIBLE", "cluster.voter_eligible"),
+    ("ORBITA_FAILURE_DOMAIN", "cluster.failure_domain"),
     (
         "ORBITA_LEADER_PEERS",
-        "cluster.leader_peers, comma separated peer addresses",
+        "cluster.leader_peers, comma separated NODE_ID=ADDR entries",
     ),
     ("ORBITA_ALLOW_VERSION_SKEW", "cluster.allow_version_skew"),
+    ("ORBITA_REQUIRE_AUTH", "cluster.require_auth"),
+    ("ORBITA_ROOT_CREDENTIAL", "cluster.root_credential"),
     (
         "ORBITA_JOIN_BACKOFF_INITIAL",
         "cluster.join_backoff_initial, a duration such as 250ms",
@@ -76,6 +96,10 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
     (
         "ORBITA_JOIN_TIMEOUT",
         "cluster.join_timeout, a duration, or 0 to retry forever",
+    ),
+    (
+        "ORBITA_DRAIN_TIMEOUT",
+        "cluster.drain_timeout, bounded by the orchestrator grace period",
     ),
     ("ORBITA_OBJECT_STORE_ENDPOINT", "object_store.endpoint"),
     ("ORBITA_OBJECT_STORE_BUCKET", "object_store.bucket"),
@@ -89,8 +113,46 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "object_store.secret_access_key",
     ),
     (
+        "ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE",
+        "object_store.credential_source: default, static, environment, \
+         web-identity, container, or instance-profile",
+    ),
+    ("ORBITA_OBJECT_STORE_ROLE_ARN", "object_store.role_arn"),
+    (
+        "ORBITA_OBJECT_STORE_ROLE_EXTERNAL_ID",
+        "object_store.role_external_id",
+    ),
+    (
+        "ORBITA_OBJECT_STORE_ROLE_SESSION_NAME",
+        "object_store.role_session_name",
+    ),
+    (
+        "ORBITA_OBJECT_STORE_STS_ENDPOINT",
+        "object_store.sts_endpoint, overriding the partition-derived one",
+    ),
+    (
         "ORBITA_OBJECT_STORE_FORCE_PATH_STYLE",
         "object_store.force_path_style",
+    ),
+    (
+        "ORBITA_SWEEP_ENABLED",
+        "sweep.enabled: turn the destructive orphan sweep on (off by default)",
+    ),
+    (
+        "ORBITA_SWEEP_DRY_RUN",
+        "sweep.dry_run: report candidates instead of deleting them",
+    ),
+    (
+        "ORBITA_SWEEP_GRACE",
+        "sweep.grace, as a duration such as 1h; must exceed the longest read and commit",
+    ),
+    (
+        "ORBITA_SWEEP_SKEW",
+        "sweep.skew, as a duration such as 5m; the object store's worst-case clock skew",
+    ),
+    (
+        "ORBITA_SWEEP_INTERVAL",
+        "sweep.interval, as a duration such as 10m; how often an owner sweeps",
     ),
     ("ORBITA_OTLP_ENDPOINT", "telemetry.otlp_endpoint"),
     ("ORBITA_TRACE_SAMPLE_RATIO", "telemetry.trace_sample_ratio"),
@@ -102,6 +164,11 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
     ),
     ("ORBITA_ENDPOINT", "client.endpoint"),
     ("ORBITA_CREDENTIAL", "client.credential"),
+    (
+        "ORBITA_KEYSPACE",
+        "client.keyspace, the default keyspace a data command uses when its \
+         leading keyspace argument is omitted",
+    ),
 ];
 
 /// Where the tool looks for a configuration file when it was not told.
@@ -136,8 +203,12 @@ pub const DEFAULT_PEER_PORT: u16 = 7101;
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum Role {
+    /// Serves worker traffic and may be selected as a Raft voter.
+    Node,
+    /// Legacy rolling-upgrade spelling for a fixed Raft voter.
     /// Runs Raft, owns the partition map, keyspace metadata, and failover.
     Leader,
+    /// Legacy rolling-upgrade spelling for a data-only process.
     /// Owns partitions and serves client reads and writes.
     Worker,
 }
@@ -145,6 +216,7 @@ pub enum Role {
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Node => f.write_str("node"),
             Self::Leader => f.write_str("leader"),
             Self::Worker => f.write_str("worker"),
         }
@@ -160,6 +232,7 @@ pub struct Config {
     pub node: NodeConfig,
     pub cluster: ClusterConfig,
     pub object_store: ObjectStoreConfig,
+    pub sweep: SweepConfig,
     pub telemetry: TelemetryConfig,
     pub client: ClientConfig,
 }
@@ -183,22 +256,66 @@ pub struct NodeConfig {
     /// resolves to the same thing.
     pub peer_advertise: String,
     pub data_dir: PathBuf,
+    /// Bytes of records read out of segments this node holds in memory,
+    /// shared across every partition it hosts.
+    ///
+    /// Node-scoped rather than cluster-scoped because it is this machine's
+    /// memory: two nodes of different sizes should hold different amounts, and
+    /// nothing about the value is agreed on. Zero turns caching off. See
+    /// ADR 0006.
+    pub value_cache_bytes: u64,
+    /// How much one cache miss fetches beyond the record that missed. Zero
+    /// fetches one record. See ADR 0006.
+    pub read_ahead_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClusterConfig {
     pub name: String,
-    /// The leader group, as peer addresses.
+    /// The leader group, as `NODE_ID=ADDR` entries.
     ///
     /// On a leader this is the initial Raft membership, identical on every
-    /// leader node, and it is ignored once the data directory holds a Raft
-    /// log, so it is safe to leave in a template forever. On a worker it is
+    /// leader node. The voter IDs are checked against the durable Raft
+    /// identity on restart, so a changed template cannot redefine a cluster.
+    /// On a worker it is
     /// the list of leaders to contact in order to register and be told the
     /// partition map. One list rather than two, because they are the same
     /// addresses and an operator keeping two lists in sync will not.
     /// See [`crate::node`] for why.
     pub leader_peers: Vec<String>,
+    pub voter_target: usize,
+    /// How many replicas a partition keeps so they can serve reads.
+    ///
+    /// Distinct from the durability contract, which is sized by the control
+    /// plane's replication factor. Raising this adds nodes that hold a copy and
+    /// answer reads; it does not add acknowledgements a write must wait for.
+    /// See ADR 0013.
+    pub read_replica_target: Option<usize>,
+    pub voter_eligible: bool,
+    pub failure_domain: String,
     pub allow_version_skew: bool,
+    /// Whether this cluster requires a credential on every client request.
+    ///
+    /// Off by default so a fresh cluster can be brought up and its first
+    /// credential issued; on, every `Kv` and `Admin` call must carry a valid
+    /// `authorization: Bearer <secret>` header. This is the server-side switch
+    /// the CLI's own credential handling assumes exists.
+    pub require_auth: bool,
+    /// A bootstrap root credential secret, if the operator configured one.
+    ///
+    /// This is what resolves the bootstrap chicken-and-egg: with
+    /// `require_auth` on, the admin surface itself demands a credential, but
+    /// the first credential is created through admin. A root secret named here
+    /// is hashed by the server and honored as a fully privileged identity
+    /// before any credential exists, so it can create the first real one.
+    ///
+    /// It is a config secret with total blast radius: it is never serialized
+    /// back out (see the skipped field below) and it is the operator's job to
+    /// rotate it and remove it once real credentials exist. `None` means no
+    /// root, and a cluster with auth on and no root must create its first
+    /// credential while auth is off.
+    #[serde(skip_serializing)]
+    pub root_credential: Option<String>,
     /// How long to wait before the first retry when the leader group is not
     /// reachable yet.
     pub join_backoff_initial_millis: u64,
@@ -209,6 +326,69 @@ pub struct ClusterConfig {
     /// How long to keep trying before giving up and exiting. Zero means retry
     /// forever.
     pub join_timeout_millis: u64,
+    /// The process-side handoff budget. Kubernetes should allow a little more
+    /// than this before SIGKILL so the timeout is reported clearly.
+    pub drain_timeout_millis: u64,
+}
+
+/// Where a node's S3 credentials come from.
+///
+/// Every value but [`CredentialSource::Default`] is named rather than
+/// discovered, and a named source is used and no other is tried. A provider
+/// chain that falls through at request time is convenient on a laptop and a
+/// liability in production: a node whose intended source is broken authenticates
+/// as whatever else is lying around, and the first anyone hears of it is an
+/// audit log full of the wrong principal.
+///
+/// [`CredentialSource::Default`] is what an unset value means. It resolves the
+/// AWS chain's order once, at startup, and logs which source it picked. It
+/// exists because mapping "no keys configured" straight to `InstanceProfile`
+/// silently re-points every EKS deployment from its workload role to its node
+/// role, which succeeds rather than failing and is therefore worse than an
+/// outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialSource {
+    /// Resolve at startup: environment, then web identity, then container,
+    /// then instance profile. A shared `~/.aws` profile is an error rather
+    /// than a step that gets skipped.
+    Default,
+    /// `access_key_id` and `secret_access_key` from configuration. What MinIO
+    /// and R2 need, and the only thing they offer.
+    Static,
+    /// `AWS_ACCESS_KEY_ID` and friends from the process environment.
+    Environment,
+    /// EKS IRSA: a projected OIDC token traded for a session on the workload
+    /// role. Not the same principal as the node's instance profile.
+    WebIdentity,
+    /// An ECS or Fargate task role, or the EKS Pod Identity agent.
+    Container,
+    /// The EC2 instance profile, over IMDSv2. Needs no Secret at all.
+    InstanceProfile,
+}
+
+impl CredentialSource {
+    /// Whether this source reads `access_key_id` and `secret_access_key`.
+    ///
+    /// One predicate rather than a `==` at each site, so validation and the
+    /// server mapping cannot disagree about whether a key is meaningful.
+    #[must_use]
+    pub fn uses_static_keys(self) -> bool {
+        self == Self::Static
+    }
+}
+
+impl fmt::Display for CredentialSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::Static => "static",
+            Self::Environment => "environment",
+            Self::WebIdentity => "web-identity",
+            Self::Container => "container",
+            Self::InstanceProfile => "instance-profile",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -218,13 +398,63 @@ pub struct ObjectStoreConfig {
     pub endpoint: Option<String>,
     pub bucket: String,
     pub region: String,
+    /// Resolved rather than configured where it was left out: keys present
+    /// means static, keys absent means the instance profile. An operator who
+    /// wants to be sure which one they get sets it.
+    pub credential_source: CredentialSource,
     pub access_key_id: Option<String>,
     #[serde(skip_serializing)]
     pub secret_access_key: Option<String>,
+    /// The role to assume on top of the base credentials, as a full ARN.
+    /// Unset means the base credentials talk to S3 directly.
+    pub role_arn: Option<String>,
+    /// The external id a cross-account role's trust policy requires. Treated
+    /// as a secret even though AWS does not call it one.
+    #[serde(skip_serializing)]
+    pub role_external_id: Option<String>,
+    /// What the assumed session is called in CloudTrail. It defaults to the
+    /// cluster name and node id, because a session name that is the same on
+    /// every node makes an audit log useless.
+    pub role_session_name: Option<String>,
+    /// Overrides the STS endpoint for role assumption and for the IRSA token
+    /// exchange. Unset derives a regional one from the region's partition,
+    /// which is correct in every partition AWS publishes; this is for
+    /// PrivateLink, for a partition newer than this release, and for a test
+    /// double.
+    pub sts_endpoint: Option<String>,
     /// MinIO and most S3-compatible stores need path style addressing, and AWS
     /// itself does not. The default suits the quickstart, so an AWS deployment
     /// has to turn it off.
     pub force_path_style: bool,
+}
+
+/// The orphan sweep: the background job that reclaims objects a failed
+/// compaction or an abandoned commit stranded in the bucket.
+///
+/// It is destructive — it deletes objects — so it is off unless an operator
+/// turns it on, and every deployment-specific bound is here rather than baked
+/// into the binary. See `orbita_storage`'s sweep for the grace-period contract.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SweepConfig {
+    /// Whether the sweep runs at all. Off by default: a loop that deletes from
+    /// the bucket should not start itself, and leaked space is a recoverable
+    /// cost where a wrong deletion is not. An operator opts in once the grace
+    /// period is set to something they trust.
+    pub enabled: bool,
+    /// Report candidates instead of deleting them. The "look before it acts"
+    /// switch for a first run against a real bucket.
+    pub dry_run: bool,
+    /// How long the dropping manifest must have been in effect, and the object
+    /// itself must have existed, before the object may be deleted. It has to
+    /// exceed the longest read and the longest commit a deployment allows, which
+    /// only the operator knows, so it is configuration.
+    pub grace_millis: u64,
+    /// How much to widen the grace period for the object store's own worst-case
+    /// internal clock skew.
+    pub skew_millis: u64,
+    /// How often an owner runs the sweep over its partitions. Far slower than a
+    /// flush, because the sweep lists a whole partition prefix.
+    pub interval_millis: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -248,6 +478,13 @@ pub struct ClientConfig {
     pub endpoint: String,
     #[serde(skip_serializing)]
     pub credential: Option<String>,
+    /// The keyspace a data command uses when its leading keyspace argument is
+    /// left off. Unset means every data command must name a keyspace, which is
+    /// how the tool behaved before this existed. It is a client-side default
+    /// rather than a server concept: an operator who works in one keyspace all
+    /// day sets it once instead of retyping it, and the REPL's current keyspace
+    /// is the same field set per session. Not a secret, so it serializes.
+    pub keyspace: Option<String>,
 }
 
 /// One source of configuration, before it is merged with the others.
@@ -265,6 +502,8 @@ pub struct Layer {
     #[serde(default)]
     pub object_store: ObjectStoreLayer,
     #[serde(default)]
+    pub sweep: SweepLayer,
+    #[serde(default)]
     pub telemetry: TelemetryLayer,
     #[serde(default)]
     pub client: ClientLayer,
@@ -280,6 +519,8 @@ pub struct NodeLayer {
     pub peer_listen: Option<String>,
     pub peer_advertise: Option<String>,
     pub data_dir: Option<PathBuf>,
+    pub value_cache_bytes: Option<u64>,
+    pub read_ahead_bytes: Option<u64>,
 }
 
 /// The join durations are strings rather than numbers so that a file says
@@ -291,10 +532,17 @@ pub struct NodeLayer {
 pub struct ClusterLayer {
     pub name: Option<String>,
     pub leader_peers: Option<Vec<String>>,
+    pub voter_target: Option<usize>,
+    pub read_replica_target: Option<usize>,
+    pub voter_eligible: Option<bool>,
+    pub failure_domain: Option<String>,
     pub allow_version_skew: Option<bool>,
+    pub require_auth: Option<bool>,
+    pub root_credential: Option<String>,
     pub join_backoff_initial: Option<String>,
     pub join_backoff_max: Option<String>,
     pub join_timeout: Option<String>,
+    pub drain_timeout: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -303,9 +551,27 @@ pub struct ObjectStoreLayer {
     pub endpoint: Option<String>,
     pub bucket: Option<String>,
     pub region: Option<String>,
+    pub credential_source: Option<CredentialSource>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+    pub role_arn: Option<String>,
+    pub role_external_id: Option<String>,
+    pub role_session_name: Option<String>,
+    pub sts_endpoint: Option<String>,
     pub force_path_style: Option<bool>,
+}
+
+/// The grace, skew, and interval are strings so a file can say `grace = "1h"`
+/// rather than a bare millisecond count whose unit nobody can see. See
+/// [`parse_duration_millis`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SweepLayer {
+    pub enabled: Option<bool>,
+    pub dry_run: Option<bool>,
+    pub grace: Option<String>,
+    pub skew: Option<String>,
+    pub interval: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -323,6 +589,7 @@ pub struct TelemetryLayer {
 pub struct ClientLayer {
     pub endpoint: Option<String>,
     pub credential: Option<String>,
+    pub keyspace: Option<String>,
 }
 
 /// Replaces `$target` with `$source` wherever the source has an opinion.
@@ -350,17 +617,26 @@ impl Layer {
             advertise,
             peer_listen,
             peer_advertise,
-            data_dir
+            data_dir,
+            value_cache_bytes,
+            read_ahead_bytes
         );
         overlay!(
             self.cluster,
             other.cluster,
             name,
             leader_peers,
+            voter_target,
+            read_replica_target,
+            voter_eligible,
+            failure_domain,
             allow_version_skew,
+            require_auth,
+            root_credential,
             join_backoff_initial,
             join_backoff_max,
-            join_timeout
+            join_timeout,
+            drain_timeout
         );
         overlay!(
             self.object_store,
@@ -368,9 +644,23 @@ impl Layer {
             endpoint,
             bucket,
             region,
+            credential_source,
             access_key_id,
             secret_access_key,
+            role_arn,
+            role_external_id,
+            role_session_name,
+            sts_endpoint,
             force_path_style
+        );
+        overlay!(
+            self.sweep,
+            other.sweep,
+            enabled,
+            dry_run,
+            grace,
+            skew,
+            interval
         );
         overlay!(
             self.telemetry,
@@ -381,7 +671,7 @@ impl Layer {
             log_level,
             resource_attributes
         );
-        overlay!(self.client, other.client, endpoint, credential);
+        overlay!(self.client, other.client, endpoint, credential, keyspace);
         self
     }
 
@@ -431,10 +721,32 @@ impl Layer {
 
         let role = get("ORBITA_NODE_ROLE")
             .map(|v| match v.to_ascii_lowercase().as_str() {
+                "node" => Ok(Role::Node),
                 "leader" => Ok(Role::Leader),
                 "worker" => Ok(Role::Worker),
-                other => bail!("ORBITA_NODE_ROLE must be leader or worker, got {other:?}"),
+                other => bail!("ORBITA_NODE_ROLE must be node, leader, or worker, got {other:?}"),
             })
+            .transpose()?;
+
+        let credential_source = get("ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE")
+            .map(
+                |v| match v.to_ascii_lowercase().replace('_', "-").as_str() {
+                    "default" => Ok(CredentialSource::Default),
+                    "static" => Ok(CredentialSource::Static),
+                    "environment" | "env" => Ok(CredentialSource::Environment),
+                    // `irsa` is what the EKS documentation calls this and what
+                    // an operator will reach for first.
+                    "web-identity" | "irsa" => Ok(CredentialSource::WebIdentity),
+                    "container" | "ecs" | "pod-identity" => Ok(CredentialSource::Container),
+                    "instance-profile" | "instance" | "imds" => {
+                        Ok(CredentialSource::InstanceProfile)
+                    }
+                    other => bail!(
+                        "ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE must be one of default, static, \
+                         environment, web-identity, container, or instance-profile, got {other:?}"
+                    ),
+                },
+            )
             .transpose()?;
 
         let ratio = get("ORBITA_TRACE_SAMPLE_RATIO")
@@ -454,22 +766,44 @@ impl Layer {
                 peer_listen: get("ORBITA_PEER_LISTEN").map(str::to_owned),
                 peer_advertise: get("ORBITA_PEER_ADVERTISE").map(str::to_owned),
                 data_dir: get("ORBITA_DATA_DIR").map(PathBuf::from),
+                value_cache_bytes: parse("ORBITA_VALUE_CACHE_BYTES")?,
+                read_ahead_bytes: parse("ORBITA_READ_AHEAD_BYTES")?,
             },
             cluster: ClusterLayer {
                 name: get("ORBITA_CLUSTER_NAME").map(str::to_owned),
                 leader_peers: get("ORBITA_LEADER_PEERS").map(parse_list),
+                voter_target: parse("ORBITA_VOTER_TARGET")?.map(|value| value as usize),
+                read_replica_target: parse("ORBITA_READ_REPLICA_TARGET")?
+                    .map(|value| value as usize),
+                voter_eligible: flag("ORBITA_VOTER_ELIGIBLE")?,
+                failure_domain: get("ORBITA_FAILURE_DOMAIN").map(str::to_owned),
                 allow_version_skew: flag("ORBITA_ALLOW_VERSION_SKEW")?,
+                require_auth: flag("ORBITA_REQUIRE_AUTH")?,
+                root_credential: get("ORBITA_ROOT_CREDENTIAL").map(str::to_owned),
                 join_backoff_initial: get("ORBITA_JOIN_BACKOFF_INITIAL").map(str::to_owned),
                 join_backoff_max: get("ORBITA_JOIN_BACKOFF_MAX").map(str::to_owned),
                 join_timeout: get("ORBITA_JOIN_TIMEOUT").map(str::to_owned),
+                drain_timeout: get("ORBITA_DRAIN_TIMEOUT").map(str::to_owned),
             },
             object_store: ObjectStoreLayer {
                 endpoint: get("ORBITA_OBJECT_STORE_ENDPOINT").map(str::to_owned),
                 bucket: get("ORBITA_OBJECT_STORE_BUCKET").map(str::to_owned),
                 region: get("ORBITA_OBJECT_STORE_REGION").map(str::to_owned),
+                credential_source,
                 access_key_id: get("ORBITA_OBJECT_STORE_ACCESS_KEY_ID").map(str::to_owned),
                 secret_access_key: get("ORBITA_OBJECT_STORE_SECRET_ACCESS_KEY").map(str::to_owned),
+                role_arn: get("ORBITA_OBJECT_STORE_ROLE_ARN").map(str::to_owned),
+                role_external_id: get("ORBITA_OBJECT_STORE_ROLE_EXTERNAL_ID").map(str::to_owned),
+                role_session_name: get("ORBITA_OBJECT_STORE_ROLE_SESSION_NAME").map(str::to_owned),
+                sts_endpoint: get("ORBITA_OBJECT_STORE_STS_ENDPOINT").map(str::to_owned),
                 force_path_style: flag("ORBITA_OBJECT_STORE_FORCE_PATH_STYLE")?,
+            },
+            sweep: SweepLayer {
+                enabled: flag("ORBITA_SWEEP_ENABLED")?,
+                dry_run: flag("ORBITA_SWEEP_DRY_RUN")?,
+                grace: get("ORBITA_SWEEP_GRACE").map(str::to_owned),
+                skew: get("ORBITA_SWEEP_SKEW").map(str::to_owned),
+                interval: get("ORBITA_SWEEP_INTERVAL").map(str::to_owned),
             },
             telemetry: TelemetryLayer {
                 otlp_endpoint: get("ORBITA_OTLP_ENDPOINT").map(str::to_owned),
@@ -483,6 +817,7 @@ impl Layer {
             client: ClientLayer {
                 endpoint: get("ORBITA_ENDPOINT").map(str::to_owned),
                 credential: get("ORBITA_CREDENTIAL").map(str::to_owned),
+                keyspace: get("ORBITA_KEYSPACE").map(str::to_owned),
             },
         })
     }
@@ -543,6 +878,9 @@ impl Layer {
         // silently for a day is not.
         let join_timeout_millis =
             duration_millis("cluster.join_timeout", self.cluster.join_timeout)?.unwrap_or(300_000);
+        let drain_timeout_millis =
+            duration_millis("cluster.drain_timeout", self.cluster.drain_timeout)?
+                .unwrap_or(290_000);
         if join_backoff_max_millis < join_backoff_initial_millis {
             bail!(
                 "cluster.join_backoff_max is {join_backoff_max_millis} ms, below \
@@ -556,6 +894,64 @@ impl Layer {
             bail!("telemetry.trace_sample_ratio must be between 0 and 1, got {trace_sample_ratio}");
         }
 
+        // The grace, skew, and interval default to the same values the server
+        // library uses, resolved here so the CLI and the library never disagree
+        // about what an unset value means. `enabled` defaults to false: the
+        // sweep deletes, so it stays off until an operator turns it on.
+        let sweep = SweepConfig {
+            enabled: self.sweep.enabled.unwrap_or(false),
+            dry_run: self.sweep.dry_run.unwrap_or(false),
+            grace_millis: duration_millis("sweep.grace", self.sweep.grace)?
+                .unwrap_or(orbita_server::DEFAULT_SWEEP_GRACE_MILLIS),
+            skew_millis: duration_millis("sweep.skew", self.sweep.skew)?
+                .unwrap_or(orbita_server::DEFAULT_SWEEP_SKEW_MILLIS),
+            interval_millis: duration_millis("sweep.interval", self.sweep.interval)?
+                .unwrap_or(orbita_server::DEFAULT_SWEEP_INTERVAL.as_millis() as u64),
+        };
+
+        // Left unset, the source follows the keys: keys mean static, and no
+        // keys means the node resolves one at startup in the AWS chain's
+        // order. It deliberately does *not* mean the instance profile. On EKS
+        // the instance profile is the node role and IRSA is the workload role,
+        // so defaulting keyless to IMDS would take every existing IRSA
+        // deployment and quietly re-point it at a different principal — which
+        // succeeds, rather than failing, wherever node IMDS is reachable.
+        let has_key = self.object_store.access_key_id.is_some()
+            || self.object_store.secret_access_key.is_some();
+        let credential_source = self.object_store.credential_source.unwrap_or({
+            if has_key {
+                CredentialSource::Static
+            } else {
+                CredentialSource::Default
+            }
+        });
+        // Catching this here rather than at startup means the pod fails with a
+        // sentence instead of a 403 from S3 several minutes into a rollout.
+        if !credential_source.uses_static_keys() && has_key {
+            bail!(
+                "object_store.credential_source is {credential_source}, but a static key is also \
+                 configured; remove the key or set credential_source to static, because a node \
+                 that silently ignores one of them is a node nobody can audit"
+            );
+        }
+        if credential_source == CredentialSource::Static
+            && self.object_store.endpoint.is_some()
+            && !has_key
+        {
+            bail!(
+                "object_store.credential_source is static, but no access_key_id or \
+                 secret_access_key was configured"
+            );
+        }
+        if let Some(sts_endpoint) = &self.object_store.sts_endpoint {
+            if !sts_endpoint.starts_with("http://") && !sts_endpoint.starts_with("https://") {
+                bail!(
+                    "object_store.sts_endpoint must start with http:// or https://, got \
+                     {sts_endpoint:?}"
+                );
+            }
+        }
+
         let endpoint = self
             .client
             .endpoint
@@ -564,14 +960,27 @@ impl Layer {
             bail!("client.endpoint must start with http:// or https://, got {endpoint:?}");
         }
 
+        let voter_target = self.cluster.voter_target.unwrap_or(3);
+        if !matches!(voter_target, 3 | 5) {
+            bail!("cluster.voter_target must be 3 or 5, got {voter_target}");
+        }
+
         Ok(Config {
             node: NodeConfig {
                 id: self.node.id.unwrap_or(1),
-                role: self.node.role.unwrap_or(Role::Worker),
+                role: self.node.role.unwrap_or(Role::Node),
                 listen,
                 advertise,
                 peer_listen,
                 peer_advertise,
+                value_cache_bytes: self
+                    .node
+                    .value_cache_bytes
+                    .unwrap_or(orbita_server::DEFAULT_VALUE_CACHE_BYTES),
+                read_ahead_bytes: self
+                    .node
+                    .read_ahead_bytes
+                    .unwrap_or(orbita_server::DEFAULT_READ_AHEAD_BYTES),
                 data_dir: self
                     .node
                     .data_dir
@@ -580,10 +989,19 @@ impl Layer {
             cluster: ClusterConfig {
                 name: self.cluster.name.unwrap_or_else(|| "orbita".to_owned()),
                 leader_peers: self.cluster.leader_peers.unwrap_or_default(),
+                voter_target,
+                // Unset means the control plane's own default, which is the
+                // durability floor. See ADR 0013.
+                read_replica_target: self.cluster.read_replica_target,
+                voter_eligible: self.cluster.voter_eligible.unwrap_or(true),
+                failure_domain: self.cluster.failure_domain.unwrap_or_default(),
                 allow_version_skew: self.cluster.allow_version_skew.unwrap_or(false),
+                require_auth: self.cluster.require_auth.unwrap_or(false),
+                root_credential: self.cluster.root_credential,
                 join_backoff_initial_millis,
                 join_backoff_max_millis,
                 join_timeout_millis,
+                drain_timeout_millis,
             },
             object_store: ObjectStoreConfig {
                 endpoint: self.object_store.endpoint,
@@ -595,10 +1013,16 @@ impl Layer {
                     .object_store
                     .region
                     .unwrap_or_else(|| "us-east-1".to_owned()),
+                credential_source,
                 access_key_id: self.object_store.access_key_id,
                 secret_access_key: self.object_store.secret_access_key,
+                role_arn: self.object_store.role_arn,
+                role_external_id: self.object_store.role_external_id,
+                role_session_name: self.object_store.role_session_name,
+                sts_endpoint: self.object_store.sts_endpoint,
                 force_path_style: self.object_store.force_path_style.unwrap_or(true),
             },
+            sweep,
             telemetry: TelemetryConfig {
                 otlp_endpoint: self.telemetry.otlp_endpoint,
                 trace_sample_ratio,
@@ -615,6 +1039,7 @@ impl Layer {
             client: ClientConfig {
                 endpoint,
                 credential: self.client.credential,
+                keyspace: self.client.keyspace,
             },
         })
     }
@@ -763,10 +1188,12 @@ pub fn dev_defaults(port: u16, data_dir: PathBuf) -> Layer {
     Layer {
         node: NodeLayer {
             id: Some(1),
-            role: Some(Role::Leader),
+            role: Some(Role::Node),
             listen: Some(format!("127.0.0.1:{port}")),
             advertise: Some(format!("127.0.0.1:{port}")),
             peer_listen: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
+            value_cache_bytes: None,
+            read_ahead_bytes: None,
             peer_advertise: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
             data_dir: Some(data_dir),
         },
@@ -795,7 +1222,7 @@ mod tests {
     fn every_option_has_a_default_so_dev_needs_no_configuration() {
         let config = Layer::default().resolve().expect("defaults must resolve");
         assert_eq!(config.node.id, 1);
-        assert_eq!(config.node.role, Role::Worker);
+        assert_eq!(config.node.role, Role::Node);
         assert_eq!(config.node.listen, "0.0.0.0:7100");
         assert_eq!(config.node.advertise, "0.0.0.0:7100");
         assert_eq!(config.node.peer_listen, "0.0.0.0:7101");
@@ -803,6 +1230,256 @@ mod tests {
         assert_eq!(config.client.endpoint, "http://127.0.0.1:7100");
         assert_eq!(config.telemetry.log_level, "info");
         assert!(config.object_store.endpoint.is_none());
+    }
+
+    #[test]
+    fn voter_target_accepts_only_three_or_five() {
+        for target in [3, 5] {
+            let layer = Layer {
+                cluster: ClusterLayer {
+                    voter_target: Some(target),
+                    ..ClusterLayer::default()
+                },
+                ..Layer::default()
+            };
+            assert_eq!(layer.resolve().unwrap().cluster.voter_target, target);
+        }
+        for target in [0, 1, 4, 7] {
+            let layer = Layer {
+                cluster: ClusterLayer {
+                    voter_target: Some(target),
+                    ..ClusterLayer::default()
+                },
+                ..Layer::default()
+            };
+            assert!(layer.resolve().is_err(), "target {target} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_orphan_sweep_is_disabled_until_an_operator_turns_it_on() {
+        // The destructive default guard: a fresh node does not sweep, so no
+        // deployment starts deleting objects it was never told to.
+        let config = Layer::default().resolve().expect("defaults must resolve");
+        assert!(!config.sweep.enabled, "the sweep is off by default");
+        assert!(!config.sweep.dry_run);
+        assert_eq!(
+            config.sweep.grace_millis,
+            orbita_server::DEFAULT_SWEEP_GRACE_MILLIS
+        );
+        assert_eq!(
+            config.sweep.skew_millis,
+            orbita_server::DEFAULT_SWEEP_SKEW_MILLIS
+        );
+    }
+
+    #[test]
+    fn the_orphan_sweep_bounds_come_from_the_environment() {
+        let environment = Layer::from_env(&env(&[
+            ("ORBITA_SWEEP_ENABLED", "true"),
+            ("ORBITA_SWEEP_DRY_RUN", "true"),
+            ("ORBITA_SWEEP_GRACE", "2h"),
+            ("ORBITA_SWEEP_SKEW", "30s"),
+            ("ORBITA_SWEEP_INTERVAL", "15m"),
+        ]))
+        .unwrap();
+        let config = Layer::default().merge(environment).resolve().unwrap();
+        assert!(config.sweep.enabled);
+        assert!(config.sweep.dry_run);
+        assert_eq!(config.sweep.grace_millis, 2 * 60 * 60 * 1000);
+        assert_eq!(config.sweep.skew_millis, 30 * 1000);
+        assert_eq!(config.sweep.interval_millis, 15 * 60 * 1000);
+    }
+
+    #[test]
+    fn an_object_store_with_no_keys_resolves_its_source_rather_than_assuming_imds() {
+        let file =
+            Layer::from_toml("[object_store]\nendpoint = \"https://s3.us-east-1.amazonaws.com\"\n")
+                .unwrap();
+        let config = Layer::default().merge(file).resolve().unwrap();
+        assert_eq!(
+            config.object_store.credential_source,
+            CredentialSource::Default,
+            "a keyless AWS deployment must be the default, but it must not be pinned to the \
+             instance profile: on EKS that is the node role, not the workload role, and \
+             defaulting to it silently changes which principal an existing deployment uses"
+        );
+    }
+
+    #[test]
+    fn every_credential_source_can_be_named_in_the_environment() {
+        for (spelling, expected) in [
+            ("default", CredentialSource::Default),
+            ("static", CredentialSource::Static),
+            ("environment", CredentialSource::Environment),
+            ("env", CredentialSource::Environment),
+            ("web-identity", CredentialSource::WebIdentity),
+            ("web_identity", CredentialSource::WebIdentity),
+            ("irsa", CredentialSource::WebIdentity),
+            ("container", CredentialSource::Container),
+            ("ecs", CredentialSource::Container),
+            ("pod-identity", CredentialSource::Container),
+            ("instance-profile", CredentialSource::InstanceProfile),
+            ("imds", CredentialSource::InstanceProfile),
+        ] {
+            let layer =
+                Layer::from_env(&env(&[("ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE", spelling)]))
+                    .unwrap_or_else(|error| panic!("{spelling:?} should parse: {error:#}"));
+            assert_eq!(
+                layer.object_store.credential_source,
+                Some(expected),
+                "{spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_key_alongside_any_keyless_source_is_refused() {
+        // Not just instance-profile: a key next to IRSA is the same
+        // unauditable ambiguity, and the chart can now render either.
+        for source in [
+            "default",
+            "environment",
+            "web-identity",
+            "container",
+            "instance-profile",
+        ] {
+            let file = Layer::from_toml(&format!(
+                "[object_store]\nendpoint = \"https://s3.us-east-1.amazonaws.com\"\n\
+                 credential_source = \"{source}\"\naccess_key_id = \"a\"\n\
+                 secret_access_key = \"s\"\n"
+            ))
+            .unwrap();
+            let error = Layer::default()
+                .merge(file)
+                .resolve()
+                .err()
+                .unwrap_or_else(|| panic!("{source} alongside a static key should be refused"));
+            assert!(
+                format!("{error:#}").contains("credential_source"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sts_endpoint_must_be_a_url() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"https://s3.us-east-1.amazonaws.com\"\n\
+             sts_endpoint = \"sts.internal.example.com\"\n",
+        )
+        .unwrap();
+        let error = Layer::default().merge(file).resolve().unwrap_err();
+        assert!(format!("{error:#}").contains("sts_endpoint"), "{error:#}");
+    }
+
+    #[test]
+    fn configured_keys_select_the_static_source() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"http://minio:9000\"\naccess_key_id = \"a\"\n\
+             secret_access_key = \"s\"\n",
+        )
+        .unwrap();
+        let config = Layer::default().merge(file).resolve().unwrap();
+        assert_eq!(
+            config.object_store.credential_source,
+            CredentialSource::Static
+        );
+    }
+
+    #[test]
+    fn a_static_key_alongside_the_instance_profile_is_refused() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"https://s3.us-east-1.amazonaws.com\"\n\
+             credential_source = \"instance-profile\"\naccess_key_id = \"a\"\n\
+             secret_access_key = \"s\"\n",
+        )
+        .unwrap();
+        let error = Layer::default().merge(file).resolve().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("credential_source"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_static_source_without_keys_is_refused() {
+        let file = Layer::from_toml(
+            "[object_store]\nendpoint = \"http://minio:9000\"\ncredential_source = \"static\"\n",
+        )
+        .unwrap();
+        assert!(Layer::default().merge(file).resolve().is_err());
+    }
+
+    #[test]
+    fn the_credential_source_can_be_named_in_the_environment() {
+        let environment = Layer::from_env(&env(&[(
+            "ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE",
+            "instance-profile",
+        )]))
+        .unwrap();
+        assert_eq!(
+            environment.object_store.credential_source,
+            Some(CredentialSource::InstanceProfile)
+        );
+        assert!(Layer::from_env(&env(&[(
+            "ORBITA_OBJECT_STORE_CREDENTIAL_SOURCE",
+            "whatever-is-lying-around",
+        )]))
+        .is_err());
+    }
+
+    #[test]
+    fn the_role_to_assume_comes_from_the_environment_too() {
+        let environment = Layer::from_env(&env(&[
+            (
+                "ORBITA_OBJECT_STORE_ROLE_ARN",
+                "arn:aws:iam::123456789012:role/orbita",
+            ),
+            ("ORBITA_OBJECT_STORE_ROLE_EXTERNAL_ID", "shared-secret"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            environment.object_store.role_arn.as_deref(),
+            Some("arn:aws:iam::123456789012:role/orbita")
+        );
+        assert_eq!(
+            environment.object_store.role_external_id.as_deref(),
+            Some("shared-secret")
+        );
+    }
+
+    #[test]
+    fn a_serialized_configuration_carries_no_credential_material() {
+        let file = Layer::from_toml(
+            "[cluster]\nroot_credential = \"the-root-secret\"\n\
+             [object_store]\nendpoint = \"http://minio:9000\"\naccess_key_id = \"the-key-id\"\n\
+             secret_access_key = \"the-secret\"\nrole_external_id = \"the-external-id\"\n",
+        )
+        .unwrap();
+        let config = Layer::default().merge(file).resolve().unwrap();
+        assert_eq!(
+            config.cluster.root_credential.as_deref(),
+            Some("the-root-secret"),
+            "the root secret is still read into the resolved configuration"
+        );
+        let rendered = serde_json::to_string(&config).expect("serializes");
+        assert!(
+            !rendered.contains("the-secret")
+                && !rendered.contains("the-external-id")
+                && !rendered.contains("the-root-secret"),
+            "a printed configuration must not be a credential dump: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_root_credential_can_be_named_in_the_environment() {
+        let environment =
+            Layer::from_env(&env(&[("ORBITA_ROOT_CREDENTIAL", "the-root-secret")])).unwrap();
+        assert_eq!(
+            environment.cluster.root_credential.as_deref(),
+            Some("the-root-secret")
+        );
     }
 
     #[test]
@@ -880,10 +1557,16 @@ mod tests {
 
     #[test]
     fn leader_peers_come_from_the_environment_as_a_comma_separated_list() {
-        let environment =
-            Layer::from_env(&env(&[("ORBITA_LEADER_PEERS", "a:7100, b:7100 ,c:7100")])).unwrap();
+        let environment = Layer::from_env(&env(&[(
+            "ORBITA_LEADER_PEERS",
+            "1=a:7101, 2=b:7101 ,3=c:7101",
+        )]))
+        .unwrap();
         let config = Layer::default().merge(environment).resolve().unwrap();
-        assert_eq!(config.cluster.leader_peers, ["a:7100", "b:7100", "c:7100"]);
+        assert_eq!(
+            config.cluster.leader_peers,
+            ["1=a:7101", "2=b:7101", "3=c:7101"]
+        );
     }
 
     #[test]
@@ -910,7 +1593,10 @@ mod tests {
     #[test]
     fn a_role_the_binary_does_not_have_is_rejected_with_the_valid_ones_named() {
         let err = Layer::from_env(&env(&[("ORBITA_NODE_ROLE", "coordinator")])).unwrap_err();
-        assert!(format!("{err:#}").contains("leader or worker"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("node, leader, or worker"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1039,6 +1725,33 @@ mod tests {
     }
 
     #[test]
+    fn the_value_cache_budget_can_be_set_and_can_be_turned_off() {
+        // Zero has to survive the resolve rather than being treated as unset
+        // and replaced by the default. It is how an operator who suspects the
+        // cache takes it out of the picture, and a knob that silently ignores
+        // the one value you reach for in an incident is worse than no knob.
+        let off = Layer::default()
+            .merge(Layer::from_toml("[node]\nvalue_cache_bytes = 0\n").unwrap())
+            .resolve()
+            .unwrap();
+        assert_eq!(off.node.value_cache_bytes, 0);
+
+        let sized = Layer::default()
+            .merge(Layer::from_env(&env(&[("ORBITA_VALUE_CACHE_BYTES", "1048576")])).unwrap())
+            .resolve()
+            .unwrap();
+        assert_eq!(sized.node.value_cache_bytes, 1_048_576);
+
+        // And left alone it is whatever the server decided, not a number this
+        // crate keeps a second copy of.
+        let defaulted = Layer::default().resolve().unwrap();
+        assert_eq!(
+            defaulted.node.value_cache_bytes,
+            orbita_server::DEFAULT_VALUE_CACHE_BYTES
+        );
+    }
+
+    #[test]
     fn join_durations_are_written_with_a_unit_rather_than_a_bare_number() {
         let file = Layer::from_toml(
             "[cluster]\njoin_backoff_initial = \"500ms\"\njoin_backoff_max = \"1m\"\n\
@@ -1112,7 +1825,7 @@ mod tests {
         let config = dev_defaults(7100, PathBuf::from(".orbita/dev"))
             .resolve()
             .unwrap();
-        assert_eq!(config.node.role, Role::Leader);
+        assert_eq!(config.node.role, Role::Node);
         assert!(config.cluster.leader_peers.is_empty());
         assert_eq!(config.node.listen, "127.0.0.1:7100");
         // Both listeners are on the loopback address, because nothing outside

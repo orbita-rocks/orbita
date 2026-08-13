@@ -16,6 +16,11 @@
 //! - [`admin`] and [`data`] wrap the `Admin` and `Kv` gRPC services. They are
 //!   deliberately thin: the CLI must not become a second implementation of
 //!   anything the API already does.
+//! - [`session`] holds the resolved config and one channel, and is the single
+//!   place a parsed command is dispatched, so the one-shot binary and the REPL
+//!   run the same code.
+//! - [`repl`] is the interactive loop: session state plus a line editor that
+//!   re-enters the same parser and renderer, never a second command surface.
 //! - [`node`] is the single seam where this crate starts a server.
 //! - [`telemetry`] carries the OpenTelemetry settings from configuration to
 //!   whoever installs the exporter.
@@ -31,6 +36,8 @@ pub mod config;
 pub mod data;
 pub mod node;
 pub mod output;
+pub mod repl;
+pub mod session;
 pub mod telemetry;
 
 /// The version string the binary reports and the version a node compares

@@ -21,13 +21,28 @@ testing = []
 [dependencies]
 orbita-core.workspace = true
 orbita-objectstore.workspace = true
+# The in-memory store stamps write times from the runtime clock, not the wall
+# clock, so a simulated run drives the orphan-sweep grace period deterministically.
+orbita-runtime.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
+# For `buffer_unordered` alone. Building a partition's index is one ranged read
+# per segment for the footer and another for the key index, and doing those in
+# sequence makes a cold open cost round trips rather than bytes: measured at
+# 2.36s for a 309 MiB partition against real S3, almost all of it waiting. These
+# are combinators rather than an executor, so the simulator still drives them
+# deterministically and nothing here spawns a task.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+proptest.workspace = true
+# The byte-decoder property tests repair CRC32C checksums after mutating an
+# input, so a corrupted-but-checksum-valid object flows past the integrity gate
+# into the parsing logic. That needs the same hasher the encoders use.
+crc32c.workspace = true

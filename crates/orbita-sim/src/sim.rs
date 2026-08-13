@@ -8,9 +8,10 @@
 
 use crate::config::SimConfig;
 use crate::harness::Failure;
+use crate::objectstore::SimBucket;
 use crate::runtime::SimRuntime;
 use crate::trace::Trace;
-use crate::world::SimCore;
+use crate::world::{BucketState, SimCore};
 
 use orbita_core::NodeId;
 use orbita_runtime::Rng;
@@ -93,35 +94,27 @@ impl Simulation {
     /// tails are enabled the last record may survive in pieces, which is what
     /// a real crash mid-append leaves behind.
     pub fn crash(&self, node: NodeId) {
-        self.core.kill_node_tasks(node);
-        let mut state = self.core.state();
-        let torn = self.core.config.disk.torn_tail_on_crash;
-        let mut torn_bytes = Vec::new();
-        if let Some(entry) = state.nodes.get_mut(&node) {
-            entry.up = false;
-            for (path, file) in entry.files.iter_mut() {
-                let unsynced = file.visible.len().saturating_sub(file.durable.len());
-                let keep = if torn && unsynced > 1 {
-                    // A prefix of the unsynced tail reached the platter. How
-                    // much is arbitrary, which is the point.
-                    self.core.fault_below(unsynced as u64) as usize
-                } else {
-                    0
-                };
-                if keep > 0 {
-                    torn_bytes.push((path.clone(), keep));
-                }
-                let end = file.durable.len() + keep;
-                file.visible.truncate(end);
-                file.durable.clear();
-                file.durable.extend_from_slice(&file.visible);
+        self.core.crash_node(node);
+    }
+
+    /// A bucket in the simulated object store, addressed by name.
+    ///
+    /// Two calls with one name hand back handles onto the same objects,
+    /// because a bucket is shared infrastructure and the interesting failures
+    /// are the ones where two writers reach it at once. Nothing here dials
+    /// anything: the handle is an [`orbita_objectstore::s3::HttpTransport`],
+    /// so the S3 store under test is the same code production runs.
+    pub fn bucket(&self, name: &str) -> Arc<SimBucket> {
+        {
+            let mut state = self.core.state();
+            if !state.buckets.contains_key(name) {
+                state
+                    .buckets
+                    .insert(name.to_string(), BucketState::default());
+                state.record(format!("bucket {name} created"));
             }
         }
-        state.handlers.retain(|(owner, _), _| *owner != node);
-        for (path, keep) in torn_bytes {
-            state.record(format!("torn tail node={node} path={path} bytes={keep}"));
-        }
-        state.record(format!("node {node} crashed"));
+        Arc::new(SimBucket::new(self.core.clone(), name.to_string()))
     }
 
     /// Brings a node back, with or without its data.
@@ -150,6 +143,7 @@ impl Simulation {
     /// sees a live peer issuing commands.
     pub fn partition_one_way(&self, from: NodeId, to: NodeId) {
         let mut state = self.core.state();
+        state.last_fault_nanos = Some(state.now);
         state.blocked.insert((from, to));
         state.record(format!("link {from}->{to} down"));
     }
@@ -177,6 +171,34 @@ impl Simulation {
         let mut state = self.core.state();
         state.blocked.clear();
         state.record("all links up");
+    }
+
+    /// Stops the world from breaking any further.
+    ///
+    /// Distinct from exhausting the budget: a run that spent its budget still
+    /// had faults on offer, whereas this says the scenario is finished
+    /// injecting them. Everything after this point is recovery, which is the
+    /// only window in which a liveness claim can be made at all. A cluster
+    /// still being torn at is under no obligation to have finished anything.
+    ///
+    /// A crashed node stays crashed. Convergence has to hold with the
+    /// survivors it actually has, not with the ones it wishes it had.
+    pub fn stop_injecting_faults(&self) {
+        let mut state = self.core.state();
+        if !state.faults_frozen {
+            state.faults_frozen = true;
+            state.record("fault injection stopped");
+        }
+    }
+
+    /// When the last fault was injected, in virtual nanoseconds.
+    ///
+    /// `None` for a run in which nothing ever went wrong, which is worth being
+    /// able to say out loud: a convergence check that passes on a run with no
+    /// faults in it has not proved much.
+    #[must_use]
+    pub fn last_fault_nanos(&self) -> Option<u64> {
+        self.core.state().last_fault_nanos
     }
 
     #[must_use]

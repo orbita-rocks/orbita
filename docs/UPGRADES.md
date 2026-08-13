@@ -10,24 +10,36 @@ command at the end. The reasoning is in
 Read this first. The chart is written for the process below; the server is not
 finished.
 
-- There is no cluster version. Nodes do not read one, do not report which
-  versions they can speak, and do not gate their behaviour on it. Mixed-version
-  operation is therefore not something you should rely on today.
-- `orbita cluster finalize-upgrade` does not exist. It is described below
-  because that is where it goes, not because you can run it. There is nothing
-  for it to finalize until the control plane holds a cluster version.
-- Readiness does not mean what it should. It means the process is answering on
-  the client port, not that the node has rejoined the leader group, recovered
-  its write-ahead log, opened its partitions, and caught up. A rolling update
-  can therefore advance to the next pod before the previous one is actually
-  carrying its share.
-- A node does not hand its partitions off on SIGTERM. The termination grace
-  periods in the chart are sized for a handoff that the server does not perform
-  yet, so today a restart is a failover.
+- The cluster version, compatibility enforcement, and `orbita cluster
+  finalize-upgrade` exist. The control plane holds the version in its
+  replicated state and refuses a registration whose speakable range does not
+  include it. The refused node stays running, reports
+  `cluster-version-compatible` and `control-plane-joined` as unmet readiness
+  conditions, and logs both its range and the active version. No behaviour
+  actually changes with the version yet because no format has two versions to
+  choose between. Worker handoff is a version-gated behaviour: workers
+  continue using the previous status protocol and ordinary failover until the
+  operator finalizes protocol 0.1. Partition merge is part of protocol 0.1, so
+  finalizing 0.1 is all it needs; there is no second finalization to wait for.
+Readiness is otherwise real: a node reports Ready only once it has recovered
+its write-ahead log and opened and caught up the partitions the map says it
+holds, and it turns unready again if a map change hands it a partition it
+cannot open. A leader voter also has to apply through the commit index reported
+by the current Raft leader. Seeing a leader is not enough.
 
-The practical consequence: stage every rollout with the `partition` field and
-check the cluster between steps. Do not let the rollout run unattended on
-anything that matters.
+A worker also reports `replicas-recoverable` as unmet when it owns a partition
+whose replica has fallen further behind than its write-ahead log still reaches.
+WAL truncation is live and hydration from object storage is not, so that
+replica cannot be recovered and the partition is permanently short a copy. The
+rollout stops there on purpose: continuing would take out another copy of a
+partition that has already lost one. Replace the replica, or wait for issue
+\#17. `orbita cluster describe` shows how far each replica has applied, and the
+owner logs which one it is and the two Lamports that bracket the gap.
+
+Stage a rollout with the `partition` field and check the cluster between steps
+when the blast radius warrants it. After finalization, a worker drains its
+partitions on SIGTERM; before finalization it exits through ordinary failover so
+the rollback-compatible control protocol remains on the replicated log.
 
 ## What a version means
 
@@ -57,6 +69,101 @@ any format version its window allows and writes the version the active cluster
 version calls for. That is what makes the rollback window below real rather
 than a hope.
 
+### Error codes on the peer path are additive
+
+A node forwards a client request to the partition's owner, and the owner's error
+comes back over the peer path as a number. 0.1.0 adds one, for a write whose
+outcome nobody can state, which is what an owner returns when it cannot reach a
+durability quorum.
+
+A node too old to know that number reports it as an internal error. The wording
+is wrong and the advice is right: internal is not retryable, and neither is the
+error it stands in for, so a half-upgraded cluster cannot tell a client to
+replay a write that may already have landed. Once the rollout finishes, every
+node reports it properly.
+
+This is why error codes are only ever added here and never reused. A recycled
+number would mean an old node acting on the wrong advice rather than on none.
+
+## The first upgrade to Raft leaders
+
+This section is a one-time transition for a release whose leader pods do not
+run Raft. Skip it when the installed release already has a working leader
+quorum.
+
+A normal StatefulSet rolling update cannot cross this boundary. It replaces
+one pod and waits for that pod to become Ready before replacing the next. The
+first new pod is one Raft-capable voter beside two old processes that cannot
+vote, so it cannot reach two-of-three and can never become Ready.
+`podManagementPolicy: Parallel` does not change rolling replacement order; it
+only changes initial creation and scaling.
+
+Render the one-time transition by setting:
+
+```
+helm upgrade orbita deploy/helm/orbita --namespace orbita \
+  --set image.tag=0.1.0 \
+  --set leader.firstRaftUpgrade=true
+```
+
+This changes the leader StatefulSet to `OnDelete`. It does not replace any pod
+on its own. Replace ordinals 1 and 2 together, then wait for both new processes
+to form a quorum and pass the catch-up readiness gate:
+
+```
+kubectl --namespace orbita delete pod orbita-leader-1 orbita-leader-2
+kubectl --namespace orbita wait --for=condition=Ready \
+  pod/orbita-leader-1 pod/orbita-leader-2 --timeout=10m
+```
+
+Do not continue unless both are Ready. Once they are, replace the remaining old
+voter and wait for its local Raft log and controller to catch up:
+
+```
+kubectl --namespace orbita delete pod orbita-leader-0
+kubectl --namespace orbita wait --for=condition=Ready \
+  pod/orbita-leader-0 --timeout=10m
+```
+
+Run Helm once more with `leader.firstRaftUpgrade=false`. The pod template is
+already current, so this restores `RollingUpdate` without another restart.
+Every later upgrade follows the ordinary procedure below.
+
+This exception replaces two leader pods together because no one-at-a-time
+sequence can create the first quorum. The worker data plane remains available
+on its last map while the leader group forms. It is not a general permission to
+restart two Raft voters together after this transition.
+
+## Migrating to combined nodes
+
+The first release implementing ADR 0011 reads the old `ORBITA_LEADER_PEERS`
+configuration and the durable `control/raft-voters` file for one compatibility
+window. Old leader processes remain the three voters and old workers remain
+data-only while old and new binaries coexist. A new binary started with
+`--role leader` or `--role worker` preserves that old role and logs that the
+spelling is transitional; it does not automatically change Raft membership
+during the rollout.
+
+Roll the old leader and worker StatefulSets under their existing names and
+volumes first. Do not switch to the combined chart shape in the same Helm
+operation, because Kubernetes cannot automatically reattach six old claims to
+three new pod names. Once every process runs the new binary, finalize the
+cluster version, drain the old workers, and move the three voter volumes to the
+combined node StatefulSet. The voter volumes already contain the authoritative
+Raft membership and cluster identity, so the object-store bootstrap certificate
+is migration metadata rather than permission to form another group.
+
+After finalization, new combined nodes use the shared object store and cluster
+name to discover the durable identity and voter certificate. They join as
+workers and learners. `ORBITA_LEADER_PEERS` may then be removed; changing it no
+longer changes membership. A volume whose persisted cluster identity disagrees
+with the bucket starts unready and names `cluster-identity-matched` rather than
+exiting, which keeps rollback diagnostics available per ADR 0005.
+
+The elected leader, voters, and workers are deliberately separate terms after
+this migration. There is one elected leader, three or five voters, and every
+node is a worker even when it is also one of those voters.
+
 ## The rollout
 
 Upgrade the image. With Helm:
@@ -79,7 +186,9 @@ kubectl --namespace orbita rollout status statefulset/orbita-worker
 
 Pods are replaced one at a time in reverse ordinal order, and the rollout does
 not move to the next pod until the current one reports Ready. That is the whole
-safety mechanism, which is why the readiness gap above matters.
+safety mechanism, which is why readiness asserts recovery and catch-up rather
+than just a listening socket, and why the rejoin gap above is a gap worth
+closing rather than a footnote.
 
 Upgrade the leader group and the workers separately. There are two StatefulSets
 and they are two rollouts.
@@ -112,11 +221,64 @@ has written a new format yet:
 kubectl --namespace orbita rollout undo statefulset/orbita-worker
 ```
 
-A node that cannot speak the cluster's active version is meant to start,
-report itself not Ready, and say why in its logs. It is not meant to exit.
+One caveat for the transition off 0.0 specifically. The first version-aware
+release writes control log entries the 0.0 binary cannot read, and 0.0's
+recovery truncates its log at the first entry it cannot decode. So once a
+control-plane node has run the new binary, rolling that node's binary back to
+0.0 discards whatever the new binary committed. The upgraded binary reads
+everything 0.0 wrote, so the forward direction is safe; it is the return to
+0.0 that is not, and this is a one-time cost of the version machinery not
+existing yet when 0.0 shipped.
+
+A node that cannot speak the cluster's active version starts, reports itself
+not Ready, and says why in its logs. It does not exit.
 That is deliberate: a pod that is running and not Ready stops the rollout at
 exactly one pod and leaves its diagnostics reachable, where a pod that exits
-takes its logs away in a restart loop. Nothing implements that yet.
+takes its logs away in a restart loop. The refusal includes the node's
+speakable range and the active cluster version, so the stopped rollout
+identifies which side needs changing.
+
+The registration check is part of the replicated state machine, not a worker
+preflight. A refused worker is not added to membership and cannot receive
+ownership. If finalization makes a previously registered node incompatible,
+the node keeps serving partitions it already holds. This preserves the data
+plane during a control-plane transition. It is excluded from placement and
+cannot be promoted or added as a new replica until it reports a compatible
+range again.
+
+## Growing a cluster mid-upgrade
+
+Adding a worker while the rollout is half done works, and the new worker is
+placed. A node inside the window speaks the active cluster version rather than
+its own binary version, so a newer worker in a cluster that has not finalized
+yet is a node of the active version in every respect the leader group reasons
+about: the same status protocol, the same on-disk formats, and ordinary
+failover rather than a planned handoff on shutdown. There is nothing about it
+an un-upgraded leader has to understand and cannot.
+
+The readiness a worker reports is the exception, and it is not a gap in what
+the leader knows so much as one in what it is allowed to write down. That claim
+travels in a registration shape the previous binary cannot decode, so it stays
+off the replicated log until you finalize, which is what keeps the rollback
+below real. Before finalization no node makes the claim and no node is judged
+on it; after finalization every node makes it and every node is judged on it.
+Both binaries decide which of those they are in from the active cluster
+version, not from their own, so they never disagree about a node they are both
+looking at.
+
+The practical consequence is that placement during the upgrade window ignores
+readiness and uses health, role, and version compatibility, which is the
+pre-0.1 rule. A worker that is up but still recovering can therefore be given a
+partition during the window; it opens it when it can, the same as it would have
+before any of this existed. Finalize when the rollout is done and the stricter
+rule comes back.
+
+The v0.0.1 heartbeat remains a deliberate special case. Its registration has
+no version field, so the control plane treats it as speaking exactly version
+0.0. It is accepted only while 0.0 is active. A newer worker can still fall
+back to the legacy heartbeat when talking to a v0.0.1 leader, but it reports
+Ready only if its own range includes 0.0. This keeps the first rolling upgrade
+working without turning a missing field into an unlimited compatibility claim.
 
 ## Finalizing
 
@@ -131,11 +293,23 @@ Only after that do nodes start writing new formats or using new behaviour.
 Until then the rollback above is available and cheap. After it, rolling back is
 not supported, and the command says so before it proceeds.
 
+Partition merge needs nothing beyond this. Its replicated tags are part of
+protocol 0.1, so finalizing 0.1 enables it along with worker handoff. A cluster
+that has agreed no version at all still refuses a merge, and refuses it before
+appending anything to the control log, because a command whose vocabulary
+nobody has accepted is the one case that gate protects against. Merge was
+originally assigned to a later protocol to keep a 0.1 voter that could not
+decode its tags rollback-safe; ADR 0012 withdrew that, because nothing had been
+released and no such voter existed.
+
 Finalization is not automatic on purpose. Doing it automatically would close
 the rollback window at the exact moment an operator is most likely to want it,
 which is a few minutes after a rollout finishes and something looks off.
 
-This command does not exist yet.
+The command checks before it commits: if any live node cannot speak the new
+version, nothing changes and the error names the nodes holding it back. A
+node the cluster has declared dead does not get a vote, because a lost node's
+last act should not be pinning the cluster to an old version.
 
 ### If you need to go back after finalizing
 
@@ -209,16 +383,21 @@ a restore.
 Three probes, three different jobs. Getting these wrong is the usual way a
 stateful system is broken on Kubernetes.
 
-- Readiness gates the rollout and the client Service. It should mean the node
-  has rejoined and caught up. Today it means the process answers.
-- Liveness kills the pod when it fails, so it checks only that the process
-  responds. It never checks cluster state and never checks whether peers are
-  reachable, because a liveness probe that depended on peers would turn a
-  network partition into every pod being killed at once.
-- Startup covers a slow start. Recovering a large write-ahead log takes time,
-  and that is not the same as being wedged, so the startup budget is generous
-  where the liveness threshold is not.
+- Readiness gates the rollout and the client Service. It runs `orbita cluster
+  ready`, which exits non-zero and names the unmet conditions until the node
+  has recovered its write-ahead log, opened and caught up its partitions,
+  registered with the leader group where it has one, and confirmed that its
+  binary can speak the active cluster version. A leader-group node also waits
+  for its durable Raft state and applies through the current leader's commit
+  index before it becomes Ready.
+- Liveness kills the pod when it fails, so it runs `orbita cluster ping` and
+  checks only that the process responds. It never checks cluster state and
+  never checks whether peers are reachable, because a liveness probe that
+  depended on peers would turn a network partition into every pod being killed
+  at once.
+- Startup covers a slow start with the readiness command and its own generous
+  budget. Recovering a large write-ahead log or waiting for the leader group
+  takes time, and that is not the same as being wedged, so the startup budget
+  is generous where the liveness threshold is not.
 
-All three run `orbita cluster ping`, which is correct for liveness and startup
-and weaker than it should be for readiness. The thresholds are under `probes`
-in the chart's values.
+The thresholds are under `probes` in the chart's values.

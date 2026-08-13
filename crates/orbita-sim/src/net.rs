@@ -174,11 +174,18 @@ impl Transport for SimTransport {
     }
 
     fn register(&self, service: ServiceId, handler: impl PeerHandler) {
-        let mut state = self.core.state();
-        state
-            .handlers
-            .insert((self.node, service as u16), Arc::new(handler));
-        state.record(format!("register node={} service={service:?}", self.node));
+        let replaced;
+        {
+            let mut state = self.core.state();
+            replaced = state
+                .handlers
+                .insert((self.node, service as u16), Arc::new(handler));
+            state.record(format!("register node={} service={service:?}", self.node));
+        }
+        // A replaced handler is dropped outside the lock, because its
+        // destructor can reach back into the world: a restarted node's new
+        // handler displaces the old one, whose drop may wake a task.
+        drop(replaced);
     }
 
     fn local_node(&self) -> NodeId {
@@ -247,12 +254,18 @@ impl Future for Await {
             state.record(format!("timeout peer={}", me.peer));
             return Poll::Ready(Err(TransportError::Timeout(me.peer)));
         }
-        if me.timer.is_none() {
-            let seq = state.seq();
-            let key = (me.deadline, seq);
-            state.timers.insert(key, cx.waker().clone());
-            me.timer = Some(key);
-        }
+        // Refreshed on every poll for the same reason `SimSleep` does it: a
+        // call that is left pending and then moved into another task must be
+        // woken through the waker of whoever is polling it now.
+        let key = match me.timer {
+            Some(key) => key,
+            None => {
+                let seq = state.seq();
+                (me.deadline, seq)
+            }
+        };
+        state.timers.insert(key, cx.waker().clone());
+        me.timer = Some(key);
         Poll::Pending
     }
 }
