@@ -30,6 +30,7 @@ use crate::membership::{NodeHealth, NodeRole};
 use crate::model::{Credential, Keyspace, KeyspaceConfig};
 use crate::version::{
     lifecycle_protocol_active, ClusterVersion, CompatibilityRefusal, VersionRange, PROTOCOL_0_1,
+    PROTOCOL_0_2,
 };
 
 use orbita_core::{
@@ -349,13 +350,18 @@ impl ClusterState {
     /// out.
     ///
     /// Checking it here rather than at the proposer is what makes it an
-    /// invariant instead of a convention. Every member applies the same
-    /// committed entry, so every member refuses the same one, and a leader with
-    /// a damaged counter produces a loud refusal instead of a silent
-    /// collision. The counter is a high-water mark taken with `max` on every
-    /// issue, so "below it" is exactly "already issued", retired ids included.
+    /// invariant instead of a convention. It starts at protocol 0.2 because
+    /// applying a new refusal while 0.1 binaries still vote would make one
+    /// committed command produce different state on old and new members. Once
+    /// 0.2 is finalized, every voter understands the rule and a damaged counter
+    /// produces a loud refusal instead of a silent collision. The counter is a
+    /// high-water mark taken with `max` on every issue, so "below it" is exactly
+    /// "already issued", retired ids included.
     fn ensure_unissued(&self, id: PartitionId) -> Result<()> {
-        if id.get() < self.next_partition_id {
+        if self.version_initialized
+            && self.version >= PROTOCOL_0_2
+            && id.get() < self.next_partition_id
+        {
             return Err(Error::InvalidArgument(format!(
                 "partition id {id} has already been issued; ids are never reused, and the next \
                  unused one is {}",
@@ -3462,6 +3468,7 @@ mod tests {
         // counter is what normally prevents it; this is the state machine
         // refusing even when the counter is wrong.
         let mut state = bootstrapped();
+        set_version(&mut state, PROTOCOL_0_2);
         let keyspace = state.keyspace_by_name("default").unwrap().id;
         let retired = state.map().partitions().next().unwrap().id;
         state
@@ -3472,15 +3479,14 @@ mod tests {
             "the id is retired, so nothing live guards it any more"
         );
 
-        let candidates = state.placement_candidates();
         let refused = state.apply(&ControlCommand::CreateKeyspace {
             id: state.next_keyspace_id(),
             name: "reborn".into(),
             config: KeyspaceConfig::default(),
             created_at_millis: 9,
             first_partition: retired,
-            owner: Some(candidates[0]),
-            replicas: candidates[1..3].to_vec(),
+            owner: None,
+            replicas: vec![],
         });
         assert!(
             matches!(refused, Err(Error::InvalidArgument(_))),
@@ -3500,7 +3506,7 @@ mod tests {
         // reuse collides with bytes on disk rather than merely confusing a
         // reader.
         let mut state = bootstrapped();
-        set_version(&mut state, PROTOCOL_0_1);
+        set_version(&mut state, PROTOCOL_0_2);
         let parent = state.map().partitions().next().unwrap().clone();
         state
             .apply(&ControlCommand::BeginSplit {
@@ -3547,7 +3553,7 @@ mod tests {
     fn a_split_cannot_name_a_child_on_an_id_that_was_already_issued() {
         // The same rule from the split side. `child_id_in_use` only sees ids
         // that are still live, so a retired grandparent's id looks free to it.
-        let mut state = split_once();
+        let mut state = split_once(PROTOCOL_0_2);
         let retired = PartitionId(1);
         let child = state.map().partitions().next().unwrap().clone();
 
@@ -3568,11 +3574,48 @@ mod tests {
         );
     }
 
-    /// A bootstrapped cluster whose one partition has been split in two, so
-    /// partition id 1 is retired and its data is notionally still on disk.
-    fn split_once() -> ClusterState {
+    #[test]
+    fn the_high_water_refusal_waits_for_protocol_0_2_finalization() {
+        // A 0.1 voter knows the worker-prepared split but predates the new
+        // high-water refusal. BeginSplit reserves ids 2 and 3 in the counter,
+        // while pending children deliberately stay out of `phases`; the old
+        // apply path therefore accepts a concurrent keyspace naming id 2.
+        // This binary must do the same until 0.2 is finalized, or the same log
+        // produces different maps during a patch rollout.
         let mut state = bootstrapped();
         set_version(&mut state, PROTOCOL_0_1);
+        let parent = state.map().partitions().next().unwrap().clone();
+        let reserved = state.next_partition_id();
+        state
+            .apply(&ControlCommand::BeginSplit {
+                parent: parent.id,
+                at: Bytes::from_static(b"m"),
+                lower: reserved,
+                upper: reserved.next(),
+                expect_epoch: parent.epoch,
+            })
+            .unwrap();
+        assert!(!state.phases.contains_key(&reserved));
+
+        let candidates = state.placement_candidates();
+        state
+            .apply(&ControlCommand::CreateKeyspace {
+                id: state.next_keyspace_id(),
+                name: "concurrent".into(),
+                config: KeyspaceConfig::default(),
+                created_at_millis: 9,
+                first_partition: reserved,
+                owner: Some(candidates[0]),
+                replicas: candidates[1..3].to_vec(),
+            })
+            .expect("protocol 0.1 keeps the apply behavior every 0.1 voter shares");
+    }
+
+    /// A bootstrapped cluster whose one partition has been split in two, so
+    /// partition id 1 is retired and its data is notionally still on disk.
+    fn split_once(version: ClusterVersion) -> ClusterState {
+        let mut state = bootstrapped();
+        set_version(&mut state, version);
         let parent = state.map().partitions().next().unwrap().clone();
         assert_eq!(parent.id, PartitionId(1));
         state
