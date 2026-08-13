@@ -107,6 +107,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cache;
 mod cursor;
 mod mutation;
 mod partition;
@@ -116,6 +117,7 @@ mod model_test;
 #[cfg(test)]
 mod testing;
 
+pub use cache::{CacheStats, ValueCache};
 pub use mutation::{Mutation, MutationOp};
 pub use orbita_format::SweepReport;
 pub use partition::{
