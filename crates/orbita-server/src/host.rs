@@ -2943,4 +2943,36 @@ mod tests {
             WalOp::Delete { .. } => panic!("a put became a delete"),
         }
     }
+
+    #[test]
+    fn the_lease_holder_gauge_counts_only_leases_that_are_still_live() {
+        // The gauge exists so that write latency moving after a read target
+        // change is explainable rather than mysterious, which only works if it
+        // reports the set a write actually waits on. A lapsed lease is one the
+        // owner has stopped waiting for, so counting it would overstate the
+        // coherence quorum exactly when an operator is trying to find out why
+        // writes got slower.
+        let sim = Simulation::new(1);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        let host = start_host(&sim, runtime, store);
+
+        assert_eq!(host.lease_holders(), 0, "nothing has been granted yet");
+
+        let now = host.runtime.clock().monotonic_nanos();
+        {
+            let mut leases = host.leases.lock().expect("lease table poisoned");
+            leases.grant(NodeId(2), now, Duration::from_secs(1));
+            leases.grant(NodeId(3), now, Duration::from_secs(1));
+            // Granted for no time at all, which is how an owner probes a
+            // replica it has stopped trusting. It is not a holder.
+            leases.grant(NodeId(4), now, Duration::ZERO);
+        }
+
+        assert_eq!(
+            host.lease_holders(),
+            2,
+            "a lease that has already lapsed is not part of the coherence quorum"
+        );
+    }
 }
