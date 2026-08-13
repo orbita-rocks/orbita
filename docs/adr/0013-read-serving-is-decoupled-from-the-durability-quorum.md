@@ -1,8 +1,12 @@
 # 0013: Read serving is decoupled from the durability quorum
 
-Status: Proposed, 2026-08-12. Revised the same day, before acceptance, to
-correct a wrong claim about the coherence quorum and to say what followers cost
-the write path.
+Status: Accepted, 2026-08-13.
+
+Proposed 2026-08-12 and revised twice before acceptance: once to correct a wrong
+claim about the coherence quorum and say what followers cost the write path, and
+once to record that the missing value cache outranks every other precondition
+here. Both corrections came from measurement rather than review, which is the
+argument for measuring a decision before freezing it.
 
 Extends [ADR 0001](0001-linearizable-reads-from-replicas.md), whose read
 protocol this keeps unchanged and whose population it widens. Narrows the
@@ -185,6 +189,14 @@ nothing for them and they may come and go freely. They pay one in-cluster hop
 per read, which is the same hop as forwarding except that the value never
 crosses it twice and the owner never touches storage to answer.
 
+**The validating tier's protocol is not designed here, and nothing implements
+it.** What this record fixes is that the tier exists, that it is the answer to
+unbounded readers, and that it is where a reader goes when it will not be
+counted by a write. The wire format of a validation, how a reader learns the
+Lamport to validate against, and how validations batch are all open, and the
+bounded tier is useful without any of it. Accepting this record commits to the
+shape and not to a protocol.
+
 The tier a node is in is a provisioning decision, not a durability one, and a
 node may move between tiers without any write noticing. That is what makes
 enlisting compute cheap, which was the point of this record; what changes is
@@ -253,9 +265,38 @@ ceiling `docs/REQUIREMENTS.md` admits is uncharacterised.
 
 ## Preconditions
 
-Two measured costs are load-bearing enough that this decision should not be
-implemented before they are addressed, because both would otherwise be blamed
-on it.
+Three measured costs are load-bearing enough that this decision should not be
+implemented before they are addressed, because all three would otherwise be
+blamed on it.
+
+**There is no value cache, and it dominates everything this record claims.**
+ADR 0006 decided that values are cached rather than resident. The caching half
+was never built: `Partition::load` checks the memtable and on a miss goes
+straight to `Partition::fetch`, which issues one `get_range` per record. Every
+read of a flushed key is therefore one object-store round trip, and the holder
+set cannot change how many round trips a read costs.
+
+Measured twice, on EKS, against real S3:
+
+| | reads/s | p50 | peak pod CPU |
+|---|---|---|---|
+| 2026-08-12, 3 holders → 5 | 9,131 → 9,001 | 24.7ms → 26.1ms | 110.3s → 65.6s |
+| 2026-08-13, 3 holders → 5 | 9,374 → 9,602 | 25.6ms → 25.2ms | 92.0s → 47.1s |
+
+The second run measured one keyspace under both conditions rather than two
+keyspaces under one each. Both agree: throughput does not move, and load
+distribution transforms. Peak pod CPU fell 41% and then 49%, total CPU across
+five pods fell from 175.2s to 142.9s, and forwarding disappeared.
+
+So the mechanism in this record works and is worth having. It buys no read
+capacity until a read can be served without going to the object store. No read
+in any run of either day returned faster than 14.4ms, at any thread count or
+holder count, with the servers about 19% utilised. That floor is the round
+trip, and it is what a reader has to stop paying before "read capacity follows
+the holder set" can be true.
+
+This is the precondition that outranks the two below. They are latency cliffs
+on a cold path; this one sets the steady-state cost of every read.
 
 **Heartbeat reporting is O(partitions), unconditionally.** `Node::progress`
 walks every host on every heartbeat and reports five fields each, with no
@@ -270,7 +311,8 @@ loops the manifest's segments and issues two ranged GETs each — footer, then k
 index — sequentially, with no concurrency anywhere in the crate. That is what
 makes a cold open latency-bound rather than bandwidth-bound, and it is what a
 follower pays on every cold start. Fetching them concurrently is a contained
-change with no format impact.
+change with no format impact. Addressed: `Snapshot::build` now fetches segments
+concurrently.
 
 Beyond those, a materialised index — one object per partition, rebuilt
 periodically, read alongside the few segments written since — would take a cold

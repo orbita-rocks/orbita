@@ -26,4 +26,4 @@ forward. The history of a wrong turn is worth more than a tidy directory.
 | [0010](0010-a-merge-shares-both-parents-segments.md) | A merge shares both parents' segments in place | Accepted |
 | [0011](0011-combined-nodes-form-one-automatically-managed-voter-set.md) | Combined nodes form one automatically managed voter set | Accepted |
 | [0012](0012-merge-commands-belong-to-cluster-protocol-0-1.md) | Merge commands belong to cluster protocol 0.1 | Accepted |
-| [0013](0013-read-serving-is-decoupled-from-the-durability-quorum.md) | Read serving is decoupled from the durability quorum | Proposed |
+| [0013](0013-read-serving-is-decoupled-from-the-durability-quorum.md) | Read serving is decoupled from the durability quorum | Accepted |
