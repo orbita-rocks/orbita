@@ -1,10 +1,13 @@
 //! What the durability claim actually rests on.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId, Result};
-use orbita_runtime::{Rng, Runtime, ServiceId, Transport};
+use orbita_runtime::{
+    Clock, PeerCall, PeerHandler, Rng, Runtime, ServiceId, Transport, TransportResult,
+};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
 use crate::log::{CatchUp, PartitionLog, TruncationReason, DEFAULT_SEGMENT_TARGET_BYTES};
@@ -970,6 +973,51 @@ async fn peer(base: &TestRuntime, net: &MemNetwork, id: NodeId) -> Peer {
         .transport()
         .register(ServiceId::Wal, service.clone());
     Peer { runtime, service }
+}
+
+/// A replica that refuses the first append and opens the partition because of
+/// it, then serves normally.
+///
+/// Event driven rather than timed. The window this reproduces is a race, and a
+/// race staged with a timer is at the mercy of what the deterministic runtime
+/// decides to run first — a timed version of this test passed against the
+/// unfixed code, because the executor advanced to the timer before the owner's
+/// first attempt and the replica was warm by the time anything asked it.
+///
+/// Keying the warm-up to the refusal itself removes the ordering question: the
+/// first append is always refused, and the replica is always ready for the
+/// second. Nothing but a retry can get a write through this.
+#[derive(Clone)]
+struct WarmsOnRefusal {
+    inner: WalService<TestRuntime>,
+    runtime: TestRuntime,
+    refused: Arc<Mutex<bool>>,
+}
+
+impl PeerHandler for WarmsOnRefusal {
+    async fn handle(&self, from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
+        let first = {
+            let mut refused = self.refused.lock().expect("refusal flag poisoned");
+            let first = !*refused;
+            *refused = true;
+            first
+        };
+        if first {
+            // What a replica that has not reconciled the map yet says, and
+            // then, belatedly, does.
+            let log = PartitionLog::open(
+                self.runtime.clone(),
+                DIR,
+                PARTITION,
+                DEFAULT_SEGMENT_TARGET_BYTES,
+            )
+            .await
+            .expect("open replica log");
+            self.inner.register(log);
+            return Ok(WalResponse::Error(format!("partition {PARTITION} not held here")).encode());
+        }
+        self.inner.handle(from, call).await
+    }
 }
 
 async fn cluster(base: &TestRuntime) -> Cluster {
@@ -2177,4 +2225,99 @@ fn a_randomised_schedule_of_commits_and_lost_peers_never_loses_an_acknowledged_w
             }
         });
     }
+}
+
+#[test]
+fn a_write_waits_for_a_replica_that_is_still_opening_the_partition() {
+    // Issue #168. Nothing makes a replica open a partition before its owner
+    // starts taking writes for it: the owner admits writes as soon as its own
+    // host is open, and each holder reconciles the map on its own poll. So for
+    // a partition that has just appeared — a split child, a new placement,
+    // every partition on a cluster that just started — the first thing that
+    // ever contacts the replica is the first client write, and it arrives
+    // before the replica has registered the partition.
+    //
+    // Failing there is the wrong answer twice over. The quorum was reachable a
+    // moment later, and the error is raised after the entry is already on the
+    // owner's disk, so the client cannot safely retry it.
+    let base = TestRuntime::solo(77);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let owner_runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let owner = Wal::open(
+            owner_runtime.clone(),
+            WalConfig::new(PARTITION, DIR, Epoch(1))
+                .with_replicas(vec![PEER_A])
+                .with_durability_acks(1),
+        )
+        .await
+        .expect("open owner");
+        let service = WalService::new();
+        service.register(owner.log());
+        owner_runtime
+            .transport()
+            .register(ServiceId::Wal, service.clone());
+
+        let replica_runtime = base.peer(MemDisk::new(), net.node(PEER_A));
+        replica_runtime.transport().register(
+            ServiceId::Wal,
+            WarmsOnRefusal {
+                inner: WalService::new(),
+                runtime: replica_runtime.clone(),
+                refused: Arc::new(Mutex::new(false)),
+            },
+        );
+
+        owner
+            .commit(op("k1"))
+            .await
+            .expect("a replica that was still opening must not fail the write");
+    });
+}
+
+#[test]
+fn a_write_still_fails_quickly_when_a_replica_that_was_following_goes_away() {
+    // The other side of the rule, and the reason the retry keys on whether a
+    // replica has ever answered rather than on a plain attempt count. A peer
+    // that was following and has now gone is an outage, not a partition coming
+    // up, and holding every write for the whole retry budget would turn one
+    // dead node into a stalled write path.
+    let base = TestRuntime::solo(78);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let owner_runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let owner = Wal::open(
+            owner_runtime.clone(),
+            WalConfig::new(PARTITION, DIR, Epoch(1))
+                .with_replicas(vec![PEER_A])
+                .with_durability_acks(1),
+        )
+        .await
+        .expect("open owner");
+        let service = WalService::new();
+        service.register(owner.log());
+        owner_runtime
+            .transport()
+            .register(ServiceId::Wal, service.clone());
+        let _peer = peer(&base, &net, PEER_A).await;
+
+        // Establish the replica, so it is no longer a partition that has never
+        // answered.
+        owner.commit(op("k1")).await.expect("the first write lands");
+
+        net.isolate(PEER_A);
+        let started = base.clock().monotonic_nanos();
+        let refused = owner.commit(op("k2")).await;
+        let waited = Duration::from_nanos(base.clock().monotonic_nanos() - started);
+
+        assert!(refused.is_err(), "an outage still fails the write");
+        // A fixed bound rather than the budget constant, so shrinking the
+        // budget cannot make this pass by moving the goalposts. Well under the
+        // two seconds an unestablished replica is given.
+        assert!(
+            waited < Duration::from_millis(500),
+            "a replica that was following and went away must not be waited out \
+             for the warm-up budget, waited {waited:?}"
+        );
+    });
 }

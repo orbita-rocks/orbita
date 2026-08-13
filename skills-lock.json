@@ -7,6 +7,12 @@
       "skillPath": "skills/conventional-commit-message/SKILL.md",
       "computedHash": "6ae250d67edc757e2e54163dae2d32f7b44bd8827231cbab2895db8fc0331ac3"
     },
+    "handoff": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/handoff/SKILL.md",
+      "computedHash": "ad03e8d4ea3cbbff66420eb7ba3cc375b5cbe1821a2449b53e863256cf5b5cde"
+    },
     "pr-branch-naming": {
       "source": "thedesignproject/agent-skills",
       "sourceType": "github",

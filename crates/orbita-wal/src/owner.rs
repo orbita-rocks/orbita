@@ -6,10 +6,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
+use std::time::Duration;
 
 use bytes::Bytes;
 use orbita_core::{Epoch, Error, Lamport, NodeId, PartitionId, Result};
-use orbita_runtime::{join_all, PeerCall, Runtime, ServiceId, Transport};
+use orbita_runtime::{join_all, Clock, PeerCall, Runtime, ServiceId, Transport};
 
 use crate::format::{self, LogRecord, WalEntry, WalOp};
 use crate::log::{CatchUp, PartitionLog, RecoveryState, DEFAULT_SEGMENT_TARGET_BYTES};
@@ -18,6 +19,34 @@ use crate::wire::{
     AppendRequest, FenceRequest, StatusRequest, WalResponse, METHOD_APPEND, METHOD_FENCE,
     METHOD_STATUS,
 };
+
+/// How long an owner keeps retrying a batch while a replica has never
+/// answered.
+///
+/// Sized against the two things that make a replica late to a partition that
+/// already has an owner: the control poll that tells it the map moved, a
+/// quarter of a second by default, and the cold open that follows, which
+/// [ADR 0013](../../../docs/adr/0013-read-serving-is-decoupled-from-the-durability-quorum.md)
+/// measured against real S3 at 1.30s for a 114 MiB partition and 2.36s for
+/// 309 MiB.
+///
+/// Two seconds covers the first and most of the second. It is deliberately
+/// under the three seconds the control plane waits before declaring a node
+/// dead, so a peer that is genuinely gone is reported gone rather than retried
+/// past the point anyone is still waiting. A partition large enough to open
+/// more slowly than this loses the tail of the window, which costs the first
+/// writes and not correctness.
+pub const DEFAULT_REPLICATION_RETRY_BUDGET: Duration = Duration::from_secs(2);
+
+/// The first pause after a batch fails, doubling from there.
+///
+/// Short enough that the common case — a replica a poll interval behind its
+/// owner — is recovered in one or two attempts rather than waited out.
+const REPLICATION_RETRY_INITIAL: Duration = Duration::from_millis(25);
+
+/// The longest pause between attempts, so the budget is spent on several tries
+/// rather than one long sleep that might outlast the window it was waiting for.
+const REPLICATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
 
 /// What a node needs to know to own a partition's log.
 #[derive(Debug, Clone)]
@@ -46,6 +75,14 @@ pub struct WalConfig {
     ///
     /// One, with this node, is the two-of-three the WAL has always required.
     pub durability_acks: usize,
+    /// How long an owner keeps trying to reach a durability quorum for a batch
+    /// while some replica has still never answered.
+    ///
+    /// Covers the window in which a partition exists on its owner and not yet
+    /// on its replicas, which is every split child, every new placement, and
+    /// every partition on a cluster that has just started. Zero restores the
+    /// single attempt every release before this made. See issue #168.
+    pub replication_retry_budget: Duration,
     pub segment_target_bytes: u64,
     /// What the manifest this node's storage was built from says, if there was
     /// one.
@@ -72,6 +109,7 @@ impl WalConfig {
             // required, so the default changes nothing for a cluster that adds
             // no followers.
             durability_acks: 1,
+            replication_retry_budget: DEFAULT_REPLICATION_RETRY_BUDGET,
             segment_target_bytes: DEFAULT_SEGMENT_TARGET_BYTES,
             hydrated: Hydration::default(),
         }
@@ -81,6 +119,14 @@ impl WalConfig {
     #[must_use]
     pub fn with_durability_acks(mut self, acks: usize) -> Self {
         self.durability_acks = acks;
+        self
+    }
+
+    /// Sets how long a batch keeps retrying while a replica has never
+    /// answered. Zero is a single attempt.
+    #[must_use]
+    pub fn with_replication_retry_budget(mut self, budget: Duration) -> Self {
+        self.replication_retry_budget = budget;
         self
     }
 
@@ -355,6 +401,9 @@ pub struct Wal<R: Runtime> {
     /// of the owner: it is a property of the durability contract, not of who
     /// happens to be listening.
     durability_acks: usize,
+    /// How long a batch keeps retrying while a replica has never answered.
+    /// Fixed for the life of the owner, like the quorum it is trying to reach.
+    replication_retry_budget: Duration,
     state: Mutex<OwnerState>,
     progress: tokio::sync::Notify,
     /// How many fsyncs this owner has issued, and how many entries they
@@ -417,6 +466,7 @@ impl<R: Runtime> Wal<R> {
             partition: config.partition,
             replicas: Mutex::new(config.replicas.into()),
             durability_acks: config.durability_acks,
+            replication_retry_budget: config.replication_retry_budget,
             state: Mutex::new(OwnerState {
                 epoch: config.epoch,
                 next_lamport: durable,
@@ -1422,7 +1472,68 @@ impl<R: Runtime> Wal<R> {
     /// rather than dropped. Dropping it would be the cheap thing to do and
     /// would leave a lagging replica lagging forever, because the fast replica
     /// wins every race.
+    /// Ships a batch to the replicas, retrying while a replica that has never
+    /// answered might still be opening the partition.
+    ///
+    /// Nothing makes a replica open a partition before its owner starts taking
+    /// writes for it. The owner admits writes as soon as its own host is open,
+    /// and each holder reconciles the map on its own poll, so for a partition
+    /// that has just appeared — a split child, a new placement, or every
+    /// partition on a cluster that has just started — the first thing that ever
+    /// contacts a replica is the first client write. It arrives before the
+    /// replica has registered the partition and is refused, and the write fails
+    /// with a quorum it could have reached a moment later. See issue #168.
+    ///
+    /// Retrying is safe because an append is idempotent by construction: a
+    /// replica skips entries at or below what it already holds, and a
+    /// per-partition gate keeps two appends from interleaving. Re-sending to a
+    /// peer that already acknowledged costs a round trip and changes nothing.
+    ///
+    /// **It retries only while some replica has never been heard from.** A
+    /// replica that is `Unestablished` has not answered since this log opened,
+    /// which is what a warming replica looks like; one that was following and
+    /// has now gone is an outage, and an outage should fail quickly rather than
+    /// hold every write for the whole budget. That distinction is why this uses
+    /// the catch-up state rather than simply counting attempts.
     async fn replicate(self: &Arc<Self>, request: AppendRequest) -> Result<()> {
+        let mut backoff = REPLICATION_RETRY_INITIAL;
+        let mut spent = Duration::ZERO;
+        loop {
+            let outcome = self.replicate_once(request.clone()).await;
+            let Err(error) = outcome else {
+                return outcome;
+            };
+            // A fenced owner is not warming up. It is done.
+            if matches!(error, Error::StaleEpoch { .. }) {
+                return Err(error);
+            }
+            if spent >= self.replication_retry_budget || !self.any_replica_unestablished() {
+                return Err(error);
+            }
+            let pause = backoff.min(self.replication_retry_budget - spent);
+            self.runtime.clock().sleep(pause).await;
+            spent += pause;
+            backoff = (backoff * 2).min(REPLICATION_RETRY_MAX_BACKOFF);
+        }
+    }
+
+    /// Whether any replica has yet to answer anything since this log opened.
+    ///
+    /// The signal that separates a partition still coming up from one whose
+    /// peers have gone. Deliberately "any" rather than "the ones this batch
+    /// needed": the quorum is a count, not a named set, so a batch that fell
+    /// short cannot say which replica would have completed it.
+    fn any_replica_unestablished(&self) -> bool {
+        let state = self.state();
+        self.replicas().iter().any(|node| {
+            !matches!(
+                state.catch_up.get(node),
+                Some(ReplicaCatchUp::Following { .. }) | Some(ReplicaCatchUp::Stranded(_))
+            )
+        })
+    }
+
+    async fn replicate_once(self: &Arc<Self>, request: AppendRequest) -> Result<()> {
         let replicas = self.replicas();
         // Sized from the durability requirement, not from how many peers happen
         // to be listening. Peers beyond the quorum are followers: they get the
