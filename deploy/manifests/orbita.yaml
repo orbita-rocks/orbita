@@ -154,7 +154,7 @@ spec:
               app.kubernetes.io/component: node
       containers:
         - name: orbita
-          image: ghcr.io/orbita-rocks/orbita:0.1.0-dev
+          image: ghcr.io/orbita-rocks/orbita:0.2.0-dev
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

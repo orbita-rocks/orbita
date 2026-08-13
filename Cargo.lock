@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-cli"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "anyhow",
  "base64",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-control"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-core"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "bytes",
  "thiserror 2.0.19",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-format"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "base64",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-objectstore"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-proto"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "prost 0.13.5",
  "tonic",
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-runtime"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "bytes",
  "orbita-core",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-server"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-sim"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-storage"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "orbita-wal"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
