@@ -245,7 +245,31 @@ impl RaftLog {
             }
         };
 
-        let (entries, hard_state, good_bytes) = decode_records(&raw);
+        let recovered = decode_records(&raw);
+        if let Some(detail) = &recovered.unreadable {
+            return Err(unreadable_record(recovered.good_bytes, raw.len(), detail));
+        }
+        let (entries, hard_state, good_bytes) = (
+            recovered.entries,
+            recovered.hard_state,
+            recovered.good_bytes,
+        );
+        // A tail that has to go must be a tail nobody ever counted on. The
+        // durable commit index is the record of what the group agreed, so a
+        // truncation that would cut into it is committed state being thrown
+        // away, not a half-finished append being cleaned up — and coming up
+        // from the shorter prefix is exactly how a partition disappears from
+        // the map while its data sits on every disk. Refuse instead, and let
+        // an operator decide.
+        let last_recovered = entries.last().map_or(0, |entry| entry.index);
+        let committed = hard_state.as_ref().map_or(0, |hs| hs.commit);
+        if committed > last_recovered {
+            return Err(Error::Internal(format!(
+                "raft log: the durable hard state commits through index {committed} but recovery \
+                 could only read up to index {last_recovered}. Refusing to start: the missing \
+                 records are committed decisions, not an unfinished append."
+            )));
+        }
         if good_bytes < raw.len() {
             tracing::warn!(
                 node = %local,
@@ -439,7 +463,14 @@ async fn replay_committed_membership<R: Runtime>(
         .map_err(disk_error)?;
     let size = file.size().await.map_err(disk_error)?;
     let bytes = file.read_at(0, size as usize).await.map_err(disk_error)?;
-    let (entries, hard_state, _) = decode_records(&bytes);
+    let recovered = decode_records(&bytes);
+    // Refused here as well as in `open_membership`, because this runs first
+    // and reads the same file. A voter directory rebuilt from a prefix is the
+    // same class of mistake as a routing map rebuilt from one.
+    if let Some(detail) = &recovered.unreadable {
+        return Err(unreadable_record(recovered.good_bytes, bytes.len(), detail));
+    }
+    let (entries, hard_state) = (recovered.entries, recovered.hard_state);
     let committed = hard_state.map_or(0, |state| state.commit);
     let mut voters: std::collections::BTreeSet<_> =
         membership.voters.iter().map(|member| member.node).collect();
@@ -1354,11 +1385,11 @@ fn encode_record(kind: u8, payload: &[u8]) -> Bytes {
 /// Entry records replay Raft's own truncation rule: an entry at index `i`
 /// supersedes everything previously read at `i` or above, because a follower
 /// that changed leaders overwrote that suffix. Hard state records apply in
-/// order with the last one winning. Returns how many bytes were trustworthy;
-/// anything after that is a torn tail for the caller to truncate.
-fn decode_records(raw: &[u8]) -> (Vec<Entry>, Option<HardState>, usize) {
+/// order with the last one winning.
+fn decode_records(raw: &[u8]) -> RecoveredRaft {
     let mut entries: Vec<Entry> = Vec::new();
     let mut hard_state = None;
+    let mut unreadable = None;
     let mut offset = 0;
 
     while offset + RECORD_HEADER_BYTES <= raw.len() {
@@ -1384,30 +1415,81 @@ fn decode_records(raw: &[u8]) -> (Vec<Entry>, Option<HardState>, usize) {
             break;
         }
         match kind {
-            RECORD_ENTRY => {
-                let Ok(entry) = Entry::decode(body) else {
-                    break;
-                };
-                while entries.last().is_some_and(|last| last.index >= entry.index) {
-                    entries.pop();
+            RECORD_ENTRY => match Entry::decode(body) {
+                Ok(entry) => {
+                    while entries.last().is_some_and(|last| last.index >= entry.index) {
+                        entries.pop();
+                    }
+                    entries.push(entry);
                 }
-                entries.push(entry);
-            }
-            RECORD_HARD_STATE => {
-                let Ok(hs) = HardState::decode(body) else {
+                Err(error) => {
+                    unreadable = Some(format!("raft entry: {error}"));
                     break;
-                };
-                hard_state = Some(hs);
-            }
+                }
+            },
+            RECORD_HARD_STATE => match HardState::decode(body) {
+                Ok(hs) => hard_state = Some(hs),
+                Err(error) => {
+                    unreadable = Some(format!("raft hard state: {error}"));
+                    break;
+                }
+            },
             // A kind this binary does not know means a newer one wrote it,
             // and everything after it may depend on it. Stop, same as an
             // undecodable body.
-            _ => break,
+            other => {
+                unreadable = Some(format!(
+                    "record kind {other} is not in this binary's alphabet"
+                ));
+                break;
+            }
         }
         offset = body_end;
     }
 
-    (entries, hard_state, offset)
+    RecoveredRaft {
+        entries,
+        hard_state,
+        good_bytes: offset,
+        unreadable,
+    }
+}
+
+/// What replaying the durable raft file produced, and why it stopped.
+struct RecoveredRaft {
+    entries: Vec<Entry>,
+    hard_state: Option<HardState>,
+    /// How many bytes were trustworthy. Anything after this is a torn tail
+    /// the caller may truncate.
+    good_bytes: usize,
+    /// Set when reading stopped at a record that was *whole* and passed its
+    /// checksum, and that this binary still could not make sense of.
+    ///
+    /// The distinction is the whole point. A torn record is a process that
+    /// died mid-append; nothing acknowledged it and dropping it is free. A
+    /// whole, checksummed record is bytes a binary deliberately fsynced, and
+    /// truncating there destroys it *and every committed decision behind it*.
+    /// That is what turns a rolling upgrade into a routing map rolled back to
+    /// an older prefix — a partition missing, `next_partition_id` walking
+    /// backwards, and an acknowledged write unreachable while its WAL is still
+    /// on every disk. See issue #171.
+    unreadable: Option<String>,
+}
+
+/// The refusal recovery gives rather than destroying a whole record.
+///
+/// Fatal on purpose. Truncating and starting anyway produces a node that looks
+/// healthy while serving state rolled back to some earlier prefix, and that is
+/// indistinguishable from working right up until an acknowledged write turns
+/// out to be gone. A process that will not start is a page. A process that
+/// quietly forgot is an incident nobody notices for a day.
+fn unreadable_record(at: usize, total: usize, detail: &str) -> Error {
+    Error::Internal(format!(
+        "raft log: the record at byte {at} is whole, passes its checksum, and this binary cannot \
+         decode it ({detail}). Refusing to start: truncating there would destroy {} bytes of \
+         committed decisions. A binary that understands this record wrote it — run one.",
+        total - at
+    ))
 }
 
 fn driver_gone() -> Error {
@@ -1466,7 +1548,8 @@ mod tests {
             // A new leader rewrote index 2, which buries the old 2 and 3.
             (RECORD_ENTRY, entry(2, 2, 4).encode_to_vec()),
         ]);
-        let (entries, _, good) = decode_records(&raw);
+        let recovered = decode_records(&raw);
+        let (entries, good) = (recovered.entries, recovered.good_bytes);
         assert_eq!(good, raw.len());
         assert_eq!(
             entries
@@ -1488,9 +1571,9 @@ mod tests {
             (RECORD_HARD_STATE, HardState::default().encode_to_vec()),
             (RECORD_HARD_STATE, newer.encode_to_vec()),
         ]);
-        let (_, hard_state, good) = decode_records(&raw);
-        assert_eq!(good, raw.len());
-        assert_eq!(hard_state, Some(newer));
+        let recovered = decode_records(&raw);
+        assert_eq!(recovered.good_bytes, raw.len());
+        assert_eq!(recovered.hard_state, Some(newer));
     }
 
     #[test]
@@ -1500,11 +1583,15 @@ mod tests {
             (RECORD_ENTRY, entry(2, 1, 2).encode_to_vec()),
         ]);
         for cut in 1..whole.len() {
-            let (entries, _, good) = decode_records(&whole[..cut]);
-            assert!(good <= cut);
-            assert!(entries.len() <= 2);
-            if !entries.is_empty() {
-                assert_eq!(entries[0].index, 1, "the intact prefix survives");
+            let recovered = decode_records(&whole[..cut]);
+            assert!(recovered.good_bytes <= cut);
+            assert!(recovered.entries.len() <= 2);
+            assert!(
+                recovered.unreadable.is_none(),
+                "a record cut short is a torn tail, not one this binary cannot read"
+            );
+            if !recovered.entries.is_empty() {
+                assert_eq!(recovered.entries[0].index, 1, "the intact prefix survives");
             }
         }
     }
@@ -1516,9 +1603,14 @@ mod tests {
             (99, b"from the future".to_vec()),
             (RECORD_ENTRY, entry(2, 1, 2).encode_to_vec()),
         ]);
-        let (entries, _, good) = decode_records(&raw);
-        assert_eq!(entries.len(), 1);
-        assert!(good < raw.len());
+        let recovered = decode_records(&raw);
+        assert_eq!(recovered.entries.len(), 1);
+        assert!(recovered.good_bytes < raw.len());
+        assert!(
+            recovered.unreadable.is_some(),
+            "a whole record from a newer binary is not a torn tail, and truncating there \
+             would take the committed records behind it too"
+        );
     }
 
     #[test]
@@ -1683,5 +1775,210 @@ mod tests {
             .err()
             .expect("the duplicate is rejected");
         assert!(error.to_string().contains("duplicate"), "{error}");
+    }
+
+    /// Stands up a real one-node control plane and commits four keyspaces
+    /// through it, returning the durable raft bytes and the state they encode.
+    ///
+    /// Shared by the two recovery-refusal tests below because what makes them
+    /// worth having is that the log is genuinely a control plane's, not a
+    /// handful of synthetic frames: the thing at stake is the routing map.
+    fn control_plane_with_four_keyspaces(seed: u64) -> (Simulation, Bytes, u64) {
+        use crate::consensus::ConsensusLog as _;
+        use crate::{BootstrapSpec, ControlConfig, Controller, KeyspaceConfig};
+
+        let sim = Simulation::new(seed);
+        let runtime = sim.add_node(NodeId(1));
+        let opening = runtime.clone();
+        let log = sim.block_on(async move { RaftLog::open(&opening, &[NodeId(1)]).await.unwrap() });
+        sim.run_for(Duration::from_secs(10));
+
+        let controller = Controller::new(
+            sim.runtime(NodeId(1)),
+            Arc::clone(&log),
+            ControlConfig::default(),
+        );
+        let setup = controller.clone();
+        sim.block_on(async move {
+            setup
+                .bootstrap(&BootstrapSpec {
+                    keyspace: "default".into(),
+                    config: KeyspaceConfig::default(),
+                    leaders: vec![(NodeId(1), "10.0.0.1:7000".into())],
+                    workers: vec![(NodeId(2), "10.0.0.2:7000".into())],
+                })
+                .await
+                .unwrap();
+            for name in ["second", "third", "fourth"] {
+                setup
+                    .create_keyspace(name, KeyspaceConfig::default())
+                    .await
+                    .unwrap();
+            }
+        });
+        let snapshot = sim.block_on({
+            let controller = controller.clone();
+            async move { controller.snapshot().await }
+        });
+        assert_eq!(snapshot.map().len(), 4);
+        assert_eq!(snapshot.next_partition_id(), orbita_core::PartitionId(5));
+        let committed = sim.block_on({
+            let log = Arc::clone(&log);
+            async move { log.commit_index().await }
+        });
+
+        log.shutdown();
+        sim.run_for(Duration::from_secs(1));
+        let reading = sim.runtime(NodeId(1));
+        let raw = sim.block_on(async move {
+            let file = reading
+                .disk()
+                .open(LOG_PATH, OpenOptions::create())
+                .await
+                .unwrap();
+            let size = file.size().await.unwrap();
+            file.read_at(0, size as usize).await.unwrap()
+        });
+        (sim, raw, committed)
+    }
+
+    /// Overwrites the durable raft file with `bytes`.
+    fn rewrite_raft_log(sim: &Simulation, bytes: Bytes) {
+        let runtime = sim.runtime(NodeId(1));
+        sim.block_on(async move {
+            let file = runtime
+                .disk()
+                .open(LOG_PATH, OpenOptions::create())
+                .await
+                .unwrap();
+            file.truncate(0).await.unwrap();
+            file.append(bytes).await.unwrap();
+            file.sync().await.unwrap();
+        });
+    }
+
+    /// The byte offset of the record boundary nearest the middle of `raw`.
+    fn middle_record_boundary(raw: &[u8]) -> usize {
+        let mut offset = 0;
+        while offset + RECORD_HEADER_BYTES <= raw.len() {
+            let len = u32::from_le_bytes([
+                raw[offset + 1],
+                raw[offset + 2],
+                raw[offset + 3],
+                raw[offset + 4],
+            ]) as usize;
+            offset += RECORD_HEADER_BYTES + len;
+            if offset >= raw.len() / 2 {
+                return offset;
+            }
+        }
+        panic!("the log has no record boundary near its middle");
+    }
+
+    #[test]
+    fn recovery_refuses_rather_than_rolling_the_control_plane_back_to_a_shorter_prefix() {
+        use crate::consensus::ConsensusLog as _;
+        use crate::{ControlConfig, Controller};
+
+        let (sim, whole, committed) = control_plane_with_four_keyspaces(21);
+
+        // A record kind this binary does not know, wedged in front of half the
+        // committed decisions — the shape a log written by a newer binary has
+        // when an older one replays it. Recovery used to stop here, truncate,
+        // and come up leader on the prefix: partition 7 gone from the map,
+        // `next_partition_id` walked back far enough to hand id 7 to the next
+        // keyspace, and an acknowledged write unreachable with its WAL still on
+        // every disk. Issue #171.
+        let cut = middle_record_boundary(&whole);
+        let mut wedged = BytesMut::from(&whole[..cut]);
+        wedged.put_slice(&encode_record(99, b"from a newer binary"));
+        wedged.put_slice(&whole[cut..]);
+        let wedged = wedged.freeze();
+        let wedged_len = wedged.len() as u64;
+        rewrite_raft_log(&sim, wedged);
+
+        let reopening = sim.runtime(NodeId(1));
+        let error = sim
+            .block_on(async move { RaftLog::open(&reopening, &[NodeId(1)]).await })
+            .err()
+            .expect("a whole record this binary cannot read is fatal, not a torn tail");
+        assert!(error.to_string().contains("Refusing to start"), "{error}");
+
+        let checking = sim.runtime(NodeId(1));
+        let after = sim.block_on(async move {
+            let file = checking
+                .disk()
+                .open(LOG_PATH, OpenOptions::create())
+                .await
+                .unwrap();
+            file.size().await.unwrap()
+        });
+        assert_eq!(
+            after, wedged_len,
+            "a refusal must leave every byte where it was, or the next binary has nothing to read"
+        );
+
+        // And the point of leaving them alone: a binary that can read the
+        // wedged record — modelled here by removing it — still finds the whole
+        // map. Nothing was destroyed while this one refused.
+        rewrite_raft_log(&sim, whole);
+        let recovering = sim.runtime(NodeId(1));
+        let log = sim
+            .block_on(async move { RaftLog::open(&recovering, &[NodeId(1)]).await })
+            .expect("the untouched log still opens");
+        sim.run_for(Duration::from_secs(10));
+        let controller = Controller::new(
+            sim.runtime(NodeId(1)),
+            Arc::clone(&log),
+            ControlConfig::default(),
+        );
+        let snapshot = sim.block_on(async move {
+            controller.recover().await.unwrap();
+            controller.snapshot().await
+        });
+        assert_eq!(snapshot.map().len(), 4, "every partition survived");
+        assert_eq!(
+            snapshot.next_partition_id(),
+            orbita_core::PartitionId(5),
+            "and the id counter never went backwards"
+        );
+        assert_eq!(
+            sim.block_on(async move { log.commit_index().await }),
+            committed
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_a_log_shorter_than_the_commit_index_it_durably_recorded() {
+        // The commit index is the record of what the group agreed. A file that
+        // cannot produce the entries behind it has lost committed decisions,
+        // whatever damaged it, and starting from the shorter prefix is the
+        // rollback issue #171 is about. Raft itself treats this as
+        // unrecoverable and aborts the process; a refusal says the same thing
+        // where an operator can read it.
+        let (sim, whole, _) = control_plane_with_four_keyspaces(22);
+        let recovered = decode_records(&whole);
+        let last = recovered.entries.last().expect("entries").index;
+        let hard_state = HardState {
+            term: recovered.hard_state.as_ref().map_or(1, |hs| hs.term),
+            vote: 1,
+            commit: last + 1,
+        };
+        let mut damaged = BytesMut::from(&whole[..]);
+        damaged.put_slice(&encode_record(
+            RECORD_HARD_STATE,
+            &hard_state.encode_to_vec(),
+        ));
+        rewrite_raft_log(&sim, damaged.freeze());
+
+        let reopening = sim.runtime(NodeId(1));
+        let error = sim
+            .block_on(async move { RaftLog::open(&reopening, &[NodeId(1)]).await })
+            .err()
+            .expect("a commit index the log cannot back up is fatal");
+        assert!(
+            error.to_string().contains("could only read up to index"),
+            "{error}"
+        );
     }
 }

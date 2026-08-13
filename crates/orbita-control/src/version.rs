@@ -146,11 +146,11 @@ impl std::fmt::Display for CompatibilityRefusal {
 /// still being defined rather than being kept compatible with. See ADR 0012.
 pub const PROTOCOL_0_1: ClusterVersion = ClusterVersion::new(0, 1);
 
-/// The next cluster version, reserved rather than in use.
+/// The cluster version that enables apply-time partition-id high-water checks.
 ///
-/// Nothing gates on this today. It is kept because the compatibility window in
-/// [`speaks_for`] is the mechanism a future protocol change will need, and a
-/// constant that names the next version is where that change starts.
+/// The check changes whether a committed command takes effect, so it cannot be
+/// enabled merely because the running binary knows it. Protocol finalization is
+/// what guarantees every voter switches to the new state-machine rule together.
 pub const PROTOCOL_0_2: ClusterVersion = ClusterVersion::new(0, 2);
 
 /// Whether `active` is a cluster version whose protocol carries worker
