@@ -291,6 +291,28 @@ pub struct Controller<R: Runtime, L: ConsensusLog> {
     inner: Arc<Mutex<Inner>>,
 }
 
+// How many replicas beside the owner a partition should keep, given what
+// was configured, what durability needs, and how large the cluster is.
+//
+// The ceiling exists because read capacity is bought out of write
+// throughput: every holder is an invalidation a write waits on before it
+// is acknowledged. Capping holders at half the placeable cluster keeps a
+// write off a majority of the nodes and leaves half the cluster free of
+// the obligation entirely. Holders are the replicas plus the owner, so the
+// cap on replicas is one below half.
+//
+// It is applied here rather than in the config builder because it depends
+// on the size of the cluster now, not its size when someone wrote the
+// number down. A cluster that grows relaxes its own ceiling on the next
+// pass, which is what makes the knob safe to set optimistically.
+//
+// The floor beats the ceiling. This knob may add reach and may never take
+// copies away, so a cluster too small to satisfy both keeps its durability
+// and exceeds the cap.
+fn read_replica_want(target: usize, floor: usize, placeable: usize) -> usize {
+    target.min((placeable / 2).saturating_sub(1)).max(floor)
+}
+
 impl<R: Runtime, L: ConsensusLog> Clone for Controller<R, L> {
     fn clone(&self) -> Self {
         Self {
@@ -2280,10 +2302,17 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
     }
 
     async fn repair_replica_sets(&self) -> Result<()> {
-        let want = self.config.replication_factor.saturating_sub(1);
+        // The read-serving set, not the durability quorum. A peer past the
+        // quorum is not counted by the WAL, so widening this costs nothing in
+        // durability. It is not free: every holder is an invalidation a write
+        // waits on before it is acknowledged, which is the coherence quorum
+        // ADR 0001 keeps separate from durability. Read capacity is therefore
+        // bought out of write throughput, which is why there is a ceiling.
+        let floor = self.config.replication_factor.saturating_sub(1);
         let commands: Vec<ControlCommand> = {
             let inner = self.inner.lock().await;
             let candidates = inner.state.placement_candidates();
+            let want = read_replica_want(self.config.read_replica_target, floor, candidates.len());
             inner
                 .state
                 .map()
@@ -2899,6 +2928,88 @@ mod tests {
             Arc::new(MembershipLog { voters, learners }),
             ControlConfig::default(),
         )
+    }
+
+    #[test]
+    fn the_read_replica_target_widens_the_holder_set_without_touching_durability() {
+        // The control-plane half of ADR 0013. Raising the read target adds
+        // holders, and holders are what may serve a read; it must not change
+        // the replication factor, which is what sizes the durability contract.
+        // If the two moved together, read capacity could only be bought with
+        // write latency.
+        let config = ControlConfig::default()
+            .with_read_replica_target(4)
+            .expect("above the durability floor");
+        assert_eq!(config.replication_factor, 3, "durability is untouched");
+        assert_eq!(config.read_replica_target, 4);
+
+        // And it refuses to take copies away, which is the direction that
+        // would quietly weaken durability rather than widen reach.
+        let refused = ControlConfig::default().with_read_replica_target(1);
+        assert!(
+            refused.is_err(),
+            "a target below the durability floor must be refused, got {refused:?}"
+        );
+    }
+
+    #[test]
+    fn no_partition_is_held_by_more_than_half_the_cluster() {
+        // Every holder is an invalidation a write waits on, so an operator who
+        // sets this high is spending write throughput without being told. The
+        // cap keeps a write off a majority of the nodes and leaves half the
+        // cluster free of the obligation. Holders are replicas plus the owner,
+        // so the replica cap is one below half.
+        const FLOOR: usize = 2;
+
+        assert_eq!(
+            read_replica_want(9, FLOOR, 10),
+            4,
+            "a target past the ceiling is clamped to it"
+        );
+        assert_eq!(
+            read_replica_want(4, FLOOR, 10),
+            4,
+            "a target exactly at the ceiling is left alone"
+        );
+        assert_eq!(
+            read_replica_want(4, FLOOR, 20),
+            4,
+            "a target under the ceiling is not inflated to it"
+        );
+
+        // The property the number is chosen for, stated directly.
+        for placeable in [8usize, 10, 16, 40] {
+            let holders = read_replica_want(usize::MAX, FLOOR, placeable) + 1;
+            assert!(
+                holders * 2 <= placeable,
+                "{holders} holders out of {placeable} nodes is more than half"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_outranks_the_read_ceiling_on_a_small_cluster() {
+        // The ceiling bounds what reads may take. It may not take copies away,
+        // because the replicas underneath it are what the write quorum is made
+        // of. On a cluster too small to satisfy both, the floor wins and the
+        // holder set exceeds half deliberately.
+        const FLOOR: usize = 2;
+
+        assert_eq!(
+            read_replica_want(4, FLOOR, 5),
+            FLOOR,
+            "a five node cluster cannot honour the ceiling without dropping below the floor"
+        );
+        assert_eq!(
+            read_replica_want(4, FLOOR, 3),
+            FLOOR,
+            "nor can a three node one"
+        );
+        assert_eq!(
+            read_replica_want(4, FLOOR, 0),
+            FLOOR,
+            "an empty candidate set must not shrink the durability contract"
+        );
     }
 
     #[test]

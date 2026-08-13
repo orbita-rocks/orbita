@@ -192,6 +192,10 @@ pub(crate) struct PartitionPaths {
     /// a checkpoint drops whole segments, so this is what decides how much
     /// history an owner keeps after one.
     pub wal_segment_bytes: u64,
+    /// How many peer acknowledgements a write requires, independent of how
+    /// many peers this partition ships appends to. See
+    /// [`orbita_wal::WalConfig::durability_acks`].
+    pub durability_acks: usize,
 }
 
 pub(crate) struct PartitionHost<R: Runtime> {
@@ -310,6 +314,7 @@ impl<R: Runtime> PartitionHost<R> {
             .with_replicas(replicas.clone())
             .with_hydration(hydrated);
         config.segment_target_bytes = paths.wal_segment_bytes;
+        config.durability_acks = paths.durability_acks;
         let wal = Wal::open(runtime.clone(), config).await?;
 
         // A restart finds entries that were durable and never applied, because
@@ -945,6 +950,23 @@ impl<R: Runtime> PartitionHost<R> {
             .as_ref()
             .map(|wal| wal.replication_lag())
             .unwrap_or_default()
+    }
+
+    /// How many replicas hold a live read lease on this partition right now.
+    ///
+    /// This is the size of the coherence quorum, and therefore the number of
+    /// invalidations a write waits on before it may be acknowledged. ADR 0013
+    /// buys read capacity out of write throughput by widening this, so it is
+    /// the number an operator needs when write latency moves after a read
+    /// target change and nothing else did. Without it the trade is invisible
+    /// and gets blamed on whatever shipped that week.
+    pub(crate) fn lease_holders(&self) -> u64 {
+        let now = self.runtime.clock().monotonic_nanos();
+        self.leases
+            .lock()
+            .expect("lease table poisoned")
+            .holders_with_expiry(now)
+            .len() as u64
     }
 
     /// How much disk this partition is using, which is what the control plane
@@ -2242,6 +2264,7 @@ mod tests {
             path: partition_path(),
             wal_dir: "wal/p1".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
         sim.block_on(async move {
             PartitionHost::open_owner(
@@ -2270,6 +2293,7 @@ mod tests {
             path: partition_path(),
             wal_dir: "wal/replica-p1".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
+            durability_acks: 1,
         };
         sim.block_on(async move {
             PartitionHost::open_replica(
@@ -2943,5 +2967,37 @@ mod tests {
             } => assert_eq!(expires_at_millis, Some(6_000)),
             WalOp::Delete { .. } => panic!("a put became a delete"),
         }
+    }
+
+    #[test]
+    fn the_lease_holder_gauge_counts_only_leases_that_are_still_live() {
+        // The gauge exists so that write latency moving after a read target
+        // change is explainable rather than mysterious, which only works if it
+        // reports the set a write actually waits on. A lapsed lease is one the
+        // owner has stopped waiting for, so counting it would overstate the
+        // coherence quorum exactly when an operator is trying to find out why
+        // writes got slower.
+        let sim = Simulation::new(1);
+        let runtime = sim.add_node(NodeId(1));
+        let store = Arc::new(FaultStore::new());
+        let host = start_host(&sim, runtime, store);
+
+        assert_eq!(host.lease_holders(), 0, "nothing has been granted yet");
+
+        let now = host.runtime.clock().monotonic_nanos();
+        {
+            let mut leases = host.leases.lock().expect("lease table poisoned");
+            leases.grant(NodeId(2), now, Duration::from_secs(1));
+            leases.grant(NodeId(3), now, Duration::from_secs(1));
+            // Granted for no time at all, which is how an owner probes a
+            // replica it has stopped trusting. It is not a holder.
+            leases.grant(NodeId(4), now, Duration::ZERO);
+        }
+
+        assert_eq!(
+            host.lease_holders(),
+            2,
+            "a lease that has already lapsed is not part of the coherence quorum"
+        );
     }
 }

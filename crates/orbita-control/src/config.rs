@@ -47,6 +47,19 @@ pub struct ControlConfig {
     /// and its reasoning live with the rest of the control-plane timing.
     pub split_threshold_bytes: u64,
 
+    /// How many replicas a partition keeps beyond its owner.
+    ///
+    /// Separate from `replication_factor`, which sizes the durability
+    /// contract. This sizes the set that holds a copy and can therefore serve
+    /// reads. Raising it buys read capacity; it does not change how many
+    /// acknowledgements a write waits for, because a peer past the durability
+    /// quorum follows the stream without being able to hold a write up. See
+    /// ADR 0013.
+    ///
+    /// Defaults to `replication_factor - 1`, which is exactly the behaviour
+    /// before the two were separable.
+    pub read_replica_target: usize,
+
     /// Desired control-plane voters, independent from worker count.
     pub voter_target: usize,
 
@@ -139,6 +152,7 @@ impl ControlConfig {
             lease_duration: Duration::from_millis(500),
             lease_margin: Duration::from_millis(50),
             replication_factor: 3,
+            read_replica_target: 2,
             split_threshold_bytes: 512 * 1024 * 1024,
             voter_target: 3,
             voter_management_enabled: false,
@@ -246,6 +260,21 @@ impl ControlConfig {
     #[must_use]
     pub fn convergence_bound(&self) -> Duration {
         self.failover_budget() + 4 * self.sweep_interval + 8 * self.heartbeat_interval
+    }
+
+    /// Sets how many replicas a partition keeps for read serving.
+    ///
+    /// Refused below `replication_factor - 1`, because that many are needed for
+    /// durability and this knob may only add reach, never take copies away.
+    pub fn with_read_replica_target(mut self, target: usize) -> orbita_core::Result<Self> {
+        let floor = self.replication_factor.saturating_sub(1);
+        if target < floor {
+            return Err(orbita_core::Error::InvalidArgument(format!(
+                "a read replica target of {target} is below the {floor} replicas durability needs"
+            )));
+        }
+        self.read_replica_target = target;
+        Ok(self)
     }
 
     /// Sets the supported odd voter target.

@@ -28,6 +28,13 @@ async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
+# For `buffer_unordered` alone. Building a partition's index is one ranged read
+# per segment for the footer and another for the key index, and doing those in
+# sequence makes a cold open cost round trips rather than bytes: measured at
+# 2.36s for a 309 MiB partition against real S3, almost all of it waiting. These
+# are combinators rather than an executor, so the simulator still drives them
+# deterministically and nothing here spawns a task.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -196,6 +196,19 @@ pub struct ServerConfig {
 
     /// Whether this node is one of the fixed voters and therefore hosts the
     /// replicated control plane rather than only consuming it.
+    /// How many peer acknowledgements a write requires, independent of how many
+    /// peers hold the partition.
+    ///
+    /// One, together with the owner, is the two-of-three the WAL has always
+    /// required. Peers beyond that follow the stream for freshness and serve
+    /// reads without being able to hold a write up, which is what lets read
+    /// capacity grow without buying it in write latency. See ADR 0013.
+    pub durability_acks: usize,
+
+    /// How many replicas a partition keeps so they can serve reads. `None`
+    /// leaves the control plane at its durability floor. See ADR 0013.
+    pub read_replica_target: Option<usize>,
+
     pub leader_member: bool,
 
     /// Whether a leader group member also owns partitions.
@@ -377,6 +390,8 @@ impl Default for ServerConfig {
             peers: Vec::new(),
             peer_call_timeout: DEFAULT_PEER_CALL_TIMEOUT,
             leader_group: Vec::new(),
+            durability_acks: 1,
+            read_replica_target: None,
             leader_member: false,
             leader_owns_partitions: false,
             automatic_cluster: false,
@@ -496,6 +511,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_leader_owns_partitions(mut self, owns: bool) -> Self {
         self.leader_owns_partitions = owns;
+        self
+    }
+
+    /// Sets how many replicas a partition keeps for serving reads.
+    #[must_use]
+    pub fn with_read_replica_target(mut self, target: Option<usize>) -> Self {
+        self.read_replica_target = target;
         self
     }
 

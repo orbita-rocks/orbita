@@ -1075,6 +1075,7 @@ dependencies = [
  "base64",
  "bytes",
  "crc32c",
+ "futures-util",
  "orbita-core",
  "orbita-objectstore",
  "orbita-runtime",

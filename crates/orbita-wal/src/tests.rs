@@ -18,6 +18,8 @@ const DIR: &str = "wal";
 const OWNER: NodeId = NodeId(1);
 const PEER_A: NodeId = NodeId(2);
 const PEER_B: NodeId = NodeId(3);
+const PEER_C: NodeId = NodeId(4);
+const PEER_D: NodeId = NodeId(5);
 
 fn segment(seq: u64) -> String {
     format!("{DIR}/{seq:012}.wal")
@@ -1050,6 +1052,107 @@ fn losing_one_of_three_replicas_loses_no_acknowledged_write() {
         .await
         .expect("reopen");
         assert_eq!(survivor.recovery().durable_lamport, Lamport(5));
+    });
+}
+
+#[test]
+fn a_follower_beyond_the_quorum_cannot_hold_up_a_write() {
+    // The property the whole read-scaling argument rests on. A peer added so
+    // it can serve reads receives every append, so its view stays current, but
+    // it is not counted toward durability. If it were, buying read capacity
+    // would mean buying write latency and enlarging the set of nodes any one
+    // of which can stall a write, which is the opposite trade.
+    let base = TestRuntime::solo(41);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let owner_runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let owner = Wal::open(
+            owner_runtime.clone(),
+            WalConfig::new(PARTITION, DIR, Epoch(1))
+                // Four peers, and still the two-of-three durability contract:
+                // this node plus one acknowledgement.
+                .with_replicas(vec![PEER_A, PEER_B, PEER_C, PEER_D])
+                .with_durability_acks(1),
+        )
+        .await
+        .expect("open owner");
+        let service = WalService::new();
+        service.register(owner.log());
+        owner_runtime
+            .transport()
+            .register(ServiceId::Wal, service.clone());
+        let peers = [
+            peer(&base, &net, PEER_A).await,
+            peer(&base, &net, PEER_B).await,
+            peer(&base, &net, PEER_C).await,
+            peer(&base, &net, PEER_D).await,
+        ];
+
+        // Everything past the quorum goes away. Under a quorum sized from the
+        // peer list this would need three acknowledgements and would now fail.
+        net.isolate(PEER_B);
+        net.isolate(PEER_C);
+        net.isolate(PEER_D);
+
+        for i in 1..=5 {
+            let lamport = owner
+                .commit(op(&format!("k{i}")))
+                .await
+                .expect("followers are not counted, so losing them changes nothing");
+            assert_eq!(lamport, Lamport(i));
+        }
+
+        assert_eq!(
+            peers[0].durable().await,
+            Lamport(5),
+            "the peer that answered holds every acknowledged write"
+        );
+        for absent in &peers[1..] {
+            assert_eq!(absent.durable().await, Lamport::ZERO);
+        }
+    });
+}
+
+#[test]
+fn a_write_still_needs_a_second_copy_however_many_followers_are_listening() {
+    // The other half of the same rule, and the one that would make this
+    // dangerous if it were wrong. Followers do not count toward durability, so
+    // they must not be able to satisfy it either by standing in for the peer
+    // that is gone. Losing every peer fails the write, exactly as it does with
+    // two.
+    let base = TestRuntime::solo(43);
+    block_on(&base, async {
+        let net = MemNetwork::new();
+        let owner_runtime = base.peer(MemDisk::new(), net.node(OWNER));
+        let owner = Wal::open(
+            owner_runtime.clone(),
+            WalConfig::new(PARTITION, DIR, Epoch(1))
+                .with_replicas(vec![PEER_A, PEER_B, PEER_C, PEER_D])
+                .with_durability_acks(1),
+        )
+        .await
+        .expect("open owner");
+        let service = WalService::new();
+        service.register(owner.log());
+        owner_runtime
+            .transport()
+            .register(ServiceId::Wal, service.clone());
+        let _peers = [
+            peer(&base, &net, PEER_A).await,
+            peer(&base, &net, PEER_B).await,
+            peer(&base, &net, PEER_C).await,
+            peer(&base, &net, PEER_D).await,
+        ];
+
+        for id in [PEER_A, PEER_B, PEER_C, PEER_D] {
+            net.isolate(id);
+        }
+
+        let refused = owner.commit(op("k1")).await;
+        assert!(
+            refused.is_err(),
+            "a write with no second copy must fail however many peers were listening"
+        );
     });
 }
 
