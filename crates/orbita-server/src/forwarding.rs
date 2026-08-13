@@ -19,6 +19,7 @@ use orbita_proto::v1::{GetRequest, ListRequest, SetRequest};
 use orbita_runtime::Runtime;
 use orbita_sim::{SimRuntime, Simulation};
 
+use orbita_storage::ValueCache;
 use std::sync::Arc;
 
 const KEYSPACE: &str = "default";
@@ -70,6 +71,7 @@ fn start(sim: &Simulation, node: NodeId) -> Arc<Node<SimRuntime>> {
     // Each node persists into its own in-memory store, so a run touches no
     // real filesystem and stays deterministic.
     let layout = DataLayout {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,

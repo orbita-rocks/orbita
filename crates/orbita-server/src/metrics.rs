@@ -46,6 +46,16 @@ struct OwnedSample {
     storage_bytes: Option<u64>,
 }
 
+/// The node-wide value cache readings, replaced by every heartbeat.
+///
+/// Node-scoped rather than per partition because the cache is one budget
+/// shared by all of them, so labelling it per partition would multiply a
+/// single number by however many partitions happened to be here.
+fn cache() -> &'static RwLock<Option<orbita_storage::CacheStats>> {
+    static CACHE: OnceLock<RwLock<Option<orbita_storage::CacheStats>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(None))
+}
+
 /// The partitions this node currently owns, republished wholesale by every
 /// heartbeat (see [`publish_owned`]).
 ///
@@ -76,6 +86,10 @@ struct Instruments {
     _replicas_behind: ObservableGauge<u64>,
     _replication_lag: ObservableGauge<u64>,
     _lease_holders: ObservableGauge<u64>,
+    _cache_bytes: ObservableGauge<u64>,
+    _cache_hits: ObservableGauge<u64>,
+    _cache_misses: ObservableGauge<u64>,
+    _cache_evictions: ObservableGauge<u64>,
     _partition_storage_bytes: ObservableGauge<u64>,
 }
 
@@ -131,6 +145,57 @@ fn instruments() -> &'static Instruments {
                 .with_callback(|observer| {
                     for sample in owned().read().unwrap().iter() {
                         observer.observe(sample.lease_holders, &owned_attributes(sample));
+                    }
+                })
+                .build(),
+            _cache_bytes: meter
+                .u64_observable_gauge("orbita.value_cache.bytes")
+                .with_unit("By")
+                .with_description(
+                    "Records read out of segments currently held in memory, across every \
+                     partition on this node.",
+                )
+                .with_callback(|observer| {
+                    if let Some(stats) = *cache().read().unwrap() {
+                        observer.observe(stats.bytes, &[]);
+                    }
+                })
+                .build(),
+            // Counters rather than a ratio, so a collector can compute a rate
+            // over whatever window it wants. A hit rate published here would
+            // be a lifetime average, which stops moving on a long-lived node
+            // exactly when someone is watching it to see whether a change
+            // helped.
+            _cache_hits: meter
+                .u64_observable_gauge("orbita.value_cache.hits")
+                .with_unit("{read}")
+                .with_description("Reads of a flushed key served without an object-store fetch.")
+                .with_callback(|observer| {
+                    if let Some(stats) = *cache().read().unwrap() {
+                        observer.observe(stats.hits, &[]);
+                    }
+                })
+                .build(),
+            _cache_misses: meter
+                .u64_observable_gauge("orbita.value_cache.misses")
+                .with_unit("{read}")
+                .with_description("Reads of a flushed key that had to fetch from object storage.")
+                .with_callback(|observer| {
+                    if let Some(stats) = *cache().read().unwrap() {
+                        observer.observe(stats.misses, &[]);
+                    }
+                })
+                .build(),
+            // The signal that says the budget is too small rather than the
+            // working set too large: a cache with hits and no evictions is
+            // sized correctly, and one evicting steadily is not.
+            _cache_evictions: meter
+                .u64_observable_gauge("orbita.value_cache.evictions")
+                .with_unit("{record}")
+                .with_description("Records dropped from the value cache to stay inside its budget.")
+                .with_callback(|observer| {
+                    if let Some(stats) = *cache().read().unwrap() {
+                        observer.observe(stats.evictions, &[]);
                     }
                 })
                 .build(),
@@ -217,6 +282,15 @@ pub(crate) struct OwnedMetric {
 /// has not yet served a client request.
 pub(crate) fn publish_owned(owned_metrics: Vec<OwnedMetric>) {
     publish_owned_into(owned(), owned_metrics);
+    instruments();
+}
+
+/// Replaces this node's value cache readings.
+///
+/// Driven from the same heartbeat as the owned-partition gauges so every
+/// number in an export describes the same instant.
+pub(crate) fn publish_cache(stats: orbita_storage::CacheStats) {
+    *cache().write().unwrap() = Some(stats);
     instruments();
 }
 

@@ -57,7 +57,7 @@ use orbita_format::PartitionPath;
 use orbita_objectstore::ObjectStore;
 use orbita_runtime::{join_all, timeout, Clock, PeerCall, Runtime, ServiceId, Transport};
 use orbita_storage::{
-    ChildSpec, Mutation, Partition, ScanBudget, ScanPage, TOMBSTONE_RETENTION_MILLIS,
+    ChildSpec, Mutation, Partition, ScanBudget, ScanPage, ValueCache, TOMBSTONE_RETENTION_MILLIS,
 };
 use orbita_wal::{CatchUpPass, Hydration, PartitionLog, Wal, WalConfig, WalEntry, WalOp};
 
@@ -196,6 +196,9 @@ pub(crate) struct PartitionPaths {
     /// many peers this partition ships appends to. See
     /// [`orbita_wal::WalConfig::durability_acks`].
     pub durability_acks: usize,
+    /// Where this partition's flushed-key reads are served from before the
+    /// object store is asked. Shared with every other partition on the node.
+    pub value_cache: Arc<ValueCache>,
 }
 
 pub(crate) struct PartitionHost<R: Runtime> {
@@ -301,7 +304,8 @@ impl<R: Runtime> PartitionHost<R> {
                 epoch,
                 range,
             )
-            .await?,
+            .await?
+            .with_value_cache(Arc::clone(&paths.value_cache)),
         );
         // What opening the storage engine built out of the bucket. On a node
         // that has held this partition all along it is the last manifest it
@@ -379,7 +383,8 @@ impl<R: Runtime> PartitionHost<R> {
                 spec.epoch,
                 spec.range.clone(),
             )
-            .await?,
+            .await?
+            .with_value_cache(Arc::clone(&paths.value_cache)),
         );
         let opened = runtime.clock().monotonic_nanos();
         let hydrated = hydration_of(&storage).await;
@@ -2260,6 +2265,7 @@ mod tests {
         store: Arc<FaultStore>,
     ) -> Arc<PartitionHost<SimRuntime>> {
         let paths = PartitionPaths {
+            value_cache: Arc::new(ValueCache::new(1 << 20)),
             store,
             path: partition_path(),
             wal_dir: "wal/p1".to_string(),
@@ -2289,6 +2295,7 @@ mod tests {
         store: Arc<FaultStore>,
     ) -> Arc<PartitionHost<SimRuntime>> {
         let paths = PartitionPaths {
+            value_cache: Arc::new(ValueCache::new(1 << 20)),
             store,
             path: partition_path(),
             wal_dir: "wal/replica-p1".to_string(),

@@ -59,7 +59,7 @@ use orbita_runtime::{
     join_all, Clock, PeerCall, PeerHandler, Runtime, ServiceId, Transport, TransportError,
     TransportResult,
 };
-use orbita_storage::{ChildSpec, ScanBudget};
+use orbita_storage::{ChildSpec, ScanBudget, ValueCache};
 use orbita_wal::WalService;
 
 use std::collections::{HashMap, HashSet};
@@ -143,6 +143,9 @@ pub(crate) struct DataLayout {
     /// the WAL has always required; peers beyond it follow for freshness and
     /// cannot hold a write up. See ADR 0013.
     pub durability_acks: usize,
+    /// Records read back out of segments, shared by every partition this node
+    /// hosts. See [`orbita_storage::ValueCache`] and ADR 0006.
+    pub value_cache: Arc<ValueCache>,
 }
 
 impl DataLayout {
@@ -153,6 +156,7 @@ impl DataLayout {
             wal_dir: format!("{}/p{}", self.wal_root, partition.get()),
             wal_segment_bytes: self.wal_segment_bytes,
             durability_acks: self.durability_acks,
+            value_cache: Arc::clone(&self.value_cache),
         }
     }
 }
@@ -1877,6 +1881,12 @@ impl<R: Runtime> Node<R> {
         // so a partition this node no longer owns drops out of the export by
         // being absent here rather than by anyone retiring its series.
         metrics::publish_owned(owned);
+        // Node-scoped, and published here rather than per partition because
+        // the cache is one budget every partition draws on. Without it the
+        // only way to know whether reads are being served from memory is to
+        // infer it from latency, which is how the last two benchmarks had to
+        // do it.
+        metrics::publish_cache(self.layout.value_cache.stats());
     }
 
     /// Moves the durability half of readiness to match what the owners here
@@ -2704,6 +2714,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(ListingFailureStore::new());
         let layout = DataLayout {
+            value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
@@ -2781,6 +2792,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(ListingFailureStore::new());
         let layout = DataLayout {
+            value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
@@ -2857,6 +2869,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(MemoryStore::new());
         let layout = DataLayout {
+            value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
@@ -2921,6 +2934,7 @@ mod tests {
             let runtime = sim.add_node(NodeId(1));
             let store = Arc::new(MemoryStore::new());
             let layout = DataLayout {
+                value_cache: Arc::new(ValueCache::new(1 << 20)),
                 store: Arc::clone(&store) as Arc<dyn ObjectStore>,
                 wal_root: "wal".to_string(),
                 wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
@@ -2974,6 +2988,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(MemoryStore::new());
         let layout = DataLayout {
+            value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
@@ -3059,6 +3074,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(MemoryStore::new());
         let layout = DataLayout {
+            value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
@@ -3141,6 +3157,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(MemoryStore::new());
         let layout = DataLayout {
+            value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
             wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,

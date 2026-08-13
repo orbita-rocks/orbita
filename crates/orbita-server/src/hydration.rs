@@ -41,6 +41,7 @@ use orbita_sim::{harness, NetworkFaults, SimConfig, SimRuntime, Simulation};
 use orbita_storage::{Mutation, Partition};
 use orbita_wal::{Hydration, Wal, WalConfig, WalService};
 
+use orbita_storage::ValueCache;
 use std::sync::Arc;
 
 const PARTITION: PartitionId = PartitionId(1);
@@ -102,6 +103,7 @@ fn start_replica(
     Arc<crate::replication::Applies>,
 ) {
     let paths = PartitionPaths {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store,
         path: path(),
         wal_dir: "wal/replica".to_string(),
@@ -414,6 +416,7 @@ fn a_hydrated_node_leaves_a_log_the_previous_binary_still_recovers() {
             );
 
             let paths = PartitionPaths {
+                value_cache: Arc::new(ValueCache::new(1 << 20)),
                 store: Arc::clone(&store) as Arc<dyn orbita_objectstore::ObjectStore>,
                 path: path(),
                 wal_dir: "wal/worker".to_string(),
