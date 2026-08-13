@@ -1,6 +1,8 @@
 # 0013: Read serving is decoupled from the durability quorum
 
-Status: Proposed, 2026-08-12.
+Status: Proposed, 2026-08-12. Revised the same day, before acceptance, to
+correct a wrong claim about the coherence quorum and to say what followers cost
+the write path.
 
 Extends [ADR 0001](0001-linearizable-reads-from-replicas.md), whose read
 protocol this keeps unchanged and whose population it widens. Narrows the
@@ -54,7 +56,10 @@ pinned to the same three nodes.
 - Any node may additionally become a **follower** of a partition: it opens the
   index from the object store, subscribes to the owner's invalidation stream,
   and serves reads under a lease. A follower carries no durability obligation
-  and is not counted by any quorum.
+  and is counted by no durability quorum. It **is** counted by the coherence
+  quorum, and an earlier draft of this record claimed otherwise. That claim was
+  wrong, it was load-bearing, and "What unbounded followers cost the write
+  path" below is what replaces it.
 
 **Consensus tracks ownership, and little else about placement.** Ownership is a
 lease with a short life, relinquished after idleness and taken by whoever writes
@@ -129,12 +134,74 @@ follower has cached is no longer referenced at all. They arrive differently and
 a follower has to tell them apart, or it will hold a segment that is correct and
 unreachable, or discard one that is still live.
 
+## What unbounded followers cost the write path
+
+The owner enumerates its lease holders today and blocks on them. `LeaseTable`
+is a `HashMap<NodeId, u64>` of grants (`crates/orbita-server/src/lease.rs`),
+`holders_with_expiry` returns the set a write must hear from, and
+`await_coherence` (`crates/orbita-server/src/host.rs`) runs on the
+acknowledgement path: a write is acknowledged once every live lease holder has
+confirmed the invalidation or its lease has lapsed.
+
+So a follower that holds a lease is enumerated, and every write pays for it.
+Reads scale with follower count and writes anti-scale with it, in fan-out per
+write and in tail latency, which becomes the slowest follower's. A follower
+that is merely slow costs each write one lease duration.
+
+This is not a gap in the implementation that a better protocol closes. A cached
+copy can be proven current in exactly two ways, and there is no third:
+
+- **Invalidate.** The writer tells the cache before it acknowledges. Reads then
+  cost no round trip, and the writer must know every reader.
+- **Validate.** The reader asks at read time. Writes then cost nothing in
+  readers, and every read pays a round trip to whatever holds the truth.
+
+ADR 0001 chose invalidation and bought linearizable reads with no round trip in
+them. The bill for that choice is denominated in readers, and this record was
+written as though the bill would not arrive.
+
+turbopuffer is the same system built on the other choice, and its published
+numbers are what the trade costs: any query node may serve any namespace, no
+node is enumerated, and a strongly consistent query pays one object-store round
+trip to check the commit point — p50 14ms warm, against under 10ms when the
+caller opts into eventual consistency. Unbounded readers, and a floor set by
+the validation round trip.
+
+Asking for unbounded followers *and* zero-round-trip linearizable reads is
+asking for a coherent cache that nobody pays coherence for. This record has to
+pick, and it picks both — explicitly, in two tiers.
+
+## The decision this forces: readers come in two tiers
+
+**A bounded, enumerated tier.** Lease holders, counted by the coherence quorum,
+serving reads with no round trip. Its size is a configured number rather than
+the replication factor, which is the part of this ADR that survives intact and
+which `read_replica_target` already implements. Writes pay for this tier, so
+its size is a write-throughput decision, and it must have a ceiling.
+
+**An unbounded, unenumerated tier.** Readers that hold no lease, are counted by
+nothing, and validate per read against the owner before answering. Writes pay
+nothing for them and they may come and go freely. They pay one in-cluster hop
+per read, which is the same hop as forwarding except that the value never
+crosses it twice and the owner never touches storage to answer.
+
+The tier a node is in is a provisioning decision, not a durability one, and a
+node may move between tiers without any write noticing. That is what makes
+enlisting compute cheap, which was the point of this record; what changes is
+the admission that the cheap tier is the one with a round trip in it.
+
 ## Fencing an owner with unbounded followers
 
-An owner cannot enumerate its followers, so a fence cannot ask them to
-acknowledge. It does not need to. Leases are time-bounded and a fence already
-waits out `lease_duration + lease_margin` before a promoted owner accepts a
-write, which is exactly the mechanism that works without knowing who holds what.
+The unbounded tier needs no fencing at all. It holds no lease and proves
+nothing on its own: it validates against the owner per read, and an owner that
+has been fenced cannot answer a validation. Readers that cache nothing they are
+allowed to trust are readers a fence can ignore.
+
+The bounded tier is enumerated, so a fence *could* ask it to acknowledge, and
+should not have to. Leases are time-bounded and a fence already waits out
+`lease_duration + lease_margin` before a promoted owner accepts a write, which
+is the mechanism that keeps a fence's cost independent of how many readers are
+listening even though the owner could count them.
 
 This is why the leases should be short. A short lease bounds the fence wait, and
 the fence wait is the availability cost of every ownership change — and in a
@@ -144,9 +211,17 @@ where the membership is known and small.
 
 ## Consequences
 
-**Read capacity stops being bounded by the replication factor.** It becomes
-bounded by how many nodes are willing to cache a partition, which is a
-provisioning decision rather than a durability one.
+**Read capacity stops being bounded by the replication factor.** Zero-round-trip
+read capacity becomes bounded by the configured lease-holder count, which is a
+provisioning decision rather than a durability one — but it is still a bound,
+and it is paid for out of write throughput. Read capacity that tolerates one
+in-cluster validation hop is bounded by nothing.
+
+**Write throughput now has a term in it that reads control.** Every lease
+holder is a confirmation a write waits on. That term did not exist while the
+holder set was the replication factor, because the replication factor is not a
+tuning knob operators reach for under read load. It is now, so the
+lease-holder count needs a ceiling and a metric before it needs a default.
 
 **Index memory distributes.** A node holds indexes for the partitions it owns or
 follows, not for every partition of every keyspace it replicates. This is the
@@ -233,3 +308,9 @@ different consistency model wearing the same API, and the value of the current
 one is that a client never has to ask which it got. If bounded staleness is ever
 wanted it should be a property a caller requests explicitly, not a thing that
 happens to reads when the cluster is busy.
+
+turbopuffer's numbers are the argument for that shape rather than against it.
+Its strongly consistent query pays the validation round trip at p50 14ms and
+its eventually consistent one skips it at under 10ms — the same engine, the
+same data, and a caller who chose. What is being rejected here is not the
+weaker model; it is the weaker model arriving unannounced.
