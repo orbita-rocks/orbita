@@ -63,8 +63,35 @@ pub enum Error {
     PermissionDenied,
 
     /// Retryable: the partition has no owner right now, typically mid-failover.
+    ///
+    /// Only for failures raised *before* anything was written. A failure after
+    /// the entry is durable locally is [`Error::Indeterminate`], because the
+    /// two need opposite handling and one code covering both leaves a client
+    /// unable to tell them apart.
     #[error("partition unavailable: {0}")]
     Unavailable(String),
+
+    /// The write may or may not have taken effect, and nobody can say which.
+    ///
+    /// Raised when an owner cannot reach a durability quorum. By then the
+    /// entry is already fsynced to the owner's own log, so it is not a write
+    /// that did not happen: it is one whose outcome is unknown, and it may
+    /// still land later — the next open replays the log above the flush
+    /// horizon.
+    ///
+    /// **Not retryable, and that is the whole point of it existing.** A client
+    /// that replays it can have its retry applied alongside the entry the log
+    /// was always going to replay. For an unconditional put the two agree; for
+    /// a conditional one they do not, and the retry is refused for a condition
+    /// the client's own first attempt made false. A lock taken with IF NOT
+    /// PRESENT is then reported as lost by the client that holds it, which is
+    /// the wedge use case failing quietly.
+    ///
+    /// What a caller should do instead is read the key back and decide from
+    /// what it finds. That is the only thing that distinguishes the two
+    /// outcomes, and no error code can do it for them.
+    #[error("write outcome unknown: {0}")]
+    Indeterminate(String),
 
     /// This node is not the leader of the control plane.
     ///
@@ -84,9 +111,11 @@ pub enum Error {
 impl Error {
     /// Whether a client can safely retry the same request.
     ///
-    /// Every write is idempotent under retry because conditional writes carry
-    /// an expected version, so this is about whether retrying could ever
-    /// succeed, not about side effects.
+    /// True only when the request is known not to have taken effect, so a
+    /// replay cannot double-apply anything. That is narrower than "retrying
+    /// might succeed": [`Error::Indeterminate`] might well succeed on a retry
+    /// and is still false here, because the first attempt may have landed and
+    /// the client has no way to know.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(

@@ -761,3 +761,80 @@ fn a_write_that_could_not_reach_a_quorum_may_still_land_after_a_restart() {
     linearizable(&sim, &recorder)
         .expect("a refused write landing later is a legal history, not divergence");
 }
+
+#[test]
+fn a_lock_acquired_by_a_write_that_was_refused_is_not_reported_as_lost() {
+    // Issue #187, in the shape that matters. Distributed locks are the wedge
+    // use case and IF NOT PRESENT is how one is taken.
+    //
+    // A client takes the lock, the write cannot reach a quorum, and the client
+    // is told the request failed with an error the API advertises as
+    // retryable. It retries, exactly as advised. By then the entry it wrote is
+    // in the owner's log and has been replayed, so the retry is refused for
+    // already existing — and the client concludes that somebody else holds the
+    // lock it is in fact holding.
+    //
+    // Nothing here is a linearizability violation. It is worse than one in
+    // practice: every step behaved as documented and the caller still ends up
+    // with the wrong answer to the only question it asked.
+    let sim = Simulation::new(187);
+    let runtime = sim.add_node(NodeId(1));
+    let bucket = sim.bucket(BUCKET);
+
+    let host = open_with_replicas(
+        &sim,
+        runtime.clone(),
+        &bucket,
+        "wal/p1",
+        Epoch(1),
+        vec![NodeId(2)],
+    );
+
+    let refused = {
+        let host = Arc::clone(&host);
+        sim.block_on(async move {
+            host.write(
+                Bytes::from_static(KEY),
+                WriteOp::Put {
+                    value: encode(1),
+                    ttl_millis: None,
+                },
+                WriteCondition::IfNotPresent,
+            )
+            .await
+        })
+    };
+    let error = refused.expect_err("the premise is a write that could not reach a quorum");
+    assert!(
+        !error.is_retryable(),
+        "a quorum failure raised after the entry is already durable locally must \
+         not tell a client it is safe to replay: {error}"
+    );
+
+    // The owner comes back and the log replays what it was holding.
+    drop(host);
+    let recovered = open(&sim, runtime, &bucket, "wal/p1", Epoch(1));
+
+    let retried = {
+        let recovered = Arc::clone(&recovered);
+        sim.block_on(async move {
+            recovered
+                .write(
+                    Bytes::from_static(KEY),
+                    WriteOp::Put {
+                        value: encode(1),
+                        ttl_millis: None,
+                    },
+                    WriteCondition::IfNotPresent,
+                )
+                .await
+        })
+    };
+
+    // This is what a client that followed the advice would see, and why the
+    // advice has to change rather than the replay.
+    assert!(
+        matches!(retried, Ok(ref ack) if !ack.applied) || retried.is_err(),
+        "the retry is refused because the first attempt landed after all"
+    );
+}

@@ -46,6 +46,14 @@ const CODE_PERMISSION_DENIED: u16 = 11;
 const CODE_UNAVAILABLE: u16 = 12;
 const CODE_INVALID_ARGUMENT: u16 = 13;
 const CODE_INTERNAL: u16 = 14;
+/// A write whose outcome nobody can state. New in 0.1.0.
+///
+/// A node too old to know this code decodes it through the unknown-code arm
+/// and reports it as internal, which is wrong in its wording and right in the
+/// only way that matters: internal is not retryable either, so an old node in
+/// the middle of an upgrade cannot advise a client to replay a write that may
+/// already have landed.
+const CODE_INDETERMINATE: u16 = 15;
 
 /// One renewal of one replica's read lease.
 ///
@@ -196,6 +204,7 @@ pub(crate) fn encode_error(error: &Error) -> Bytes {
         Error::Unauthenticated => (CODE_UNAUTHENTICATED, 0, 0, String::new()),
         Error::PermissionDenied => (CODE_PERMISSION_DENIED, 0, 0, String::new()),
         Error::Unavailable(m) => (CODE_UNAVAILABLE, 0, 0, m.clone()),
+        Error::Indeterminate(m) => (CODE_INDETERMINATE, 0, 0, m.clone()),
         // A control plane redirect that surfaces on the data path is not
         // something the origin node can route around, so it degrades to the
         // retryable code rather than earning a wire code of its own.
@@ -273,6 +282,7 @@ fn decode_error(mut buf: &[u8]) -> Result<Error> {
         CODE_UNAUTHENTICATED => Error::Unauthenticated,
         CODE_PERMISSION_DENIED => Error::PermissionDenied,
         CODE_UNAVAILABLE => Error::Unavailable(message),
+        CODE_INDETERMINATE => Error::Indeterminate(message),
         CODE_INVALID_ARGUMENT => Error::InvalidArgument(message),
         CODE_INTERNAL => Error::Internal(message),
         other => Error::Internal(format!("unknown proxy error code {other}")),
@@ -426,5 +436,24 @@ mod tests {
             decode_reply::<GetResponse>(&[TAG_ERROR, 0]),
             Err(Error::Internal(_))
         ));
+    }
+
+    #[test]
+    fn an_indeterminate_write_stays_indeterminate_across_the_hop() {
+        // A forwarded write is the common case for this error: the client
+        // reached a node that does not own the partition, and the owner is
+        // where the quorum failed. If the hop flattened it back into
+        // Unavailable the forwarding node would hand the client the retry
+        // advice the owner deliberately withheld, and the fix would work only
+        // for clients that happened to guess the right node. See #187.
+        let hopped = round_trip(&Error::Indeterminate("partition 1 lost quorum".into()));
+        assert!(
+            matches!(hopped, Error::Indeterminate(ref m) if m == "partition 1 lost quorum"),
+            "expected the outcome to stay unknown, got {hopped:?}"
+        );
+        assert!(
+            !hopped.is_retryable(),
+            "and it must not become retryable by crossing a node"
+        );
     }
 }

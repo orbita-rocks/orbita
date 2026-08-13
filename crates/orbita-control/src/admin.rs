@@ -892,6 +892,12 @@ fn status(error: Error) -> Status {
         Error::Unavailable(_) | Error::NotOwner { .. } | Error::NotLeader { .. } => {
             Status::unavailable(error.to_string())
         }
+        // Unknown, because an admin command whose outcome nobody can state is
+        // one an operator has to go and look at rather than reissue. It should
+        // not reach this edge — the control plane does not write through a
+        // partition quorum — and if it does, saying so plainly beats folding it
+        // in with the retryable cases.
+        Error::Indeterminate(_) => Status::unknown(error.to_string()),
         // A stale epoch reaching an operator means the cluster moved under
         // their command. Aborted is the code that tells a client to re-read
         // and try again rather than to give up.
