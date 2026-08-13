@@ -73,6 +73,16 @@ pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = orbita_wal::DEFAULT_SEGMENT_TARGET_BY
 /// wants more should be told rather than guessed at.
 pub const DEFAULT_VALUE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// How much one cache miss fetches beyond the record that missed.
+///
+/// Sized against the round trip rather than against the record. A ranged GET
+/// to S3 measured about 14ms for a single 1 KiB record on the benchmark
+/// cluster, and the marginal cost of asking for more in the same request is far
+/// below the cost of asking again. 256 KiB is a couple of hundred records at
+/// the sizes measured, and small enough that a random-access workload wastes
+/// bandwidth rather than saturating it.
+pub const DEFAULT_READ_AHEAD_BYTES: u64 = 256 * 1024;
+
 /// Where a node's S3 credentials come from before any role is assumed.
 ///
 /// Every variant but [`S3CredentialSource::Default`] is a *named* source: it
@@ -234,6 +244,16 @@ pub struct ServerConfig {
     /// partitions would otherwise have thousands of budgets and no bound. Zero
     /// turns caching off and restores the previous behaviour exactly.
     pub value_cache_bytes: u64,
+
+    /// How many bytes one cache miss may fetch, counting from the record that
+    /// missed.
+    ///
+    /// A miss costs a round trip whatever it brings back, so fetching only the
+    /// record asked for spends the expensive part on the cheapest result.
+    /// Segment records are sorted by key and laid out in that order, so the
+    /// neighbours are already inside the bytes the request has to cross. Zero
+    /// fetches one record, which is what every release before this did.
+    pub read_ahead_bytes: u64,
 
     pub leader_member: bool,
 
@@ -419,6 +439,7 @@ impl Default for ServerConfig {
             durability_acks: 1,
             read_replica_target: None,
             value_cache_bytes: DEFAULT_VALUE_CACHE_BYTES,
+            read_ahead_bytes: DEFAULT_READ_AHEAD_BYTES,
             leader_member: false,
             leader_owns_partitions: false,
             automatic_cluster: false,
@@ -556,6 +577,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_value_cache_bytes(mut self, bytes: u64) -> Self {
         self.value_cache_bytes = bytes;
+        self
+    }
+
+    /// Sets how much one cache miss fetches. Zero fetches one record.
+    #[must_use]
+    pub fn with_read_ahead_bytes(mut self, bytes: u64) -> Self {
+        self.read_ahead_bytes = bytes;
         self
     }
 

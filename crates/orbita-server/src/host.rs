@@ -199,6 +199,8 @@ pub(crate) struct PartitionPaths {
     /// Where this partition's flushed-key reads are served from before the
     /// object store is asked. Shared with every other partition on the node.
     pub value_cache: Arc<ValueCache>,
+    /// How much one cache miss fetches beyond the record that missed.
+    pub read_ahead_bytes: u64,
 }
 
 pub(crate) struct PartitionHost<R: Runtime> {
@@ -305,7 +307,8 @@ impl<R: Runtime> PartitionHost<R> {
                 range,
             )
             .await?
-            .with_value_cache(Arc::clone(&paths.value_cache)),
+            .with_value_cache(Arc::clone(&paths.value_cache))
+            .with_read_ahead(paths.read_ahead_bytes),
         );
         // What opening the storage engine built out of the bucket. On a node
         // that has held this partition all along it is the last manifest it
@@ -384,7 +387,8 @@ impl<R: Runtime> PartitionHost<R> {
                 spec.range.clone(),
             )
             .await?
-            .with_value_cache(Arc::clone(&paths.value_cache)),
+            .with_value_cache(Arc::clone(&paths.value_cache))
+            .with_read_ahead(paths.read_ahead_bytes),
         );
         let opened = runtime.clock().monotonic_nanos();
         let hydrated = hydration_of(&storage).await;
@@ -2265,6 +2269,7 @@ mod tests {
         store: Arc<FaultStore>,
     ) -> Arc<PartitionHost<SimRuntime>> {
         let paths = PartitionPaths {
+            read_ahead_bytes: 256 * 1024,
             value_cache: Arc::new(ValueCache::new(1 << 20)),
             store,
             path: partition_path(),
@@ -2295,6 +2300,7 @@ mod tests {
         store: Arc<FaultStore>,
     ) -> Arc<PartitionHost<SimRuntime>> {
         let paths = PartitionPaths {
+            read_ahead_bytes: 256 * 1024,
             value_cache: Arc::new(ValueCache::new(1 << 20)),
             store,
             path: partition_path(),

@@ -126,8 +126,8 @@ mod validate;
 pub use aws::{AssumeRoleConfig, DEFAULT_SESSION_DURATION_SECONDS};
 pub use config::{
     S3CredentialSource, S3StorageConfig, ServerConfig, DEFAULT_CONTROL_POLL_INTERVAL,
-    DEFAULT_FLUSH_INTERVAL, DEFAULT_KEYSPACE, DEFAULT_SWEEP_INTERVAL, DEFAULT_VALUE_CACHE_BYTES,
-    DEFAULT_WAL_SEGMENT_BYTES,
+    DEFAULT_FLUSH_INTERVAL, DEFAULT_KEYSPACE, DEFAULT_READ_AHEAD_BYTES, DEFAULT_SWEEP_INTERVAL,
+    DEFAULT_VALUE_CACHE_BYTES, DEFAULT_WAL_SEGMENT_BYTES,
 };
 pub use control::{ControlMapSource, PeerDirectorySync, StatusReporter};
 pub use lease::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_MARGIN};
@@ -388,6 +388,7 @@ impl Server {
             // One cache for the whole node, so the budget bounds the process
             // rather than multiplying by however many partitions land here.
             value_cache: Arc::new(ValueCache::new(config.value_cache_bytes)),
+            read_ahead_bytes: config.read_ahead_bytes,
             // ADR 0013: the durability contract is one peer plus this node,
             // whatever the partition's peer list has grown to for read serving.
             durability_acks: config.durability_acks,

@@ -66,6 +66,10 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "ORBITA_VALUE_CACHE_BYTES",
         "node.value_cache_bytes, memory held for values read out of segments",
     ),
+    (
+        "ORBITA_READ_AHEAD_BYTES",
+        "node.read_ahead_bytes, bytes one cache miss fetches beyond its record",
+    ),
     ("ORBITA_CLUSTER_NAME", "cluster.name"),
     ("ORBITA_VOTER_TARGET", "cluster.voter_target, either 3 or 5"),
     (
@@ -260,6 +264,9 @@ pub struct NodeConfig {
     /// nothing about the value is agreed on. Zero turns caching off. See
     /// ADR 0006.
     pub value_cache_bytes: u64,
+    /// How much one cache miss fetches beyond the record that missed. Zero
+    /// fetches one record. See ADR 0006.
+    pub read_ahead_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -513,6 +520,7 @@ pub struct NodeLayer {
     pub peer_advertise: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub value_cache_bytes: Option<u64>,
+    pub read_ahead_bytes: Option<u64>,
 }
 
 /// The join durations are strings rather than numbers so that a file says
@@ -610,7 +618,8 @@ impl Layer {
             peer_listen,
             peer_advertise,
             data_dir,
-            value_cache_bytes
+            value_cache_bytes,
+            read_ahead_bytes
         );
         overlay!(
             self.cluster,
@@ -758,6 +767,7 @@ impl Layer {
                 peer_advertise: get("ORBITA_PEER_ADVERTISE").map(str::to_owned),
                 data_dir: get("ORBITA_DATA_DIR").map(PathBuf::from),
                 value_cache_bytes: parse("ORBITA_VALUE_CACHE_BYTES")?,
+                read_ahead_bytes: parse("ORBITA_READ_AHEAD_BYTES")?,
             },
             cluster: ClusterLayer {
                 name: get("ORBITA_CLUSTER_NAME").map(str::to_owned),
@@ -967,6 +977,10 @@ impl Layer {
                     .node
                     .value_cache_bytes
                     .unwrap_or(orbita_server::DEFAULT_VALUE_CACHE_BYTES),
+                read_ahead_bytes: self
+                    .node
+                    .read_ahead_bytes
+                    .unwrap_or(orbita_server::DEFAULT_READ_AHEAD_BYTES),
                 data_dir: self
                     .node
                     .data_dir
@@ -1179,6 +1193,7 @@ pub fn dev_defaults(port: u16, data_dir: PathBuf) -> Layer {
             advertise: Some(format!("127.0.0.1:{port}")),
             peer_listen: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
             value_cache_bytes: None,
+            read_ahead_bytes: None,
             peer_advertise: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
             data_dir: Some(data_dir),
         },

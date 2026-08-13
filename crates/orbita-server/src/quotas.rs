@@ -85,6 +85,7 @@ fn start_with_auth(
 ) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(NodeId(1));
     let layout = DataLayout {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
@@ -175,6 +176,7 @@ fn start_with_map(sim: &Simulation, map: PartitionMap) -> Arc<Node<SimRuntime>> 
     let runtime = sim.add_node(NodeId(1));
     let clock = runtime.clock().clone();
     let layout = DataLayout {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),

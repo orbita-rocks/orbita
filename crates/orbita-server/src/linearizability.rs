@@ -60,6 +60,7 @@ const KEY: &[u8] = b"register";
 /// simulator's fault-injecting transport.
 fn partition_paths() -> PartitionPaths {
     PartitionPaths {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
@@ -623,6 +624,7 @@ fn start_node_with_map(
     // Each node gets its own store, the way each node owns its own bucket
     // prefix or data directory in production.
     let layout = DataLayout {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),

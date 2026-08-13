@@ -331,6 +331,11 @@ pub struct ServeArgs {
     #[arg(long, value_name = "BYTES")]
     pub value_cache_bytes: Option<u64>,
 
+    /// Bytes one cache miss fetches beyond the record that missed. Zero fetches
+    /// exactly the record asked for.
+    #[arg(long, value_name = "BYTES")]
+    pub read_ahead_bytes: Option<u64>,
+
     /// The leader group, as NODE_ID=ADDR entries.
     ///
     /// Identical on every node. A leader uses the ids as fixed Raft voters and
@@ -386,6 +391,7 @@ impl ServeArgs {
                 peer_advertise: self.peer_advertise.clone(),
                 data_dir: self.data_dir.clone(),
                 value_cache_bytes: self.value_cache_bytes,
+                read_ahead_bytes: self.read_ahead_bytes,
             },
             cluster: ClusterLayer {
                 leader_peers: self.leader_peers.clone(),

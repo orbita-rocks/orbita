@@ -41,6 +41,7 @@ const ROUNDS: u64 = 8;
 
 fn partition_paths() -> PartitionPaths {
     PartitionPaths {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
@@ -52,6 +53,7 @@ fn partition_paths() -> PartitionPaths {
 
 fn paths_in(store: Arc<MemoryStore>, wal_dir: &str) -> PartitionPaths {
     PartitionPaths {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store,
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),

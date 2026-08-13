@@ -254,6 +254,7 @@ fn start_node_with_snapshots(
 ) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store,
         wal_root: format!("wal-{}", node.get()),
