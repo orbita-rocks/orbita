@@ -459,6 +459,16 @@ class Writer:
             channel.close()
 
 
+# The cluster protocol merge became part of, per ADR 0012.
+MERGE_FLOOR = "at least 0.1"
+
+
+def _below_merge_floor(version: str) -> bool:
+    """Whether `major.minor` is older than the protocol merge belongs to."""
+    major, minor = (int(part) for part in version.split("."))
+    return (major, minor) < (0, 1)
+
+
 def _read(cluster: Cluster, key: bytes) -> kv_pb2.GetResponse:
     endpoints = cluster.live_worker_endpoints()
     assert endpoints, "no live worker to read from"
@@ -572,18 +582,33 @@ def test_a_rolling_upgrade_preserves_writes_and_locks_out_the_old_binary(
         # Merge used to be gated behind protocol 0.2 so that a 0.1 voter which
         # could not decode its tags stayed rollback-safe. ADR 0012 withdrew
         # that: nothing was released, so no such voter exists and merge belongs
-        # to 0.1. What is asserted here now is that the operation is reachable
-        # on this cluster rather than refused by the protocol, and that a
-        # nonsense request is still refused on its own merits.
-        # The cluster is still at 0.0 here: the roll has finished but nothing
-        # has finalized. Merge is refused because no vocabulary has been agreed
-        # at all, which is the case the gate still exists for, and the refusal
-        # has to come before id validation so a malformed request cannot enter
-        # merge logic and reach the log.
+        # to 0.1.
+        #
+        # What is asserted is that a nonsense request never reaches merge logic,
+        # whichever side of the gate this cluster is on. The roll has finished
+        # and nothing has finalized, so the cluster is still at the old version,
+        # and whether that is below the merge floor depends on which minor the
+        # workspace is at — it was below on the 0.1 line and is not on the 0.2
+        # line. Pinning one of those two answers is what made this test fail on
+        # the first routine bump rather than on any change in behaviour.
         refused = cluster.refused_by_leader("partition", "merge", "1", "2")
-        assert "at least 0.1" in refused, (
-            f"merge was not refused for want of an agreed protocol: {refused}"
-        )
+        if _below_merge_floor(old_version):
+            # No vocabulary has been agreed at all, which is the case the gate
+            # exists for. The refusal has to come before id validation, so a
+            # malformed request cannot enter merge logic and reach the log.
+            assert MERGE_FLOOR in refused, (
+                f"merge was not refused for want of an agreed protocol: {refused}"
+            )
+        else:
+            # The gate is open, so the request is refused on its own merits and
+            # nothing about the protocol is mentioned. It still must not have
+            # reached the log, which "no partition" is the evidence of.
+            assert "no partition" in refused, (
+                f"a nonsense merge was not refused on its merits: {refused}"
+            )
+            assert MERGE_FLOOR not in refused, (
+                f"merge was refused by the protocol on a cluster that speaks it: {refused}"
+            )
         # It no longer asks for finalization, because there is no later
         # protocol to finalize to. See ADR 0012.
         assert "finalize-upgrade" not in refused, (
