@@ -335,10 +335,95 @@ struct Loc {
     record_length: u32,
 }
 
+/// Whether a record decoded out of a read-ahead window is the one the index
+/// currently points at, and so worth spending cache budget on.
+///
+/// Segment as well as offset. Offsets repeat across segments — every segment
+/// holds a record just after its header — so a check on offset alone admits a
+/// superseded copy whenever its winner happens to sit at the same place in
+/// another segment. Nothing would serve the dead copy, because the cache is
+/// keyed by object and no index entry resolves to it, but it would hold budget
+/// a live record needs, which is a cache that is too small wearing a disguise.
+fn is_winning_record(
+    index: &BTreeMap<Bytes, Loc>,
+    key: &[u8],
+    segment: usize,
+    offset: u64,
+) -> bool {
+    index
+        .get(key)
+        .is_some_and(|held| held.segment == segment && held.offset == offset)
+}
+
+/// How many index entries one miss may look at while planning its window.
+///
+/// The walk skips entries belonging to other segments, and on a segment whose
+/// keys have mostly been superseded there may be very few of its own left.
+/// Without a cap the walk would then run to the end of the partition's index
+/// looking for neighbours that are not there, so a random read over an old
+/// segment would cost a scan of every later key — while holding the read lock,
+/// and once per miss.
+///
+/// Generous enough that a segment which is still mostly current never reaches
+/// it: at the default budget and the record sizes measured, a full window is
+/// about 250 entries. Reaching this cap means the segment is sparse here, and
+/// giving up is the right answer rather than a compromise, because read-ahead
+/// over a mostly-superseded segment would fetch bytes nothing is going to ask
+/// for.
+const MAX_READ_AHEAD_SCAN: usize = 1024;
+
+/// Plans the byte range a miss should fetch.
+///
+/// Free of the partition so it can be tested against a synthetic index: the
+/// interesting cases are a sparse segment and a dense one, and building either
+/// through the write path would say more about flushing than about this.
+fn plan_read_ahead(index: &BTreeMap<Bytes, Loc>, loc: Loc, key: &[u8], budget: u64) -> ReadWindow {
+    let start = loc.offset;
+    let mut end = start + u64::from(loc.record_length);
+    let mut followers = 0usize;
+    let mut scanned = 0usize;
+    if budget == 0 {
+        return ReadWindow {
+            start,
+            end,
+            followers,
+            scanned,
+        };
+    }
+    for (_, next) in index.range::<[u8], _>((Bound::Excluded(key), Bound::Unbounded)) {
+        if scanned >= MAX_READ_AHEAD_SCAN {
+            break;
+        }
+        scanned += 1;
+        if next.segment != loc.segment || next.offset < end {
+            continue;
+        }
+        let candidate = next.offset + u64::from(next.record_length);
+        if candidate.saturating_sub(start) > budget {
+            break;
+        }
+        end = candidate;
+        followers += 1;
+    }
+    ReadWindow {
+        start,
+        end,
+        followers,
+        scanned,
+    }
+}
+
 /// The byte range a single miss fetches.
 struct ReadWindow {
     start: u64,
     end: u64,
+    /// Index entries the plan looked at, including ones it skipped.
+    ///
+    /// Carried because the bound on that walk is otherwise invisible: the cap
+    /// changes no window this returns — a sparse segment plans the same one
+    /// record either way — so the only way to hold it, or to notice it
+    /// binding, is to measure the work rather than the answer.
+    scanned: usize,
     /// Records beyond the one that was asked for. Zero means the window is
     /// exactly one record and the strict length check still applies.
     followers: usize,
@@ -1415,36 +1500,7 @@ impl<R: Runtime> Partition<R> {
     /// bytes, so stopping at the first one would usually read ahead by nothing
     /// at all on a partition with more than one segment.
     fn read_ahead(&self, state: &State, loc: Loc, key: &[u8]) -> ReadWindow {
-        let start = loc.offset;
-        let mut end = start + u64::from(loc.record_length);
-        let mut followers = 0usize;
-        if self.read_ahead_bytes == 0 {
-            return ReadWindow {
-                start,
-                end,
-                followers,
-            };
-        }
-        let budget = self.read_ahead_bytes;
-        for (_, next) in state
-            .index
-            .range::<[u8], _>((Bound::Excluded(key), Bound::Unbounded))
-        {
-            if next.segment != loc.segment || next.offset < end {
-                continue;
-            }
-            let candidate = next.offset + u64::from(next.record_length);
-            if candidate.saturating_sub(start) > budget {
-                break;
-            }
-            end = candidate;
-            followers += 1;
-        }
-        ReadWindow {
-            start,
-            end,
-            followers,
-        }
+        plan_read_ahead(&state.index, loc, key, self.read_ahead_bytes)
     }
 
     /// Caches the records that came back behind the one that was asked for.
@@ -1463,6 +1519,7 @@ impl<R: Runtime> Partition<R> {
     fn warm_followers(
         &self,
         state: &State,
+        segment: usize,
         object: &str,
         start: u64,
         mut rest: &[u8],
@@ -1476,10 +1533,7 @@ impl<R: Runtime> Partition<R> {
                 return;
             }
             let offset = start + offset_in_window as u64;
-            let winning = state
-                .index
-                .get(record.key.as_ref())
-                .is_some_and(|held| held.offset == offset);
+            let winning = is_winning_record(&state.index, record.key.as_ref(), segment, offset);
             if winning {
                 if let RecordValue::Inline(value) = &record.value {
                     self.cache.insert(
@@ -1537,6 +1591,19 @@ impl<R: Runtime> Partition<R> {
         // record that was asked for spends the expensive part of the operation
         // on the cheapest possible result.
         let window = self.read_ahead(state, loc, key);
+        if window.scanned >= MAX_READ_AHEAD_SCAN {
+            // Read-ahead gave up rather than kept walking. It means this
+            // segment holds few of the keys that follow, which is what a
+            // segment looks like when later flushes have superseded most of
+            // it, so it is a hint that compaction is behind rather than a
+            // problem with the read. Debug because a partition in that state
+            // says it on every miss.
+            tracing::debug!(
+                segment = %entry.name,
+                scanned = window.scanned,
+                "read-ahead reached its scan bound and planned a short window"
+            );
+        }
         let raw = self
             .store
             .get_range(&object, window.start..window.end)
@@ -1552,7 +1619,14 @@ impl<R: Runtime> Partition<R> {
             )));
         }
         if window.followers > 0 {
-            self.warm_followers(state, &object, window.start, &raw[consumed..], consumed);
+            self.warm_followers(
+                state,
+                loc.segment,
+                &object,
+                window.start,
+                &raw[consumed..],
+                consumed,
+            );
         } else if consumed != raw.len() {
             // Without read-ahead the range is exactly one record, so anything
             // left over means the index and the segment disagree about how long
@@ -5245,6 +5319,118 @@ mod tests {
         assert!(
             store.segment_reads() > 0,
             "with read-ahead off a neighbour is still a fetch"
+        );
+    }
+
+    fn loc(segment: usize, offset: u64, len: u32) -> Loc {
+        Loc {
+            segment,
+            offset,
+            record_length: len,
+        }
+    }
+
+    #[test]
+    fn planning_a_window_bounds_the_index_it_walks() {
+        // The cost this bounds is a scan, not a fetch, so the window it
+        // returns is the same either way: a sparse segment plans one record
+        // whether the walk stopped early or ran to the end of the partition.
+        // Only the work differs, so only the work can be asserted.
+        //
+        // Without the bound, one cold read of an old segment costs a pass over
+        // every later key in the partition, under the read lock, once per miss.
+        let mut index: BTreeMap<Bytes, Loc> = BTreeMap::new();
+        index.insert(bytes("k00000"), loc(0, 0, 64));
+        for i in 0..(MAX_READ_AHEAD_SCAN * 4) {
+            index.insert(bytes(&format!("k{:05}", i + 1)), loc(1, i as u64 * 64, 64));
+        }
+
+        let window = plan_read_ahead(&index, loc(0, 0, 64), b"k00000", 1 << 20);
+
+        assert!(
+            window.scanned <= MAX_READ_AHEAD_SCAN,
+            "walked {} entries of a {} entry index",
+            window.scanned,
+            index.len()
+        );
+        assert_eq!(
+            window.followers, 0,
+            "there is nothing else in this segment to warm"
+        );
+        assert_eq!(window.end, 64, "so the window is the one record asked for");
+    }
+
+    #[test]
+    fn planning_a_window_still_reaches_across_records_another_segment_interleaves() {
+        // The reason the walk skips rather than stops. Two segments whose keys
+        // alternate are the ordinary result of a flush, and a plan that ended
+        // at the first foreign key would read ahead by nothing at all.
+        let mut index: BTreeMap<Bytes, Loc> = BTreeMap::new();
+        for i in 0..16u64 {
+            let (segment, offset) = if i % 2 == 0 {
+                (0, i / 2 * 64)
+            } else {
+                (1, i / 2 * 64)
+            };
+            index.insert(bytes(&format!("k{i:05}")), loc(segment, offset, 64));
+        }
+
+        let window = plan_read_ahead(&index, loc(0, 0, 64), b"k00000", 1 << 20);
+
+        assert_eq!(
+            window.followers, 7,
+            "every later record in this segment, none of the other's"
+        );
+        assert_eq!(window.end, 8 * 64);
+    }
+
+    #[test]
+    fn planning_a_window_stops_at_the_budget() {
+        let mut index: BTreeMap<Bytes, Loc> = BTreeMap::new();
+        for i in 0..64u64 {
+            index.insert(bytes(&format!("k{i:05}")), loc(0, i * 64, 64));
+        }
+
+        let window = plan_read_ahead(&index, loc(0, 0, 64), b"k00000", 4 * 64);
+
+        assert_eq!(window.end - window.start, 4 * 64);
+        assert_eq!(window.followers, 3);
+    }
+
+    #[test]
+    fn a_record_a_later_segment_superseded_is_not_worth_cache_budget() {
+        // Offsets repeat across segments, because every segment holds a record
+        // just after its header. So the copy of a key sitting at offset 32 of
+        // an old segment and the winning copy at offset 32 of a newer one are
+        // different records at the same number, and only one of them is worth
+        // holding.
+        //
+        // Admitting the dead one serves nothing — the cache is keyed by object
+        // and no index entry resolves to it — but it spends budget a live
+        // record needs, which is a cache that is too small wearing a disguise.
+        let mut index: BTreeMap<Bytes, Loc> = BTreeMap::new();
+        index.insert(bytes("rewritten"), loc(1, 32, 64));
+        index.insert(bytes("untouched"), loc(0, 96, 64));
+
+        assert!(
+            !is_winning_record(&index, b"rewritten", 0, 32),
+            "the superseded copy shares an offset with its winner and is still dead"
+        );
+        assert!(
+            is_winning_record(&index, b"rewritten", 1, 32),
+            "the winning copy is admitted"
+        );
+        assert!(
+            is_winning_record(&index, b"untouched", 0, 96),
+            "a key no later segment touched is admitted from where it lives"
+        );
+        assert!(
+            !is_winning_record(&index, b"untouched", 0, 32),
+            "and not from an offset the index does not name"
+        );
+        assert!(
+            !is_winning_record(&index, b"absent", 0, 32),
+            "a key compaction dropped entirely is not worth holding"
         );
     }
 }
