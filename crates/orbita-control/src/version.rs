@@ -249,18 +249,20 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_minor_binary_speaks_only_its_own_version() {
-        // 0.1 has no predecessor to roll back to, so the window is a point.
-        // The two-version window is what a 0.2 binary gets, and
-        // `speaks_for` is tested at that pair directly rather than through
-        // whatever version this workspace happens to be at.
-        let speaks = binary_speaks();
-        assert_eq!(speaks.max, PROTOCOL_0_1);
-        assert!(speaks.contains(PROTOCOL_0_1));
-        assert!(!speaks.contains(PROTOCOL_0_2));
-
-        let next = speaks_for(PROTOCOL_0_2);
-        assert!(next.contains(PROTOCOL_0_1) && next.contains(PROTOCOL_0_2));
+    fn the_window_follows_the_rule_rather_than_this_release() {
+        // What replaced a test that asserted `binary_speaks().max` equalled a
+        // literal 0.1. That named the version the workspace happened to be at,
+        // so the first routine bump to 0.2 failed the release back-merge with
+        // it — a test about the calendar rather than about the code.
+        //
+        // The rule itself is covered against fixed inputs by
+        // `a_binary_at_minor_zero_speaks_only_itself` and
+        // `a_binary_speaks_its_own_minor_and_the_one_before`. What is left,
+        // and what is worth pinning against the real build, is that
+        // `binary_speaks` is that rule applied to this binary and not a second
+        // implementation that could drift from it.
+        let own = binary_version();
+        assert_eq!(binary_speaks(), speaks_for(own));
     }
 
     #[test]
