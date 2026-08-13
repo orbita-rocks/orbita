@@ -79,6 +79,38 @@ fn paths(bucket: &Arc<SimBucket>, wal_dir: &str) -> PartitionPaths {
     }
 }
 
+/// Opens an owner that believes it has replicas.
+///
+/// Naming a node the simulation does not contain is how these scenarios get a
+/// quorum this owner cannot reach: the transport answers `UnknownPeer`
+/// immediately, so the write fails for the reason a real one does when the
+/// replicas have not opened the partition yet, without waiting on anything.
+fn open_with_replicas(
+    sim: &Simulation,
+    runtime: SimRuntime,
+    bucket: &Arc<SimBucket>,
+    wal_dir: &str,
+    epoch: Epoch,
+    replicas: Vec<NodeId>,
+) -> Arc<PartitionHost<SimRuntime>> {
+    let paths = paths(bucket, wal_dir);
+    sim.block_on(async move {
+        PartitionHost::open_owner(
+            runtime,
+            HostSpec {
+                id: PartitionId(1),
+                epoch,
+                range: KeyRange::unbounded(),
+                lease: LeasePolicy::default(),
+            },
+            &paths,
+            replicas,
+        )
+        .await
+        .expect("the partition opens")
+    })
+}
+
 fn open(
     sim: &Simulation,
     runtime: SimRuntime,
@@ -659,4 +691,73 @@ fn a_partition_flushing_through_a_failing_store_never_loses_an_acknowledged_writ
             linearizable(&sim, &recorder)
         },
     );
+}
+
+#[test]
+fn a_write_that_could_not_reach_a_quorum_may_still_land_after_a_restart() {
+    // Issue #188. A write that cannot reach a durability quorum is refused
+    // after the entry is already fsynced to the owner's own log, and it is not
+    // applied to owner storage. The entry stays in the log, and the next open
+    // replays everything above the flush horizon into storage, so the record
+    // appears after a restart.
+    //
+    // That is not a lost write and this scenario does not claim it is a
+    // violation. The client was told the outcome was unknown, and the register
+    // checker is free to place an unknown write anywhere or nowhere. What this
+    // pins is that the window is real and that the late landing is explainable
+    // as a legal history rather than as divergence — which is the difference
+    // between a contract that needs documenting and a bug that needs fixing.
+    let sim = Simulation::new(188);
+    let node = NodeId(1);
+    let runtime = sim.add_node(node);
+    let bucket = sim.bucket(BUCKET);
+    let recorder = Recorder::<RegisterOp, RegisterRet>::new();
+
+    // A replica the map named and this node cannot reach, because NodeId(2) is
+    // not in this simulation at all.
+    let host = open_with_replicas(
+        &sim,
+        runtime.clone(),
+        &bucket,
+        "wal/p1",
+        Epoch(1),
+        vec![NodeId(2)],
+    );
+
+    // Recorded through the same helper every scenario here uses, so a write
+    // whose outcome the client never learned enters the history as outstanding
+    // rather than as absent.
+    write(&sim, &host, &recorder, 1, 7);
+    read(&sim, &host, &recorder, 1);
+
+    let before_restart = {
+        let host = Arc::clone(&host);
+        sim.block_on(async move { host.get(KEY).await.expect("the read succeeds") })
+    };
+    assert!(
+        before_restart.is_none(),
+        "the premise is a write that was refused and not applied, found {:?}",
+        before_restart.map(|record| decode(&record))
+    );
+
+    // The same node comes back on the same disk and the same bucket, with the
+    // unreachable replica gone from its map.
+    drop(host);
+    let recovered = open(&sim, runtime, &bucket, "wal/p1", Epoch(1));
+    read(&sim, &recovered, &recorder, 1);
+
+    let after_restart = {
+        let recovered = Arc::clone(&recovered);
+        sim.block_on(async move { recovered.get(KEY).await.expect("the read succeeds") })
+    };
+    assert_eq!(
+        after_restart.as_ref().map(decode),
+        Some(7),
+        "the entry the client was told failed is expected to be replayed by the \
+         next open; if this fails the behaviour changed and #188 should be revisited"
+    );
+
+    // The part that decides whether #188 is a bug or a contract to write down.
+    linearizable(&sim, &recorder)
+        .expect("a refused write landing later is a legal history, not divergence");
 }
