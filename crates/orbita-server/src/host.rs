@@ -361,6 +361,11 @@ impl<R: Runtime> PartitionHost<R> {
         paths: &PartitionPaths,
     ) -> Result<Arc<Self>> {
         let id = spec.id;
+        // Timed because what it costs to give a partition a new holder is the
+        // number that decides whether load can be moved across a cluster at
+        // all. Today only a lost replica provokes one, where any cost beats the
+        // alternative, so nothing has ever had a reason to ask. See #170.
+        let began = runtime.clock().monotonic_nanos();
         let storage = Arc::new(
             Partition::open(
                 runtime.clone(),
@@ -371,6 +376,7 @@ impl<R: Runtime> PartitionHost<R> {
             )
             .await?,
         );
+        let opened = runtime.clock().monotonic_nanos();
         let hydrated = hydration_of(&storage).await;
         let log = PartitionLog::open(
             runtime.clone(),
@@ -388,6 +394,7 @@ impl<R: Runtime> PartitionHost<R> {
         // `Partition::apply` would discard them anyway, but reading a value out
         // of a log to have it thrown away is work proportional to the retained
         // log rather than to the tail that matters.
+        let mut replayed = 0u64;
         for entry in log
             .recovery()
             .entries
@@ -395,7 +402,25 @@ impl<R: Runtime> PartitionHost<R> {
             .filter(|e| e.lamport > hydrated.through)
         {
             storage.apply(&mutation_of(entry)).await?;
+            replayed += 1;
         }
+
+        // Split into the two halves because they scale with different things
+        // and only one of them is a copy. Reading the manifest is proportional
+        // to the partition's object count; replaying the tail is proportional
+        // to what the local log already held, which for a node that never held
+        // this partition is nothing. A holder set that can widen cheaply is the
+        // difference between a cluster that can be packed and one that cannot.
+        let finished = runtime.clock().monotonic_nanos();
+        tracing::info!(
+            partition = id.get(),
+            epoch = spec.epoch.get(),
+            open_us = (opened.saturating_sub(began)) / 1_000,
+            total_us = (finished.saturating_sub(began)) / 1_000,
+            hydrated_through = hydrated.through.get(),
+            replayed_entries = replayed,
+            "opened a replica"
+        );
 
         let host = Self::assemble(runtime, &spec, storage, None, log, Vec::new());
         // The invalidation stream continues from where the log is, not from
