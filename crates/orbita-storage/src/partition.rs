@@ -34,6 +34,7 @@
 //! or an abandoned commit leaves behind. A cache for values read back out of
 //! segments is still deliberate scope for later.
 
+use crate::cache::ValueCache;
 use crate::cursor::Cursor;
 use crate::mutation::{version_at, Mutation, MutationOp};
 
@@ -399,6 +400,14 @@ pub struct Partition<R: Runtime> {
     path: PartitionPath,
     range: KeyRange,
     writer: PartitionWriter<dyn ObjectStore>,
+    /// Records read back out of segments, shared with every other partition
+    /// on the node so the budget bounds the node rather than the partition.
+    ///
+    /// Deliberately not inside `state`: a hit only reads, but keeping recency
+    /// means mutating, and doing that under the partition's `RwLock` would
+    /// make every cache hit take the write lock and serialise the read path
+    /// behind it. Its own lock is held for a map lookup and nothing else.
+    cache: Arc<ValueCache>,
     /// One lock rather than a lock per key is deliberate: a partition already
     /// has exactly one writer in production, because the owning worker
     /// serializes writes before they reach here, so striping would buy
@@ -473,10 +482,32 @@ impl<R: Runtime> Partition<R> {
             path,
             range,
             writer,
+            // Off until a caller supplies one. A zero-budget cache is a
+            // working cache that holds nothing, so the read path has no branch
+            // for whether caching is configured.
+            cache: Arc::new(ValueCache::new(0)),
             state: tokio::sync::RwLock::new(state),
             maintenance_frozen: std::sync::atomic::AtomicBool::new(false),
             compaction_input_bytes: std::sync::atomic::AtomicU64::new(COMPACTION_INPUT_BYTES),
         })
+    }
+
+    /// Serves reads of flushed keys out of `cache` instead of the object
+    /// store, sharing it with every other partition given the same one.
+    ///
+    /// Additive rather than an argument to [`Partition::open`] because a
+    /// partition without a cache is correct, only slow, and every existing
+    /// caller should keep working without deciding about memory it does not
+    /// own. The one that does own it — the node — passes one in.
+    ///
+    /// Sharing is the point. A per-partition budget on a node holding
+    /// thousands of partitions is thousands of budgets and no bound at all,
+    /// and it would give a cold tenant the same memory as the hot one paying
+    /// for the node.
+    #[must_use]
+    pub fn with_value_cache(mut self, cache: Arc<ValueCache>) -> Self {
+        self.cache = cache;
+        self
     }
 
     /// Freezes flush, compaction, and sweep because this partition is a split
@@ -1349,10 +1380,21 @@ impl<R: Runtime> Partition<R> {
         // rather than under this partition's own prefix. See ADR 0009.
         let entry = &state.segments[loc.segment];
         let name = &entry.name;
+        let object = self.path.resolve_segment(entry);
+
+        // The resolved object and the offset within it, never the `Loc`: a
+        // `Loc` names a slot in the current segment list and compaction
+        // replaces that list wholesale. Segments themselves are immutable, so
+        // a hit here needs no proof of freshness beyond having been read from
+        // this object at this offset once before.
+        if let Some(cached) = self.cache.get(&object, loc.offset) {
+            return Ok(cached);
+        }
+
         let raw = self
             .store
             .get_range(
-                &self.path.resolve_segment(entry),
+                &object,
                 loc.offset..loc.offset + u64::from(loc.record_length),
             )
             .await
@@ -1391,12 +1433,19 @@ impl<R: Runtime> Partition<R> {
                 bytes
             }
         };
-        Ok(Stored {
+        let stored = Stored {
             version: Version(record.lamport.get()),
             expires_at_millis: record.expires_at_millis,
             deleted,
             value,
-        })
+        };
+        // Held after decoding rather than as raw bytes, so a hit skips the
+        // decode and the checksum as well as the round trip. An external value
+        // is cached in the same entry, which is what makes the second read of
+        // an ADR 0007 record cost nothing rather than one round trip instead
+        // of two.
+        self.cache.insert(&object, loc.offset, stored.clone());
+        Ok(stored)
     }
 
     /// Commits one entry to the mutable table and advances the Lamport, then
@@ -4795,6 +4844,119 @@ mod tests {
             2,
             "one small read each, which is what decides the expensive one is \
              not worth doing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flushed_key_read_twice_only_reaches_the_object_store_once() {
+        // The whole point of the cache, and the thing two EKS runs measured
+        // the absence of: before this, every read of a flushed key was an
+        // object-store round trip, and no read on a benchmarked cluster ever
+        // came back faster than 14.4ms.
+        //
+        // Asserted on reads rather than on latency or on the value, because a
+        // cached read and an uncached one return the same bytes. The cost is
+        // the behaviour.
+        let (owner, _replica, store) = crate::testing::counting_partition_pair().await;
+        let owner = owner.with_value_cache(Arc::new(ValueCache::new(1 << 20)));
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("a"), bytes("v"), None))
+            .await
+            .unwrap();
+        // Flushed, so the memtable no longer shadows the segment. Until it is,
+        // a read never reaches the object store and proves nothing.
+        owner.flush().await.unwrap();
+
+        store.reset();
+        assert_eq!(
+            owner.get(b"a").await.unwrap().map(|r| r.value),
+            Some(bytes("v"))
+        );
+        assert!(
+            store.segment_reads() > 0,
+            "the first read of a flushed key has to fetch it"
+        );
+
+        store.reset();
+        for _ in 0..8 {
+            assert_eq!(
+                owner.get(b"a").await.unwrap().map(|r| r.value),
+                Some(bytes("v")),
+                "a cached read answers with the same record"
+            );
+        }
+        assert_eq!(
+            store.segment_reads(),
+            0,
+            "every read after the first must be served from memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_is_not_answered_from_a_cached_copy_of_what_it_replaced() {
+        // The safety property that makes an uninvalidated cache sound. Nothing
+        // tells the cache a write happened, so what protects a reader is the
+        // order of the read path: a write lands in the memtable, the memtable
+        // is consulted first, and the stale entry underneath is simply never
+        // reached.
+        let (owner, _replica, store) = crate::testing::counting_partition_pair().await;
+        let owner = owner.with_value_cache(Arc::new(ValueCache::new(1 << 20)));
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("a"), bytes("old"), None))
+            .await
+            .unwrap();
+        owner.flush().await.unwrap();
+
+        // Warm the cache with the flushed value, so there is something stale
+        // to serve if the ordering is ever wrong.
+        assert_eq!(
+            owner.get(b"a").await.unwrap().map(|r| r.value),
+            Some(bytes("old"))
+        );
+
+        owner
+            .apply(&Mutation::put(Lamport(2), bytes("a"), bytes("new"), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            owner.get(b"a").await.unwrap().map(|r| r.value),
+            Some(bytes("new")),
+            "the memtable shadows the cached record"
+        );
+
+        // And after the flush publishes the new record at a new offset, the
+        // old cached entry is unreachable rather than merely shadowed.
+        owner.flush().await.unwrap();
+        store.reset();
+        assert_eq!(
+            owner.get(b"a").await.unwrap().map(|r| r.value),
+            Some(bytes("new")),
+            "the new record is read from its own offset"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partition_without_a_cache_still_serves_reads() {
+        // The default. A cache is memory the node owns and decides about, so a
+        // partition opened without one has to keep working rather than fail
+        // closed or quietly hold an unbounded one.
+        let (owner, _replica, store) = crate::testing::counting_partition_pair().await;
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("a"), bytes("v"), None))
+            .await
+            .unwrap();
+        owner.flush().await.unwrap();
+
+        store.reset();
+        for _ in 0..3 {
+            assert_eq!(
+                owner.get(b"a").await.unwrap().map(|r| r.value),
+                Some(bytes("v"))
+            );
+        }
+        assert!(
+            store.segment_reads() >= 3,
+            "with no cache every read fetches, which is what it did before"
         );
     }
 }
