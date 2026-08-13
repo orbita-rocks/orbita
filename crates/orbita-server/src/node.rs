@@ -1869,6 +1869,7 @@ impl<R: Runtime> Node<R> {
                 keyspace: keyspace.name.as_str().to_owned(),
                 partition: host.id(),
                 replication_lag: host.replication_lag(),
+                lease_holders: host.lease_holders(),
                 storage_bytes: host.size_bytes().await.ok(),
             });
         }

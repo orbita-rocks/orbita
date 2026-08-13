@@ -927,6 +927,23 @@ impl<R: Runtime> PartitionHost<R> {
             .unwrap_or_default()
     }
 
+    /// How many replicas hold a live read lease on this partition right now.
+    ///
+    /// This is the size of the coherence quorum, and therefore the number of
+    /// invalidations a write waits on before it may be acknowledged. ADR 0013
+    /// buys read capacity out of write throughput by widening this, so it is
+    /// the number an operator needs when write latency moves after a read
+    /// target change and nothing else did. Without it the trade is invisible
+    /// and gets blamed on whatever shipped that week.
+    pub(crate) fn lease_holders(&self) -> u64 {
+        let now = self.runtime.clock().monotonic_nanos();
+        self.leases
+            .lock()
+            .expect("lease table poisoned")
+            .holders_with_expiry(now)
+            .len() as u64
+    }
+
     /// How much disk this partition is using, which is what the control plane
     /// compares against the split threshold.
     pub(crate) async fn size_bytes(&self) -> Result<u64> {

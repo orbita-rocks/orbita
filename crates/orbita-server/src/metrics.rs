@@ -39,6 +39,7 @@ struct OwnedSample {
     partition: i64,
     replicas_behind: u64,
     replication_lag: u64,
+    lease_holders: u64,
     /// `None` when the owner could not size the partition this heartbeat, in
     /// which case its storage series is left unreported rather than pinned at a
     /// stale or zero value.
@@ -74,6 +75,7 @@ struct Instruments {
     request_duration: Histogram<f64>,
     _replicas_behind: ObservableGauge<u64>,
     _replication_lag: ObservableGauge<u64>,
+    _lease_holders: ObservableGauge<u64>,
     _partition_storage_bytes: ObservableGauge<u64>,
 }
 
@@ -116,6 +118,19 @@ fn instruments() -> &'static Instruments {
                 .with_callback(|observer| {
                     for sample in owned().read().unwrap().iter() {
                         observer.observe(sample.replication_lag, &owned_attributes(sample));
+                    }
+                })
+                .build(),
+            _lease_holders: meter
+                .u64_observable_gauge("orbita.partition.lease_holders")
+                .with_unit("{replica}")
+                .with_description(
+                    "Replicas holding a live read lease on a partition, which is the coherence \
+                     quorum every write to it waits on.",
+                )
+                .with_callback(|observer| {
+                    for sample in owned().read().unwrap().iter() {
+                        observer.observe(sample.lease_holders, &owned_attributes(sample));
                     }
                 })
                 .build(),
@@ -183,6 +198,9 @@ pub(crate) struct OwnedMetric {
     pub partition: PartitionId,
     /// Its replication lag from the owner's point of view this heartbeat.
     pub replication_lag: orbita_wal::ReplicationLag,
+    /// How many replicas held a live read lease when this was sampled, which is
+    /// the coherence quorum a write on this partition waits for.
+    pub lease_holders: u64,
     /// Its on-disk size, or `None` when the owner could not size it this
     /// heartbeat, so the storage series is left unreported rather than stale.
     pub storage_bytes: Option<u64>,
@@ -217,6 +235,7 @@ fn publish_owned_into(target: &RwLock<Vec<OwnedSample>>, owned_metrics: Vec<Owne
             partition: metric.partition.get() as i64,
             replicas_behind: metric.replication_lag.replicas_behind,
             replication_lag: metric.replication_lag.max_lamports,
+            lease_holders: metric.lease_holders,
             storage_bytes: metric.storage_bytes,
         })
         .collect();
@@ -272,12 +291,14 @@ mod tests {
                     keyspace: "tenant".to_owned(),
                     partition: PartitionId(7),
                     replication_lag: lag,
+                    lease_holders: 2,
                     storage_bytes: Some(4096),
                 },
                 OwnedMetric {
                     keyspace: "tenant".to_owned(),
                     partition: PartitionId(8),
                     replication_lag: lag,
+                    lease_holders: 2,
                     storage_bytes: None,
                 },
             ],
@@ -291,6 +312,7 @@ mod tests {
                 keyspace: "tenant".to_owned(),
                 partition: PartitionId(8),
                 replication_lag: lag,
+                lease_holders: 2,
                 storage_bytes: None,
             }],
         );
