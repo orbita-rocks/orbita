@@ -26,6 +26,7 @@ use orbita_runtime::{Runtime, ServiceId, Transport};
 use orbita_sim::{harness, SimRuntime, Simulation};
 use orbita_wal::WalService;
 
+use orbita_storage::ValueCache;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,7 @@ const ROUNDS: u64 = 8;
 
 fn partition_paths() -> PartitionPaths {
     PartitionPaths {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
         wal_dir: "wal/p1".to_string(),
@@ -50,6 +52,7 @@ fn partition_paths() -> PartitionPaths {
 
 fn paths_in(store: Arc<MemoryStore>, wal_dir: &str) -> PartitionPaths {
     PartitionPaths {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store,
         path: PartitionPath::new("", KeyspaceId(1), PartitionId(1)),
         wal_dir: wal_dir.to_string(),

@@ -35,6 +35,7 @@ use orbita_proto::v1::{GetRequest, SetRequest};
 use orbita_runtime::{Clock, Runtime};
 use orbita_sim::{harness, SimRuntime, Simulation};
 
+use orbita_storage::ValueCache;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -112,6 +113,7 @@ fn start_node_on_store(
 ) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store,
         wal_root: "wal".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
@@ -156,6 +158,7 @@ fn start_node_reporting(
 ) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
         // The default, so nothing here rolls a segment: these scenarios are

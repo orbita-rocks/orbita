@@ -49,6 +49,7 @@ use orbita_sim::{
     harness, DiskPolicy, SimBucket, SimConfig, SimRuntime, Simulation, StoreFault, StoreFaults,
 };
 
+use orbita_storage::ValueCache;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,6 +69,7 @@ fn partition_path() -> PartitionPath {
 
 fn paths(bucket: &Arc<SimBucket>, wal_dir: &str) -> PartitionPaths {
     PartitionPaths {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: bucket.store(),
         path: partition_path(),
         wal_dir: wal_dir.to_string(),

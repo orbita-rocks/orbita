@@ -243,7 +243,8 @@ fn server_config(
         .with_peer_listen_addr(peer_listen)
         .with_peer_advertise_addr(config.node.peer_advertise.clone())
         .with_require_auth(config.cluster.require_auth)
-        .with_root_credential(config.cluster.root_credential.clone());
+        .with_root_credential(config.cluster.root_credential.clone())
+        .with_value_cache_bytes(config.node.value_cache_bytes);
 
     let peers = parse_leader_peers(&config.cluster.leader_peers)?;
     if config.node.role == Role::Node && !options.dev {

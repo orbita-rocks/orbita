@@ -60,6 +60,19 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// much lag a partition survives.
 pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = orbita_wal::DEFAULT_SEGMENT_TARGET_BYTES;
 
+/// How much of a node's memory holds records read back out of segments.
+///
+/// A flat number rather than a fraction of the machine, because the engine
+/// cannot see the machine and a container's limit is not the host's memory.
+/// It is deliberately modest: the index is already resident and is the
+/// allocation that must not be squeezed, since losing it costs a rebuild from
+/// object storage while losing a cached value costs one fetch.
+///
+/// Large enough to matter, though. The working sets this was measured against
+/// were 5.7 MiB and 228 MiB, so this holds either outright, and a node that
+/// wants more should be told rather than guessed at.
+pub const DEFAULT_VALUE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Where a node's S3 credentials come from before any role is assumed.
 ///
 /// Every variant but [`S3CredentialSource::Default`] is a *named* source: it
@@ -208,6 +221,19 @@ pub struct ServerConfig {
     /// How many replicas a partition keeps so they can serve reads. `None`
     /// leaves the control plane at its durability floor. See ADR 0013.
     pub read_replica_target: Option<usize>,
+
+    /// Bytes of records read back out of segments this node will hold in
+    /// memory, shared across every partition it hosts.
+    ///
+    /// ADR 0006 decided values are cached rather than resident, which is what
+    /// lets a partition hold more than a node's memory. Without a cache every
+    /// read of a flushed key is an object-store round trip, and a measured
+    /// cluster never answered one faster than 14.4ms.
+    ///
+    /// Shared rather than per partition because a node holding thousands of
+    /// partitions would otherwise have thousands of budgets and no bound. Zero
+    /// turns caching off and restores the previous behaviour exactly.
+    pub value_cache_bytes: u64,
 
     pub leader_member: bool,
 
@@ -392,6 +418,7 @@ impl Default for ServerConfig {
             leader_group: Vec::new(),
             durability_acks: 1,
             read_replica_target: None,
+            value_cache_bytes: DEFAULT_VALUE_CACHE_BYTES,
             leader_member: false,
             leader_owns_partitions: false,
             automatic_cluster: false,
@@ -518,6 +545,17 @@ impl ServerConfig {
     #[must_use]
     pub fn with_read_replica_target(mut self, target: Option<usize>) -> Self {
         self.read_replica_target = target;
+        self
+    }
+
+    /// Sets how much memory this node holds records read out of segments in.
+    ///
+    /// Zero is meaningful and supported: it turns caching off and restores the
+    /// behaviour of every release before ADR 0006's cache existed, which is
+    /// what an operator reaches for when they suspect it.
+    #[must_use]
+    pub fn with_value_cache_bytes(mut self, bytes: u64) -> Self {
+        self.value_cache_bytes = bytes;
         self
     }
 

@@ -29,6 +29,7 @@ use orbita_proto::v1::{GetRequest, SetRequest};
 use orbita_runtime::Runtime;
 use orbita_sim::{SimRuntime, Simulation};
 
+use orbita_storage::ValueCache;
 use std::sync::Arc;
 
 /// A keyspace configured with whatever quotas a test cares about, plus a single
@@ -84,6 +85,7 @@ fn start_with_auth(
 ) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(NodeId(1));
     let layout = DataLayout {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,
@@ -173,6 +175,7 @@ fn start_with_map(sim: &Simulation, map: PartitionMap) -> Arc<Node<SimRuntime>> 
     let runtime = sim.add_node(NodeId(1));
     let clock = runtime.clock().clone();
     let layout = DataLayout {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,

@@ -53,6 +53,7 @@ use orbita_proto::v1::{GetRequest, SetRequest};
 use orbita_runtime::{Clock, Runtime};
 use orbita_sim::{harness, DiskPolicy, Failure, SimRuntime, Simulation};
 
+use orbita_storage::ValueCache;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,6 +157,7 @@ fn cluster_map() -> PartitionMap {
 /// simulated disk under `wal_root`.
 fn layout(store: &Arc<MemoryStore>) -> DataLayout {
     DataLayout {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::clone(store) as Arc<dyn orbita_objectstore::ObjectStore>,
         wal_root: "wal".to_string(),
         wal_segment_bytes: WAL_SEGMENT_BYTES,

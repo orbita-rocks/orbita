@@ -31,6 +31,7 @@ use orbita_proto::v1::{GetRequest, ListRequest, SetRequest};
 use orbita_runtime::{Clock, Runtime};
 use orbita_sim::{harness, Failure, SimRuntime, Simulation};
 
+use orbita_storage::ValueCache;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -253,6 +254,7 @@ fn start_node_with_snapshots(
 ) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
+        value_cache: Arc::new(ValueCache::new(1 << 20)),
         store,
         wal_root: format!("wal-{}", node.get()),
         wal_segment_bytes: crate::DEFAULT_WAL_SEGMENT_BYTES,

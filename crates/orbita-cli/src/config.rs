@@ -62,6 +62,10 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
     ("ORBITA_PEER_LISTEN", "node.peer_listen"),
     ("ORBITA_PEER_ADVERTISE", "node.peer_advertise"),
     ("ORBITA_DATA_DIR", "node.data_dir"),
+    (
+        "ORBITA_VALUE_CACHE_BYTES",
+        "node.value_cache_bytes, memory held for values read out of segments",
+    ),
     ("ORBITA_CLUSTER_NAME", "cluster.name"),
     ("ORBITA_VOTER_TARGET", "cluster.voter_target, either 3 or 5"),
     (
@@ -248,6 +252,14 @@ pub struct NodeConfig {
     /// resolves to the same thing.
     pub peer_advertise: String,
     pub data_dir: PathBuf,
+    /// Bytes of records read out of segments this node holds in memory,
+    /// shared across every partition it hosts.
+    ///
+    /// Node-scoped rather than cluster-scoped because it is this machine's
+    /// memory: two nodes of different sizes should hold different amounts, and
+    /// nothing about the value is agreed on. Zero turns caching off. See
+    /// ADR 0006.
+    pub value_cache_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -500,6 +512,7 @@ pub struct NodeLayer {
     pub peer_listen: Option<String>,
     pub peer_advertise: Option<String>,
     pub data_dir: Option<PathBuf>,
+    pub value_cache_bytes: Option<u64>,
 }
 
 /// The join durations are strings rather than numbers so that a file says
@@ -596,7 +609,8 @@ impl Layer {
             advertise,
             peer_listen,
             peer_advertise,
-            data_dir
+            data_dir,
+            value_cache_bytes
         );
         overlay!(
             self.cluster,
@@ -743,6 +757,7 @@ impl Layer {
                 peer_listen: get("ORBITA_PEER_LISTEN").map(str::to_owned),
                 peer_advertise: get("ORBITA_PEER_ADVERTISE").map(str::to_owned),
                 data_dir: get("ORBITA_DATA_DIR").map(PathBuf::from),
+                value_cache_bytes: parse("ORBITA_VALUE_CACHE_BYTES")?,
             },
             cluster: ClusterLayer {
                 name: get("ORBITA_CLUSTER_NAME").map(str::to_owned),
@@ -948,6 +963,10 @@ impl Layer {
                 advertise,
                 peer_listen,
                 peer_advertise,
+                value_cache_bytes: self
+                    .node
+                    .value_cache_bytes
+                    .unwrap_or(orbita_server::DEFAULT_VALUE_CACHE_BYTES),
                 data_dir: self
                     .node
                     .data_dir
@@ -1159,6 +1178,7 @@ pub fn dev_defaults(port: u16, data_dir: PathBuf) -> Layer {
             listen: Some(format!("127.0.0.1:{port}")),
             advertise: Some(format!("127.0.0.1:{port}")),
             peer_listen: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
+            value_cache_bytes: None,
             peer_advertise: Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
             data_dir: Some(data_dir),
         },
@@ -1687,6 +1707,33 @@ mod tests {
         let config = Layer::default().merge(environment).resolve().unwrap();
         assert_eq!(config.node.peer_listen, "10.1.0.4:9101");
         assert_eq!(config.node.peer_advertise, "node-a.internal:9101");
+    }
+
+    #[test]
+    fn the_value_cache_budget_can_be_set_and_can_be_turned_off() {
+        // Zero has to survive the resolve rather than being treated as unset
+        // and replaced by the default. It is how an operator who suspects the
+        // cache takes it out of the picture, and a knob that silently ignores
+        // the one value you reach for in an incident is worse than no knob.
+        let off = Layer::default()
+            .merge(Layer::from_toml("[node]\nvalue_cache_bytes = 0\n").unwrap())
+            .resolve()
+            .unwrap();
+        assert_eq!(off.node.value_cache_bytes, 0);
+
+        let sized = Layer::default()
+            .merge(Layer::from_env(&env(&[("ORBITA_VALUE_CACHE_BYTES", "1048576")])).unwrap())
+            .resolve()
+            .unwrap();
+        assert_eq!(sized.node.value_cache_bytes, 1_048_576);
+
+        // And left alone it is whatever the server decided, not a number this
+        // crate keeps a second copy of.
+        let defaulted = Layer::default().resolve().unwrap();
+        assert_eq!(
+            defaulted.node.value_cache_bytes,
+            orbita_server::DEFAULT_VALUE_CACHE_BYTES
+        );
     }
 
     #[test]
