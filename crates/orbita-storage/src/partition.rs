@@ -335,6 +335,15 @@ struct Loc {
     record_length: u32,
 }
 
+/// The byte range a single miss fetches.
+struct ReadWindow {
+    start: u64,
+    end: u64,
+    /// Records beyond the one that was asked for. Zero means the window is
+    /// exactly one record and the strict length check still applies.
+    followers: usize,
+}
+
 /// Everything that changes together under the partition's one lock.
 struct State {
     /// Acknowledged writes not yet in a segment. Holds at most one entry per
@@ -408,6 +417,11 @@ pub struct Partition<R: Runtime> {
     /// make every cache hit take the write lock and serialise the read path
     /// behind it. Its own lock is held for a map lookup and nothing else.
     cache: Arc<ValueCache>,
+    /// How many bytes a miss may fetch, counting from the record that missed.
+    ///
+    /// Zero fetches exactly the record asked for, which is what every release
+    /// before this did.
+    read_ahead_bytes: u64,
     /// One lock rather than a lock per key is deliberate: a partition already
     /// has exactly one writer in production, because the owning worker
     /// serializes writes before they reach here, so striping would buy
@@ -486,6 +500,7 @@ impl<R: Runtime> Partition<R> {
             // working cache that holds nothing, so the read path has no branch
             // for whether caching is configured.
             cache: Arc::new(ValueCache::new(0)),
+            read_ahead_bytes: 0,
             state: tokio::sync::RwLock::new(state),
             maintenance_frozen: std::sync::atomic::AtomicBool::new(false),
             compaction_input_bytes: std::sync::atomic::AtomicU64::new(COMPACTION_INPUT_BYTES),
@@ -507,6 +522,18 @@ impl<R: Runtime> Partition<R> {
     #[must_use]
     pub fn with_value_cache(mut self, cache: Arc<ValueCache>) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// Fetches up to `bytes` per miss instead of one record.
+    ///
+    /// Separate from the cache because the two answer different questions. The
+    /// cache decides what a second read of a key costs; this decides what the
+    /// first read of its neighbours costs, and the two are worth turning on and
+    /// measuring independently.
+    #[must_use]
+    pub fn with_read_ahead(mut self, bytes: u64) -> Self {
+        self.read_ahead_bytes = bytes;
         self
     }
 
@@ -1373,6 +1400,119 @@ impl<R: Runtime> Partition<R> {
     }
 
     /// Reads one record out of its segment and verifies it is the one the
+    /// The byte range one miss should fetch, and how many extra records it
+    /// covers.
+    ///
+    /// Bounded by the index rather than by the segment's layout. Records in a
+    /// segment are sorted by key and laid out in that order, so walking the
+    /// index forward from the key that missed gives the records that physically
+    /// follow it. Ending on a record boundary the index named means the window
+    /// can never run past the data section into the key index, which decoding
+    /// would read as records and would be nonsense.
+    ///
+    /// Entries belonging to other segments are skipped rather than ending the
+    /// walk: they interleave in key order without interrupting this segment's
+    /// bytes, so stopping at the first one would usually read ahead by nothing
+    /// at all on a partition with more than one segment.
+    fn read_ahead(&self, state: &State, loc: Loc, key: &[u8]) -> ReadWindow {
+        let start = loc.offset;
+        let mut end = start + u64::from(loc.record_length);
+        let mut followers = 0usize;
+        if self.read_ahead_bytes == 0 {
+            return ReadWindow {
+                start,
+                end,
+                followers,
+            };
+        }
+        let budget = self.read_ahead_bytes;
+        for (_, next) in state
+            .index
+            .range::<[u8], _>((Bound::Excluded(key), Bound::Unbounded))
+        {
+            if next.segment != loc.segment || next.offset < end {
+                continue;
+            }
+            let candidate = next.offset + u64::from(next.record_length);
+            if candidate.saturating_sub(start) > budget {
+                break;
+            }
+            end = candidate;
+            followers += 1;
+        }
+        ReadWindow {
+            start,
+            end,
+            followers,
+        }
+    }
+
+    /// Caches the records that came back behind the one that was asked for.
+    ///
+    /// Every insert is checked against the index before it is kept. A segment
+    /// holds shadowed versions as well as winning ones, and the bytes between
+    /// two indexed records may belong to a version some later segment replaced.
+    /// Caching those would be harmless — they are keyed by the offset they
+    /// really live at, and no index entry points there, so nothing could read
+    /// them back — but they would hold budget that live records need.
+    ///
+    /// Decode failures end the walk rather than failing the read. The record
+    /// the caller asked for has already been decoded and verified; anything
+    /// after it is opportunistic, and a partial trailing record at the end of
+    /// the window is expected rather than exceptional.
+    fn warm_followers(
+        &self,
+        state: &State,
+        object: &str,
+        start: u64,
+        mut rest: &[u8],
+        mut offset_in_window: usize,
+    ) {
+        while !rest.is_empty() {
+            let Ok((record, consumed)) = SegmentRecord::decode(rest) else {
+                return;
+            };
+            if consumed == 0 {
+                return;
+            }
+            let offset = start + offset_in_window as u64;
+            let winning = state
+                .index
+                .get(record.key.as_ref())
+                .is_some_and(|held| held.offset == offset);
+            if winning {
+                if let RecordValue::Inline(value) = &record.value {
+                    self.cache.insert(
+                        object,
+                        offset,
+                        Stored {
+                            version: Version(record.lamport.get()),
+                            expires_at_millis: record.expires_at_millis,
+                            deleted: record.is_tombstone(),
+                            value: value.clone(),
+                        },
+                    );
+                } else if record.is_tombstone() {
+                    self.cache.insert(
+                        object,
+                        offset,
+                        Stored {
+                            version: Version(record.lamport.get()),
+                            expires_at_millis: record.expires_at_millis,
+                            deleted: true,
+                            value: Bytes::new(),
+                        },
+                    );
+                }
+                // An external value lives in its own object (ADR 0007), so
+                // warming it would be a second round trip per neighbour and
+                // defeat the point. It is left for its own read to fetch.
+            }
+            rest = &rest[consumed..];
+            offset_in_window += consumed;
+        }
+    }
+
     /// index promised.
     async fn fetch(&self, state: &State, loc: Loc, key: &[u8]) -> Result<Stored> {
         // A shared segment (a split child's cross-partition reference) lives
@@ -1391,16 +1531,32 @@ impl<R: Runtime> Partition<R> {
             return Ok(cached);
         }
 
+        // One round trip, however many records it comes back with. A miss is
+        // dominated by the round trip rather than by the bytes — measured at
+        // about 14ms against S3 for a 1 KiB record — so fetching only the
+        // record that was asked for spends the expensive part of the operation
+        // on the cheapest possible result.
+        let window = self.read_ahead(state, loc, key);
         let raw = self
             .store
-            .get_range(
-                &object,
-                loc.offset..loc.offset + u64::from(loc.record_length),
-            )
+            .get_range(&object, window.start..window.end)
             .await
             .map_err(store_error)?;
+
+        // The asked-for record sits at the front of the window by construction,
+        // so it decodes first and the neighbours behind it are a side effect.
         let (record, consumed) = SegmentRecord::decode(&raw).map_err(format_error)?;
-        if consumed != raw.len() || record.key != key {
+        if record.key != key {
+            return Err(Error::Internal(format!(
+                "{name} holds a different record than the index claims for this key"
+            )));
+        }
+        if window.followers > 0 {
+            self.warm_followers(state, &object, window.start, &raw[consumed..], consumed);
+        } else if consumed != raw.len() {
+            // Without read-ahead the range is exactly one record, so anything
+            // left over means the index and the segment disagree about how long
+            // it is. With read-ahead there is deliberately more.
             return Err(Error::Internal(format!(
                 "{name} holds a different record than the index claims for this key"
             )));
@@ -4957,6 +5113,138 @@ mod tests {
         assert!(
             store.segment_reads() >= 3,
             "with no cache every read fetches, which is what it did before"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_miss_warms_the_records_next_to_it() {
+        // The point of read-ahead. A miss costs a round trip whatever it brings
+        // back — about 14ms against S3 — so bringing back one record spends the
+        // expensive part of the operation on the cheapest possible result.
+        // Segment records are sorted by key and laid out in that order, so the
+        // neighbours are already in the bytes the range request has to cross.
+        let (owner, _replica, store) = crate::testing::counting_partition_pair().await;
+        let owner = owner
+            .with_value_cache(Arc::new(ValueCache::new(1 << 20)))
+            .with_read_ahead(64 * 1024);
+        for i in 0..16u32 {
+            owner
+                .apply(&Mutation::put(
+                    Lamport(u64::from(i) + 1),
+                    bytes(&format!("k{i:03}")),
+                    bytes("value"),
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+        owner.flush().await.unwrap();
+
+        store.reset();
+        assert!(owner.get(b"k000").await.unwrap().is_some());
+        let first = store.segment_reads();
+        assert!(first > 0, "the first read has to fetch");
+
+        // Every other key was in the bytes that fetch already crossed.
+        store.reset();
+        for i in 1..16u32 {
+            assert!(
+                owner
+                    .get(format!("k{i:03}").as_bytes())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "k{i:03} should have been warmed by the miss on k000"
+            );
+        }
+        assert_eq!(
+            store.segment_reads(),
+            0,
+            "fifteen neighbours came back with the first miss and none of them fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_ahead_does_not_serve_a_neighbour_a_later_write_replaced() {
+        // The risk read-ahead introduces. A segment holds shadowed versions as
+        // well as winning ones, so the bytes behind a record may be a version
+        // some later flush replaced. Warming them blindly would put a stale
+        // record in the cache under an offset nothing indexes — harmless on its
+        // own — but the read path must still answer with the winning version.
+        let (owner, _replica, store) = crate::testing::counting_partition_pair().await;
+        let owner = owner
+            .with_value_cache(Arc::new(ValueCache::new(1 << 20)))
+            .with_read_ahead(64 * 1024);
+        for i in 0..8u32 {
+            owner
+                .apply(&Mutation::put(
+                    Lamport(u64::from(i) + 1),
+                    bytes(&format!("k{i:03}")),
+                    bytes("old"),
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+        owner.flush().await.unwrap();
+
+        // A second segment, shadowing one of the keys in the first.
+        owner
+            .apply(&Mutation::put(
+                Lamport(100),
+                bytes("k004"),
+                bytes("new"),
+                None,
+            ))
+            .await
+            .unwrap();
+        owner.flush().await.unwrap();
+
+        store.reset();
+        // Missing on k000 drags the whole first segment's data through,
+        // including the superseded copy of k004.
+        assert!(owner.get(b"k000").await.unwrap().is_some());
+
+        assert_eq!(
+            owner.get(b"k004").await.unwrap().map(|r| r.value),
+            Some(bytes("new")),
+            "the winning version, not the one read-ahead happened to cross"
+        );
+        assert_eq!(
+            owner.get(b"k003").await.unwrap().map(|r| r.value),
+            Some(bytes("old")),
+            "a neighbour nothing replaced is still correct"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_ahead_off_fetches_exactly_one_record() {
+        // The default, and the behaviour every release before this had. Worth a
+        // test because the strict length check that catches an index disagreeing
+        // with its segment only applies when the window is one record, and it
+        // would be easy to lose it while making room for a window that is not.
+        let (owner, _replica, store) = crate::testing::counting_partition_pair().await;
+        let owner = owner.with_value_cache(Arc::new(ValueCache::new(1 << 20)));
+        for i in 0..8u32 {
+            owner
+                .apply(&Mutation::put(
+                    Lamport(u64::from(i) + 1),
+                    bytes(&format!("k{i:03}")),
+                    bytes("value"),
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+        owner.flush().await.unwrap();
+
+        store.reset();
+        assert!(owner.get(b"k000").await.unwrap().is_some());
+        store.reset();
+        assert!(owner.get(b"k001").await.unwrap().is_some());
+        assert!(
+            store.segment_reads() > 0,
+            "with read-ahead off a neighbour is still a fetch"
         );
     }
 }

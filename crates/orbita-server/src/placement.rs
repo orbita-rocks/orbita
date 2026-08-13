@@ -113,6 +113,7 @@ fn start_node_on_store(
 ) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store,
         wal_root: "wal".to_string(),
@@ -158,6 +159,7 @@ fn start_node_reporting(
 ) -> Arc<Node<SimRuntime>> {
     let runtime = sim.add_node(node);
     let layout = DataLayout {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),

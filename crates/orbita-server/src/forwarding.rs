@@ -71,6 +71,7 @@ fn start(sim: &Simulation, node: NodeId) -> Arc<Node<SimRuntime>> {
     // Each node persists into its own in-memory store, so a run touches no
     // real filesystem and stays deterministic.
     let layout = DataLayout {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::new(MemoryStore::new()),
         wal_root: "wal".to_string(),

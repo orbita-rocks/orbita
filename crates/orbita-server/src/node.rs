@@ -146,6 +146,8 @@ pub(crate) struct DataLayout {
     /// Records read back out of segments, shared by every partition this node
     /// hosts. See [`orbita_storage::ValueCache`] and ADR 0006.
     pub value_cache: Arc<ValueCache>,
+    /// How much one cache miss fetches beyond the record that missed.
+    pub read_ahead_bytes: u64,
 }
 
 impl DataLayout {
@@ -157,6 +159,7 @@ impl DataLayout {
             wal_segment_bytes: self.wal_segment_bytes,
             durability_acks: self.durability_acks,
             value_cache: Arc::clone(&self.value_cache),
+            read_ahead_bytes: self.read_ahead_bytes,
         }
     }
 }
@@ -166,6 +169,14 @@ pub(crate) struct Node<R: Runtime> {
     runtime: R,
     node_id: NodeId,
     layout: DataLayout,
+    /// Monotonic nanoseconds the value cache was last logged at.
+    ///
+    /// The gauges are the real interface, but they need a collector, and the
+    /// two benchmarks that most needed this number had none — the hit rate had
+    /// to be inferred from latency both times. A log line costs nothing and can
+    /// be read with `kubectl logs`, which is what an operator has to hand
+    /// during the run rather than after it.
+    cache_logged_at: std::sync::atomic::AtomicU64,
     map: RwLock<Arc<PartitionMap>>,
     source: BoxedMapSource,
     hosts: tokio::sync::RwLock<HashMap<PartitionId, Arc<PartitionHost<R>>>>,
@@ -356,6 +367,7 @@ impl<R: Runtime> Node<R> {
         wal_service.hydrate_with(Arc::clone(&bridge) as Arc<dyn orbita_wal::PartitionHydrator>);
 
         let node = Arc::new(Self {
+            cache_logged_at: std::sync::atomic::AtomicU64::new(0),
             runtime: runtime.clone(),
             node_id,
             layout,
@@ -1886,7 +1898,54 @@ impl<R: Runtime> Node<R> {
         // only way to know whether reads are being served from memory is to
         // infer it from latency, which is how the last two benchmarks had to
         // do it.
-        metrics::publish_cache(self.layout.value_cache.stats());
+        let stats = self.layout.value_cache.stats();
+        metrics::publish_cache(stats);
+        self.log_cache(stats);
+    }
+
+    /// Reports the value cache's standing, at most once every ten seconds.
+    ///
+    /// Rate limited because the heartbeat that drives it runs six times a
+    /// second per node, and a signal nobody can read without `grep -v` is not
+    /// a signal. Ten seconds is short enough to see a change land inside a
+    /// benchmark run and long enough to leave the log usable.
+    fn log_cache(&self, stats: orbita_storage::CacheStats) {
+        use std::sync::atomic::Ordering;
+
+        const EVERY_NANOS: u64 = 10 * 1_000_000_000;
+        let now = self.runtime.clock().monotonic_nanos();
+        let last = self.cache_logged_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < EVERY_NANOS {
+            return;
+        }
+        if self
+            .cache_logged_at
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        // Absent before the first read rather than zero, because a hit rate of
+        // zero and no reads at all are different situations and one of them is
+        // not a problem.
+        match stats.hit_rate() {
+            Some(rate) => tracing::info!(
+                target: "orbita::value_cache",
+                hits = stats.hits,
+                misses = stats.misses,
+                hit_rate = format!("{:.4}", rate),
+                bytes = stats.bytes,
+                entries = stats.entries,
+                evictions = stats.evictions,
+                "value cache"
+            ),
+            None => tracing::info!(
+                target: "orbita::value_cache",
+                bytes = stats.bytes,
+                entries = stats.entries,
+                "value cache has served no reads yet"
+            ),
+        }
     }
 
     /// Moves the durability half of readiness to match what the owners here
@@ -2714,6 +2773,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(ListingFailureStore::new());
         let layout = DataLayout {
+            read_ahead_bytes: 256 * 1024,
             value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
@@ -2792,6 +2852,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(ListingFailureStore::new());
         let layout = DataLayout {
+            read_ahead_bytes: 256 * 1024,
             value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
@@ -2869,6 +2930,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(MemoryStore::new());
         let layout = DataLayout {
+            read_ahead_bytes: 256 * 1024,
             value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
@@ -2934,6 +2996,7 @@ mod tests {
             let runtime = sim.add_node(NodeId(1));
             let store = Arc::new(MemoryStore::new());
             let layout = DataLayout {
+                read_ahead_bytes: 256 * 1024,
                 value_cache: Arc::new(ValueCache::new(1 << 20)),
                 store: Arc::clone(&store) as Arc<dyn ObjectStore>,
                 wal_root: "wal".to_string(),
@@ -2988,6 +3051,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(MemoryStore::new());
         let layout = DataLayout {
+            read_ahead_bytes: 256 * 1024,
             value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
@@ -3074,6 +3138,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(MemoryStore::new());
         let layout = DataLayout {
+            read_ahead_bytes: 256 * 1024,
             value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),
@@ -3157,6 +3222,7 @@ mod tests {
         let runtime = sim.add_node(NodeId(1));
         let store = Arc::new(MemoryStore::new());
         let layout = DataLayout {
+            read_ahead_bytes: 256 * 1024,
             value_cache: Arc::new(ValueCache::new(1 << 20)),
             store: Arc::clone(&store) as Arc<dyn ObjectStore>,
             wal_root: "wal".to_string(),

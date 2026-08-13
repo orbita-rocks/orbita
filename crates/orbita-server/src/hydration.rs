@@ -103,6 +103,7 @@ fn start_replica(
     Arc<crate::replication::Applies>,
 ) {
     let paths = PartitionPaths {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store,
         path: path(),
@@ -416,6 +417,7 @@ fn a_hydrated_node_leaves_a_log_the_previous_binary_still_recovers() {
             );
 
             let paths = PartitionPaths {
+                read_ahead_bytes: 256 * 1024,
                 value_cache: Arc::new(ValueCache::new(1 << 20)),
                 store: Arc::clone(&store) as Arc<dyn orbita_objectstore::ObjectStore>,
                 path: path(),

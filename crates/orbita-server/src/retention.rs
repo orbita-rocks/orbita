@@ -157,6 +157,7 @@ fn cluster_map() -> PartitionMap {
 /// simulated disk under `wal_root`.
 fn layout(store: &Arc<MemoryStore>) -> DataLayout {
     DataLayout {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: Arc::clone(store) as Arc<dyn orbita_objectstore::ObjectStore>,
         wal_root: "wal".to_string(),

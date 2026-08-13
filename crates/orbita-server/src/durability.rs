@@ -69,6 +69,7 @@ fn partition_path() -> PartitionPath {
 
 fn paths(bucket: &Arc<SimBucket>, wal_dir: &str) -> PartitionPaths {
     PartitionPaths {
+        read_ahead_bytes: 256 * 1024,
         value_cache: Arc::new(ValueCache::new(1 << 20)),
         store: bucket.store(),
         path: partition_path(),
