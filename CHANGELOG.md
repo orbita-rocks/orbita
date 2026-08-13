@@ -51,18 +51,44 @@ sentence a commit subject cannot carry.
   so the number to quote is "under 2ms at about 15k reads/s per node" rather than
   "under 2ms".
 
+### Fixed
+
+- **The first writes to a new partition no longer fail while its replicas are
+  still opening it** (#168). An owner admits writes the moment it opens, and
+  nothing requires its replicas to have opened the same partition yet, so for a
+  split child, a new placement, or every partition on a cluster that has just
+  started, the first client write was the first thing to contact a replica —
+  and there was no retry anywhere on that path. A 2,000 record load against a
+  just-ready cluster lost 294 records to it. An owner now keeps trying while
+  some replica has never answered, and still fails fast when a replica that was
+  following goes away, because an outage is not a partition coming up.
+
+### Changed
+
+- **A write that could not reach a durability quorum is no longer reported as
+  retryable** (#187). It now returns a distinct error and the gRPC status
+  `UNKNOWN` rather than `UNAVAILABLE`, which most client stacks retry by
+  default.
+
+  The failure is raised after the entry is already durable on the owner, so the
+  write may still take effect — the next open replays the log above the flush
+  horizon. Replaying it is what turns one legal late landing into two writes.
+  For a conditional write the damage is plainer: a lock taken with IF NOT
+  PRESENT, refused, and retried is reported as lost to the client that holds
+  it, which is the wedge use case failing quietly.
+
+  **What a client should do instead is read the key back and decide from what
+  it finds.** Nothing else can tell the two outcomes apart.
+
+  A node running an older build decodes the new peer error code through its
+  unknown-code path and reports it as internal. The wording is wrong and the
+  advice is right: internal is not retryable either, so a half-upgraded cluster
+  cannot tell a client to replay a write that may already have landed.
+
 ### Known issues
 
 Disclosed rather than fixed. Each has an issue.
 
-- **A new partition's replication path starts cold** (#168). An owner admits
-  writes the moment it opens, and nothing requires its replicas to have opened
-  the same partition yet, so the first writes can fail with
-  `could not reach a second copy` until the replicas catch up. There is no retry
-  in the owner's replication path today. It affects fresh clusters as well as
-  split children — a 2,000 record load against a just-ready cluster lost 294
-  records to it — and the failure is genuinely ambiguous, so it must not be
-  retried blindly by a client.
 - **Adjacent partition merges ship present but disabled** (#125, ADR 0012). The
   code is in this release and the vocabulary sits behind cluster protocol 0.2,
   so nothing exercises it until a `finalize-upgrade` to 0.2. That is deliberate:
@@ -77,6 +103,12 @@ Disclosed rather than fixed. Each has an issue.
 - **Heartbeat reporting is O(partitions) on every interval** (#177), whatever
   changed. It is invisible at the partition counts tested here and is the one
   place a cold partition is not free.
+- **A write refused for want of a quorum may still land later** (#188), because
+  the entry is durable on the owner before replication is attempted and the next
+  open replays it. This is a documented outcome rather than a defect: the client
+  is told the result is unknown, and a refused write landing later is a legal
+  history, which the simulator's linearizability checker confirms. It is listed
+  here because it surprises people, not because it is wrong.
 - **A node that loses its data directory may not rejoin** (#184), refusing with
   a cluster identity mismatch and serving health only. Seen once, on a cluster
   scaled up and down repeatedly, and not yet reproduced deliberately.

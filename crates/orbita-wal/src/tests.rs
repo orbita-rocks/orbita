@@ -1214,8 +1214,15 @@ fn losing_two_replicas_fails_the_write_rather_than_acknowledging_it() {
 
         let result = c.owner.commit(op("lonely")).await;
         assert!(
-            matches!(result, Err(Error::Unavailable(_))),
+            matches!(result, Err(Error::Indeterminate(_))),
             "a write that reached one copy is not a write, got {result:?}"
+        );
+        // Indeterminate rather than Unavailable, because the entry is fsynced
+        // here before replication is attempted. The client must not replay it:
+        // this log still holds it and the next open will apply it. See #187.
+        assert!(
+            !result.as_ref().unwrap_err().is_retryable(),
+            "a write that may already be durable must not be advertised as safe to replay"
         );
         assert_eq!(
             c.owner.committed_lamport(),

@@ -1454,7 +1454,12 @@ impl<R: Runtime> Wal<R> {
                     return Err(fatal.clone());
                 }
                 if lamport <= state.failed_through {
-                    return Err(Error::Unavailable(format!(
+                    // Indeterminate, not Unavailable. The entry is already
+                    // fsynced to this node's log by the time replication is
+                    // attempted, so this is not a write that did not happen —
+                    // it is one nobody can speak for, and the next open will
+                    // replay it. See issue #187.
+                    return Err(Error::Indeterminate(format!(
                         "partition {} could not reach a second copy for {lamport}",
                         self.partition
                     )));

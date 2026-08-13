@@ -69,6 +69,22 @@ any format version its window allows and writes the version the active cluster
 version calls for. That is what makes the rollback window below real rather
 than a hope.
 
+### Error codes on the peer path are additive
+
+A node forwards a client request to the partition's owner, and the owner's error
+comes back over the peer path as a number. 0.1.0 adds one, for a write whose
+outcome nobody can state, which is what an owner returns when it cannot reach a
+durability quorum.
+
+A node too old to know that number reports it as an internal error. The wording
+is wrong and the advice is right: internal is not retryable, and neither is the
+error it stands in for, so a half-upgraded cluster cannot tell a client to
+replay a write that may already have landed. Once the rollout finishes, every
+node reports it properly.
+
+This is why error codes are only ever added here and never reused. A recycled
+number would mean an old node acting on the wrong advice rather than on none.
+
 ## The first upgrade to Raft leaders
 
 This section is a one-time transition for a release whose leader pods do not
