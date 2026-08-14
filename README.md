@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <em>One coordination backbone. From laptop to cloud scale.</em>
+  <em>Fast, durable key-value store for control plane state.</em>
 </p>
 
 <p align="center">
@@ -13,9 +13,9 @@
 </p>
 
 Orbita is a strongly consistent store for locks, leases, catalogs, epochs, and
-control-plane state. Start with one process. Grow into one shared, multitenant
-system without replacing the direct KV model or running a cluster for every
-team.
+control-plane state. It aims to be the durable shared memory a platform
+coordinates on: Redis-like latency on the fast path, datasets that can outgrow
+memory, and operational simplicity that doesn't require a team to maintain it.
 
 The amount of coordination data is usually small. Its consequences are not.
 Orbita is built for the state that tells a larger system who owns what, what is
@@ -23,6 +23,36 @@ current, and what may happen next.
 
 [Website](https://orbita.rocks) · [Quickstart](docs/QUICKSTART.md) ·
 [Requirements](docs/REQUIREMENTS.md) · [Roadmap](ROADMAP.md)
+
+## Why Orbita exists
+
+I have typically leaned on Redis as the source of truth for control planes. It
+acts as shared memory, and its collection of data structures makes it easy to
+model rate limits, quotas, epochs, mutexes, leader election, and more. I used
+this strategy at Tower, and it worked, but a few problems kept coming back:
+
+- **Durability was always a question.** You can put Redis into a durable mode,
+  but crash recovery is expensive, and coordination state is exactly the data
+  you cannot afford to lose.
+- **Memory residency.** You cannot outgrow memory. When the dataset grows, the
+  only answer is more memory.
+- **Tooling.** We had to build all of our own tooling for exploring the state
+  of our control plane data, which became expensive to maintain.
+- **Hosting.** ElastiCache is a decent hosted option, but I wanted something
+  more full service, with cloud-native authentication and real multitenancy.
+
+The alternatives each came with their own tax. At Snowflake we used FoundationDB
+and got amazing results from it, but we had a large team maintaining it and
+contributing to it. Tower's control plane store originally ran on etcd, and
+operating that was likewise complicated. ZooKeeper, which I ran at Cloudability,
+was amazingly fragile. DynamoDB fit the shape of the problem, but its serverless
+pricing got expensive for this workload.
+
+What I always wanted was a cloud-native service for control-plane state that is
+not shockingly expensive to run as a service, has Redis-like performance, can
+handle datasets larger than memory, is operationally simple, and comes with
+good tooling over standard interfaces. That is why I built Orbita. It will be
+the store behind a service I eventually host.
 
 ## Status
 
