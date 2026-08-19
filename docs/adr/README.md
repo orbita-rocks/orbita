@@ -24,6 +24,7 @@ forward. The history of a wrong turn is worth more than a tidy directory.
 | [0008](0008-a-fenced-owner-stays-a-replica.md) | A fenced owner stays a replica | Accepted |
 | [0009](0009-a-split-shares-the-parents-segments.md) | A split shares the parent's segments in place | Accepted |
 | [0010](0010-a-merge-shares-both-parents-segments.md) | A merge shares both parents' segments in place | Accepted |
-| [0011](0011-combined-nodes-form-one-automatically-managed-voter-set.md) | Combined nodes form one automatically managed voter set | Accepted |
+| [0011](0011-combined-nodes-form-one-automatically-managed-voter-set.md) | Combined nodes form one automatically managed voter set | Accepted, extended by 0014 |
 | [0012](0012-merge-commands-belong-to-cluster-protocol-0-1.md) | Merge commands belong to cluster protocol 0.1 | Accepted |
 | [0013](0013-read-serving-is-decoupled-from-the-durability-quorum.md) | Read serving is decoupled from the durability quorum | Accepted |
+| [0014](0014-a-voter-that-loses-its-disk-returns-through-membership-repair.md) | A voter that loses its disk returns through membership repair | Accepted |
