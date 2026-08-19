@@ -116,6 +116,18 @@ pub trait ConsensusLog: Send + Sync + 'static {
         async { Vec::new() }
     }
 
+    /// The durable node identity that applied membership binds to this id.
+    ///
+    /// `None` when the id is not a member; an empty string when membership
+    /// predates identity records. The distinction matters to ADR 0014: a
+    /// report from a member id under a different identity is a returned
+    /// incarnation of a lost disk, and it must not revive the seat it can no
+    /// longer safely hold. Only an identity actually recorded by committed
+    /// membership can make that call, so absence stays conservative.
+    fn member_identity(&self, _node: NodeId) -> impl Future<Output = Option<String>> + Send {
+        async { None }
+    }
+
     /// Whether a learner has replicated the leader's current log.
     fn learner_caught_up(&self, _node: NodeId) -> impl Future<Output = bool> + Send {
         async { false }

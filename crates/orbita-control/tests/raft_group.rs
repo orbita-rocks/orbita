@@ -9,10 +9,10 @@
 
 use orbita_control::{
     BootstrapSpec, ConsensusLog, ControlCommand, ControlConfig, Controller, KeyspaceConfig,
-    MembershipChange, NodeRole, NodeStatus, RaftLog,
+    MembershipChange, NodeRole, NodeStatus, RaftLog, RaftMember, RaftMembership,
 };
 use orbita_core::{Error, MapVersion, NodeId};
-use orbita_sim::{check_seeds, Failure, Simulation};
+use orbita_sim::{check_seeds, DiskPolicy, Failure, Simulation};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -690,6 +690,230 @@ fn a_permanently_lost_voter_is_replaced_add_first_with_an_eligible_node() {
             if voters.len() != 3 || voters.contains(&lost) || !voters.contains(&NodeId(5)) {
                 return Err(sim.failure(format!(
                     "replacement did not finish at three voters: {voters:?}; transitions: {transitions:?}"
+                )));
+            }
+            Ok(())
+        },
+    );
+}
+
+/// ADR 0014: a voter that loses its disk comes back as a new incarnation of
+/// the same numeric id, and the repair sweep reseats it without a spare node.
+///
+/// The scenario models the displaced node the way the server will behave: it
+/// never opens Raft under the contested id. It only heartbeats with the fresh
+/// durable identity its empty disk minted, and it opens Raft as a learner
+/// only after the leader has vacated the old seat and admitted the new
+/// incarnation through committed membership changes. Before ADR 0014, the
+/// fresh incarnation's heartbeat revived the dead voter's health record and
+/// suppressed repair, so a three-node cluster stayed at two live voters
+/// forever.
+#[test]
+fn a_voter_that_loses_its_disk_is_reseated_without_a_spare_node() {
+    check_seeds(
+        "a_voter_that_loses_its_disk_is_reseated_without_a_spare_node",
+        10,
+        |seed| {
+            let sim = Simulation::new(seed);
+            // Open with identity-bearing membership, the shape every
+            // automatic cluster has from its bootstrap certificate. The
+            // identity records are what let the leader tell a returned
+            // incarnation from a restart at all.
+            let members: Vec<RaftMember> = NODES
+                .iter()
+                .map(|node| RaftMember {
+                    node: *node,
+                    address: format!("10.0.0.{node}:7000"),
+                    node_identity: format!("identity-{node}"),
+                })
+                .collect();
+            for node in NODES {
+                sim.add_node(node);
+            }
+            let logs: Vec<_> = NODES
+                .iter()
+                .map(|node| {
+                    let runtime = sim.runtime(*node);
+                    let membership = RaftMembership {
+                        voters: members.clone(),
+                        learners: Vec::new(),
+                    };
+                    sim.block_on(async move {
+                        RaftLog::open_membership(&runtime, membership)
+                            .await
+                            .expect("open raft log")
+                    })
+                })
+                .collect();
+            let leader = elect(&sim, &logs)?;
+            let leader_index = NODES.iter().position(|node| *node == leader).unwrap();
+            let config = ControlConfig {
+                suspect_after: Duration::from_secs(60),
+                dead_after: Duration::from_secs(120),
+                voter_management_enabled: true,
+                ..ControlConfig::default()
+            };
+            let controller = Controller::new(
+                sim.runtime(leader),
+                Arc::clone(&logs[leader_index]),
+                config.clone(),
+            );
+            let bootstrapping = controller.clone();
+            sim.block_on(async move {
+                bootstrapping
+                    .bootstrap(&BootstrapSpec {
+                        keyspace: "default".into(),
+                        config: KeyspaceConfig::default(),
+                        leaders: Vec::new(),
+                        workers: NODES
+                            .iter()
+                            .map(|node| (*node, format!("10.0.0.{node}:7000")))
+                            .collect(),
+                    })
+                    .await
+            })
+            .map_err(|error| sim.failure(format!("bootstrap failed: {error}")))?;
+
+            let report = |node: NodeId, identity: String| {
+                let reporting = controller.clone();
+                sim.block_on(async move {
+                    reporting
+                        .record_status(
+                            node,
+                            NodeStatus {
+                                role: NodeRole::Worker,
+                                address: format!("10.0.0.{node}:7000"),
+                                map_version: MapVersion::default(),
+                                speaks: orbita_control::binary_speaks(),
+                                ready: true,
+                                draining: false,
+                                voter_eligible: true,
+                                failure_domain: format!("zone-{node}"),
+                                node_identity: identity,
+                                partitions: Vec::new(),
+                            },
+                        )
+                        .await
+                })
+            };
+            for node in NODES {
+                report(node, format!("identity-{node}"))
+                    .map_err(|error| sim.failure(format!("status for {node} failed: {error}")))?;
+            }
+            let observing = controller.clone();
+            sim.block_on(async move { observing.tick().await })
+                .map_err(|error| sim.failure(format!("initial voter sweep failed: {error}")))?;
+
+            // The volume is lost. The pod comes back with the same ordinal and
+            // a fresh identity, and stays out of Raft while its old seat is
+            // still committed membership.
+            let lost = NODES.iter().copied().find(|node| *node != leader).unwrap();
+            sim.crash(lost);
+            sim.run_for(config.voter_replacement_after);
+            let rebuilt_identity = format!("identity-{lost}-rebuilt");
+            for node in NODES.iter().copied().filter(|node| *node != lost) {
+                report(node, format!("identity-{node}"))
+                    .map_err(|error| sim.failure(format!("refresh for {node} failed: {error}")))?;
+            }
+            report(lost, rebuilt_identity.clone()).map_err(|error| {
+                sim.failure(format!("displaced incarnation heartbeat failed: {error}"))
+            })?;
+
+            // Sweep one vacates the dead seat. This is the step the fresh
+            // incarnation's heartbeat used to suppress.
+            let repairing = controller.clone();
+            sim.block_on(async move { repairing.tick().await })
+                .map_err(|error| sim.failure(format!("seat removal failed: {error}")))?;
+            let log = Arc::clone(&logs[leader_index]);
+            let voters = sim.block_on(async move { log.voters().await });
+            if voters.len() != 2 || voters.contains(&lost) {
+                return Err(sim.failure(format!(
+                    "the dead seat was never vacated: voters {voters:?}"
+                )));
+            }
+
+            // With the seat vacated, the next heartbeat from the returned
+            // incarnation goes through the ordinary path and re-registers it
+            // as a healthy worker. Heartbeats are continuous in production;
+            // the sweeps are minutes apart.
+            report(lost, rebuilt_identity.clone())
+                .map_err(|error| sim.failure(format!("post-removal heartbeat failed: {error}")))?;
+
+            // Sweep two admits the returned incarnation as a learner.
+            let repairing = controller.clone();
+            sim.block_on(async move { repairing.tick().await })
+                .map_err(|error| sim.failure(format!("learner re-add failed: {error}")))?;
+            let log = Arc::clone(&logs[leader_index]);
+            let learners = sim.block_on(async move { log.learners().await });
+            if learners != vec![lost] {
+                return Err(sim.failure(format!(
+                    "the returned incarnation was not re-added as a learner: {learners:?}"
+                )));
+            }
+
+            // Only now, told by the heartbeat response that membership binds
+            // its id to its new identity, does the node open Raft as a
+            // learner over its wiped disk.
+            let runtime = sim.restart(lost, DiskPolicy::Lost);
+            let membership = RaftMembership {
+                voters: NODES
+                    .iter()
+                    .copied()
+                    .filter(|node| *node != lost)
+                    .map(|node| RaftMember {
+                        node,
+                        address: format!("10.0.0.{node}:7000"),
+                        node_identity: format!("identity-{node}"),
+                    })
+                    .collect(),
+                learners: vec![RaftMember {
+                    node: lost,
+                    address: format!("10.0.0.{lost}:7000"),
+                    node_identity: rebuilt_identity.clone(),
+                }],
+            };
+            let relog = sim.block_on(async move {
+                RaftLog::open_membership(&runtime, membership)
+                    .await
+                    .expect("the displaced node reopens raft as a learner")
+            });
+            sim.run_for(ELECTION_GRACE);
+            for node in NODES.iter().copied().filter(|node| *node != lost) {
+                report(node, format!("identity-{node}"))
+                    .map_err(|error| sim.failure(format!("catch-up refresh failed: {error}")))?;
+            }
+            report(lost, rebuilt_identity)
+                .map_err(|error| sim.failure(format!("catch-up heartbeat failed: {error}")))?;
+
+            // Sweep three promotes it, and the group is whole again.
+            let repairing = controller.clone();
+            sim.block_on(async move { repairing.tick().await })
+                .map_err(|error| sim.failure(format!("promotion failed: {error}")))?;
+            let log = Arc::clone(&logs[leader_index]);
+            let voters = sim.block_on(async move { log.voters().await });
+            if voters.len() != 3 || !voters.contains(&lost) {
+                return Err(sim.failure(format!(
+                    "the returned incarnation was never promoted: voters {voters:?}"
+                )));
+            }
+            let survivors: Vec<_> = NODES.iter().copied().filter(|node| *node != lost).collect();
+            let elected: Vec<NodeId> = survivors
+                .iter()
+                .map(|node| {
+                    let index = NODES.iter().position(|item| item == node).unwrap();
+                    let log = Arc::clone(&logs[index]);
+                    (*node, sim.block_on(async move { log.is_leader().await }))
+                })
+                .filter_map(|(node, is_leader)| is_leader.then_some(node))
+                .collect();
+            let relog_leader = {
+                let relog = Arc::clone(&relog);
+                sim.block_on(async move { relog.is_leader().await })
+            };
+            let leader_count = elected.len() + usize::from(relog_leader);
+            if leader_count != 1 {
+                return Err(sim.failure(format!(
+                    "the repaired group must have exactly one leader, found {elected:?} plus rebuilt={relog_leader}"
                 )));
             }
             Ok(())
