@@ -184,6 +184,14 @@ struct Inner {
     /// learns what its command did even when another task did the applying.
     results: BTreeMap<LogIndex, Result<()>>,
     observations: BTreeMap<NodeId, Observation>,
+    /// Reports from returned incarnations: a member id heartbeating under a
+    /// durable identity that differs from the one committed membership binds
+    /// to that id (ADR 0014). Kept apart from `observations` on purpose. The
+    /// old incarnation's silence is what proves its seat is permanently lost,
+    /// and folding the new incarnation's heartbeats into the ordinary map
+    /// would revive the seat and suppress the very repair that reseats it.
+    /// Leader-local, like every observation.
+    returnees: BTreeMap<NodeId, Observation>,
     /// Durable split-preparation acknowledgements: for each parent being split,
     /// the holders that have reported their child storage is prepared. This is
     /// an observation, not replicated state — a worker re-reports it whenever it
@@ -337,6 +345,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 applied: 0,
                 results: BTreeMap::new(),
                 observations: BTreeMap::new(),
+                returnees: BTreeMap::new(),
                 prepared_splits: BTreeMap::new(),
                 prepared_merges: Vec::new(),
                 fenced_since: BTreeMap::new(),
@@ -630,6 +639,53 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         status: NodeStatus,
     ) -> Result<RegistrationOutcome> {
         let now = self.runtime.clock().monotonic_nanos();
+        // ADR 0014: a member id reporting under a different durable identity
+        // is a returned incarnation of a lost disk, not the member restarting.
+        // Its heartbeats must not refresh the old incarnation's observation or
+        // revive its committed health, or the silence that proves the seat is
+        // permanently lost would never accumulate and repair would never run.
+        // The report is remembered separately so repair can reseat the node.
+        // Empty identities stay on the ordinary path: membership written
+        // before identity records cannot tell incarnations apart, and
+        // guessing here would strand a merely-restarted node.
+        let member_identity = self.log.member_identity(node).await;
+        if let Some(member_identity) = member_identity {
+            if !member_identity.is_empty()
+                && !status.node_identity.is_empty()
+                && member_identity != status.node_identity
+            {
+                let mut inner = self.inner.lock().await;
+                let old_reporting = inner.observations.get(&node).is_some_and(|observation| {
+                    now.saturating_sub(observation.heard_at_nanos)
+                        < self.config.suspect_after.as_nanos() as u64
+                });
+                if old_reporting {
+                    // Both incarnations are alive, which no failure produces.
+                    // Two processes are sharing one node id, and any automated
+                    // choice between them is a guess. Keep the returnee report
+                    // for diagnosis, change nothing, and say so.
+                    tracing::warn!(
+                        %node,
+                        member_identity,
+                        reported_identity = status.node_identity,
+                        "two incarnations of one node id are reporting; refusing to arbitrate"
+                    );
+                }
+                inner.returnees.insert(
+                    node,
+                    Observation {
+                        heard_at_nanos: now,
+                        status,
+                    },
+                );
+                let version = inner.state.map_version();
+                return Ok(RegistrationOutcome::Accepted(version));
+            }
+            // The identities agree again, so any returnee record is stale:
+            // either the repair completed and membership now names the new
+            // incarnation, or the original member is back after all.
+            self.inner.lock().await.returnees.remove(&node);
+        }
         let (known, mut refusal, lifecycle_enabled) = {
             let mut inner = self.inner.lock().await;
             let known = inner.state.node(node).cloned();
@@ -1915,7 +1971,7 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         let learners = self.log.learners().await;
         let now = self.runtime.clock().monotonic_nanos();
         let replacement_after = self.config.voter_replacement_after.as_nanos() as u64;
-        let (permanently_dead, candidates, surplus) = {
+        let (permanently_dead, candidates, surplus, returned) = {
             let inner = self.inner.lock().await;
             let permanently_dead: Vec<NodeId> = voters
                 .iter()
@@ -2005,7 +2061,35 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
                 })
                 .collect();
             surplus.sort_unstable_by_key(|node| (*node == local, *node));
-            (permanently_dead, candidates, surplus)
+            // ADR 0014: a permanently dead voter whose id is heartbeating
+            // under a new durable identity is a returned incarnation waiting
+            // to be reseated. Raft cannot hold two incarnations of one id, so
+            // add-first is impossible for it; it becomes eligible for
+            // remove-first below, and only below, when nothing else is wrong.
+            let returned: Vec<NodeId> = permanently_dead
+                .iter()
+                .copied()
+                .filter(|voter| {
+                    inner.returnees.get(voter).is_some_and(|observation| {
+                        observation.status.voter_eligible
+                            && observation.status.ready
+                            && now.saturating_sub(observation.heard_at_nanos)
+                                < self.config.suspect_after.as_nanos() as u64
+                    })
+                })
+                .filter(|voter| {
+                    // The window at a reduced quorum is accepted only when
+                    // every other voter is provably fine. Degraded but stable
+                    // beats an automated step that can lose the cluster.
+                    voters.iter().filter(|other| *other != voter).all(|other| {
+                        inner
+                            .state
+                            .node(*other)
+                            .is_some_and(|record| record.health == NodeHealth::Healthy)
+                    })
+                })
+                .collect();
+            (permanently_dead, candidates, surplus, returned)
         };
 
         let needs_voter = voters.len() < self.config.voter_target
@@ -2013,6 +2097,21 @@ impl<R: Runtime, L: ConsensusLog> Controller<R, L> {
         if needs_voter {
             let Some((_, _, node_identity, candidate, address)) = candidates.first().cloned()
             else {
+                // No spare node can absorb the seat add-first. If the dead
+                // voter's own returned incarnation is waiting, vacate the
+                // seat for it; the next sweeps re-admit it as a learner
+                // through the ordinary candidate path and promote it once
+                // caught up (ADR 0014).
+                if let Some(remove) = returned.first().copied() {
+                    self.log
+                        .change_membership(MembershipChange::Remove(remove))
+                        .await?;
+                    self.inner.lock().await.returnees.remove(&remove);
+                    tracing::info!(
+                        voter = %remove,
+                        "vacated a dead voter seat for its returned incarnation"
+                    );
+                }
                 return Ok(());
             };
             if !learners.contains(&candidate) {

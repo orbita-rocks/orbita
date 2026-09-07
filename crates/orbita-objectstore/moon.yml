@@ -28,15 +28,11 @@ tasks:
   # every pull request drift away from the thing that checks the backends we
   # actually tell people to use.
   test-live-s3:
-    # Two commands, because a test binary containing no tests exits 0 and reads
-    # as coverage. `--list` is the cheap assertion that the binary still holds
-    # the tests we think it does: drop `--all-features` and the whole file cfgs
-    # out to nothing behind `hyper-client`, and without this guard the run would
-    # go green having talked to no server at all.
-    script: >
-      cargo test -p orbita-objectstore --all-features --test minio -- --ignored --list
-      | grep -q 'conditional_writes_enforce_the_manifest_swap_rules: test'
-      && cargo test -p orbita-objectstore --all-features --test minio -- --ignored
+    # The script is shared with the weekly live workflow. Keeping the guarded
+    # cargo invocation in one place means MinIO, AWS S3, and R2 cannot drift
+    # onto different tests, while the live job does not have to load Moon's
+    # unrelated workspace toolchains before it can open a socket.
+    script: ./scripts/test-live-s3.sh
     options:
       # Never cached, for the same reason `sim-long` is not. The inputs to this
       # task are not only the source: they are also whichever server the

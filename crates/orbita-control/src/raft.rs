@@ -142,6 +142,10 @@ struct Shared {
     voters: Vec<NodeId>,
     learners: Vec<NodeId>,
     caught_up_learners: Vec<NodeId>,
+    /// The durable identity applied membership binds to each member id, so
+    /// the controller can tell a returned incarnation from a restart without
+    /// waiting on the driver (ADR 0014).
+    identities: HashMap<NodeId, String>,
 }
 
 enum Event {
@@ -310,6 +314,12 @@ impl RaftLog {
         let shared = Arc::new(Mutex::new(Shared {
             voters: durable_voters,
             learners: durable_learners,
+            identities: membership
+                .voters
+                .iter()
+                .chain(&membership.learners)
+                .map(|member| (member.node, member.node_identity.clone()))
+                .collect(),
             ..Shared::default()
         }));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -786,6 +796,10 @@ impl ConsensusLog for RaftLog {
         self.lock().caught_up_learners.contains(&node)
     }
 
+    async fn member_identity(&self, node: NodeId) -> Option<String> {
+        self.lock().identities.get(&node).cloned()
+    }
+
     async fn change_membership(&self, change: MembershipChange) -> Result<()> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -1243,6 +1257,11 @@ impl<R: Runtime> Driver<R> {
                     let mut shared = self.shared.lock().expect("raft shared state poisoned");
                     shared.voters = voters;
                     shared.learners = learners;
+                    shared.identities = self
+                        .members
+                        .iter()
+                        .map(|(node, member)| (*node, member.node_identity.clone()))
+                        .collect();
                 }
                 if let Ok(id) = <[u8; 8]>::try_from(entry.context.as_slice()) {
                     if let Some(pending) = self.membership.remove(&u64::from_le_bytes(id)) {
