@@ -222,11 +222,6 @@ jobs:
       # feature, not a chore. Resolve a new SHA with, for example,
       # `gh api repos/actions/checkout/commits/v4 --jq .sha`.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          # moon reads the base revision to work out what a change affects.
-          # Nothing here uses --affected, but moon is happier with real history
-          # than with a single grafted commit.
-          fetch-depth: 0
 
       # No protoc step, unlike the jobs in ci.yml. orbita-objectstore depends on
       # no other crate in this workspace and nothing here compiles a proto, so
@@ -239,31 +234,6 @@ jobs:
           # `@stable` is how the action selects the stable Rust channel and it
           # publishes no semver tag for it.
           toolchain: stable
-
-      # ci.yml writes the moon version out again in its own `env` block, and
-      # .prototools says the two are kept in step by hand. A third hand-synced
-      # copy is worse here than there: this workflow runs once a week, so a
-      # stale pin would show up seven days late on the one job whose red is
-      # meant to mean a vendor changed. Reading the pin is cheap.
-      - id: moon
-        name: Read the pinned moon version
-        run: |
-          version="$(sed -n 's/^moon = "\(.*\)"$/\1/p' .prototools)"
-          if [ -z "$version" ]; then
-            echo "::error::could not find a moon pin in .prototools"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
-        with:
-          # Keep auto-install off. It runs `proto install`, and proto reads
-          # rust-toolchain.toml as a version file, so it takes the Rust install
-          # away from rustup and leaves a toolchain with no cargo in it.
-          auto-install: false
-          # The action installs `latest` unless told otherwise, and it does
-          # not read .prototools, so the version has to be passed in.
-          moon-version: ${{ steps.moon.outputs.version }}
 
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
@@ -289,12 +259,15 @@ jobs:
           aws-region: ${{ matrix.region }}
           output-credentials: true
 
-      # The same moon task the MinIO step in ci.yml runs, pointed somewhere
-      # else. One definition, three backends: if it drifts, it drifts for all of
-      # them at once instead of quietly covering only the cheap one.
+      # The same repository script the MinIO moon task in ci.yml runs, pointed
+      # somewhere else. One definition, three backends: if it drifts, it drifts
+      # for all of them at once instead of quietly covering only the cheap one.
       #
       # The task refuses to pass when the test binary turns out to contain no
-      # tests, which is the failure a `cargo test` alone reports as success.
+      # tests, which is the failure a `cargo test` alone reports as success. It
+      # runs directly here because loading the full workspace through Moon also
+      # downloads unrelated toolchain plugins, adding network failures to a job
+      # whose red is supposed to mean an object-store claim needs attention.
       - name: Live conditional-write tests
         env:
           # ORBITA_S3_TEST_ENDPOINT comes from the resolve step, through
@@ -311,7 +284,7 @@ jobs:
           # Only temporary credentials carry a session token. It is empty on the
           # keys row, and the test treats an empty value as absent.
           ORBITA_S3_TEST_SESSION_TOKEN: ${{ steps.aws-oidc.outputs.aws-session-token }}
-        run: moon run orbita-objectstore:test-live-s3
+        run: crates/orbita-objectstore/scripts/test-live-s3.sh
 
   # Who finds out when this breaks.
   #
