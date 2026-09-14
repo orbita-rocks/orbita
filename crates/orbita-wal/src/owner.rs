@@ -1334,15 +1334,9 @@ impl<R: Runtime> Wal<R> {
         }
     }
 
-    /// Writes and fsyncs one batch, then hands its replication to a task of
-    /// its own.
-    ///
-    /// The hand-off is what keeps the disk and the network from taking turns.
-    /// Awaiting replication here would mean the next batch could not start its
-    /// fsync until the previous one had reached a quorum, so every cycle would
-    /// cost a sync plus a network round trip and `pending` would grow for a
-    /// whole peer timeout whenever a replica was slow. The flusher goes back
-    /// for the next batch as soon as this one is on the local disk.
+    /// Starts replication alongside the local append. The committed prefix
+    /// remains capped by local durability, so a fast peer cannot acknowledge
+    /// a client before this owner's disk has completed its sync.
     async fn flush_batch(self: &Arc<Self>, batch: Vec<Pending>) {
         let first = batch[0].entry.lamport;
         let last = batch[batch.len() - 1].entry.lamport;
@@ -1353,6 +1347,14 @@ impl<R: Runtime> Wal<R> {
         self.flushes.fetch_add(1, Ordering::Relaxed);
         self.flushed_entries
             .fetch_add(frames.len() as u64, Ordering::Relaxed);
+
+        // Register before either side can finish. The flusher still serializes
+        // local batches, preserving both disk order and emergent group commit.
+        self.state().inflight.push(Batch { last, acked: false });
+        let wal = Arc::clone(self);
+        self.runtime.spawn(async move {
+            wal.replicate_batch(batch, first, last).await;
+        });
 
         if let Err(e) = self.log.append_frames(&frames, last).await {
             // A failed local write leaves the log in a state we cannot reason
@@ -1366,21 +1368,11 @@ impl<R: Runtime> Wal<R> {
         {
             let mut state = self.state();
             state.durable_local = last;
-            state.inflight.push(Batch { last, acked: false });
+            advance(&mut state);
         }
         // Wakes the committers this batch carried as soon as it is on the disk,
         // rather than making them wait out the replication below.
         self.progress.notify_waiters();
-
-        // Replication runs on its own task so the flusher can take the next
-        // batch straight back to the disk. Ordering across batches is still the
-        // replica's to enforce: it refuses an append that would leave a hole,
-        // which is the same guarantee that held when two flushes could overlap
-        // here before.
-        let wal = Arc::clone(self);
-        self.runtime.spawn(async move {
-            wal.replicate_batch(batch, first, last).await;
-        });
     }
 
     /// Ships one batch to the replicas and folds the answer into the committed
@@ -1453,7 +1445,7 @@ impl<R: Runtime> Wal<R> {
                 if let Some(fatal) = &state.fatal {
                     return Err(fatal.clone());
                 }
-                if lamport <= state.failed_through {
+                if lamport <= state.failed_through && lamport <= state.durable_local {
                     // Indeterminate, not Unavailable. The entry is already
                     // fsynced to this node's log by the time replication is
                     // attempted, so this is not a write that did not happen —
