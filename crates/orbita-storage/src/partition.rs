@@ -513,6 +513,9 @@ pub struct Partition<R: Runtime> {
     /// contention we do not have in exchange for a class of bugs we would
     /// rather not reason about. Reads share it.
     state: tokio::sync::RwLock<State>,
+    // Serializes manifest publishers without excluding reads or WAL applies
+    // while a frozen flush is in object storage.
+    publication: tokio::sync::Mutex<()>,
     /// True while this partition is a split parent whose children reference its
     /// segments in place, per
     /// [ADR 0009](../../../docs/adr/0009-a-split-shares-the-parents-segments.md).
@@ -587,6 +590,7 @@ impl<R: Runtime> Partition<R> {
             cache: Arc::new(ValueCache::new(0)),
             read_ahead_bytes: 0,
             state: tokio::sync::RwLock::new(state),
+            publication: tokio::sync::Mutex::new(()),
             maintenance_frozen: std::sync::atomic::AtomicBool::new(false),
             compaction_input_bytes: std::sync::atomic::AtomicU64::new(COMPACTION_INPUT_BYTES),
         })
@@ -684,6 +688,7 @@ impl<R: Runtime> Partition<R> {
         ttl: Option<Duration>,
         condition: WriteCondition,
     ) -> Result<WriteOutcome> {
+        let _publication = self.publication.lock().await;
         self.check_key(key)?;
         if value.len() > MAX_VALUE_BYTES {
             return Err(Error::TooLarge {
@@ -725,6 +730,7 @@ impl<R: Runtime> Partition<R> {
         key: &[u8],
         condition: WriteCondition,
     ) -> Result<WriteOutcome> {
+        let _publication = self.publication.lock().await;
         self.check_key(key)?;
 
         let now = self.now_millis();
@@ -985,17 +991,7 @@ impl<R: Runtime> Partition<R> {
     /// the state lock so it cannot race the publication of those child
     /// manifests. See [`Partition::freeze_maintenance`].
     pub async fn flush(&self) -> Result<()> {
-        let mut state = self.state.write().await;
-        if self.is_maintenance_frozen() {
-            return Ok(());
-        }
-        if !state.segments.is_empty() {
-            state.timer_flushes_since_compaction += 1;
-        }
-        // Compaction is no longer spilled out of a flush. Both triggers are
-        // counters now, and [`Partition::compact_if_needed`] is the one place
-        // that acts on them, so a flush costs a flush whoever asked for it.
-        self.flush_locked(&mut state, false).await
+        self.flush_snapshot(false).await
     }
 
     /// Flushes only when the mutable table has crossed the size trigger.
@@ -1008,14 +1004,7 @@ impl<R: Runtime> Partition<R> {
     /// write admission before it retires the parent, so the table it declines
     /// to flush here is bounded by the brief pre-quiesce window.
     pub async fn flush_if_needed(&self) -> Result<()> {
-        let mut state = self.state.write().await;
-        if self.is_maintenance_frozen() {
-            return Ok(());
-        }
-        if state.memtable_bytes < FLUSH_TRIGGER_BYTES {
-            return Ok(());
-        }
-        self.flush_locked(&mut state, true).await
+        self.flush_snapshot(true).await
     }
 
     /// Durably prepares child storage for a split, copying no segment bytes.
@@ -1039,6 +1028,7 @@ impl<R: Runtime> Partition<R> {
     /// intended epoch is left untouched, so a retried preparation — which a
     /// worker will do whenever a report is lost — publishes nothing new.
     pub async fn prepare_child_partitions(&self, children: &[ChildSpec]) -> Result<Lamport> {
+        let _publication = self.publication.lock().await;
         let mut state = self.state.write().await;
         // The memtable is not shareable: only segments can be referenced, so
         // everything committed has to be flushed into one before a child can
@@ -1065,6 +1055,7 @@ impl<R: Runtime> Partition<R> {
         upper: &Self,
         child: &ChildSpec,
     ) -> Result<Lamport> {
+        let _publication = self.publication.lock().await;
         let combined = KeyRange::merge(&self.range, &upper.range).ok_or_else(|| {
             Error::InvalidArgument("merge sources must be adjacent and in lower/upper order".into())
         })?;
@@ -1078,6 +1069,7 @@ impl<R: Runtime> Partition<R> {
         // order gives every merge one lock order and avoids a dual-parent
         // deadlock. Both maintenance freezes are already set, so no compaction
         // can invalidate either state while these guards are held.
+        let _upper_publication = upper.publication.lock().await;
         let mut lower_state = self.state.write().await;
         self.flush_locked(&mut lower_state, false).await?;
         let mut upper_state = upper.state.write().await;
@@ -1220,6 +1212,7 @@ impl<R: Runtime> Partition<R> {
     /// entry stays in memory and the next attempt waits for another
     /// flush-sized interval of growth.
     pub async fn reclaim_published_if_needed(&self) -> Result<()> {
+        let _publication = self.publication.lock().await;
         {
             let mut state = self.state.write().await;
             let retry_at = state
@@ -1272,6 +1265,7 @@ impl<R: Runtime> Partition<R> {
     /// hydrated in order to serve somebody claiming to own the partition has
     /// to be able to check that claim against it. See [`Hydration`].
     pub async fn hydrate(&self) -> Result<Hydration> {
+        let _publication = self.publication.lock().await;
         // The manifest first, on its own. It is one small object, where opening
         // a snapshot reads the footer and key index of every segment the
         // manifest names -- bytes proportional to the partition's keys.
@@ -1361,6 +1355,7 @@ impl<R: Runtime> Partition<R> {
     /// manifests are published, so a compaction can never run against a segment
     /// a child already references. See [`Partition::freeze_maintenance`].
     pub async fn compact(&self) -> Result<()> {
+        let _publication = self.publication.lock().await;
         let mut state = self.state.write().await;
         if self.is_maintenance_frozen() {
             return Ok(());
@@ -1412,6 +1407,7 @@ impl<R: Runtime> Partition<R> {
         max_skew_millis: u64,
         dry_run: bool,
     ) -> Result<SweepReport> {
+        let _publication = self.publication.lock().await;
         // Frozen during a split. A split parent's children reference its
         // segments, and the `shared` set a single node can assemble may not
         // name a child owned only by another node, so the safe answer while the
@@ -1718,6 +1714,92 @@ impl<R: Runtime> Partition<R> {
         Ok(())
     }
 
+    /// Keeps the snapshot in the live table until publication succeeds. A
+    /// cancellation or failed upload therefore needs no rollback; newer writes
+    /// replace snapshot entries normally and survive installation below.
+    async fn flush_snapshot(&self, full_flush: bool) -> Result<()> {
+        let _publication = self.publication.lock().await;
+        let (table, mut segments, committed) = {
+            let mut state = self.state.write().await;
+            if self.is_maintenance_frozen() {
+                return Ok(());
+            }
+            if full_flush && state.memtable_bytes < FLUSH_TRIGGER_BYTES {
+                return Ok(());
+            }
+            if !full_flush && !state.segments.is_empty() {
+                state.timer_flushes_since_compaction += 1;
+            }
+            if state.memtable.is_empty() {
+                return Ok(());
+            }
+            (
+                state.memtable.clone(),
+                state.segments.clone(),
+                state.committed,
+            )
+        };
+        let mut builder = SegmentBuilder::new(
+            self.path.keyspace_id(),
+            self.path.partition_id(),
+            self.writer.epoch(),
+        );
+        for (key, entry) in &table {
+            builder
+                .push(&segment_record_of(key, entry))
+                .map_err(format_error)?;
+        }
+        let built = builder.finish().map_err(format_error)?;
+        segments.push(
+            self.writer
+                .put_segment(&built)
+                .await
+                .map_err(format_error)?,
+        );
+        let manifest = self
+            .writer
+            .commit(|_| CommitPlan {
+                committed_lamport: committed,
+                range: self.range.clone(),
+                segments: segments.clone(),
+            })
+            .await
+            .map_err(format_error)?;
+
+        let mut state = self.state.write().await;
+        let position = manifest.segments.len() - 1;
+        for entry in built.index.entries() {
+            let previous = state.index.insert(
+                entry.key.clone(),
+                Loc {
+                    segment: position,
+                    offset: entry.offset,
+                    record_length: entry.record_length,
+                },
+            );
+            if previous.is_none() {
+                state.index_bytes += index_entry_cost(&entry.key);
+            }
+        }
+        // A concurrent apply may already have replaced the snapshot's value.
+        // Remove only versions this manifest actually made durable.
+        state
+            .memtable
+            .retain(|_, entry| entry.version.get() > committed.get());
+        state.memtable_bytes = state
+            .memtable
+            .iter()
+            .map(|(key, entry)| entry_cost(key, entry))
+            .sum();
+        state.segments = manifest.segments;
+        state.flushed_epoch = state.flushed_epoch.max(manifest.epoch);
+        state.flushed = committed;
+        if full_flush {
+            state.full_flushes_since_compaction += 1;
+        }
+        Ok(())
+    }
+
     async fn flush_locked(&self, state: &mut State, full_flush: bool) -> Result<()> {
         if state.memtable.is_empty() {
             return Ok(());
@@ -1809,6 +1891,7 @@ impl<R: Runtime> Partition<R> {
     /// happens inside a request. Bounding the work per merge is issue \#143 and
     /// is what actually shortens the stall.
     pub async fn compact_if_needed(&self) -> Result<()> {
+        let _publication = self.publication.lock().await;
         let mut state = self.state.write().await;
         if self.is_maintenance_frozen() {
             return Ok(());
