@@ -1149,7 +1149,16 @@ impl<R: Runtime> PartitionHost<R> {
                 .lock()
                 .expect("pending set poisoned")
                 .overlay(&key);
-            let committed = self.storage.get(&key).await?;
+            // SET does not return the old existence or version. Reading it
+            // here could fetch an object while holding admission for every
+            // key in the partition. DELETE and conditional writes still need
+            // the old state and the pending overlay.
+            let committed =
+                if matches!(op, WriteOp::Put { .. }) && matches!(condition, WriteCondition::None) {
+                    None
+                } else {
+                    self.storage.get(&key).await?
+                };
             let visible = pending::visible(committed, &overlay, now);
 
             // An unconditional write does not read the key, so nothing about
