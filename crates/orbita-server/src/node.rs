@@ -164,6 +164,43 @@ impl DataLayout {
     }
 }
 
+/// Quota divisors travel with the map that produced them, so a refresh
+/// publishes routing and admission counts atomically.
+struct RoutingSnapshot {
+    map: Arc<PartitionMap>,
+    counts: HashMap<KeyspaceId, (u32, u32)>,
+}
+
+impl RoutingSnapshot {
+    fn new(map: PartitionMap) -> Self {
+        let mut sets: HashMap<KeyspaceId, (HashSet<NodeId>, HashSet<NodeId>)> = HashMap::new();
+        for partition in map.partitions() {
+            let (writers, readers) = sets.entry(partition.keyspace).or_default();
+            if let Some(owner) = partition.owner {
+                writers.insert(owner);
+                readers.insert(owner);
+            }
+            readers.extend(partition.replicas.iter().copied());
+        }
+        let counts = sets
+            .into_iter()
+            .map(|(keyspace, (writers, readers))| {
+                (
+                    keyspace,
+                    (
+                        u32::try_from(writers.len()).unwrap_or(u32::MAX).max(1),
+                        u32::try_from(readers.len()).unwrap_or(u32::MAX).max(1),
+                    ),
+                )
+            })
+            .collect();
+        Self {
+            map: Arc::new(map),
+            counts,
+        }
+    }
+}
+
 /// One worker.
 pub(crate) struct Node<R: Runtime> {
     runtime: R,
@@ -177,7 +214,7 @@ pub(crate) struct Node<R: Runtime> {
     /// be read with `kubectl logs`, which is what an operator has to hand
     /// during the run rather than after it.
     cache_logged_at: std::sync::atomic::AtomicU64,
-    map: RwLock<Arc<PartitionMap>>,
+    map: RwLock<RoutingSnapshot>,
     source: BoxedMapSource,
     hosts: tokio::sync::RwLock<HashMap<PartitionId, Arc<PartitionHost<R>>>>,
     wal_service: WalService<R>,
@@ -371,7 +408,7 @@ impl<R: Runtime> Node<R> {
             runtime: runtime.clone(),
             node_id,
             layout,
-            map: RwLock::new(Arc::new(map)),
+            map: RwLock::new(RoutingSnapshot::new(map)),
             source,
             hosts: tokio::sync::RwLock::new(HashMap::new()),
             wal_service,
@@ -470,7 +507,7 @@ impl<R: Runtime> Node<R> {
 
     #[must_use]
     pub(crate) fn map(&self) -> Arc<PartitionMap> {
-        Arc::clone(&self.map.read().expect("partition map poisoned"))
+        Arc::clone(&self.map.read().expect("partition map poisoned").map)
     }
 
     #[must_use]
@@ -494,8 +531,8 @@ impl<R: Runtime> Node<R> {
         let fetched = self.source.fetch().await?;
         {
             let mut held = self.map.write().expect("partition map poisoned");
-            if fetched.version() > held.version() {
-                *held = Arc::new(fetched);
+            if fetched.version() > held.map.version() {
+                *held = RoutingSnapshot::new(fetched);
             } else if !self.unreconciled.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -1662,18 +1699,13 @@ impl<R: Runtime> Node<R> {
     /// requirement that no admission decision take a dependency spanning
     /// keyspaces.
     fn serving_node_count(&self, keyspace: KeyspaceId, access: Access) -> u32 {
-        use std::collections::HashSet;
-        let map = self.map();
-        let mut nodes: HashSet<NodeId> = HashSet::new();
-        for partition in map.partitions().filter(|p| p.keyspace == keyspace) {
-            if let Some(owner) = partition.owner {
-                nodes.insert(owner);
-            }
-            if access == Access::Read {
-                nodes.extend(partition.replicas.iter().copied());
-            }
+        let held = self.map.read().expect("partition map poisoned");
+        let (writers, readers) = held.counts.get(&keyspace).copied().unwrap_or((1, 1));
+        if access == Access::Write {
+            writers
+        } else {
+            readers
         }
-        u32::try_from(nodes.len()).unwrap_or(u32::MAX).max(1)
     }
 
     /// Refuses a write that would carry this owner past its share of the
