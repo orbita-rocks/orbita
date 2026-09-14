@@ -58,7 +58,13 @@ pub(crate) struct AppendRequest {
 
 impl AppendRequest {
     pub(crate) fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(
+            36 + self
+                .entries
+                .iter()
+                .map(|(_, frame)| frame.len())
+                .sum::<usize>(),
+        );
         buf.put_u64_le(self.partition.get());
         buf.put_u64_le(self.epoch.get());
         buf.put_u64_le(self.prev_lamport.get());

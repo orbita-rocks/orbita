@@ -1501,10 +1501,11 @@ impl<R: Runtime> Wal<R> {
     /// hold every write for the whole budget. That distinction is why this uses
     /// the catch-up state rather than simply counting attempts.
     async fn replicate(self: &Arc<Self>, request: AppendRequest) -> Result<()> {
+        let payload = request.encode();
         let mut backoff = REPLICATION_RETRY_INITIAL;
         let mut spent = Duration::ZERO;
         loop {
-            let outcome = self.replicate_once(request.clone()).await;
+            let outcome = self.replicate_once(request.clone(), payload.clone()).await;
             let Err(error) = outcome else {
                 return outcome;
             };
@@ -1538,7 +1539,11 @@ impl<R: Runtime> Wal<R> {
         })
     }
 
-    async fn replicate_once(self: &Arc<Self>, request: AppendRequest) -> Result<()> {
+    async fn replicate_once(
+        self: &Arc<Self>,
+        request: AppendRequest,
+        payload: Bytes,
+    ) -> Result<()> {
         let replicas = self.replicas();
         // Sized from the durability requirement, not from how many peers happen
         // to be listening. Peers beyond the quorum are followers: they get the
@@ -1555,8 +1560,9 @@ impl<R: Runtime> Wal<R> {
             .map(|node| {
                 let this = Arc::clone(self);
                 let request = request.clone();
+                let payload = payload.clone();
                 let node = *node;
-                Box::pin(async move { this.call_replica(node, request).await })
+                Box::pin(async move { this.call_replica_encoded(node, request, payload).await })
                     as Pin<Box<dyn Future<Output = Outcome> + Send>>
             })
             .collect();
@@ -1639,7 +1645,19 @@ impl<R: Runtime> Wal<R> {
     }
 
     async fn call_replica(&self, node: NodeId, request: AppendRequest) -> Outcome {
-        match self.send(node, METHOD_APPEND, request.encode()).await {
+        let payload = request.encode();
+        self.call_replica_encoded(node, request, payload).await
+    }
+
+    // Every peer receives the same immutable bytes. Catch-up still retains
+    // the logical request so it can construct the missing prefix separately.
+    async fn call_replica_encoded(
+        &self,
+        node: NodeId,
+        request: AppendRequest,
+        payload: Bytes,
+    ) -> Outcome {
+        match self.send(node, METHOD_APPEND, payload).await {
             Ok(WalResponse::Ok {
                 durable_lamport, ..
             }) => {
