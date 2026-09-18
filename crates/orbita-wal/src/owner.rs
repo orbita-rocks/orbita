@@ -1186,6 +1186,23 @@ impl<R: Runtime> Wal<R> {
     ///
     /// [ADR 0002]: https://github.com/orbita-rocks/orbita/blob/develop/docs/adr/0002-key-versions-are-partition-lamports.md
     pub async fn quiesce(&self) -> Result<Lamport> {
+        // Replication can now finish before the local sync. Freeze commits
+        // first, then let the local flusher finish before choosing a truncate
+        // horizon; otherwise an append could land after the cut.
+        loop {
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let flushing = {
+                let mut state = self.state();
+                state.quiesced = true;
+                state.flushing
+            };
+            if !flushing {
+                break;
+            }
+            notified.await;
+        }
         let (committed, dropped_from) = {
             let mut state = self.state();
             if let Some(fatal) = &state.fatal {
@@ -1445,12 +1462,15 @@ impl<R: Runtime> Wal<R> {
                 if let Some(fatal) = &state.fatal {
                     return Err(fatal.clone());
                 }
-                if lamport <= state.failed_through && lamport <= state.durable_local {
-                    // Indeterminate, not Unavailable. The entry is already
-                    // fsynced to this node's log by the time replication is
-                    // attempted, so this is not a write that did not happen —
-                    // it is one nobody can speak for, and the next open will
-                    // replay it. See issue #187.
+                if lamport <= state.failed_through
+                    && (lamport <= state.durable_local || state.quiesced)
+                {
+                    // Replication and local sync overlap, so wait for the
+                    // local result before settling a failed batch. Quiesce
+                    // also settles entries it truncated after freezing the
+                    // committed prefix. In either case a peer may hold the
+                    // write: report an unknown outcome, not a safe retry.
+                    // See issue #187.
                     return Err(Error::Indeterminate(format!(
                         "partition {} could not reach a second copy for {lamport}",
                         self.partition

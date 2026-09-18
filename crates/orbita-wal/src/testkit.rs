@@ -234,6 +234,7 @@ struct DiskInner {
     files: HashMap<String, Arc<Mutex<Vec<u8>>>>,
     faults: Faults,
     syncs: u64,
+    sync_pause: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[derive(Clone, Default)]
@@ -248,6 +249,12 @@ impl MemDisk {
 
     pub(crate) fn set_faults(&self, faults: Faults) {
         self.inner.lock().expect("disk poisoned").faults = faults;
+    }
+
+    pub(crate) fn pause_next_sync(&self) -> Arc<tokio::sync::Notify> {
+        let release = Arc::new(tokio::sync::Notify::new());
+        self.inner.lock().expect("disk poisoned").sync_pause = Some(Arc::clone(&release));
+        release
     }
 
     pub(crate) fn syncs(&self) -> u64 {
@@ -295,6 +302,7 @@ impl MemDisk {
                 files,
                 faults: Faults::default(),
                 syncs: 0,
+                sync_pause: None,
             })),
         }
     }
@@ -381,6 +389,10 @@ impl File for MemFile {
             inner.syncs += 1;
             std::mem::take(&mut inner.faults.fail_next_sync)
         };
+        let pause = self.disk.lock().expect("disk poisoned").sync_pause.take();
+        if let Some(pause) = pause {
+            pause.notified().await;
+        }
         // A real fsync is slow enough that other writers pile up behind it,
         // and that pile is what group commit exists to serve. Yielding here is
         // what makes that visible to the tests.

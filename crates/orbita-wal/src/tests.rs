@@ -2328,3 +2328,98 @@ fn a_write_still_fails_quickly_when_a_replica_that_was_following_goes_away() {
         );
     });
 }
+
+#[test]
+fn peers_can_finish_before_local_sync_but_the_client_cannot() {
+    let base = TestRuntime::solo(913);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        // Establish epochs before pausing a data sync rather than a fence.
+        c.owner.commit(op("warm")).await.unwrap();
+        let release = c.owner_peer.runtime.mem_disk().pause_next_sync();
+        let lamport = c.owner.submit(op("overlap")).unwrap();
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        assert!(
+            c.owner.acked_through(PEER_A) >= lamport,
+            "peer replication should not wait for the paused local sync"
+        );
+        assert!(
+            c.owner.committed_lamport() < lamport,
+            "a peer ACK must not substitute for the owner's durable copy"
+        );
+        release.notify_one();
+        assert_eq!(c.owner.wait_for(lamport).await.unwrap(), lamport);
+    });
+}
+
+#[test]
+fn local_sync_cannot_commit_while_both_replicas_are_paused() {
+    let base = TestRuntime::solo(914);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        c.owner.commit(op("warm")).await.unwrap();
+        c.owner.catch_up_replicas().await.unwrap();
+        let releases: Vec<_> = c
+            .peers
+            .iter()
+            .map(|peer| peer.runtime.mem_disk().pause_next_sync())
+            .collect();
+        let lamport = c.owner.submit(op("invalidate")).unwrap();
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        assert!(c.owner.durable_lamport() >= lamport);
+        assert!(c.owner.acked_through(PEER_A) < lamport);
+        assert!(
+            c.owner.committed_lamport() < lamport,
+            "the local copy alone must not form a durability quorum"
+        );
+        for release in releases {
+            release.notify_one();
+        }
+        assert_eq!(c.owner.wait_for(lamport).await.unwrap(), lamport);
+    });
+}
+
+#[test]
+fn quiesce_waits_for_local_sync_before_truncating_the_uncommitted_tail() {
+    let base = TestRuntime::solo(915);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        c.owner.commit(op("warm")).await.unwrap();
+        let release = c.owner_peer.runtime.mem_disk().pause_next_sync();
+        let lamport = c.owner.submit(op("in-flight")).unwrap();
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        assert!(c.owner.acked_through(PEER_A) >= lamport);
+        assert!(c.owner.durable_lamport() < lamport);
+
+        let outcome = Arc::new(Mutex::new(None));
+        let result = Arc::clone(&outcome);
+        let owner = Arc::clone(&c.owner);
+        base.spawn(async move {
+            *result.lock().unwrap() = Some(owner.quiesce().await);
+        });
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        assert!(
+            outcome.lock().unwrap().is_none(),
+            "quiesce must wait for the local flusher"
+        );
+        release.notify_one();
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        assert_eq!(outcome.lock().unwrap().take().unwrap().unwrap(), Lamport(1));
+        assert_eq!(c.owner_peer.durable().await, Lamport(1));
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+        assert!(matches!(
+            c.owner.wait_for(lamport).await,
+            Err(Error::Indeterminate(_))
+        ));
+    });
+}
