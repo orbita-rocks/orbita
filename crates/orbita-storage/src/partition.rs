@@ -629,11 +629,11 @@ impl<R: Runtime> Partition<R> {
     /// Freezes flush, compaction, and sweep because this partition is a split
     /// parent whose children now reference its segments in place (ADR 0009).
     ///
-    /// Set before the child manifests are published. Because every maintenance
-    /// path re-checks it under [`Partition::state`], and publication also holds
-    /// that lock, a maintenance pass either ran before the children existed
-    /// (touching only unshared segments) or sees the freeze and stands down;
-    /// there is no interleaving in which it deletes a segment a child points at.
+    /// Set before the child manifests are published. Maintenance and child
+    /// publication share the publication mutex, and maintenance checks this
+    /// flag after acquiring it. A pass either finishes before the children
+    /// exist or sees the freeze and stands down; it cannot delete a segment
+    /// while a child is being published that points at it.
     pub fn freeze_maintenance(&self) {
         self.maintenance_frozen
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2504,6 +2504,61 @@ mod tests {
                 .expect("write");
         }
         owner.flush().await.expect("flush");
+    }
+
+    #[tokio::test]
+    async fn a_flush_upload_does_not_block_apply_or_discard_newer_versions() {
+        let (owner, reader, store) = crate::testing::counting_partition_pair().await;
+        let owner = std::sync::Arc::new(owner);
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("k"), bytes("old"), None))
+            .await
+            .unwrap();
+        let (entered, release) = store.pause_upload();
+        let flushing = std::sync::Arc::clone(&owner);
+        let upload = tokio::spawn(async move { flushing.flush().await });
+        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            owner
+                .apply(&Mutation::put(Lamport(2), bytes("k"), bytes("new"), None))
+                .await
+                .unwrap();
+            assert_eq!(owner.get(b"k").await.unwrap().unwrap().value, bytes("new"));
+        })
+        .await
+        .expect("upload must not hold the state lock");
+        release.notify_one();
+        upload.await.unwrap().unwrap();
+        assert_eq!(owner.flushed_lamport().await.unwrap(), Lamport(1));
+        assert_eq!(owner.get(b"k").await.unwrap().unwrap().value, bytes("new"));
+        reader.hydrate().await.unwrap();
+        assert_eq!(reader.get(b"k").await.unwrap().unwrap().value, bytes("old"));
+        owner.flush().await.unwrap();
+        reader.hydrate().await.unwrap();
+        assert_eq!(reader.get(b"k").await.unwrap().unwrap().value, bytes("new"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_flush_upload_leaves_its_snapshot_readable() {
+        let (owner, _, store) = crate::testing::counting_partition_pair().await;
+        let owner = std::sync::Arc::new(owner);
+        owner
+            .apply(&Mutation::put(Lamport(1), bytes("k"), bytes("value"), None))
+            .await
+            .unwrap();
+        let (entered, _) = store.pause_upload();
+        let flushing = std::sync::Arc::clone(&owner);
+        let upload = tokio::spawn(async move { flushing.flush().await });
+        entered.notified().await;
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            owner.get(b"k").await.unwrap().unwrap().value,
+            bytes("value")
+        );
+        assert_eq!(owner.flushed_lamport().await.unwrap(), Lamport::ZERO);
+        owner.flush().await.unwrap();
+        assert_eq!(owner.flushed_lamport().await.unwrap(), Lamport(1));
     }
 
     #[tokio::test]
