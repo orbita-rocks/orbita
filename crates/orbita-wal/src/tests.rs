@@ -2330,7 +2330,7 @@ fn a_write_still_fails_quickly_when_a_replica_that_was_following_goes_away() {
 }
 
 #[test]
-fn peers_can_finish_before_local_sync_but_the_client_cannot() {
+fn replication_waits_for_local_sync_before_exposing_new_lamports() {
     let base = TestRuntime::solo(913);
     block_on(&base, async {
         let c = cluster(&base).await;
@@ -2342,8 +2342,8 @@ fn peers_can_finish_before_local_sync_but_the_client_cannot() {
             yield_now().await;
         }
         assert!(
-            c.owner.acked_through(PEER_A) >= lamport,
-            "peer replication should not wait for the paused local sync"
+            c.owner.acked_through(PEER_A) < lamport,
+            "peers must not learn a Lamport the owner could reuse after a crash"
         );
         assert!(
             c.owner.committed_lamport() < lamport,
@@ -2394,7 +2394,7 @@ fn quiesce_waits_for_local_sync_before_truncating_the_uncommitted_tail() {
         for _ in 0..500 {
             yield_now().await;
         }
-        assert!(c.owner.acked_through(PEER_A) >= lamport);
+        assert!(c.owner.acked_through(PEER_A) < lamport);
         assert!(c.owner.durable_lamport() < lamport);
 
         let outcome = Arc::new(Mutex::new(None));
@@ -2422,4 +2422,108 @@ fn quiesce_waits_for_local_sync_before_truncating_the_uncommitted_tail() {
             Err(Error::Indeterminate(_))
         ));
     });
+}
+
+#[test]
+fn same_epoch_restart_cannot_acknowledge_reused_lamports_with_different_bytes() {
+    let base = TestRuntime::solo(916);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        c.owner.commit(op("warm")).await.unwrap();
+        c.owner.catch_up_replicas().await.unwrap();
+        // Restore only the last synced bytes on restart: the paused append
+        // may have changed the page cache but has not made it durable.
+        let synced = c.owner_peer.runtime.mem_disk().snapshot();
+        let _paused = c.owner_peer.runtime.mem_disk().pause_next_sync();
+        let lost = c.owner.submit(op("unacknowledged-original")).unwrap();
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        assert!(c.owner.committed_lamport() < lost);
+        let runtime = base.peer(synced, c.net.node(OWNER));
+        let reopened = Wal::open(
+            runtime.clone(),
+            WalConfig::new(PARTITION, DIR, Epoch(1)).with_replicas(vec![PEER_A, PEER_B]),
+        )
+        .await
+        .unwrap();
+        let service = WalService::new();
+        service.register(reopened.log());
+        runtime.transport().register(ServiceId::Wal, service);
+        assert_eq!(
+            reopened
+                .commit(op("acknowledged-replacement"))
+                .await
+                .unwrap(),
+            lost
+        );
+        reopened.catch_up_replicas().await.unwrap();
+        for peer in &c.peers {
+            let log = peer.service.log(PARTITION).unwrap();
+            let CatchUp::Entries(entries) = log.entries_after(Lamport(1)).await.unwrap() else {
+                panic!("the acknowledged replacement must be on the replica");
+            };
+            assert_eq!(entries[0].op, op("acknowledged-replacement"));
+        }
+    });
+}
+
+#[derive(Clone)]
+struct ShortAppendAck {
+    inner: WalService<TestRuntime>,
+    gap_first: Arc<Mutex<bool>>,
+}
+
+impl PeerHandler for ShortAppendAck {
+    async fn handle(&self, from: NodeId, call: PeerCall) -> TransportResult<Bytes> {
+        if call.method != crate::wire::METHOD_APPEND {
+            return self.inner.handle(from, call).await;
+        }
+        let gap = std::mem::take(&mut *self.gap_first.lock().unwrap());
+        Ok(if gap {
+            WalResponse::Gap {
+                durable_lamport: Lamport::ZERO,
+                epoch: Epoch(1),
+            }
+        } else {
+            WalResponse::Ok {
+                durable_lamport: Lamport(1),
+                epoch: Epoch(1),
+            }
+        }
+        .encode())
+    }
+}
+
+fn assert_short_ack_does_not_commit(gap_first: bool) {
+    let base = TestRuntime::solo(917);
+    block_on(&base, async {
+        let c = cluster(&base).await;
+        c.owner.commit(op("warm")).await.unwrap();
+        c.owner.catch_up_replicas().await.unwrap();
+        c.net.isolate(PEER_B);
+        c.peers[0].runtime.transport().register(
+            ServiceId::Wal,
+            ShortAppendAck {
+                inner: c.peers[0].service.clone(),
+                gap_first: Arc::new(Mutex::new(gap_first)),
+            },
+        );
+        assert!(matches!(
+            c.owner.commit(op("not-replicated")).await,
+            Err(Error::Indeterminate(_))
+        ));
+        assert_eq!(c.owner.committed_lamport(), Lamport(1));
+        assert_eq!(c.owner.acked_through(PEER_A), Lamport(1));
+    });
+}
+
+#[test]
+fn a_catch_up_ack_below_the_requested_horizon_cannot_commit_the_batch() {
+    assert_short_ack_does_not_commit(true);
+}
+
+#[test]
+fn an_append_ack_below_the_requested_horizon_cannot_commit_the_batch() {
+    assert_short_ack_does_not_commit(false);
 }
