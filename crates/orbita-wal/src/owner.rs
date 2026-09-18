@@ -1186,6 +1186,22 @@ impl<R: Runtime> Wal<R> {
     ///
     /// [ADR 0002]: https://github.com/orbita-rocks/orbita/blob/develop/docs/adr/0002-key-versions-are-partition-lamports.md
     pub async fn quiesce(&self) -> Result<Lamport> {
+        // Freeze commits, then let the local flusher finish before choosing
+        // a truncate horizon; otherwise an append could land after the cut.
+        loop {
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let flushing = {
+                let mut state = self.state();
+                state.quiesced = true;
+                state.flushing
+            };
+            if !flushing {
+                break;
+            }
+            notified.await;
+        }
         let (committed, dropped_from) = {
             let mut state = self.state();
             if let Some(fatal) = &state.fatal {
@@ -1343,6 +1359,12 @@ impl<R: Runtime> Wal<R> {
     /// cost a sync plus a network round trip and `pending` would grow for a
     /// whole peer timeout whenever a replica was slow. The flusher goes back
     /// for the next batch as soon as this one is on the local disk.
+    ///
+    /// Local durability must precede sending this batch. A same-epoch reopen
+    /// resumes Lamports from the local disk, and replicas treat an existing
+    /// Lamport as a retransmission without comparing bytes. Sending ahead of
+    /// local sync could therefore let a restarted owner reuse a replica's
+    /// Lamport for different bytes and acknowledge a write with only one copy.
     async fn flush_batch(self: &Arc<Self>, batch: Vec<Pending>) {
         let first = batch[0].entry.lamport;
         let last = batch[batch.len() - 1].entry.lamport;
@@ -1453,12 +1475,14 @@ impl<R: Runtime> Wal<R> {
                 if let Some(fatal) = &state.fatal {
                     return Err(fatal.clone());
                 }
-                if lamport <= state.failed_through {
-                    // Indeterminate, not Unavailable. The entry is already
-                    // fsynced to this node's log by the time replication is
-                    // attempted, so this is not a write that did not happen —
-                    // it is one nobody can speak for, and the next open will
-                    // replay it. See issue #187.
+                if lamport <= state.failed_through
+                    && (lamport <= state.durable_local || state.quiesced)
+                {
+                    // A failed batch can still exist on a replica. Quiesce
+                    // also settles entries it truncated after freezing the
+                    // committed prefix. In either case a peer may hold the
+                    // write: report an unknown outcome, not a safe retry.
+                    // See issue #187.
                     return Err(Error::Indeterminate(format!(
                         "partition {} could not reach a second copy for {lamport}",
                         self.partition
@@ -1501,10 +1525,11 @@ impl<R: Runtime> Wal<R> {
     /// hold every write for the whole budget. That distinction is why this uses
     /// the catch-up state rather than simply counting attempts.
     async fn replicate(self: &Arc<Self>, request: AppendRequest) -> Result<()> {
+        let payload = request.encode();
         let mut backoff = REPLICATION_RETRY_INITIAL;
         let mut spent = Duration::ZERO;
         loop {
-            let outcome = self.replicate_once(request.clone()).await;
+            let outcome = self.replicate_once(request.clone(), payload.clone()).await;
             let Err(error) = outcome else {
                 return outcome;
             };
@@ -1538,7 +1563,11 @@ impl<R: Runtime> Wal<R> {
         })
     }
 
-    async fn replicate_once(self: &Arc<Self>, request: AppendRequest) -> Result<()> {
+    async fn replicate_once(
+        self: &Arc<Self>,
+        request: AppendRequest,
+        payload: Bytes,
+    ) -> Result<()> {
         let replicas = self.replicas();
         // Sized from the durability requirement, not from how many peers happen
         // to be listening. Peers beyond the quorum are followers: they get the
@@ -1555,8 +1584,9 @@ impl<R: Runtime> Wal<R> {
             .map(|node| {
                 let this = Arc::clone(self);
                 let request = request.clone();
+                let payload = payload.clone();
                 let node = *node;
-                Box::pin(async move { this.call_replica(node, request).await })
+                Box::pin(async move { this.call_replica_encoded(node, request, payload).await })
                     as Pin<Box<dyn Future<Output = Outcome> + Send>>
             })
             .collect();
@@ -1639,12 +1669,28 @@ impl<R: Runtime> Wal<R> {
     }
 
     async fn call_replica(&self, node: NodeId, request: AppendRequest) -> Outcome {
-        match self.send(node, METHOD_APPEND, request.encode()).await {
+        let payload = request.encode();
+        self.call_replica_encoded(node, request, payload).await
+    }
+
+    // Every peer receives the same immutable bytes. Catch-up still retains
+    // the logical request so it can construct the missing prefix separately.
+    async fn call_replica_encoded(
+        &self,
+        node: NodeId,
+        request: AppendRequest,
+        payload: Bytes,
+    ) -> Outcome {
+        match self.send(node, METHOD_APPEND, payload).await {
             Ok(WalResponse::Ok {
                 durable_lamport, ..
             }) => {
                 self.record_ack(node, durable_lamport);
-                Outcome::Acked
+                if durable_lamport >= request.last_lamport() {
+                    Outcome::Acked
+                } else {
+                    Outcome::Failed
+                }
             }
             Ok(WalResponse::StaleEpoch { current }) => {
                 tracing::warn!(
@@ -1727,7 +1773,11 @@ impl<R: Runtime> Wal<R> {
                 durable_lamport, ..
             }) => {
                 self.record_ack(node, durable_lamport);
-                Outcome::Acked
+                if durable_lamport >= request.last_lamport() {
+                    Outcome::Acked
+                } else {
+                    Outcome::Failed
+                }
             }
             Ok(WalResponse::StaleEpoch { current }) => Outcome::Stale(current),
             _ => Outcome::Failed,

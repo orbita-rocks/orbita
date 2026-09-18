@@ -520,6 +520,7 @@ pub(crate) struct CountingStore {
     inner: MemoryStore,
     manifest_reads: AtomicUsize,
     segment_reads: AtomicUsize,
+    paused_upload: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl CountingStore {
@@ -528,6 +529,24 @@ impl CountingStore {
             inner: MemoryStore::new(),
             manifest_reads: AtomicUsize::new(0),
             segment_reads: AtomicUsize::new(0),
+            paused_upload: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn pause_upload(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.paused_upload.lock().unwrap() = Some((entered.clone(), release.clone()));
+        (entered, release)
+    }
+
+    async fn upload_gate(&self, key: &str) {
+        if key.contains("/segments/") {
+            let pause = self.paused_upload.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
         }
     }
 
@@ -559,10 +578,12 @@ impl CountingStore {
 #[async_trait::async_trait]
 impl ObjectStore for CountingStore {
     async fn put(&self, key: &str, data: Bytes) -> ObjectResult<ETag> {
+        self.upload_gate(key).await;
         self.inner.put(key, data).await
     }
 
     async fn put_if(&self, key: &str, data: Bytes, condition: Precondition) -> ObjectResult<ETag> {
+        self.upload_gate(key).await;
         self.inner.put_if(key, data, condition).await
     }
 

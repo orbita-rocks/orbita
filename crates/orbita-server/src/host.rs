@@ -473,6 +473,21 @@ impl<R: Runtime> PartitionHost<R> {
         // its storage engine there and then. A background task keeping the
         // engine alive would let a deposed incarnation keep applying after
         // its replacement has opened the same partition.
+        let (flush_requests, mut flush_queue) = tokio::sync::mpsc::channel::<()>(1);
+        if wal.is_some() {
+            let storage = Arc::downgrade(&storage);
+            let log = Arc::downgrade(&log);
+            let flushing = Arc::downgrade(&flushing);
+            runtime.spawn(async move {
+                while flush_queue.recv().await.is_some() {
+                    let (Some(storage), Some(log), Some(flushing)) =
+                        (storage.upgrade(), log.upgrade(), flushing.upgrade()) else { return; };
+                    if let Err(error) = flush_and_checkpoint(&storage, &log, &flushing, false).await {
+                        tracing::warn!(%error, "size-triggered flush failed; WAL remains replayable");
+                    }
+                }
+            });
+        }
         runtime.spawn(apply_loop(
             spec.id,
             ApplyTarget {
@@ -481,9 +496,7 @@ impl<R: Runtime> PartitionHost<R> {
                 drained: Arc::downgrade(&drained),
                 settled: Arc::downgrade(&settled),
                 wal: wal.as_ref().map(Arc::downgrade),
-                log: Arc::downgrade(&log),
-                flushing: Arc::downgrade(&flushing),
-                flush_on_trigger: wal.is_some(),
+                flush_requests: wal.is_some().then_some(flush_requests),
             },
             queue,
         ));
@@ -1149,7 +1162,16 @@ impl<R: Runtime> PartitionHost<R> {
                 .lock()
                 .expect("pending set poisoned")
                 .overlay(&key);
-            let committed = self.storage.get(&key).await?;
+            // SET does not return the old existence or version. Reading it
+            // here could fetch an object while holding admission for every
+            // key in the partition. DELETE and conditional writes still need
+            // the old state and the pending overlay.
+            let committed =
+                if matches!(op, WriteOp::Put { .. }) && matches!(condition, WriteCondition::None) {
+                    None
+                } else {
+                    self.storage.get(&key).await?
+                };
             let visible = pending::visible(committed, &overlay, now);
 
             // An unconditional write does not read the key, so nothing about
@@ -1868,9 +1890,7 @@ struct ApplyTarget<R: Runtime> {
     drained: Weak<tokio::sync::Notify>,
     settled: Weak<tokio::sync::Notify>,
     wal: Option<Weak<Wal<R>>>,
-    log: Weak<PartitionLog<R>>,
-    flushing: Weak<tokio::sync::Mutex<()>>,
-    flush_on_trigger: bool,
+    flush_requests: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 /// One submitted write, handed to the applier at submission rather than on
@@ -1990,15 +2010,12 @@ async fn apply_loop<R: Runtime>(
                 false
             }
         };
-        if applied && target.flush_on_trigger {
-            if let (Some(log), Some(flushing)) = (target.log.upgrade(), target.flushing.upgrade()) {
-                if let Err(error) = flush_and_checkpoint(&storage, &log, &flushing, false).await {
-                    tracing::warn!(
-                        partition = partition.get(),
-                        %error,
-                        "size-triggered flush failed; the WAL remains replayable"
-                    );
-                }
+        if applied {
+            if let Some(flush_requests) = &target.flush_requests {
+                // One pending request coalesces all applies while an upload
+                // runs. The next pass sees the new table, without parking the
+                // ordered applier behind object storage.
+                let _ = flush_requests.try_send(());
             }
         }
         pending
