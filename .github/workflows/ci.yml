@@ -117,6 +117,8 @@ jobs:
       # takes `server /data` as its command, and service containers have no way
       # to supply one.
       #
+      # Quay still serves this exact digest after the Docker Hub repository
+      # became unavailable. Keep the content pin when changing registries.
       # The digest is RELEASE.2025-09-07T16-13-09Z. Two things fix it there.
       # The floor is conditional PUT, which MinIO shipped in early 2025;
       # against a 2023 server these tests fail on the assertion rather than on
@@ -131,7 +133,7 @@ jobs:
           docker run -d --name orbita-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=orbita-ci \
             -e MINIO_ROOT_PASSWORD=orbita-ci-secret \
-            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
 
       # `mc` ships inside that image, so readiness and bucket creation need no
